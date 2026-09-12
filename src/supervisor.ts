@@ -560,9 +560,14 @@ export class Supervisor {
     const status = await this.#adapter.getStatus(this.#handle);
     if (!status.running) return;
     const now = Date.now();
-    const startedAt = Date.parse(this.#task.startedAt);
-    const lastOutputAt = status.lastOutputAt ? Date.parse(status.lastOutputAt) : startedAt;
-    const reason = this.#deadlineMs > 0 && now - startedAt >= this.#deadlineMs
+    const taskStartedAt = Date.parse(this.#task.startedAt);
+    // The deadline is cumulative across recovery, but the no-output timer
+    // starts when this worker process starts. Otherwise a slow Decision Worker
+    // startup or a recovered task can be stopped on its first watchdog tick
+    // before this worker has had a chance to produce output.
+    const workerStartedAt = Date.parse(this.#handle.startedAt);
+    const lastOutputAt = status.lastOutputAt ? Date.parse(status.lastOutputAt) : workerStartedAt;
+    const reason = this.#deadlineMs > 0 && now - taskStartedAt >= this.#deadlineMs
       ? "worker deadline exceeded"
       : this.#noOutputTimeoutMs > 0 && now - lastOutputAt >= this.#noOutputTimeoutMs
         ? "worker produced no output before timeout"
