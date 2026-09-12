@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.2.2](https://github.com/btnalit/pi-claude-supervisor/compare/v0.2.1...v0.2.2) (2026-09-12)
+
+
+### Bug Fixes
+
+* baseline no-output watchdog at worker start ([6596d85](https://github.com/btnalit/pi-claude-supervisor/commit/6596d857522e61be7a4aa837dcd74f520300da0a))
+
 ## [0.2.1](https://github.com/btnalit/pi-claude-supervisor/compare/v0.2.0...v0.2.1) (2026-09-12)
 
 
