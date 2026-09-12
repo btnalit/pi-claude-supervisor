@@ -35,6 +35,8 @@ export interface SupervisorStartOptions {
   /** Reuse an existing task id when explicitly recovering after a Pi restart. */
   taskId?: string;
   task: string;
+  /** Override the first worker message; recovery uses an empty message to avoid replay. */
+  initialInput?: string;
   cwd: string;
   command: string;
   args?: string[];
@@ -164,7 +166,7 @@ export class Supervisor {
         await this.#decision.start();
       }
       const input: WorkerStartInput = {
-        task: options.task,
+        task: options.initialInput ?? options.task,
         cwd: options.cwd,
         command: options.command,
         args: options.args,
@@ -271,13 +273,24 @@ export class Supervisor {
 
   async #decisionFailure(event: WorkerEvent, error: unknown): Promise<void> {
     return this.#exclusive(async () => {
-      await this.#appendEvent({
-        type: "decision_worker_failed",
-        taskId: this.#task?.taskId,
-        workerId: event.handle.id,
-        data: { eventType: event.type, error: safeMessage(error) },
-      });
-      await this.#requestHuman(`Decision Worker API failed: ${safeMessage(error)}`, event);
+      let auditError: unknown;
+      try {
+        await this.#appendEvent({
+          type: "decision_worker_failed",
+          taskId: this.#task?.taskId,
+          workerId: event.handle.id,
+          data: { eventType: event.type, error: safeMessage(error) },
+        });
+      } catch (failure) {
+        auditError = failure;
+      }
+      let noticeError: unknown;
+      try {
+        await this.#requestHuman(`Decision Worker API failed: ${safeMessage(error)}`, event);
+      } catch (failure) {
+        noticeError = failure;
+      }
+      if (auditError || noticeError) throw new AggregateError([auditError, noticeError].filter(Boolean), "Decision Worker failure handling failed");
     });
   }
 
@@ -440,6 +453,14 @@ export class Supervisor {
     await this.#appendEvent({ type: "worker_resumed", taskId: this.#task?.taskId, workerId: this.#handle.id });
   }
 
+  async abortStart(reason = "startup aborted"): Promise<void> {
+    // This path intentionally bypasses #exclusive(): start() may be blocked in
+    // a Decision Worker model call and shutdown must still dispose that session.
+    await this.#decision?.close().catch(() => {});
+    this.#decision = undefined;
+    if (this.#handle) await this.#adapter.stop(this.#handle, reason).catch(() => {});
+  }
+
   async stop(reason = "human requested stop"): Promise<void> {
     // Start the adapter stop immediately so a queued/hung send cannot delay
     // process termination. State/event changes still remain serialized below.
@@ -570,7 +591,7 @@ export class Supervisor {
 
 function workerEventKey(event: WorkerEvent): string {
   if (event.type === "permission_request") return `${event.handle.id}:permission:${event.request.requestId}`;
-  if (event.type === "turn_completed") return `${event.handle.id}:result:${String(event.result.uuid ?? event.result.session_id ?? JSON.stringify(event.result))}`;
+  if (event.type === "turn_completed") return `${event.handle.id}:result:${event.sequence}`;
   if (event.type === "exited") return `${event.handle.id}:exit`;
   if (event.type === "jsonl") return `${event.handle.id}:jsonl:${String(event.record.uuid ?? event.record.request_id ?? JSON.stringify(event.record))}`;
   return `${event.handle.id}:output:${event.chunk.at}:${event.chunk.text.slice(0, 80)}`;

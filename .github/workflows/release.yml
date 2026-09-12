@@ -38,12 +38,14 @@ jobs:
           token: ${{ github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-      - name: Dispatch CI for bot release PRs
+      - name: Run CI for bot-created release PRs
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v8
         env:
           RELEASE_PRS: ${{ steps.release.outputs.prs || '[]' }}
         with:
           script: |
+            // GITHUB_TOKEN events cannot trigger another push/PR workflow. Explicit
+            // workflow_dispatch can, without storing a personal GitHub token.
             for (const pr of JSON.parse(process.env.RELEASE_PRS)) {
               if (!Number.isSafeInteger(pr.number)) throw new Error('Invalid release PR');
               const {data} = await github.rest.pulls.get({...context.repo, pull_number: pr.number});
@@ -68,12 +70,17 @@ jobs:
             if (!/^v\d+\.\d+\.\d+$/.test(tag)) throw new Error('Only stable vX.Y.Z releases are publishable');
             const {data: release} = await github.rest.repos.getReleaseByTag({...context.repo, tag});
             if (release.draft || release.prerelease) throw new Error('Release must be public and stable');
-            const {data: ref} = await github.rest.git.getRef({...context.repo, ref: `tags/${tag}`});
-            if (ref.object.type !== 'commit' || !/^[a-f0-9]{40}$/.test(ref.object.sha)) throw new Error('Invalid release commit');
-            const {data: comparison} = await github.rest.repos.compareCommitsWithBasehead({...context.repo, basehead: `${ref.object.sha}...main`});
+            let {data: ref} = await github.rest.git.getRef({...context.repo, ref: `tags/${tag}`});
+            let object = ref.object;
+            while (object.type === 'tag') {
+              const {data} = await github.rest.git.getTag({...context.repo, tag_sha: object.sha});
+              object = data.object;
+            }
+            if (object.type !== 'commit' || !/^[a-f0-9]{40}$/.test(object.sha)) throw new Error('Invalid release commit');
+            const {data: comparison} = await github.rest.repos.compareCommitsWithBasehead({...context.repo, basehead: `${object.sha}...main`});
             if (!['ahead', 'identical'].includes(comparison.status)) throw new Error('Release is outside main history');
             core.setOutput('tag', tag);
-            core.setOutput('sha', ref.object.sha);
+            core.setOutput('sha', object.sha);
 
   verify:
     needs: plan
@@ -100,7 +107,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
-          ref: ${{ needs.plan.outputs.sha }}
+          # The publishing tools come from this trusted main workflow, not an artifact.
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
         with:

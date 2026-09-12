@@ -1,5 +1,11 @@
 # pi-claude-supervisor
 
+[![CI](https://github.com/btnalit/pi-claude-supervisor/actions/workflows/ci.yml/badge.svg)](https://github.com/btnalit/pi-claude-supervisor/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/pi-claude-supervisor)](https://www.npmjs.com/package/pi-claude-supervisor)
+[![MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+English · [简体中文](README.cn.md)
+
 A policy-gated [Pi](https://pi.dev) extension for supervising a Claude Code worker.
 The MVP keeps Pi in control of lifecycle, state, policy and verification while the
 worker remains an explicitly started child process.
@@ -99,6 +105,7 @@ npm test
 npm run check:package
 npm run check:docs
 npm run check:automation
+npm run check:workflows
 npm run build
 ```
 

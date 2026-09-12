@@ -22,7 +22,7 @@ export interface WorkerPermissionRequest {
 export type WorkerEvent =
   | { type: "output"; handle: WorkerHandle; chunk: WorkerOutputChunk }
   | { type: "jsonl"; handle: WorkerHandle; record: Record<string, unknown> }
-  | { type: "turn_completed"; handle: WorkerHandle; result: Record<string, unknown> }
+  | { type: "turn_completed"; handle: WorkerHandle; result: Record<string, unknown>; sequence: number }
   | { type: "permission_request"; handle: WorkerHandle; request: WorkerPermissionRequest }
   | { type: "exited"; handle: WorkerHandle; exitCode?: number | null; signal?: NodeJS.Signals };
 

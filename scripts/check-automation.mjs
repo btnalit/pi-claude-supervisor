@@ -1,25 +1,50 @@
+// Repository policy assertions complement actionlint's workflow/schema validation.
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { parse } from "yaml";
 
-const packageJson = JSON.parse(readFileSync("package.json", "utf8"));
-const ci = readFileSync(".github/workflows/ci.yml", "utf8");
-const release = readFileSync(".github/workflows/release.yml", "utf8");
-const dependabot = readFileSync(".github/dependabot.yml", "utf8");
-const releaseConfig = JSON.parse(readFileSync("release-please-config.json", "utf8"));
-const manifest = JSON.parse(readFileSync(".release-please-manifest.json", "utf8"));
-
-for (const script of ["check", "check:docs", "check:automation", "test:install", "test:pi", "build"]) {
-  assert.equal(typeof packageJson.scripts[script], "string", `missing npm script: ${script}`);
+const read = (path) => readFileSync(path, "utf8");
+const pkg = JSON.parse(read("package.json"));
+assert.equal(JSON.parse(read(".release-please-manifest.json"))["."], pkg.version, "Release manifest/version drift");
+const lock = JSON.parse(read("package-lock.json"));
+assert.equal(lock.packages[""].version, pkg.version);
+assert.deepEqual(lock.packages[""].devDependencies, pkg.devDependencies, "Lockfile dev dependency drift");
+const config = JSON.parse(read("release-please-config.json"));
+assert.equal(config.packages["."]["release-type"], "node");
+assert.equal(config["include-component-in-tag"], false);
+for (const file of readdirSync(".github/workflows")) {
+  const workflow = parse(read(`.github/workflows/${file}`));
+  assert.ok(!workflow.on.pull_request_target, "Never run untrusted PR code with a privileged trigger");
+  assert.deepEqual(workflow.permissions, { contents: "read" }, "Default workflow token must be read-only");
+  for (const [name, job] of Object.entries(workflow.jobs)) {
+    assert.ok(job["timeout-minutes"] || job.uses?.startsWith("./"), `${file}/${name} needs a time limit`);
+    assert.notEqual(job.secrets, "inherit", "Reusable verification must not inherit publishing secrets");
+    for (const [permission, value] of Object.entries(job.permissions ?? {})) {
+      if (value === "write") assert.ok(file === "release.yml" && ["plan", "publish"].includes(name), `Unexpected writable ${permission} in ${file}/${name}`);
+    }
+    for (const step of job.steps ?? []) {
+      if (step.uses) assert.match(step.uses, /^[\w.-]+\/[\w./-]+@[a-f0-9]{40}$/u, "External actions must use immutable commit pins");
+      if (step.uses?.startsWith("actions/checkout@")) assert.equal(step.with["persist-credentials"], false);
+      if (step.run) assert.ok(!step.run.includes("${{"), "Pass dynamic data through environment variables, not shell interpolation");
+    }
+  }
 }
-for (const text of ["pull_request:", "branches: [main]", "npm run check", "npm run test:install", "npm audit", "gate:", "needs:"]) {
-  assert.ok(ci.includes(text), `CI workflow missing gate requirement: ${text}`);
+const ci = parse(read(".github/workflows/ci.yml"));
+for (const event of ["pull_request", "push", "workflow_dispatch", "schedule", "workflow_call"]) assert.ok(event in ci.on);
+assert.equal(ci.jobs.gate.name, "Quality gate");
+assert.equal(ci.jobs.gate.if, "always()");
+assert.deepEqual([...ci.jobs.gate.needs].sort(), ["build", "checks", "checks_npm_latest", "integration", "policy"]);
+assert.deepEqual(ci.jobs.checks_npm_latest.strategy.matrix.npm, ["10", "12"]);
+for (const command of ["npm run check", "npm run test:install", "npm run build"]) {
+  assert.ok(ci.jobs.checks_npm_latest.steps.some((step) => step.run === command), `Explicit npm lanes must run ${command}`);
 }
-assert.ok(ci.includes("workflow_call:"), "CI must be reusable for exact-tag release verification");
-for (const text of ["release-please-action", "publish-package.mjs", "id-token: write", "environment: npm", "NPM_TOKEN"]) {
-  assert.ok(release.includes(text), `release workflow missing publication control: ${text}`);
-}
-assert.equal(releaseConfig["release-type"], "node");
-assert.equal(manifest["."], packageJson.version, "release-please manifest must match package version");
-assert.ok(dependabot.includes("package-ecosystem: npm"), "Dependabot npm updates are not configured");
-assert.ok(dependabot.includes("package-ecosystem: github-actions"), "Dependabot Actions updates are not configured");
-console.log("CI, release, Dependabot and release-please policy checks passed");
+assert.ok(ci.jobs.checks_npm_latest.steps.some((step) => step.run?.includes("npm install --global --ignore-scripts \"npm@$NPM_VERSION\"")), "npm major selection must actually run, not use an unsupported action input");
+assert.ok(!ci.on.pull_request.paths && !ci.on.pull_request["paths-ignore"], "Required checks cannot be skipped by path filters");
+const release = parse(read(".github/workflows/release.yml"));
+assert.equal(release.jobs.publish.environment, "npm");
+assert.deepEqual(release.jobs.publish.needs, ["plan", "verify"]);
+assert.equal(release.jobs.verify.uses, "./.github/workflows/ci.yml");
+assert.ok(release.jobs.plan.steps.some((step) => step.with?.script?.includes("createWorkflowDispatch")), "Bot PRs need explicit CI dispatch when using GITHUB_TOKEN");
+const dependabot = parse(read(".github/dependabot.yml"));
+assert.deepEqual(dependabot.updates.map((update) => update["package-ecosystem"]).sort(), ["github-actions", "npm"]);
+console.log("PASS: release metadata, read-only CI, pinned actions, protected publication graph and dependency update configuration.");

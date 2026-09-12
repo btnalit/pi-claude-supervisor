@@ -37,6 +37,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   const reservedCwds = new Map<string, string>();
   const pendingCwds = new Set<string>();
   const pendingStarts = new Set<Promise<void>>();
+  const pendingStartSessions = new Set<Supervisor>();
   let activeTaskId: string | undefined;
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;
@@ -148,6 +149,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
               }
             },
           });
+          pendingStartSessions.add(session);
           const startOperation = (async () => {
             try {
               const handle = await session.start({
@@ -226,6 +228,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             throw error;
           } finally {
             pendingStarts.delete(startOperation);
+            pendingStartSessions.delete(session);
             pendingCwds.delete(cwdKey);
           }
         } else if (operation === "recover") {
@@ -236,6 +239,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           const record = await decisionStore.load(taskId);
           if (!record || record.state !== "active") throw new Error(`No recoverable Decision Worker session: ${taskId}`);
           if (!await decisionStore.sessionFileExists(taskId)) throw new Error(`Decision Worker session file is missing or unsafe: ${taskId}`);
+          if (record.maxTurns > 0 && record.turn >= record.maxTurns) throw new Error(`Cannot recover task after its turn budget was exhausted: ${taskId}`);
+          if (record.deadlineMs > 0 && Date.now() - Date.parse(record.startedAt) >= record.deadlineMs) throw new Error(`Cannot recover task after its wall-clock deadline: ${taskId}`);
           const cwdKey = await canonicalCwd(record.cwd);
           await releaseSettledReservations();
           if (shuttingDown) throw new Error("Pi session is shutting down");
@@ -267,11 +272,16 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
               }
             },
           });
+          pendingStartSessions.add(session);
           const recoveryOperation = (async () => {
             try {
               const handle = await session.start({
                 taskId: record.taskId,
+                // Claude session resume is not supported by this adapter. Start
+                // idle so recovery never replays the original task; the operator
+                // must explicitly send the next instruction.
                 task: record.task,
+                initialInput: "",
                 cwd: record.cwd,
                 command: record.command,
                 args: record.args,
@@ -306,11 +316,12 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
               sessions.set(record.taskId, session);
               reservedCwds.set(record.taskId, cwdKey);
               activeTaskId = record.taskId;
+              await session.takeover();
               if (shuttingDown) {
                 await stopSession(session, "Pi session shutdown during recovery");
                 throw new Error("Pi session shut down during recovery");
               }
-              message = `Worker recovered: task=${record.taskId} worker=${handle.id}; Decision Worker session restored`;
+              message = `Worker recovered idle: task=${record.taskId} worker=${handle.id}; original task was not replayed; send an explicit continuation, then use resume-auto`;
             } catch (error) {
               if (session.handle) {
                 sessions.set(record.taskId, session);
@@ -325,6 +336,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             await recoveryOperation;
           } finally {
             pendingStarts.delete(recoveryOperation);
+            pendingStartSessions.delete(session);
             pendingCwds.delete(cwdKey);
           }
         } else if (operation === "sessions") {
@@ -388,7 +400,12 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     if (shutdownPromise) return shutdownPromise;
     shuttingDown = true;
     shutdownPromise = (async () => {
-      await Promise.allSettled([...pendingStarts]);
+      const pending = [...pendingStarts];
+      await Promise.race([Promise.allSettled(pending), delay(5_000)]);
+      if (pendingStarts.size > 0) {
+        await Promise.allSettled([...pendingStartSessions].map((session) => session.abortStart("Pi session shutdown during startup")));
+        await Promise.race([Promise.allSettled([...pendingStarts]), delay(5_000)]);
+      }
       const results = await Promise.allSettled([...sessions.values()].map((session) => stopSession(session, "Pi session shutdown")));
       const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
       if (failures.length > 0) {

@@ -1,5 +1,11 @@
 # pi-claude-supervisor
 
+[![CI](https://github.com/btnalit/pi-claude-supervisor/actions/workflows/ci.yml/badge.svg)](https://github.com/btnalit/pi-claude-supervisor/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/pi-claude-supervisor)](https://www.npmjs.com/package/pi-claude-supervisor)
+[![MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+[English](README.md)
+
 用于 Pi 的 Claude Code Worker 监督扩展。MVP 中 Pi 负责生命周期、状态机、策略门和独立验收；Worker 只是被显式启动的子进程。
 
 > 当前默认 transport 是无额外依赖的 process pipe，不是 PTY。已新增可选 Claude JSONL framing，并通过基础 prompt、多轮和 resume Spike。当前优先保证生命周期、进程组清理、恢复和独立验收；低权限用户、OS sandbox 与网络隔离不作为当前主线，按明确授权和宿主机策略运行，后续再做安全加固。

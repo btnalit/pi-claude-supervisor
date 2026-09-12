@@ -198,7 +198,7 @@ function parseDecision(text: string, event: WorkerEvent): DecisionAction {
 
 function eventKey(event: WorkerEvent): string {
   if (event.type === "permission_request") return `${event.handle.id}:permission:${event.request.requestId}`;
-  if (event.type === "turn_completed") return `${event.handle.id}:result:${String(event.result.session_id ?? event.result.uuid ?? JSON.stringify(event.result))}`;
+  if (event.type === "turn_completed") return `${event.handle.id}:result:${event.sequence}`;
   if (event.type === "exited") return `${event.handle.id}:exit`;
   if (event.type === "jsonl") return `${event.handle.id}:jsonl:${String(event.record.uuid ?? event.record.request_id ?? JSON.stringify(event.record))}`;
   return `${event.handle.id}:output:${event.chunk.at}:${event.chunk.text.slice(0, 80)}`;

@@ -40,6 +40,7 @@ interface ProcessRecord {
   lastOutputAt?: string;
   lastInputAt?: string;
   activeRequests: number;
+  turnSequence: number;
   protocolBuffer: string;
   exitCode?: number | null;
   signal?: NodeJS.Signals;
@@ -129,6 +130,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       outputBytes: 0,
       outputTruncated: false,
       activeRequests: input.task ? 1 : 0,
+      turnSequence: 0,
       protocolBuffer: "",
       exited,
       resolveExit,
@@ -407,7 +409,8 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
           }
           if (event.type === "result") {
             record.activeRequests = Math.max(0, record.activeRequests - 1);
-            this.#emit(record, { type: "turn_completed", handle: record.handle, result: event });
+            record.turnSequence += 1;
+            this.#emit(record, { type: "turn_completed", handle: record.handle, result: event, sequence: record.turnSequence });
           }
         } catch {
           // Keep raw output for diagnostics; malformed output is not a completion signal.
