@@ -87,6 +87,42 @@ test("watchdog stops a worker that produces no output", async () => {
   assert.equal(supervisor.state, "stopped");
 });
 
+test("watchdog starts the no-output clock at the worker start", async () => {
+  const handle: WorkerHandle = {
+    id: "worker-start-baseline",
+    startedAt: new Date().toISOString(),
+    cwd: "/tmp",
+  };
+  let running = true;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "process-pipe", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true }),
+    start: async () => handle,
+    getStatus: async (): Promise<WorkerStatus> => ({ handle, running, activeRequests: 1, processGroupCleaned: true }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter);
+
+  await supervisor.start({
+    task: "recovered fixture",
+    cwd: "/tmp",
+    command: "fixture",
+    // The cumulative task deadline may already be old during recovery, but
+    // the worker itself has only just started.
+    startedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+    deadlineMs: 0,
+    noOutputTimeoutMs: 5_000,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  assert.equal(supervisor.state, "running");
+  await supervisor.stop("test complete");
+});
+
 test("watchdog stops the worker even when timeout events cannot be persisted", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-watchdog-log-failure-"));
   const adapter = new ProcessWorkerAdapter({ terminationGraceMs: 25, killGraceMs: 25 });
