@@ -9,7 +9,9 @@ if (!pkg.peerDependencies?.["@earendil-works/pi-coding-agent"]) throw new Error(
 if (!pkg.files.includes("src/**/*.ts")) throw new Error("source files must be published");
 const output = execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {encoding: "utf8"});
 const pack = JSON.parse(output.trim());
-const names = new Set(pack[0].files.map((file) => file.path));
+const entry = Array.isArray(pack) ? pack[0] : pack[pkg.name];
+if (!entry?.files) throw new Error("npm pack returned no file manifest");
+const names = new Set(entry.files.map((file) => file.path));
 for (const required of ["package.json", "README.md", "LICENSE", "src/index.ts", "src/supervisor.ts"]) {
   if (!names.has(required)) throw new Error(`package missing ${required}`);
 }
