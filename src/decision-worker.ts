@@ -20,6 +20,7 @@ export interface DecisionWorkerOptions {
   context: DecisionContext;
   onAction: (action: DecisionAction, event: WorkerEvent) => Promise<void> | void;
   onFailure?: (event: WorkerEvent, error: unknown) => Promise<void> | void;
+  onStartupFailure?: (error: unknown) => Promise<void> | void;
   /** Existing Pi session JSONL to restore after a Supervisor/Pi restart. */
   sessionFile?: string;
   /** Directory for newly created Pi session JSONL files. */
@@ -80,7 +81,14 @@ export class PiDecisionWorker {
       if (!this.#sessionFile) throw new Error("Decision Worker session persistence was requested but no session file was created");
       await this.#options.onSessionReady({ sessionFile: this.#sessionFile, sessionId: session.sessionId, restored });
     }
-    if (!restored) await session.prompt(decisionInstructions(this.#context));
+    if (!restored) {
+      try {
+        await session.prompt(decisionInstructions(this.#context));
+      } catch (error) {
+        try { await this.#options.onStartupFailure?.(error); } catch { /* preserve the original startup failure */ }
+        throw error;
+      }
+    }
   }
 
   updateContext(patch: Partial<DecisionContext>): void {

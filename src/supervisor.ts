@@ -162,6 +162,7 @@ export class Supervisor {
           }),
           onAction: (action, event) => this.#applyDecision(action, event),
           onFailure: (event, error) => this.#decisionFailure(event, error),
+          onStartupFailure: (error) => this.#decisionStartupFailure(error),
         });
         await this.#decision.start();
       }
@@ -268,6 +269,29 @@ export class Supervisor {
     if (this.#decision && (event.type === "permission_request" || event.type === "turn_completed" || event.type === "exited")) {
       this.#decision.updateContext({ state: this.#machine.state, turn: this.#turn });
       this.#decision.notify(event);
+    }
+  }
+
+  async #decisionStartupFailure(error: unknown): Promise<void> {
+    const task = this.#task;
+    if (!task) return;
+    const reason = `Decision Worker API failed during initialization: ${safeMessage(error)}`;
+    try {
+      await this.#appendEvent({ type: "decision_worker_failed", taskId: task.taskId, data: { eventType: "startup", error: safeMessage(error) } });
+    } catch (auditError) {
+      console.error(`pi-claude-supervisor decision startup audit failed: ${safeMessage(auditError)}`);
+    }
+    const notice: HumanInterventionNotice = { taskId: task.taskId, cwd: task.cwd, task: task.task, reason };
+    try {
+      await this.#appendEvent({ type: "human_intervention_required", taskId: task.taskId, data: notice as unknown as Record<string, unknown> });
+    } catch (auditError) {
+      console.error(`pi-claude-supervisor human intervention audit failed: ${safeMessage(auditError)}`);
+    }
+    try {
+      if (this.#onHumanRequired) await this.#onHumanRequired(notice);
+      else console.error(`pi-claude-supervisor human intervention required: ${reason}`);
+    } catch (notifyError) {
+      console.error(`pi-claude-supervisor human intervention notification failed: ${safeMessage(notifyError)}`);
     }
   }
 
