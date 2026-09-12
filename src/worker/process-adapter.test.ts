@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { access, constants, readFile } from "node:fs/promises";
 import test from "node:test";
 import { ProcessWorkerAdapter } from "./process-adapter.ts";
+
+const requiredCgroupTestAvailable = process.platform === "linux" && await canCreateCgroup();
 
 test("process adapter reports spawn failures instead of leaving a running record", async () => {
   const adapter = new ProcessWorkerAdapter();
@@ -173,8 +176,7 @@ test("leader exit automatically cleans descendants before status is terminal", a
   }
 });
 
-test("required cgroup cleanup kills a setsid descendant", async () => {
-  if (process.platform !== "linux") return;
+test("required cgroup cleanup kills a setsid descendant", { skip: !requiredCgroupTestAvailable }, async () => {
   const adapter = new ProcessWorkerAdapter({ cgroupMode: "required", terminationGraceMs: 25, killGraceMs: 200 });
   const handle = await adapter.start({
     task: "setsid descendant cleanup",
@@ -317,6 +319,18 @@ test("claude-jsonl mode frames initial and subsequent messages", async () => {
   assert.equal((await adapter.getStatus(handle)).running, false);
   assert.equal(adapter.capabilities().transport, "jsonl");
 });
+
+async function canCreateCgroup(): Promise<boolean> {
+  try {
+    const contents = await readFile("/proc/self/cgroup", "utf8");
+    const match = contents.match(/^0::([^\n]*)$/mu);
+    if (!match) return false;
+    await access(`/sys/fs/cgroup${match[1]}`, constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function waitForStatus(
   adapter: ProcessWorkerAdapter,

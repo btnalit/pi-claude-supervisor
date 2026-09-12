@@ -1,0 +1,11 @@
+{
+  "release-type": "node",
+  "bump-minor-pre-major": true,
+  "changelog-path": "CHANGELOG.md",
+  "packages": {
+    ".": {
+      "package-name": "pi-claude-supervisor",
+      "release-type": "node"
+    }
+  }
+}
