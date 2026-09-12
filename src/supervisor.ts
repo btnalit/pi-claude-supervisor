@@ -24,6 +24,11 @@ export interface DecisionSessionReadyInfo {
   sessionFile: string;
   sessionId: string;
   restored: boolean;
+  maxTurns: number;
+  deadlineMs: number;
+  noOutputTimeoutMs: number;
+  startedAt: string;
+  turn: number;
 }
 
 export interface SupervisorStartOptions {
@@ -46,7 +51,11 @@ export interface SupervisorStartOptions {
   /** Persistent Pi session location for the Decision Worker. */
   decisionSessionFile?: string;
   decisionSessionDir?: string;
+  /** Internal recovery values; elapsed wall time remains cumulative. */
+  startedAt?: string;
+  initialTurn?: number;
   onDecisionSessionReady?: (info: DecisionSessionReadyInfo) => Promise<void> | void;
+  onDecisionSessionProgress?: (info: { taskId: string; turn: number }) => Promise<void> | void;
   onDecisionSessionClosed?: (taskId: string) => Promise<void> | void;
   onHumanRequired?: (notice: HumanInterventionNotice) => Promise<void> | void;
 }
@@ -81,6 +90,7 @@ export class Supervisor {
   #handledEvents = new Set<string>();
   #pendingPermissions = new Map<string, WorkerPermissionRequest>();
   #humanRequired = false;
+  #onDecisionSessionProgress?: (info: { taskId: string; turn: number }) => Promise<void> | void;
   #onDecisionSessionClosed?: (taskId: string) => Promise<void> | void;
 
   constructor(adapter: WorkerAdapter, events = new EventLog(), hooks: { onHumanRequired?: (notice: HumanInterventionNotice) => Promise<void> | void } = {}) {
@@ -108,12 +118,13 @@ export class Supervisor {
     this.#lastVerification = undefined;
     this.#preemptiveStop = undefined;
     this.#automation = options.automation ?? false;
+    this.#onDecisionSessionProgress = options.onDecisionSessionProgress;
     this.#onDecisionSessionClosed = options.onDecisionSessionClosed;
     this.#handledEvents.clear();
     this.#pendingPermissions.clear();
     this.#humanRequired = false;
-    this.#task = { taskId, task: options.task, cwd: options.cwd, maxTurns: options.maxTurns ?? 100, startedAt: new Date().toISOString() };
-    this.#turn = 0;
+    this.#task = { taskId, task: options.task, cwd: options.cwd, maxTurns: options.maxTurns ?? 100, startedAt: options.startedAt ?? new Date().toISOString() };
+    this.#turn = options.initialTurn ?? 0;
     this.#deadlineMs = options.deadlineMs ?? 4 * 60 * 60_000;
     this.#noOutputTimeoutMs = options.noOutputTimeoutMs ?? 20 * 60_000;
     this.#clearWatchdog();
@@ -136,7 +147,17 @@ export class Supervisor {
           context: { taskId, task: options.task, cwd: options.cwd, state: this.#machine.state, turn: this.#turn, maxTurns: this.#task.maxTurns },
           sessionFile: options.decisionSessionFile,
           sessionDir: options.decisionSessionDir ? join(options.decisionSessionDir, taskId) : undefined,
-          onSessionReady: (info) => options.onDecisionSessionReady?.({ taskId, task: options.task, cwd: options.cwd, ...info }),
+          onSessionReady: (info) => options.onDecisionSessionReady?.({
+            taskId,
+            task: options.task,
+            cwd: options.cwd,
+            ...info,
+            maxTurns: this.#task!.maxTurns,
+            deadlineMs: this.#deadlineMs,
+            noOutputTimeoutMs: this.#noOutputTimeoutMs,
+            startedAt: this.#task!.startedAt,
+            turn: this.#turn,
+          }),
           onAction: (action, event) => this.#applyDecision(action, event),
           onFailure: (event, error) => this.#decisionFailure(event, error),
         });
@@ -243,6 +264,7 @@ export class Supervisor {
       });
     }
     if (this.#decision && (event.type === "permission_request" || event.type === "turn_completed" || event.type === "exited")) {
+      this.#decision.updateContext({ state: this.#machine.state, turn: this.#turn });
       this.#decision.notify(event);
     }
   }
@@ -391,6 +413,7 @@ export class Supervisor {
     await this.#adapter.send(handle, message, `${taskId}:turn:${this.#turn}`);
     if (this.#machine.state === "waiting") this.#machine.transition("running");
     await this.#appendEvent({ type: "worker_message_sent", taskId, workerId: handle.id, idempotencyKey: `${taskId}:turn:${this.#turn}`, data: { message } });
+    await Promise.resolve(this.#onDecisionSessionProgress?.({ taskId, turn: this.#turn })).catch(() => {});
   }
 
   async pause(): Promise<void> {

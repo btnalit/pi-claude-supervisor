@@ -2,25 +2,65 @@ name: CI
 
 on:
   pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
   push:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact commit to verify
+        required: true
+        type: string
+    outputs:
+      artifact:
+        description: Built package artifact name
+        value: ${{ jobs.build.outputs.artifact }}
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.ref || 'head' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CHECKOUT_REF: ${{ inputs.ref || github.sha }}
+
 jobs:
-  checks:
+  policy:
+    name: Workflow and PR policy
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+          persist-credentials: false
+      - name: Conventional PR title
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: >-
+          node --input-type=module -e 'if (!/^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([\w./-]+\))?!?: .+/u.test(process.env.PR_TITLE)) throw new Error("Use a Conventional Commit PR title");'
+      - name: Validate automation policy
+        run: npm run check:automation
+
+  checks:
+    name: Node ${{ matrix.node }} checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         node: ['22.19.0', '24']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
+          ref: ${{ env.CHECKOUT_REF }}
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -29,3 +69,87 @@ jobs:
       - run: npm run test:pi
       - run: npm run test:install
       - run: npm audit --audit-level=high
+
+  checks_npm_latest:
+    name: Node 24 / npm ${{ matrix.npm }} checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        npm: ['10', '12']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Select and verify npm major
+        env:
+          NPM_VERSION: ${{ matrix.npm }}
+        run: |
+          npm install --global --ignore-scripts "npm@$NPM_VERSION"
+          node --input-type=module -e 'import {execFileSync} from "node:child_process"; if (execFileSync("npm", ["--version"], {encoding:"utf8"}).trim().split(".")[0] !== process.env.NPM_VERSION) throw new Error("npm major mismatch");'
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm run test:install
+      - run: npm run build
+
+  integration:
+    name: Pi installation and integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run test:install
+      - run: npm run test:pi
+
+  build:
+    name: Package artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      artifact: ${{ steps.name.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - id: name
+        run: echo "artifact=package-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: ${{ steps.name.outputs.artifact }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  gate:
+    name: Quality gate
+    if: always()
+    needs: [policy, checks, checks_npm_latest, integration, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every check to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: >-
+          node --input-type=module -e 'for (const [name, job] of Object.entries(JSON.parse(process.env.RESULTS))) if (job.result !== "success") throw new Error(name + ": " + job.result);'

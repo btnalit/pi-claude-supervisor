@@ -40,9 +40,11 @@ export class PiDecisionWorker {
   #closed = false;
   #initialized = false;
   #sessionFile?: string;
+  #context: DecisionContext;
 
   constructor(options: DecisionWorkerOptions) {
     this.#options = options;
+    this.#context = { ...options.context };
   }
 
   async start(): Promise<void> {
@@ -60,6 +62,7 @@ export class PiDecisionWorker {
     });
     const persisted = Boolean(this.#options.sessionFile || this.#options.sessionDir);
     const restored = Boolean(this.#options.sessionFile && await fileExists(this.#options.sessionFile));
+    if (this.#options.sessionFile && !restored) throw new Error("Decision Worker session file is missing; refusing fresh recovery");
     const sessionManager = restored
       ? SessionManager.open(this.#options.sessionFile!, this.#options.sessionDir, this.#options.context.cwd)
       : persisted
@@ -77,7 +80,11 @@ export class PiDecisionWorker {
       if (!this.#sessionFile) throw new Error("Decision Worker session persistence was requested but no session file was created");
       await this.#options.onSessionReady({ sessionFile: this.#sessionFile, sessionId: session.sessionId, restored });
     }
-    if (!restored) await session.prompt(decisionInstructions(this.#options.context));
+    if (!restored) await session.prompt(decisionInstructions(this.#context));
+  }
+
+  updateContext(patch: Partial<DecisionContext>): void {
+    this.#context = { ...this.#context, ...patch };
   }
 
   notify(event: WorkerEvent): void {
@@ -91,7 +98,7 @@ export class PiDecisionWorker {
     }
     this.#tail = this.#tail.then(async () => {
       if (!this.#session || this.#closed) return;
-      const text = await askDecision(this.#session, event, this.#options.context);
+      const text = await askDecision(this.#session, event, this.#context);
       const action = parseDecision(text, event);
       await this.#options.onAction(action, event);
     }).catch(async (error) => {

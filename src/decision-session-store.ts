@@ -1,4 +1,4 @@
-import { chmod, mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 
 export interface DecisionSessionRecord {
@@ -10,6 +10,11 @@ export interface DecisionSessionRecord {
   args: string[];
   approval?: { actor: "human"; reason: string };
   decisionSessionFile: string;
+  maxTurns: number;
+  deadlineMs: number;
+  noOutputTimeoutMs: number;
+  startedAt: string;
+  turn: number;
   state: "active" | "closed";
   updatedAt: string;
 }
@@ -61,6 +66,24 @@ export class DecisionSessionStore {
     await this.save({ ...record, state: "closed", updatedAt: new Date().toISOString() });
   }
 
+  async update(taskId: string, patch: Partial<Pick<DecisionSessionRecord, "turn" | "updatedAt">>): Promise<void> {
+    const record = await this.load(taskId);
+    if (!record || record.state !== "active") return;
+    await this.save({ ...record, ...patch, updatedAt: patch.updatedAt ?? new Date().toISOString() });
+  }
+
+  async sessionFileExists(taskId: string): Promise<boolean> {
+    const record = await this.load(taskId);
+    if (!record) return false;
+    try {
+      const [directoryInfo, fileInfo] = await Promise.all([lstat(this.sessionDirectory(taskId)), lstat(record.decisionSessionFile)]);
+      return !directoryInfo.isSymbolicLink() && fileInfo.isFile() && !fileInfo.isSymbolicLink() && fileInfo.size > 0;
+    } catch (error) {
+      if (error instanceof Error && /ENOENT/u.test(error.message)) return false;
+      throw error;
+    }
+  }
+
   async load(taskId: string): Promise<DecisionSessionRecord | undefined> {
     assertTaskId(taskId);
     try {
@@ -107,7 +130,9 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     || typeof value.task !== "string" || typeof value.cwd !== "string" || typeof value.command !== "string"
     || !Array.isArray(value.args) || value.args.some((arg) => typeof arg !== "string")
     || typeof value.decisionSessionFile !== "string" || (value.state !== "active" && value.state !== "closed")
-    || typeof value.updatedAt !== "string") {
+    || typeof value.updatedAt !== "string" || !Number.isFinite(Date.parse(value.updatedAt))
+    || !validLimit(value.maxTurns, 0) || !validLimit(value.deadlineMs, 0) || !validLimit(value.noOutputTimeoutMs, 0)
+    || !validLimit(value.turn, 0) || (value.startedAt !== undefined && (typeof value.startedAt !== "string" || !Number.isFinite(Date.parse(value.startedAt))))) {
     throw new Error("invalid Decision Worker session record");
   }
   const decisionSessionFile = resolve(value.decisionSessionFile);
@@ -121,6 +146,11 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     args: [...value.args],
     approval: value.approval,
     decisionSessionFile,
+    maxTurns: value.maxTurns ?? 100,
+    deadlineMs: value.deadlineMs ?? 4 * 60 * 60_000,
+    noOutputTimeoutMs: value.noOutputTimeoutMs ?? 20 * 60_000,
+    startedAt: value.startedAt ?? value.updatedAt,
+    turn: value.turn ?? 0,
     state: value.state,
     updatedAt: value.updatedAt,
   };
@@ -133,4 +163,8 @@ function assertTaskId(taskId: string): void {
 function assertSessionPath(sessionFile: string, directory: string, taskId: string): void {
   const allowedPrefix = `${resolve(directory)}/${taskId}/`;
   if (!sessionFile.startsWith(allowedPrefix)) throw new Error("Decision Worker session file is outside the task session directory");
+}
+
+function validLimit(value: unknown, minimum: number): boolean {
+  return value === undefined || (typeof value === "number" && Number.isSafeInteger(value) && value >= minimum);
 }
