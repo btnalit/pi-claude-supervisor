@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { readFile, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 
@@ -12,11 +12,39 @@ assert.equal(`v${manifest.version}`, tag, "archive version does not match releas
 assert.equal(manifest.commit, sha, "archive was not built from the release commit");
 const archives = (await readdir("dist")).filter((name) => name.endsWith(".tgz"));
 assert.deepEqual(archives, [manifest.filename], "release artifact directory must contain exactly one archive");
-// npm treats a bare relative tarball path as a package spec and may resolve it
-// as a git dependency. Use an absolute archive path, as required by npm's
-// publish-tarball flow.
-const npmArgs = ["publish", resolve("dist", manifest.filename), "--access", "public", "--provenance"];
-execFileSync("npm", npmArgs, { stdio: "inherit" });
-const published = execFileSync("npm", ["view", `${manifest.name}@${manifest.version}`, "version", "--json"], { encoding: "utf8" }).trim();
-assert.equal(JSON.parse(published), manifest.version, "npm registry did not report the published version");
-console.log(`Published ${manifest.name}@${manifest.version} from ${sha}`);
+
+const registry = "https://registry.npmjs.org/";
+const packageVersion = `${manifest.name}@${manifest.version}`;
+const registryArgs = ["view", packageVersion, "version", "dist.integrity", "--json", "--registry", registry];
+const readPublished = () => {
+  const result = spawnSync("npm", registryArgs, { encoding: "utf8" });
+  if (result.status !== 0) return null;
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    return null;
+  }
+};
+const assertPublished = (published) => {
+  assert.equal(published?.version, manifest.version, "npm registry reported an unexpected version");
+  assert.equal(published?.["dist.integrity"], manifest.integrity, "published package integrity does not match the verified archive");
+};
+
+let published = readPublished();
+if (published) {
+  assertPublished(published);
+  console.log(`Already published: ${packageVersion}; exact integrity verified.`);
+} else {
+  // npm treats a bare relative tarball path as a package spec and may resolve it
+  // as a git dependency. Use an absolute archive path for npm's tarball flow.
+  const archive = resolve("dist", manifest.filename);
+  execFileSync("npm", ["publish", archive, "--access", "public", "--provenance", "--ignore-scripts", "--registry", registry], { stdio: "inherit" });
+
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    published = readPublished();
+    if (published) break;
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+  assertPublished(published);
+  console.log(`Published ${packageVersion} with verified integrity.`);
+}
