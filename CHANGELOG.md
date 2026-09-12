@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented here.
 
+## [0.2.1](https://github.com/btnalit/pi-claude-supervisor/compare/v0.2.0...v0.2.1) (2026-09-12)
+
+
+### Bug Fixes
+
+* make npm publication idempotent ([27eec2c](https://github.com/btnalit/pi-claude-supervisor/commit/27eec2c10f93e4ca3edcc52dc4ac58d2cfad0764))
+* publish npm archive reliably ([14cd7aa](https://github.com/btnalit/pi-claude-supervisor/commit/14cd7aa497863cce2579ed84c03581cbc45818d9))
+
 ## [0.2.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.1.0...v0.2.0) (2026-09-12)
 
 
