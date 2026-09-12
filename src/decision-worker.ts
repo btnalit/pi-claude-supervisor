@@ -20,6 +20,7 @@ export interface DecisionWorkerOptions {
   context: DecisionContext;
   onAction: (action: DecisionAction, event: WorkerEvent) => Promise<void> | void;
   onFailure?: (event: WorkerEvent, error: unknown) => Promise<void> | void;
+  onStartupFailure?: (error: unknown) => Promise<void> | void;
   /** Existing Pi session JSONL to restore after a Supervisor/Pi restart. */
   sessionFile?: string;
   /** Directory for newly created Pi session JSONL files. */
@@ -40,9 +41,11 @@ export class PiDecisionWorker {
   #closed = false;
   #initialized = false;
   #sessionFile?: string;
+  #context: DecisionContext;
 
   constructor(options: DecisionWorkerOptions) {
     this.#options = options;
+    this.#context = { ...options.context };
   }
 
   async start(): Promise<void> {
@@ -60,6 +63,7 @@ export class PiDecisionWorker {
     });
     const persisted = Boolean(this.#options.sessionFile || this.#options.sessionDir);
     const restored = Boolean(this.#options.sessionFile && await fileExists(this.#options.sessionFile));
+    if (this.#options.sessionFile && !restored) throw new Error("Decision Worker session file is missing; refusing fresh recovery");
     const sessionManager = restored
       ? SessionManager.open(this.#options.sessionFile!, this.#options.sessionDir, this.#options.context.cwd)
       : persisted
@@ -77,7 +81,18 @@ export class PiDecisionWorker {
       if (!this.#sessionFile) throw new Error("Decision Worker session persistence was requested but no session file was created");
       await this.#options.onSessionReady({ sessionFile: this.#sessionFile, sessionId: session.sessionId, restored });
     }
-    if (!restored) await session.prompt(decisionInstructions(this.#options.context));
+    if (!restored) {
+      try {
+        await session.prompt(decisionInstructions(this.#context));
+      } catch (error) {
+        try { await this.#options.onStartupFailure?.(error); } catch { /* preserve the original startup failure */ }
+        throw error;
+      }
+    }
+  }
+
+  updateContext(patch: Partial<DecisionContext>): void {
+    this.#context = { ...this.#context, ...patch };
   }
 
   notify(event: WorkerEvent): void {
@@ -91,7 +106,7 @@ export class PiDecisionWorker {
     }
     this.#tail = this.#tail.then(async () => {
       if (!this.#session || this.#closed) return;
-      const text = await askDecision(this.#session, event, this.#options.context);
+      const text = await askDecision(this.#session, event, this.#context);
       const action = parseDecision(text, event);
       await this.#options.onAction(action, event);
     }).catch(async (error) => {
@@ -191,7 +206,7 @@ function parseDecision(text: string, event: WorkerEvent): DecisionAction {
 
 function eventKey(event: WorkerEvent): string {
   if (event.type === "permission_request") return `${event.handle.id}:permission:${event.request.requestId}`;
-  if (event.type === "turn_completed") return `${event.handle.id}:result:${String(event.result.session_id ?? event.result.uuid ?? JSON.stringify(event.result))}`;
+  if (event.type === "turn_completed") return `${event.handle.id}:result:${event.sequence}`;
   if (event.type === "exited") return `${event.handle.id}:exit`;
   if (event.type === "jsonl") return `${event.handle.id}:jsonl:${String(event.record.uuid ?? event.record.request_id ?? JSON.stringify(event.record))}`;
   return `${event.handle.id}:output:${event.chunk.at}:${event.chunk.text.slice(0, 80)}`;

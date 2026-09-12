@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { access, constants, readFile } from "node:fs/promises";
 import test from "node:test";
 import { ProcessWorkerAdapter } from "./process-adapter.ts";
+
+const requiredCgroupTestAvailable = process.platform === "linux" && await canCreateCgroup();
 
 test("process adapter reports spawn failures instead of leaving a running record", async () => {
   const adapter = new ProcessWorkerAdapter();
@@ -173,8 +176,7 @@ test("leader exit automatically cleans descendants before status is terminal", a
   }
 });
 
-test("required cgroup cleanup kills a setsid descendant", async () => {
-  if (process.platform !== "linux") return;
+test("required cgroup cleanup kills a setsid descendant", { skip: !requiredCgroupTestAvailable }, async () => {
   const adapter = new ProcessWorkerAdapter({ cgroupMode: "required", terminationGraceMs: 25, killGraceMs: 200 });
   const handle = await adapter.start({
     task: "setsid descendant cleanup",
@@ -227,20 +229,27 @@ test("stop cleans descendants after the worker leader exits", async () => {
   assert.fail(`descendant process ${childPid} survived group cleanup`);
 });
 
-test("claude-jsonl immediate results do not resurrect active request count", async () => {
+test("claude-jsonl result sequence distinguishes repeated session ids", async () => {
   const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
+  const events: import("../types.ts").WorkerEvent[] = [];
   const handle = await adapter.start({
     task: "first",
     cwd: process.cwd(),
     command: process.execPath,
-    args: ["-e", "process.stdin.once('data', () => process.stdout.write(JSON.stringify({type:'result'}) + '\\n'))", "--"],
+    eventListener: (event) => { events.push(event); },
+    args: ["-e", "let n=0; process.stdin.on('data', () => { n++; process.stdout.write(JSON.stringify({type:'result',session_id:'same-session'}) + '\\n'); if (n === 2) process.exit(0); })", "--"],
   });
-  for (let attempt = 0; attempt < 20; attempt++) {
+  for (let attempt = 0; attempt < 20 && !events.some((event) => event.type === "turn_completed"); attempt += 1) {
     await adapter.readOutput(handle);
-    if ((await adapter.getStatus(handle)).activeRequests === 0) break;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+  await adapter.send(handle, "second", "turn-2");
+  for (let attempt = 0; attempt < 40 && events.filter((event) => event.type === "turn_completed").length < 2; attempt += 1) {
+    await adapter.readOutput(handle);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const completed = events.filter((event): event is Extract<import("../types.ts").WorkerEvent, { type: "turn_completed" }> => event.type === "turn_completed");
+  assert.deepEqual(completed.map((event) => event.sequence), [1, 2]);
   await adapter.stop(handle, "test complete");
 });
 
@@ -317,6 +326,18 @@ test("claude-jsonl mode frames initial and subsequent messages", async () => {
   assert.equal((await adapter.getStatus(handle)).running, false);
   assert.equal(adapter.capabilities().transport, "jsonl");
 });
+
+async function canCreateCgroup(): Promise<boolean> {
+  try {
+    const contents = await readFile("/proc/self/cgroup", "utf8");
+    const match = contents.match(/^0::([^\n]*)$/mu);
+    if (!match) return false;
+    await access(`/sys/fs/cgroup${match[1]}`, constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function waitForStatus(
   adapter: ProcessWorkerAdapter,

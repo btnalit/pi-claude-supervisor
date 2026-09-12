@@ -1,5 +1,11 @@
 # pi-claude-supervisor
 
+[![CI](https://github.com/btnalit/pi-claude-supervisor/actions/workflows/ci.yml/badge.svg)](https://github.com/btnalit/pi-claude-supervisor/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/pi-claude-supervisor)](https://www.npmjs.com/package/pi-claude-supervisor)
+[![MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+[English](README.md)
+
 用于 Pi 的 Claude Code Worker 监督扩展。MVP 中 Pi 负责生命周期、状态机、策略门和独立验收；Worker 只是被显式启动的子进程。
 
 > 当前默认 transport 是无额外依赖的 process pipe，不是 PTY。已新增可选 Claude JSONL framing，并通过基础 prompt、多轮和 resume Spike。当前优先保证生命周期、进程组清理、恢复和独立验收；低权限用户、OS sandbox 与网络隔离不作为当前主线，按明确授权和宿主机策略运行，后续再做安全加固。
@@ -14,7 +20,7 @@
 - 普通联网查询不因联网本身被拒绝；下载后直接交给 shell 等高风险模式仍需人工复核。
 - Worker 声称完成只会进入 `verifying`，不能作为成功证据。
 - 默认独立验收命令为 `git diff --check`。
-- 不自动 merge、deploy、release 或 publish。
+- 扩展运行时不执行 merge、deploy、release 或 publish；仓库 Release 只会在维护者合并 Release Please PR 且 CI 门禁全部通过后自动发布。
 - 默认 4 小时总时限、20 分钟无输出 watchdog 超时即停止 Worker，适合长程开发任务；嵌入调用方可将对应选项设为 `0` 关闭。
 
 ## 安装和使用
@@ -87,4 +93,6 @@ Claude CLI `2.1.268` 运行，跨版本兼容性不在本轮范围内。
 /supervise send <task-id> continue after checking the test failure
 ```
 
-详细内容见 [engineering-plan.md](docs/engineering-plan.md)、[independent-review.md](docs/independent-review.md)、[architecture.md](docs/architecture.md) 和 [testing.md](docs/testing.md)。
+Pull Request 必须通过聚合的 `CI / Quality gate`。Release Please 根据 Conventional Commits 创建版本 PR；维护者合并后，Release workflow 会针对精确 tag commit 重新验证，并通过受保护的 `npm` environment 使用 npm provenance 发布。
+
+详细内容见 [engineering-plan.md](docs/engineering-plan.md)、[independent-review.md](docs/independent-review.md)、[architecture.md](docs/architecture.md)、[testing.md](docs/testing.md) 和 [releasing.md](docs/releasing.md)。

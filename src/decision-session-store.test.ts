@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -19,6 +19,11 @@ test("Decision Worker session registry survives a fresh store instance", async (
     args: ["--print"],
     approval: { actor: "human", reason: "test approval" },
     decisionSessionFile: sessionFile,
+    maxTurns: 100,
+    deadlineMs: 4 * 60 * 60_000,
+    noOutputTimeoutMs: 20 * 60_000,
+    startedAt: new Date().toISOString(),
+    turn: 0,
     state: "active",
   });
 
@@ -28,6 +33,12 @@ test("Decision Worker session registry survives a fresh store instance", async (
   assert.equal(restored?.decisionSessionFile, sessionFile);
   assert.deepEqual(restored?.args, ["--print"]);
   assert.equal((await stat(join(directory, `${taskId}.json`))).mode & 0o777, 0o600);
+  assert.equal(await store.sessionFileExists(taskId), false);
+  await mkdir(store.sessionDirectory(taskId), { recursive: true });
+  await writeFile(sessionFile, "{\"session\":true}\n");
+  assert.equal(await store.sessionFileExists(taskId), true);
+  await store.update(taskId, { turn: 3 });
+  assert.equal((await store.load(taskId))?.turn, 3);
 
   await store.close(taskId);
   assert.equal((await store.load(taskId))?.state, "closed");
@@ -44,6 +55,11 @@ test("Decision Worker session registry ignores corrupt records during discovery"
     command: "claude",
     args: [],
     decisionSessionFile: join(store.sessionDirectory(taskId), "session.jsonl"),
+    maxTurns: 100,
+    deadlineMs: 4 * 60 * 60_000,
+    noOutputTimeoutMs: 20 * 60_000,
+    startedAt: new Date().toISOString(),
+    turn: 0,
     state: "active",
   });
   await writeFile(join(directory, "corrupt.json"), "not-json\n");

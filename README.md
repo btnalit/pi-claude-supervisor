@@ -1,5 +1,11 @@
 # pi-claude-supervisor
 
+[![CI](https://github.com/btnalit/pi-claude-supervisor/actions/workflows/ci.yml/badge.svg)](https://github.com/btnalit/pi-claude-supervisor/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/pi-claude-supervisor)](https://www.npmjs.com/package/pi-claude-supervisor)
+[![MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+English · [简体中文](README.cn.md)
+
 A policy-gated [Pi](https://pi.dev) extension for supervising a Claude Code worker.
 The MVP keeps Pi in control of lifecycle, state, policy and verification while the
 worker remains an explicitly started child process.
@@ -19,7 +25,7 @@ worker remains an explicitly started child process.
 - Ordinary network use is not denied merely because it is network use; download-to-shell patterns still require review.
 - A worker completion is only a transition to `verifying`; it is not evidence of success.
 - Verification is an independent host command (default: `git diff --check`).
-- There is no automatic merge, deploy, release, or publish operation.
+- The extension never performs merge, deploy, release, or publish at runtime. Repository releases are automated only after a maintainer merges a Release Please PR and the full CI gate passes.
 - A 4-hour wall-clock and 20-minute no-output watchdog stop a worker by default for long development tasks; embedding callers can set either to `0` to disable.
 - On Linux, the adapter automatically uses a writable cgroup v2 for descendant cleanup, including `setsid()` descendants; it falls back to process-group cleanup when unavailable. Use the adapter's `cgroupMode: "required"` for a fail-closed integration.
 - Events are append-only JSONL records in `~/.pi/agent/claude-supervisor/events.jsonl`.
@@ -97,11 +103,19 @@ integration. For the built-in command, opt in to named variables, for example
 npm run typecheck
 npm test
 npm run check:package
+npm run check:docs
+npm run check:automation
+npm run check:workflows
 npm run build
 ```
 
 See [the engineering plan](docs/engineering-plan.md), [the independent review](docs/independent-review.md),
-[architecture](docs/architecture.md), and [testing](docs/testing.md).
+[architecture](docs/architecture.md), [testing](docs/testing.md), and [releasing](docs/releasing.md).
+
+Pull requests are gated by the aggregated `CI / Quality gate`. Release Please
+creates version PRs from Conventional Commits; after a maintainer merges one,
+`Release` verifies the exact tag commit and publishes the package with npm
+provenance through the protected `npm` environment.
 
 ## License
 

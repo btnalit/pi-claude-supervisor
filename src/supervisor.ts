@@ -24,12 +24,19 @@ export interface DecisionSessionReadyInfo {
   sessionFile: string;
   sessionId: string;
   restored: boolean;
+  maxTurns: number;
+  deadlineMs: number;
+  noOutputTimeoutMs: number;
+  startedAt: string;
+  turn: number;
 }
 
 export interface SupervisorStartOptions {
   /** Reuse an existing task id when explicitly recovering after a Pi restart. */
   taskId?: string;
   task: string;
+  /** Override the first worker message; recovery uses an empty message to avoid replay. */
+  initialInput?: string;
   cwd: string;
   command: string;
   args?: string[];
@@ -46,7 +53,11 @@ export interface SupervisorStartOptions {
   /** Persistent Pi session location for the Decision Worker. */
   decisionSessionFile?: string;
   decisionSessionDir?: string;
+  /** Internal recovery values; elapsed wall time remains cumulative. */
+  startedAt?: string;
+  initialTurn?: number;
   onDecisionSessionReady?: (info: DecisionSessionReadyInfo) => Promise<void> | void;
+  onDecisionSessionProgress?: (info: { taskId: string; turn: number }) => Promise<void> | void;
   onDecisionSessionClosed?: (taskId: string) => Promise<void> | void;
   onHumanRequired?: (notice: HumanInterventionNotice) => Promise<void> | void;
 }
@@ -81,6 +92,7 @@ export class Supervisor {
   #handledEvents = new Set<string>();
   #pendingPermissions = new Map<string, WorkerPermissionRequest>();
   #humanRequired = false;
+  #onDecisionSessionProgress?: (info: { taskId: string; turn: number }) => Promise<void> | void;
   #onDecisionSessionClosed?: (taskId: string) => Promise<void> | void;
 
   constructor(adapter: WorkerAdapter, events = new EventLog(), hooks: { onHumanRequired?: (notice: HumanInterventionNotice) => Promise<void> | void } = {}) {
@@ -108,12 +120,13 @@ export class Supervisor {
     this.#lastVerification = undefined;
     this.#preemptiveStop = undefined;
     this.#automation = options.automation ?? false;
+    this.#onDecisionSessionProgress = options.onDecisionSessionProgress;
     this.#onDecisionSessionClosed = options.onDecisionSessionClosed;
     this.#handledEvents.clear();
     this.#pendingPermissions.clear();
     this.#humanRequired = false;
-    this.#task = { taskId, task: options.task, cwd: options.cwd, maxTurns: options.maxTurns ?? 100, startedAt: new Date().toISOString() };
-    this.#turn = 0;
+    this.#task = { taskId, task: options.task, cwd: options.cwd, maxTurns: options.maxTurns ?? 100, startedAt: options.startedAt ?? new Date().toISOString() };
+    this.#turn = options.initialTurn ?? 0;
     this.#deadlineMs = options.deadlineMs ?? 4 * 60 * 60_000;
     this.#noOutputTimeoutMs = options.noOutputTimeoutMs ?? 20 * 60_000;
     this.#clearWatchdog();
@@ -136,14 +149,25 @@ export class Supervisor {
           context: { taskId, task: options.task, cwd: options.cwd, state: this.#machine.state, turn: this.#turn, maxTurns: this.#task.maxTurns },
           sessionFile: options.decisionSessionFile,
           sessionDir: options.decisionSessionDir ? join(options.decisionSessionDir, taskId) : undefined,
-          onSessionReady: (info) => options.onDecisionSessionReady?.({ taskId, task: options.task, cwd: options.cwd, ...info }),
+          onSessionReady: (info) => options.onDecisionSessionReady?.({
+            taskId,
+            task: options.task,
+            cwd: options.cwd,
+            ...info,
+            maxTurns: this.#task!.maxTurns,
+            deadlineMs: this.#deadlineMs,
+            noOutputTimeoutMs: this.#noOutputTimeoutMs,
+            startedAt: this.#task!.startedAt,
+            turn: this.#turn,
+          }),
           onAction: (action, event) => this.#applyDecision(action, event),
           onFailure: (event, error) => this.#decisionFailure(event, error),
+          onStartupFailure: (error) => this.#decisionStartupFailure(error),
         });
         await this.#decision.start();
       }
       const input: WorkerStartInput = {
-        task: options.task,
+        task: options.initialInput ?? options.task,
         cwd: options.cwd,
         command: options.command,
         args: options.args,
@@ -243,19 +267,54 @@ export class Supervisor {
       });
     }
     if (this.#decision && (event.type === "permission_request" || event.type === "turn_completed" || event.type === "exited")) {
+      this.#decision.updateContext({ state: this.#machine.state, turn: this.#turn });
       this.#decision.notify(event);
+    }
+  }
+
+  async #decisionStartupFailure(error: unknown): Promise<void> {
+    const task = this.#task;
+    if (!task) return;
+    const reason = `Decision Worker API failed during initialization: ${safeMessage(error)}`;
+    try {
+      await this.#appendEvent({ type: "decision_worker_failed", taskId: task.taskId, data: { eventType: "startup", error: safeMessage(error) } });
+    } catch (auditError) {
+      console.error(`pi-claude-supervisor decision startup audit failed: ${safeMessage(auditError)}`);
+    }
+    const notice: HumanInterventionNotice = { taskId: task.taskId, cwd: task.cwd, task: task.task, reason };
+    try {
+      await this.#appendEvent({ type: "human_intervention_required", taskId: task.taskId, data: notice as unknown as Record<string, unknown> });
+    } catch (auditError) {
+      console.error(`pi-claude-supervisor human intervention audit failed: ${safeMessage(auditError)}`);
+    }
+    try {
+      if (this.#onHumanRequired) await this.#onHumanRequired(notice);
+      else console.error(`pi-claude-supervisor human intervention required: ${reason}`);
+    } catch (notifyError) {
+      console.error(`pi-claude-supervisor human intervention notification failed: ${safeMessage(notifyError)}`);
     }
   }
 
   async #decisionFailure(event: WorkerEvent, error: unknown): Promise<void> {
     return this.#exclusive(async () => {
-      await this.#appendEvent({
-        type: "decision_worker_failed",
-        taskId: this.#task?.taskId,
-        workerId: event.handle.id,
-        data: { eventType: event.type, error: safeMessage(error) },
-      });
-      await this.#requestHuman(`Decision Worker API failed: ${safeMessage(error)}`, event);
+      let auditError: unknown;
+      try {
+        await this.#appendEvent({
+          type: "decision_worker_failed",
+          taskId: this.#task?.taskId,
+          workerId: event.handle.id,
+          data: { eventType: event.type, error: safeMessage(error) },
+        });
+      } catch (failure) {
+        auditError = failure;
+      }
+      let noticeError: unknown;
+      try {
+        await this.#requestHuman(`Decision Worker API failed: ${safeMessage(error)}`, event);
+      } catch (failure) {
+        noticeError = failure;
+      }
+      if (auditError || noticeError) throw new AggregateError([auditError, noticeError].filter(Boolean), "Decision Worker failure handling failed");
     });
   }
 
@@ -391,6 +450,7 @@ export class Supervisor {
     await this.#adapter.send(handle, message, `${taskId}:turn:${this.#turn}`);
     if (this.#machine.state === "waiting") this.#machine.transition("running");
     await this.#appendEvent({ type: "worker_message_sent", taskId, workerId: handle.id, idempotencyKey: `${taskId}:turn:${this.#turn}`, data: { message } });
+    await Promise.resolve(this.#onDecisionSessionProgress?.({ taskId, turn: this.#turn })).catch(() => {});
   }
 
   async pause(): Promise<void> {
@@ -415,6 +475,14 @@ export class Supervisor {
     await this.#adapter.resume(this.#handle);
     this.#machine.transition("running");
     await this.#appendEvent({ type: "worker_resumed", taskId: this.#task?.taskId, workerId: this.#handle.id });
+  }
+
+  async abortStart(reason = "startup aborted"): Promise<void> {
+    // This path intentionally bypasses #exclusive(): start() may be blocked in
+    // a Decision Worker model call and shutdown must still dispose that session.
+    await this.#decision?.close().catch(() => {});
+    this.#decision = undefined;
+    if (this.#handle) await this.#adapter.stop(this.#handle, reason).catch(() => {});
   }
 
   async stop(reason = "human requested stop"): Promise<void> {
@@ -547,7 +615,7 @@ export class Supervisor {
 
 function workerEventKey(event: WorkerEvent): string {
   if (event.type === "permission_request") return `${event.handle.id}:permission:${event.request.requestId}`;
-  if (event.type === "turn_completed") return `${event.handle.id}:result:${String(event.result.uuid ?? event.result.session_id ?? JSON.stringify(event.result))}`;
+  if (event.type === "turn_completed") return `${event.handle.id}:result:${event.sequence}`;
   if (event.type === "exited") return `${event.handle.id}:exit`;
   if (event.type === "jsonl") return `${event.handle.id}:jsonl:${String(event.record.uuid ?? event.record.request_id ?? JSON.stringify(event.record))}`;
   return `${event.handle.id}:output:${event.chunk.at}:${event.chunk.text.slice(0, 80)}`;

@@ -37,6 +37,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   const reservedCwds = new Map<string, string>();
   const pendingCwds = new Set<string>();
   const pendingStarts = new Set<Promise<void>>();
+  const pendingStartSessions = new Set<Supervisor>();
   let activeTaskId: string | undefined;
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;
@@ -148,6 +149,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
               }
             },
           });
+          pendingStartSessions.add(session);
           const startOperation = (async () => {
             try {
               const handle = await session.start({
@@ -167,8 +169,14 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                   args: workerArgs,
                   approval,
                   decisionSessionFile: info.sessionFile,
+                  maxTurns: info.maxTurns,
+                  deadlineMs: info.deadlineMs,
+                  noOutputTimeoutMs: info.noOutputTimeoutMs,
+                  startedAt: info.startedAt,
+                  turn: info.turn,
                   state: "active",
                 }),
+                onDecisionSessionProgress: (info) => decisionStore.update(info.taskId, { turn: info.turn }),
                 onDecisionSessionClosed: (taskId) => decisionStore.close(taskId),
               });
               const taskId = session.task?.taskId;
@@ -220,16 +228,22 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             throw error;
           } finally {
             pendingStarts.delete(startOperation);
+            pendingStartSessions.delete(session);
             pendingCwds.delete(cwdKey);
           }
         } else if (operation === "recover") {
           const taskId = rest[0];
           if (!taskId) throw new Error("Usage: /supervise recover <task-id>");
+          if (shuttingDown) throw new Error("Pi session is shutting down");
           if (sessions.has(taskId)) throw new Error(`Task session is already loaded: ${taskId}`);
           const record = await decisionStore.load(taskId);
           if (!record || record.state !== "active") throw new Error(`No recoverable Decision Worker session: ${taskId}`);
+          if (!await decisionStore.sessionFileExists(taskId)) throw new Error(`Decision Worker session file is missing or unsafe: ${taskId}`);
+          if (record.maxTurns > 0 && record.turn >= record.maxTurns) throw new Error(`Cannot recover task after its turn budget was exhausted: ${taskId}`);
+          if (record.deadlineMs > 0 && Date.now() - Date.parse(record.startedAt) >= record.deadlineMs) throw new Error(`Cannot recover task after its wall-clock deadline: ${taskId}`);
           const cwdKey = await canonicalCwd(record.cwd);
           await releaseSettledReservations();
+          if (shuttingDown) throw new Error("Pi session is shutting down");
           const reservedPaths = [...pendingCwds, ...reservedCwds.values()];
           if (reservedPaths.some((reserved) => pathsOverlap(reserved, cwdKey))) {
             throw new Error("An active, starting, or unreaped worker uses an overlapping cwd; use a separate worktree for recovery");
@@ -246,6 +260,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             if (!approved) throw new Error("Worker command not approved");
             approval = { actor: "human", reason: policy.reason };
           }
+          pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
             onHumanRequired: async (notice) => {
               if (ctx.hasUI) ctx.ui.notify(`Claude Worker needs human intervention: ${notice.reason}`, "warning");
@@ -257,33 +272,73 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
               }
             },
           });
-          const handle = await session.start({
-            taskId: record.taskId,
-            task: record.task,
-            cwd: record.cwd,
-            command: record.command,
-            args: record.args,
-            env: selectedWorkerEnvironment(),
-            approval,
-            automation: true,
-            decisionSessionFile: record.decisionSessionFile,
-            decisionSessionDir: decisionStore.directory,
-            onDecisionSessionReady: (info) => decisionStore.save({
-              taskId: info.taskId,
-              task: info.task,
-              cwd: info.cwd,
-              command: record.command,
-              args: record.args,
-              approval,
-              decisionSessionFile: info.sessionFile,
-              state: "active",
-            }),
-            onDecisionSessionClosed: (closedTaskId) => decisionStore.close(closedTaskId),
-          });
-          sessions.set(record.taskId, session);
-          reservedCwds.set(record.taskId, cwdKey);
-          activeTaskId = record.taskId;
-          message = `Worker recovered: task=${record.taskId} worker=${handle.id}; Decision Worker session restored`;
+          pendingStartSessions.add(session);
+          const recoveryOperation = (async () => {
+            try {
+              const handle = await session.start({
+                taskId: record.taskId,
+                // Claude session resume is not supported by this adapter. Start
+                // idle so recovery never replays the original task; the operator
+                // must explicitly send the next instruction.
+                task: record.task,
+                initialInput: "",
+                cwd: record.cwd,
+                command: record.command,
+                args: record.args,
+                env: selectedWorkerEnvironment(),
+                approval,
+                automation: true,
+                maxTurns: record.maxTurns,
+                deadlineMs: record.deadlineMs,
+                noOutputTimeoutMs: record.noOutputTimeoutMs,
+                startedAt: record.startedAt,
+                initialTurn: record.turn,
+                decisionSessionFile: record.decisionSessionFile,
+                decisionSessionDir: decisionStore.directory,
+                onDecisionSessionReady: (info) => decisionStore.save({
+                  taskId: info.taskId,
+                  task: info.task,
+                  cwd: info.cwd,
+                  command: record.command,
+                  args: record.args,
+                  approval,
+                  decisionSessionFile: info.sessionFile,
+                  maxTurns: info.maxTurns,
+                  deadlineMs: info.deadlineMs,
+                  noOutputTimeoutMs: info.noOutputTimeoutMs,
+                  startedAt: info.startedAt,
+                  turn: info.turn,
+                  state: "active",
+                }),
+                onDecisionSessionProgress: (info) => decisionStore.update(info.taskId, { turn: info.turn }),
+                onDecisionSessionClosed: (closedTaskId) => decisionStore.close(closedTaskId),
+              });
+              sessions.set(record.taskId, session);
+              reservedCwds.set(record.taskId, cwdKey);
+              activeTaskId = record.taskId;
+              await session.takeover();
+              if (shuttingDown) {
+                await stopSession(session, "Pi session shutdown during recovery");
+                throw new Error("Pi session shut down during recovery");
+              }
+              message = `Worker recovered idle: task=${record.taskId} worker=${handle.id}; original task was not replayed; send an explicit continuation, then use resume-auto`;
+            } catch (error) {
+              if (session.handle) {
+                sessions.set(record.taskId, session);
+                reservedCwds.set(record.taskId, cwdKey);
+                activeTaskId = record.taskId;
+              }
+              throw error;
+            }
+          })();
+          pendingStarts.add(recoveryOperation);
+          try {
+            await recoveryOperation;
+          } finally {
+            pendingStarts.delete(recoveryOperation);
+            pendingStartSessions.delete(session);
+            pendingCwds.delete(cwdKey);
+          }
         } else if (operation === "sessions") {
           const recoverable = await decisionStore.list({ activeOnly: true });
           message = formatSessions(sessions, recoverable);
@@ -345,7 +400,12 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     if (shutdownPromise) return shutdownPromise;
     shuttingDown = true;
     shutdownPromise = (async () => {
-      await Promise.allSettled([...pendingStarts]);
+      const pending = [...pendingStarts];
+      await Promise.race([Promise.allSettled(pending), delay(5_000)]);
+      if (pendingStarts.size > 0) {
+        await Promise.allSettled([...pendingStartSessions].map((session) => session.abortStart("Pi session shutdown during startup")));
+        await Promise.race([Promise.allSettled([...pendingStarts]), delay(5_000)]);
+      }
       const results = await Promise.allSettled([...sessions.values()].map((session) => stopSession(session, "Pi session shutdown")));
       const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
       if (failures.length > 0) {
