@@ -6,7 +6,13 @@ import test from "node:test";
 import type { SupervisorEvent } from "./events.ts";
 import type { WorkerAdapter, WorkerHandle, WorkerOutputChunk, WorkerStatus } from "./types.ts";
 import { Supervisor } from "./supervisor.ts";
-import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
+import { ProcessWorkerAdapter as RealProcessWorkerAdapter, type ProcessWorkerAdapterOptions } from "./worker/process-adapter.ts";
+
+class ProcessWorkerAdapter extends RealProcessWorkerAdapter {
+  constructor(options: ProcessWorkerAdapterOptions = {}) {
+    super({ cgroupMode: "off", ...options });
+  }
+}
 
 class FlakyEventLog {
   readonly events: Array<Omit<SupervisorEvent, "seq" | "at">> = [];

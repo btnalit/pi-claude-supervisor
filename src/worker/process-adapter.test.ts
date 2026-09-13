@@ -1,9 +1,16 @@
 import assert from "node:assert/strict";
 import { access, constants, readFile } from "node:fs/promises";
 import test from "node:test";
-import { ProcessWorkerAdapter } from "./process-adapter.ts";
+import { ProcessWorkerAdapter as RealProcessWorkerAdapter, type ProcessWorkerAdapterOptions } from "./process-adapter.ts";
 
 const requiredCgroupTestAvailable = process.platform === "linux" && await canCreateCgroup();
+const testCgroupMode = requiredCgroupTestAvailable ? "required" : "off";
+
+class ProcessWorkerAdapter extends RealProcessWorkerAdapter {
+  constructor(options: ProcessWorkerAdapterOptions = {}) {
+    super({ cgroupMode: testCgroupMode, ...options });
+  }
+}
 
 test("process adapter reports spawn failures instead of leaving a running record", async () => {
   const adapter = new ProcessWorkerAdapter();

@@ -27,7 +27,7 @@ export interface ProcessWorkerAdapterOptions {
   maxOutputBytes?: number;
   /** Maximum time a blocked stdin write may hold lifecycle operations. */
   inputWriteTimeoutMs?: number;
-  /** Linux descendant cleanup mode; auto uses cgroup v2 when available. */
+  /** Linux descendant cleanup mode; required is the fail-closed default. */
   cgroupMode?: "off" | "auto" | "required";
 }
 
@@ -89,7 +89,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     this.#maxOutputChunks = boundedPositiveInteger(options.maxOutputChunks ?? 10_000, "maxOutputChunks");
     this.#maxOutputBytes = boundedPositiveInteger(options.maxOutputBytes ?? 8 * 1024 * 1024, "maxOutputBytes");
     this.#inputWriteTimeoutMs = boundedDelay(options.inputWriteTimeoutMs ?? 10_000);
-    this.#cgroupMode = options.cgroupMode ?? "auto";
+    this.#cgroupMode = options.cgroupMode ?? "required";
   }
 
   capabilities(): WorkerCapabilities {
