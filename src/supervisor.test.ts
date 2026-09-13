@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -54,6 +54,61 @@ test("supervisor rejects spawn failure before reporting a worker start", async (
   }), /spawn|ENOENT/u);
   assert.equal(supervisor.state, "failed");
   assert.equal(supervisor.handle, undefined);
+});
+
+test("stop preempts a startup blocked before a worker handle exists", async () => {
+  const handle: WorkerHandle = { id: "never-started", startedAt: new Date().toISOString(), cwd: "/tmp" };
+  let aborts = 0;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "process-pipe", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true }),
+    start: async (input) => new Promise<WorkerHandle>((_resolve, reject) => {
+      input.abortSignal?.addEventListener("abort", () => { aborts += 1; reject(new Error("startup aborted")); }, { once: true });
+    }),
+    abortStart: async () => {},
+    getStatus: async (): Promise<WorkerStatus> => ({ handle, running: false, processGroupCleaned: true }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter);
+  const start = supervisor.start({ task: "blocked startup", cwd: "/tmp", command: "fixture", deadlineMs: 0, noOutputTimeoutMs: 0 });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const startedAt = Date.now();
+  await supervisor.stop("operator preempted startup");
+  assert.ok(Date.now() - startedAt < 1_000);
+  await assert.rejects(start, /startup aborted/u);
+  assert.equal(aborts, 1);
+  assert.equal(supervisor.state, "stopped");
+});
+
+test("startup cancellation fails closed when adapter cleanup reports an error", async () => {
+  const handle: WorkerHandle = { id: "unclean-start", startedAt: new Date().toISOString(), cwd: "/tmp" };
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "process-pipe", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true }),
+    start: async (input) => new Promise<WorkerHandle>((_resolve, reject) => {
+      input.abortSignal?.addEventListener("abort", () => reject(new Error("startup aborted")), { once: true });
+    }),
+    abortStart: async () => { throw new Error("startup cleanup failed"); },
+    getStatus: async (): Promise<WorkerStatus> => ({ handle, running: true }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { throw new Error("startup cleanup failed"); },
+    killProcessGroup: async () => { throw new Error("startup cleanup failed"); },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter);
+  const start = supervisor.start({ task: "unclean startup", cwd: "/tmp", command: "fixture", deadlineMs: 0, noOutputTimeoutMs: 0 });
+  const startFailure = assert.rejects(start, /startup aborted/u);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await assert.rejects(supervisor.stop("operator cancellation"), /startup cleanup failed/u);
+  await startFailure;
+  assert.equal(supervisor.state, "failed");
 });
 
 test("startup failure events preserve pending lifecycle order", async () => {
@@ -337,6 +392,29 @@ test("verification stops an owned persistent worker before completion", async ()
   assert.equal(supervisor.state, "completed");
 });
 
+test("verification rejects cgroup cleanup errors instead of completing", async () => {
+  const handle: WorkerHandle = { id: "persistent-cgroup-error", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
+  let stopped = false;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running: !stopped, activeRequests: 0, processGroupCleaned: stopped, ...(stopped ? { cgroupError: "injected cgroup cleanup boundary failure" } : {}) }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { stopped = true; },
+    release: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter);
+  await supervisor.start({ task: "fixture", cwd: "/tmp", command: "fixture", deadlineMs: 0, noOutputTimeoutMs: 0 });
+  await supervisor.poll();
+  await assert.rejects(() => supervisor.verify({ command: process.execPath, args: ["-e", "process.exit(0)"] }), /cgroup cleanup/u);
+  assert.equal(supervisor.state, "failed");
+});
+
 test("verification policy rejection stops a persistent worker", async () => {
   const handle: WorkerHandle = { id: "persistent-verification-rejection", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
   let stopped = false;
@@ -361,9 +439,32 @@ test("verification policy rejection stops a persistent worker", async () => {
   assert.equal(supervisor.state, "failed");
 });
 
+test("verification accepts confirmed process-group fallback in auto cgroup mode", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-auto-cgroup-"));
+  const cgroupParentDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-fake-cgroup-"));
+  const cgroupParentPath = join(cgroupParentDir, "not-a-cgroup-directory");
+  await writeFile(cgroupParentPath, "not a cgroup\n");
+  const supervisor = new Supervisor(new ProcessWorkerAdapter({ cgroupMode: "auto", cgroupParentPath }));
+  await supervisor.start({ task: "fixture", cwd, command: process.execPath, args: ["-e", "console.log('worker complete')"] });
+  let polled = await supervisor.poll();
+  for (let attempt = 0; polled.status.running && attempt < 40; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    polled = await supervisor.poll();
+  }
+  assert.equal(polled.status.running, false);
+  assert.equal(supervisor.state, "verifying");
+  assert.equal(polled.status.cgroupRequired, false);
+  assert.match(polled.status.cgroupError ?? "", /cgroup|ENOTDIR|ENOENT/u);
+  assert.equal(polled.status.processGroupCleaned, true);
+  const result = await supervisor.verify({ command: process.execPath, args: ["-e", "process.exit(0)"] });
+  assert.equal(result.ok, true);
+  assert.equal(supervisor.state, "completed");
+  await rm(cgroupParentDir, { recursive: true, force: true });
+});
+
 test("supervisor requires independent verification after worker exit", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-"));
-  const supervisor = new Supervisor(new ProcessWorkerAdapter());
+  const supervisor = new Supervisor(new ProcessWorkerAdapter({ cgroupMode: "off" }));
   await supervisor.start({ task: "fixture", cwd, command: process.execPath, args: ["-e", "console.log('worker complete')"] });
   let polled = await supervisor.poll();
   for (let attempt = 0; polled.status.running && attempt < 40; attempt++) {

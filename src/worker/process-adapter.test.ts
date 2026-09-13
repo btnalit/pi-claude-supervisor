@@ -14,6 +14,47 @@ test("process adapter reports spawn failures instead of leaving a running record
   }), /ENOENT|spawn/u);
 });
 
+test("process adapter cancels startup before returning a handle", async () => {
+  const adapter = new ProcessWorkerAdapter({ terminationGraceMs: 50, killGraceMs: 50 });
+  const controller = new AbortController();
+  const start = adapter.start({
+    task: "",
+    cwd: process.cwd(),
+    command: process.execPath,
+    args: ["-e", "setTimeout(() => {}, 10000)"],
+    abortSignal: controller.signal,
+  });
+  const rejection = assert.rejects(start, /startup aborted/u);
+  controller.abort();
+  await adapter.abortStart("test cancellation");
+  await rejection;
+});
+
+test("startup cancellation only aborts the targeted concurrent start", async () => {
+  const adapter = new ProcessWorkerAdapter({ terminationGraceMs: 50, killGraceMs: 50 });
+  const first = adapter.start({
+    task: "",
+    cwd: process.cwd(),
+    command: process.execPath,
+    args: ["-e", "setTimeout(() => {}, 10000)"],
+    startupToken: "first-start",
+  });
+  const second = adapter.start({
+    task: "",
+    cwd: process.cwd(),
+    command: process.execPath,
+    args: ["-e", "setTimeout(() => {}, 10000)"],
+    startupToken: "second-start",
+  });
+  const firstRejection = assert.rejects(first, /startup aborted/u);
+  const abortFirst = adapter.abortStart("cancel first", "first-start");
+  const secondHandle = await second;
+  await abortFirst;
+  await firstRejection;
+  assert.equal((await adapter.getStatus(secondHandle)).running, true);
+  await adapter.stop(secondHandle, "cleanup second start");
+});
+
 test("approved review-level worker command passes the adapter gate", async () => {
   const adapter = new ProcessWorkerAdapter();
   const handle = await adapter.start({

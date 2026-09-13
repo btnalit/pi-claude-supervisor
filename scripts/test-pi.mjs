@@ -1,3 +1,5 @@
+const previousCgroupMode = process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE;
+process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "off";
 const extension = await import(new URL("../src/index.ts", import.meta.url));
 const registrations = {commands: [], events: []};
 const fakePi = {
@@ -32,5 +34,7 @@ try {
   if (previousWorker === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_WORKER;
   else process.env.PI_CLAUDE_SUPERVISOR_WORKER = previousWorker;
   await registrations.events.find(({name}) => name === "session_shutdown").handler();
+  if (previousCgroupMode === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE;
+  else process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = previousCgroupMode;
 }
 console.log("Pi extension registration and command smoke tests passed");

@@ -8,7 +8,7 @@ without exposing credentials or allowing repository changes.
 ## Environment
 
 - Node: `v26.8.1` (declared package minimum remains `>=22.19`)
-- Claude Code: `2.1.268`
+- Claude Code: `2.1.268` (historical headless probe; current release validation uses `2.1.270`)
 - Executable: resolved through `PATH` as `claude`
 - Working directory: `/home/yancao/Work`
 - Session persistence: disabled for the stateless fixture; enabled for the separate resume fixture
@@ -56,7 +56,7 @@ existing default remains generic `process-pipe`.
 
 ## Required follow-up
 
-Additional evidence was collected with Claude Code `2.1.268` using
+Historical permission evidence was collected with Claude Code `2.1.268` using
 `--permission-prompt-tool stdio --permission-mode default --tools Bash`:
 
 - The CLI emitted `control_request` with `request.subtype=can_use_tool`,
@@ -72,7 +72,7 @@ Additional evidence was collected with Claude Code `2.1.268` using
   decision at the wrong envelope level is rejected as an invalid permission
   result.
 
-The exact signal fixture also passed for `2.1.268`: after `system/init`, a group
+The exact signal fixture also passed for historical version `2.1.268`: after `system/init`, a group
 `SIGTERM` produced exit code `143` with no terminal result; group `SIGINT`
 produced exit code `0` and a terminal result with `terminal_reason=
 "aborted_streaming"` and `is_error=true`. The new adapter cgroup-v2 fixture
@@ -87,8 +87,8 @@ npm run spike:signals
 ```
 
 Remaining evidence is malformed/duplicate CLI input, no secret leakage in
-captured events, and the cgroup startup-attachment window. Release scope is
-pinned to Claude Code `2.1.268` on the validated device; cross-version
-portability is explicitly out of scope for this iteration. The adapter-level
-lifecycle track is now **GO** for the installed CLI and host; atomic OS process
-containment remains follow-up work.
+captured events, and the cgroup startup-attachment window. The current release
+also passed a real Claude Code `2.1.270` tmux validation: owned multi-turn
+interaction, pause/resume, explicit detach, and identity-bound restart
+re-adoption. The adapter-level lifecycle track is now **GO** for the installed
+CLI and host; atomic OS process containment remains follow-up work.

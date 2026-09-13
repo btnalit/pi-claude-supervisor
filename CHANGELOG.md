@@ -8,6 +8,11 @@ All notable changes to this project will be documented here.
 ### Features
 
 * add safe tmux Claude worker transport ([1706153](https://github.com/btnalit/pi-claude-supervisor/commit/1706153289f9a6f7f9f59b2763ed98d061b79204))
+* add cross-process canonical cwd leases and identity-bound tmux handoff
+* make startup cancellation scoped per start and shutdown cleanup fail closed
+* add cgroup-v2 required/auto/off policies with verified fallback cleanup
+* harden owned/adopted tmux lifecycle, pane identity validation, and restart re-adoption
+* validate real Claude Code 2.1.270 tmux multi-turn, pause/resume, and re-adoption behavior
 
 ## [0.2.2](https://github.com/btnalit/pi-claude-supervisor/compare/v0.2.1...v0.2.2) (2026-09-12)
 
@@ -47,7 +52,7 @@ All notable changes to this project will be documented here.
 - Bounded output capture, stdin-write timeout, process-group cleanup retry and stop preemption.
 - Linux cgroup-v2 descendant cleanup, including a `setsid()` regression fixture, with required/auto modes.
 - Lifecycle event retry/order preservation, output restoration after log failure and shutdown cleanup retries.
-- Claude CLI 2.1.268 permission allow/deny and SIGTERM/SIGINT transport spike evidence.
+- Historical Claude CLI 2.1.268 permission allow/deny and SIGTERM/SIGINT transport spike evidence; current release validation uses Claude CLI 2.1.270.
 - Event-driven JSONL `control_request`/`result`/exit events, permission responses, persistent Pi Decision Worker automation, bounded duplicate/turn handling, and outbound human-intervention webhooks.
 - Long-task defaults are now 100 automatic turns, 4 hours wall time and 20 minutes without output; Decision Worker API failures alert human operators directly instead of attempting an LLM fallback.
 - Automatic Decision Worker sessions now persist as Pi JSONL with a 0600 task registry. Unclean Pi restarts expose explicit `/supervise recover <task-id>` recovery; Claude work is not silently duplicated.
@@ -55,5 +60,5 @@ All notable changes to this project will be documented here.
 
 ### Limitations
 
-- tmux/PTY screen state is not Claude JSONL: trust, permission and ambiguous TUI states require human handling. Cross-version Claude CLI permission/session semantics remain outside the pinned compatibility claim. The installed 2.1.268 CLI is covered by local permission and signal spikes, while the cgroup startup-attachment window remains.
+- tmux/PTY screen state is not Claude JSONL: trust, permission and ambiguous TUI states require human handling. Cross-version Claude CLI permission/session semantics remain outside the pinned compatibility claim. Historical permission and signal spikes use 2.1.268; current tmux validation uses 2.1.270, while the cgroup startup-attachment window remains.
 - No automatic merge, deployment, release or publication is implemented.

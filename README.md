@@ -104,6 +104,7 @@ For an interactive Claude Code window, opt in to the tmux transport:
 ```bash
 export PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux
 export PI_CLAUDE_SUPERVISOR_WORKER='claude --permission-mode plan'
+# tmux does not support cgroup required mode; use cgroup mode auto/off.
 # Optional automatic Decision Worker (manual mode is the default):
 # export PI_CLAUDE_SUPERVISOR_MODE=auto
 # Optional, only when adopting a non-default tmux server:

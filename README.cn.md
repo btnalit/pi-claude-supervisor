@@ -42,9 +42,9 @@ export PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_FORMAT=generic
 # export PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_SECRET='shared-secret'
 ```
 
-自动模式会强制使用 `claude-jsonl`，通过 `result`、`control_request` 和进程
-`exit` 事件唤醒 Decision Worker；不会依赖 `/supervise poll` 轮询。本版本固定按已验证设备的
-Claude CLI `2.1.268` 运行，跨版本兼容性不在本轮范围内。
+自动模式默认使用 `claude-jsonl`，通过 `result`、`control_request` 和进程
+`exit` 事件唤醒 Decision Worker；显式选择 tmux 时仍使用屏幕交互，不使用 JSONL 权限协议，也不会依赖 `/supervise poll` 轮询。本版本固定按已验证设备的
+Claude CLI `2.1.270` 运行，跨版本兼容性不在本轮范围内。
 
 然后在 Pi 中使用：
 

@@ -104,7 +104,8 @@ Major updates remain separate for explicit review. There is no blanket auto-merg
 A maintainer can retry an existing stable release from Actions:
 
 ```bash
-gh workflow run release.yml --ref main -f tag=v0.1.1
+TAG=v0.3.0
+gh workflow run release.yml --ref main -f tag="$TAG"
 ```
 
 The workflow verifies that the release tag is stable and belongs to `main`, then

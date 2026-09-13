@@ -40,8 +40,21 @@ export interface WorkerStartInput {
   tmuxSession?: string;
   /** Optional tmux socket path; omitted means the user's default server. */
   tmuxSocket?: string;
+  /** Persisted identity required when handing off an existing tmux lease. */
+  tmuxExpectedIdentity?: {
+    pid?: number;
+    startTime?: string;
+    tmuxTarget?: string;
+    tmuxPaneId?: string;
+    paneStartTime?: string;
+    paneCommand?: string;
+  };
   /** Adopted sessions must not replay the task as a new user message. */
   sendInitialInput?: boolean;
+  /** Cancel startup before a worker is fully returned to the supervisor. */
+  abortSignal?: AbortSignal;
+  /** Internal token that scopes out-of-band startup cancellation. */
+  startupToken?: string;
 }
 
 export interface WorkerHandle {
@@ -53,6 +66,12 @@ export interface WorkerHandle {
   sessionName?: string;
   tmuxSocket?: string;
   ownership?: "owned" | "adopted";
+  /** Verified process-boundary metadata persisted in the cwd lease registry. */
+  cgroupPath?: string;
+  tmuxTarget?: string;
+  tmuxPaneId?: string;
+  paneStartTime?: string;
+  paneCommand?: string;
 }
 
 export interface WorkerStatus {
@@ -68,6 +87,8 @@ export interface WorkerStatus {
   processGroupCleaned?: boolean;
   /** Whether a Linux cgroup provided descendant cleanup for this worker. */
   cgroupCleaned?: boolean;
+  /** Whether cgroup attachment was required for this worker. */
+  cgroupRequired?: boolean;
   /** cgroup attachment was unavailable and a fallback may have been used. */
   cgroupError?: string;
   /** Cleanup failure is diagnostic and must be treated as a safety failure. */
@@ -85,7 +106,7 @@ export interface WorkerAdapter {
   capabilities(): WorkerCapabilities;
   start(input: WorkerStartInput): Promise<WorkerHandle>;
   /** Cancel adapter-owned startup work before a WorkerHandle is returned. */
-  abortStart?(reason: string): Promise<void>;
+  abortStart?(reason: string, startupToken?: string): Promise<void>;
   getStatus(handle: WorkerHandle): Promise<WorkerStatus>;
   readOutput(handle: WorkerHandle): Promise<WorkerOutputChunk[]>;
   /** Restore chunks when diagnostic event persistence fails before acknowledgement. */

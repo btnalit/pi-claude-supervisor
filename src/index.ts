@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { join } from "node:path";
 import { realpath } from "node:fs/promises";
 import { EventLog } from "./events.ts";
 import { redactSensitive } from "./redaction.ts";
@@ -11,6 +12,7 @@ import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
 import { loadSupervisorEnvironment } from "./config.ts";
 import { DecisionSessionStore, type DecisionSessionRecord } from "./decision-session-store.ts";
+import { CwdLeaseStore, type CwdLeaseHandle, pathsOverlap, workerIdentity } from "./cwd-lease.ts";
 
 /**
  * Pi Claude Supervisor.
@@ -25,8 +27,15 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   const stateDir = process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR ?? join(homedir(), ".pi", "agent", "claude-supervisor");
   const configuredTransport = process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
   const transport = configuredTransport ?? (automation ? "jsonl" : "process-pipe");
+  const cgroupMode = process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE ?? "auto";
   if (!(["process-pipe", "jsonl", "tmux"] as string[]).includes(transport)) {
     throw new Error(`Unsupported PI_CLAUDE_SUPERVISOR_TRANSPORT: ${transport}; expected process-pipe, jsonl, or tmux`);
+  }
+  if (!["off", "auto", "required"].includes(cgroupMode)) {
+    throw new Error(`Unsupported PI_CLAUDE_SUPERVISOR_CGROUP_MODE: ${cgroupMode}; expected off, auto, or required`);
+  }
+  if (transport === "tmux" && cgroupMode === "required") {
+    throw new Error("PI_CLAUDE_SUPERVISOR_CGROUP_MODE=required is unsupported with tmux; use process-pipe/jsonl or set cgroup mode to auto/off");
   }
   const adapter = transport === "tmux"
     ? new TmuxWorkerAdapter({ stateDir })
@@ -34,6 +43,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
       // Automatic decisions require Claude's structured event stream. The pipe
       // transport remains available for manual/compatibility sessions.
       mode: automation || transport === "jsonl" ? "claude-jsonl" : "process-pipe",
+      cgroupMode: cgroupMode as "off" | "auto" | "required",
     });
   const humanWebhook = new HumanWebhookNotifier({
     url: process.env.PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL,
@@ -42,7 +52,10 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   });
   const events = new EventLog(join(stateDir, "events.jsonl"));
   const decisionStore = new DecisionSessionStore(join(stateDir, "decision-sessions"));
+  const cwdLeaseStore = new CwdLeaseStore(process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR ?? join(homedir(), ".pi", "agent", "claude-supervisor", "cwd-leases"));
   const sessions = new Map<string, Supervisor>();
+  const cwdLeases = new Map<string, CwdLeaseHandle>();
+  const cleanupRequiredTasks = new Set<string>();
   const reservedCwds = new Map<string, string>();
   const pendingCwds = new Set<string>();
   const pendingStarts = new Set<Promise<void>>();
@@ -56,30 +69,54 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   };
   const activeSessions = () => [...sessions.entries()].filter(([, session]) =>
     ["starting", "running", "waiting", "paused"].includes(session.state));
+  const releaseLease = async (taskId: string): Promise<boolean> => {
+    const lease = cwdLeases.get(taskId);
+    if (!lease) return false;
+    try {
+      await lease.release();
+      cwdLeases.delete(taskId);
+      return true;
+    } catch (error) {
+      console.error(`pi-claude-supervisor cwd lease release failed: ${redactText(error instanceof Error ? error.message : String(error))}`);
+      return false;
+    }
+  };
   const releaseSettledReservations = async (): Promise<void> => {
     for (const [taskId, session] of sessions) {
       if (!["completed", "stopped", "failed"].includes(session.state)) continue;
       if (!session.handle) {
-        reservedCwds.delete(taskId);
+        if (await releaseLease(taskId)) {
+          reservedCwds.delete(taskId);
+          cleanupRequiredTasks.delete(taskId);
+        }
         continue;
       }
       try {
         const status = await adapter.getStatus(session.handle);
-        if (!status.running && status.processGroupCleaned === true && !status.cleanupError) reservedCwds.delete(taskId);
+        if (!status.running && status.processGroupCleaned === true && !status.cleanupError && (!status.cgroupError || status.cgroupRequired === false)) {
+          if (await releaseLease(taskId)) {
+            reservedCwds.delete(taskId);
+            cleanupRequiredTasks.delete(taskId);
+          }
+        }
       } catch {
         // Keep the reservation when cleanup status cannot be confirmed.
       }
     }
   };
-  const stopSession = async (session: Supervisor, reason: string): Promise<void> => {
+  const stopSession = async (session: Supervisor, reason: string, releasePersistent = false): Promise<void> => {
     const handle = session.handle;
     const persistent = adapter.capabilities().persistentSession && Boolean(handle);
+    const taskId = session.task?.taskId;
     const adoptedPersistent = persistent && handle?.ownership === "adopted";
     const healthyPersistent = persistent && !["failed", "completed", "stopped"].includes(session.state);
-    if (adoptedPersistent || healthyPersistent) {
+    const cleanupRequired = taskId ? cleanupRequiredTasks.has(taskId) : false;
+    const markCleanupRequired = () => { if (taskId) cleanupRequiredTasks.add(taskId); };
+    if (adoptedPersistent || (releasePersistent && healthyPersistent && !cleanupRequired)) {
       await session.release(reason);
       return;
     }
+    if (!handle && ["failed", "completed", "stopped"].includes(session.state)) return;
     let lifecycleError: unknown;
     try {
       await session.stop(reason);
@@ -88,7 +125,10 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     }
 
     if (!handle) {
-      if (lifecycleError) throw lifecycleError;
+      if (lifecycleError) {
+        markCleanupRequired();
+        throw lifecycleError;
+      }
       return;
     }
 
@@ -97,8 +137,12 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     while (Date.now() <= deadline) {
       try {
         const status = await adapter.getStatus(handle);
-        if (!status.running && status.processGroupCleaned === true && !status.cleanupError) {
-          if (lifecycleError) throw lifecycleError;
+        if (!status.running && status.processGroupCleaned === true && !status.cleanupError && (!status.cgroupError || status.cgroupRequired === false)) {
+          if (lifecycleError) {
+            markCleanupRequired();
+            throw lifecycleError;
+          }
+          if (taskId) cleanupRequiredTasks.delete(taskId);
           return;
         }
       } catch (error) {
@@ -112,6 +156,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
       await delay(25);
     }
 
+    markCleanupRequired();
     if (lifecycleError) throw lifecycleError;
     throw cleanupError instanceof Error
       ? cleanupError
@@ -152,6 +197,15 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           if (reservedPaths.some((reserved) => pathsOverlap(reserved, cwdKey))) {
             throw new Error("An active, starting, or unreaped worker uses an overlapping cwd; use a separate worktree for concurrent sessions");
           }
+          const taskId = randomUUID();
+          const lease = await cwdLeaseStore.acquire(cwdKey, taskId, adapter.capabilities().transport, tmuxSession
+            ? { handoff: { sessionName: tmuxSession, tmuxSocket: process.env.PI_CLAUDE_SUPERVISOR_TMUX_SOCKET } }
+            : {});
+          cwdLeases.set(taskId, lease);
+          if (shuttingDown) {
+            await releaseLease(taskId);
+            throw new Error("Pi session is shutting down");
+          }
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
             onHumanRequired: async (notice) => {
@@ -168,11 +222,13 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             },
           });
           pendingStartSessions.add(session);
+          let startupCleanupCompleted = false;
           const startOperation = (async () => {
             try {
               const handle = await session.start({
+                taskId,
                 task,
-                cwd: ctx.cwd,
+                cwd: cwdKey,
                 command,
                 args: workerArgs,
                 env: selectedWorkerEnvironment(),
@@ -180,6 +236,14 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 automation,
                 tmuxSession,
                 tmuxSocket: process.env.PI_CLAUDE_SUPERVISOR_TMUX_SOCKET,
+                tmuxExpectedIdentity: tmuxSession && lease.record.worker ? {
+                  pid: lease.record.worker.pid,
+                  startTime: lease.record.worker.startTime,
+                  tmuxTarget: lease.record.worker.tmuxTarget,
+                  tmuxPaneId: lease.record.worker.tmuxPaneId,
+                  paneStartTime: lease.record.worker.paneStartTime,
+                  paneCommand: lease.record.worker.paneCommand,
+                } : undefined,
                 sendInitialInput: !tmuxSession,
                 decisionSessionDir: decisionStore.directory,
                 onDecisionSessionReady: (info) => decisionStore.save({
@@ -200,37 +264,70 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 onDecisionSessionProgress: (info) => decisionStore.update(info.taskId, { turn: info.turn }),
                 onDecisionSessionClosed: (taskId) => decisionStore.close(taskId),
               });
-              const taskId = session.task?.taskId;
-              if (!taskId) throw new Error("worker started without a task id");
+              const startedTaskId = session.task?.taskId;
+              if (!startedTaskId) throw new Error("worker started without a task id");
+              try {
+                await lease.updateWorker({
+                  transport: adapter.capabilities().transport,
+                  ...(await workerIdentity(handle)),
+                  sessionName: handle.sessionName,
+                  tmuxSocket: handle.tmuxSocket,
+                  ownership: handle.ownership,
+                });
+              } catch (error) {
+                const registrationError = error instanceof Error ? error : new Error(String(error));
+                if (handle.ownership !== "adopted") {
+                  try {
+                    await stopSession(session, "cwd lease metadata registration failed");
+                    startupCleanupCompleted = await releaseLease(taskId);
+                  } catch (cleanupError) {
+                    const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+                    registrationError.message = `${registrationError.message}; worker cleanup failed: ${message}`;
+                    Object.defineProperty(registrationError, "workerCleanupRequired", { value: true, enumerable: false });
+                  }
+                }
+                throw registrationError;
+              }
               // Register immediately after spawn so shutdown can retry cleanup if
               // the first stop attempt fails.
-              sessions.set(taskId, session);
-              reservedCwds.set(taskId, cwdKey);
-              activeTaskId = taskId;
+              sessions.set(startedTaskId, session);
+              reservedCwds.set(startedTaskId, cwdKey);
+              activeTaskId = startedTaskId;
               if (shuttingDown) {
                 try {
-                  await stopSession(session, "Pi session shutdown during worker start");
-                  sessions.delete(taskId);
-                  reservedCwds.delete(taskId);
+                  await stopSession(session, "Pi session shutdown during worker start", true);
+                  sessions.delete(startedTaskId);
+                  reservedCwds.delete(startedTaskId);
                 } finally {
                   if (session.state !== "stopped") {
                     // Keep the session registered for the shutdown retry below.
-                    sessions.set(taskId, session);
-                    reservedCwds.set(taskId, cwdKey);
+                    sessions.set(startedTaskId, session);
+                    reservedCwds.set(startedTaskId, cwdKey);
                   }
                 }
                 throw new Error("Pi session shut down during worker start");
               }
               const attach = handle.sessionName ? ` attach=${attachCommand(handle)}` : "";
-              message = `${tmuxSession ? "Tmux worker adopted" : "Worker started"}: task=${taskId} worker=${handle.id} (pid ${handle.pid ?? "unknown"}); transport=${adapter.capabilities().transport}${attach}`;
+              message = `${tmuxSession ? "Tmux worker adopted" : "Worker started"}: task=${startedTaskId} worker=${handle.id} (pid ${handle.pid ?? "unknown"}); transport=${adapter.capabilities().transport}${attach}`;
             } catch (error) {
               // Register failed starts before the promise settles, so shutdown
               // cannot snapshot sessions before a returned handle is retained.
               const failedTaskId = session.task?.taskId;
-              if (failedTaskId && session.handle) {
+              const cleanupRequired = requiresWorkerCleanup(error);
+              if (cleanupRequired && failedTaskId) cleanupRequiredTasks.add(failedTaskId);
+              const retainHandle = !startupCleanupCompleted && failedTaskId && session.handle
+                && (cleanupRequired || session.handle.ownership === "adopted");
+              if (retainHandle) {
                 sessions.set(failedTaskId, session);
                 reservedCwds.set(failedTaskId, cwdKey);
                 activeTaskId = failedTaskId;
+              } else if (!cleanupRequired && !startupCleanupCompleted) {
+                const released = await releaseLease(taskId);
+                if (!released && failedTaskId) {
+                  sessions.set(failedTaskId, session);
+                  reservedCwds.set(failedTaskId, cwdKey);
+                  activeTaskId = failedTaskId;
+                }
               }
               throw error;
             }
@@ -242,10 +339,21 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             // Preserve a failed startup in the registry when the adapter
             // returned a handle but lifecycle/event setup failed.
             const failedTaskId = session.task?.taskId;
-            if (failedTaskId && session.handle) {
+            const cleanupRequired = requiresWorkerCleanup(error);
+            if (cleanupRequired && failedTaskId) cleanupRequiredTasks.add(failedTaskId);
+            const retainHandle = !startupCleanupCompleted && failedTaskId && session.handle
+              && (cleanupRequired || session.handle.ownership === "adopted");
+            if (retainHandle) {
               sessions.set(failedTaskId, session);
               reservedCwds.set(failedTaskId, cwdKey);
               activeTaskId = failedTaskId;
+            } else if (!cleanupRequired && !startupCleanupCompleted) {
+              const released = await releaseLease(taskId);
+              if (!released && failedTaskId) {
+                sessions.set(failedTaskId, session);
+                reservedCwds.set(failedTaskId, cwdKey);
+                activeTaskId = failedTaskId;
+              }
             }
             throw error;
           } finally {
@@ -282,6 +390,12 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             if (!approved) throw new Error("Worker command not approved");
             approval = { actor: "human", reason: policy.reason };
           }
+          const lease = await cwdLeaseStore.acquire(cwdKey, record.taskId, adapter.capabilities().transport);
+          cwdLeases.set(record.taskId, lease);
+          if (shuttingDown) {
+            await releaseLease(record.taskId);
+            throw new Error("Pi session is shutting down");
+          }
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
             onHumanRequired: async (notice) => {
@@ -295,6 +409,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             },
           });
           pendingStartSessions.add(session);
+          let recoveryCleanupCompleted = false;
           const recoveryOperation = (async () => {
             try {
               const handle = await session.start({
@@ -305,7 +420,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 task: record.task,
                 initialInput: "",
                 sendInitialInput: false,
-                cwd: record.cwd,
+                cwd: cwdKey,
                 command: record.command,
                 args: record.args,
                 env: selectedWorkerEnvironment(),
@@ -336,20 +451,51 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 onDecisionSessionProgress: (info) => decisionStore.update(info.taskId, { turn: info.turn }),
                 onDecisionSessionClosed: (closedTaskId) => decisionStore.close(closedTaskId),
               });
+              try {
+                await lease.updateWorker({
+                  transport: adapter.capabilities().transport,
+                  ...(await workerIdentity(handle)),
+                  sessionName: handle.sessionName,
+                  tmuxSocket: handle.tmuxSocket,
+                  ownership: handle.ownership,
+                });
+              } catch (error) {
+                const registrationError = error instanceof Error ? error : new Error(String(error));
+                try {
+                  await stopSession(session, "cwd lease metadata registration failed");
+                  recoveryCleanupCompleted = await releaseLease(record.taskId);
+                } catch (cleanupError) {
+                  const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+                  registrationError.message = `${registrationError.message}; worker cleanup failed: ${message}`;
+                  Object.defineProperty(registrationError, "workerCleanupRequired", { value: true, enumerable: false });
+                }
+                throw registrationError;
+              }
               sessions.set(record.taskId, session);
               reservedCwds.set(record.taskId, cwdKey);
               activeTaskId = record.taskId;
               await session.takeover();
               if (shuttingDown) {
-                await stopSession(session, "Pi session shutdown during recovery");
+                await stopSession(session, "Pi session shutdown during recovery", true);
                 throw new Error("Pi session shut down during recovery");
               }
               message = `Worker recovered idle: task=${record.taskId} worker=${handle.id}; original task was not replayed; send an explicit continuation, then use resume-auto`;
             } catch (error) {
-              if (session.handle) {
+              const cleanupRequired = requiresWorkerCleanup(error);
+              if (cleanupRequired) cleanupRequiredTasks.add(record.taskId);
+              const retainHandle = !recoveryCleanupCompleted && session.handle
+                && (cleanupRequired || session.handle.ownership === "adopted");
+              if (retainHandle) {
                 sessions.set(record.taskId, session);
                 reservedCwds.set(record.taskId, cwdKey);
                 activeTaskId = record.taskId;
+              } else if (!cleanupRequired && !recoveryCleanupCompleted) {
+                const released = await releaseLease(record.taskId);
+                if (!released) {
+                  sessions.set(record.taskId, session);
+                  reservedCwds.set(record.taskId, cwdKey);
+                  activeTaskId = record.taskId;
+                }
               }
               throw error;
             }
@@ -395,9 +541,12 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           } else if (operation === "resume") {
             await session.resume(); message = `Worker resumed: ${sessionId}.`;
           } else if (operation === "stop") {
-            await session.stop(remaining.join(" ") || "human requested stop"); message = `Worker stopped: ${sessionId}.`;
+            await stopSession(session, remaining.join(" ") || "human requested stop");
+            await releaseSettledReservations();
+            message = `Worker stopped: ${sessionId}.`;
           } else if (operation === "verify") {
             const result = await session.verify();
+            await releaseSettledReservations();
             message = `${result.ok ? "Verification passed" : "Verification failed"}: ${result.command}\n${result.output}`.trim();
           } else if (operation === "approve") {
             const behavior = remaining[0];
@@ -429,12 +578,18 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
       if (pendingStarts.size > 0) {
         const abortResults = await Promise.allSettled([...pendingStartSessions].map((session) => session.abortStart("Pi session shutdown during startup")));
         startupFailures = abortResults.filter((result): result is PromiseRejectedResult => result.status === "rejected");
-        // Startup adapters own their cleanup and expose bounded cancellation;
-        // do not exit while one of those cleanups is still in flight. A model
-        // provider can still fail to honor disposal, so retain a final bound.
-        await Promise.race([Promise.allSettled([...pendingStarts]), delay(30_000)]);
+        // Do not snapshot sessions or release leases until every startup has
+        // settled. Otherwise a provider that resolves after a fixed timeout
+        // could register a live handle after shutdown cleanup had completed.
+        // Adapters expose bounded cancellation; an uncooperative provider must
+        // keep shutdown fail-closed rather than allowing a late worker escape.
+        while (pendingStarts.size > 0) {
+          const results = await Promise.allSettled([...pendingStarts]);
+          startupFailures.push(...results.filter((result): result is PromiseRejectedResult => result.status === "rejected"));
+        }
       }
-      const results = await Promise.allSettled([...sessions.values()].map((session) => stopSession(session, "Pi session shutdown")));
+      const results = await Promise.allSettled([...sessions.values()].map((session) => stopSession(session, "Pi session shutdown", true)));
+      await releaseSettledReservations();
       const failures = [...startupFailures, ...results.filter((result): result is PromiseRejectedResult => result.status === "rejected")];
       if (failures.length > 0) {
         for (const failure of failures) console.error(`pi-claude-supervisor shutdown cleanup failed: ${redactText(failure.reason instanceof Error ? failure.reason.message : String(failure.reason))}`);
@@ -477,13 +632,8 @@ async function canonicalCwd(cwd: string): Promise<string> {
   return realpath(cwd);
 }
 
-function pathsOverlap(first: string, second: string): boolean {
-  return isWithin(first, second) || isWithin(second, first);
-}
-
-function isWithin(parent: string, child: string): boolean {
-  const childRelative = relative(parent, child);
-  return childRelative === "" || (childRelative !== ".." && !childRelative.startsWith(`..${sep}`) && !isAbsolute(childRelative));
+function requiresWorkerCleanup(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && (error as { workerCleanupRequired?: unknown }).workerCleanupRequired === true);
 }
 
 function formatSessions(sessions: Map<string, Supervisor>, recoverable: DecisionSessionRecord[] = []): string {

@@ -56,6 +56,7 @@
     "test:install": "node scripts/test-install.mjs",
     "test:pi": "node scripts/test-pi.mjs",
     "spike:transport": "node scripts/spike-claude-transport.mjs",
+    "spike:tmux": "node scripts/spike-claude-tmux.mjs",
     "spike:permissions": "node scripts/spike-claude-permissions.mjs",
     "spike:signals": "node scripts/spike-claude-signals.mjs",
     "spike:automation": "node scripts/spike-claude-automation.mjs",

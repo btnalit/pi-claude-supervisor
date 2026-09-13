@@ -53,6 +53,8 @@ export interface SupervisorStartOptions {
   tmuxSession?: string;
   /** Optional socket path for an existing non-default tmux server. */
   tmuxSocket?: string;
+  /** Persisted identity required when handing off an existing tmux lease. */
+  tmuxExpectedIdentity?: WorkerStartInput["tmuxExpectedIdentity"];
   /** Do not replay the task when adopting an existing interactive session. */
   sendInitialInput?: boolean;
   /** Enable the event-driven Pi Decision Worker. Requires claude-jsonl or tmux. */
@@ -101,6 +103,11 @@ export class Supervisor {
   #humanRequired = false;
   #onDecisionSessionProgress?: (info: { taskId: string; turn: number }) => Promise<void> | void;
   #onDecisionSessionClosed?: (taskId: string) => Promise<void> | void;
+  #startAbortController?: AbortController;
+  #startToken?: string;
+  #startStopReason?: string;
+  #startAbortError?: unknown;
+  #startAbortCompletion?: Promise<void>;
 
   constructor(adapter: WorkerAdapter, events = new EventLog(), hooks: { onHumanRequired?: (notice: HumanInterventionNotice) => Promise<void> | void } = {}) {
     this.#adapter = adapter;
@@ -138,6 +145,11 @@ export class Supervisor {
     this.#noOutputTimeoutMs = options.noOutputTimeoutMs ?? 20 * 60_000;
     this.#clearWatchdog();
     this.#machine.transition("starting");
+    const startAbortController = new AbortController();
+    this.#startAbortController = startAbortController;
+    this.#startToken = randomUUID();
+    this.#startStopReason = undefined;
+    this.#startAbortError = undefined;
     try {
       await this.#appendEvent({
         type: "task_started",
@@ -151,6 +163,7 @@ export class Supervisor {
       if (this.#automation && !["jsonl", "tmux"].includes(this.#adapter.capabilities().transport)) {
         throw new Error("automatic supervision requires claude-jsonl or tmux transport");
       }
+      this.#assertStartNotAborted(startAbortController.signal);
       if (this.#automation) {
         this.#decision = new PiDecisionWorker({
           context: { taskId, task: options.task, cwd: options.cwd, state: this.#machine.state, turn: this.#turn, maxTurns: this.#task.maxTurns },
@@ -173,6 +186,7 @@ export class Supervisor {
         });
         await this.#decision.start();
       }
+      this.#assertStartNotAborted(startAbortController.signal);
       const input: WorkerStartInput = {
         task: options.initialInput ?? options.task,
         cwd: options.cwd,
@@ -182,35 +196,64 @@ export class Supervisor {
         approval: options.approval,
         tmuxSession: options.tmuxSession,
         tmuxSocket: options.tmuxSocket,
+        tmuxExpectedIdentity: options.tmuxExpectedIdentity,
         sendInitialInput: options.sendInitialInput,
         eventListener: (event) => this.#receiveWorkerEvent(event),
+        abortSignal: startAbortController.signal,
+        startupToken: this.#startToken,
       };
       this.#handle = await this.#adapter.start(input);
+      this.#assertStartNotAborted(startAbortController.signal);
       this.#machine.transition("running");
       await this.#appendEvent({ type: "worker_started", taskId, workerId: this.#handle.id, data: { pid: this.#handle.pid } });
       this.#armWatchdog();
+      this.#startAbortController = undefined;
+      this.#startToken = undefined;
+      this.#startStopReason = undefined;
+      this.#startAbortError = undefined;
       return this.#handle;
     } catch (error) {
-      const startFailure = error as { workerHandle?: WorkerHandle; workerCleanupRequired?: boolean };
+      const startupError = error instanceof Error ? error : new Error(String(error));
+      const startFailure = startupError as Error & { workerHandle?: WorkerHandle; workerCleanupRequired?: boolean };
       const startFailureHandle = startFailure.workerHandle;
       if (!this.#handle && startFailureHandle && (startFailure.workerCleanupRequired || startFailureHandle.ownership || startFailureHandle.sessionName)) this.#handle = startFailureHandle;
       const handle = this.#handle;
+      const startupCancelled = Boolean(this.#startStopReason || startAbortController.signal.aborted);
+      let startupCleanupError: unknown = this.#startAbortError;
+      const abortCompletion = this.#startAbortCompletion;
+      if (abortCompletion) {
+        try { await abortCompletion; }
+        catch (error) { startupCleanupError ??= error; }
+      }
       if (handle) {
         try {
-          await this.#adapter.stop(handle, "startup failed");
-        } catch {
-          try { await this.#adapter.killProcessGroup(handle, "startup cleanup"); } catch { /* preserve startup error */ }
+          await this.#adapter.stop(handle, startupCancelled ? (this.#startStopReason ?? "startup aborted") : "startup failed");
+        } catch (error) {
+          startupCleanupError = error;
+          try { await this.#adapter.killProcessGroup(handle, "startup cleanup"); }
+          catch (cleanupError) { startupCleanupError ??= cleanupError; }
         }
       }
-      if (["starting", "running"].includes(this.#machine.state)) this.#machine.transition("failed");
+      if (startupCleanupError && !startFailure.workerCleanupRequired) {
+        Object.defineProperty(startupError, "workerCleanupRequired", { value: true, enumerable: false });
+      }
+      if (["starting", "running"].includes(this.#machine.state)) this.#machine.transition(startupCancelled && !startupCleanupError ? "stopped" : "failed");
       try {
-        await this.#appendEvent({ type: "worker_start_failed", taskId, data: { error: safeMessage(error) } });
+        await this.#appendEvent({ type: "worker_start_failed", taskId, data: { error: safeMessage(startupError) } });
       } catch { /* logging failure must not hide the startup failure */ }
       await this.#decision?.close().catch(() => {});
       this.#decision = undefined;
       await Promise.resolve(this.#onDecisionSessionClosed?.(taskId)).catch(() => {});
-      throw error;
+      this.#startAbortController = undefined;
+      this.#startToken = undefined;
+      this.#startStopReason = undefined;
+      this.#startAbortError = undefined;
+      throw startupError;
     }
+  }
+
+  #assertStartNotAborted(signal: AbortSignal): void {
+    if (signal.aborted) throw new Error(`worker startup aborted: ${this.#startStopReason ?? "startup cancellation requested"}`);
   }
 
   async poll(): Promise<{ status: WorkerStatus; output: WorkerOutputChunk[] }> {
@@ -496,21 +539,35 @@ export class Supervisor {
   }
 
   async abortStart(reason = "startup aborted"): Promise<void> {
+    if (this.#machine.state !== "starting" && !this.#startAbortController) return;
     // This path intentionally bypasses #exclusive(): start() may be blocked in
     // a Decision Worker model call and shutdown must still dispose that session.
-    let cleanupError: unknown;
-    const abort = this.#adapter.abortStart?.(reason);
-    if (abort) {
-      try { await abort; }
-      catch (error) { cleanupError = error; }
+    this.#startStopReason = reason;
+    const completion = (async () => {
+      this.#startAbortController?.abort(reason);
+      let cleanupError: unknown;
+      const abort = this.#adapter.abortStart?.(reason, this.#startToken);
+      if (abort) {
+        try { await abort; }
+        catch (error) { cleanupError = error; }
+      }
+      await this.#decision?.close().catch(() => {});
+      this.#decision = undefined;
+      if (this.#handle) {
+        try { await this.#adapter.stop(this.#handle, reason); }
+        catch (error) { cleanupError ??= error; }
+      }
+      if (cleanupError) throw cleanupError;
+    })();
+    this.#startAbortCompletion = completion;
+    try {
+      await completion;
+    } catch (error) {
+      this.#startAbortError = error;
+      throw error;
+    } finally {
+      if (this.#startAbortCompletion === completion) this.#startAbortCompletion = undefined;
     }
-    await this.#decision?.close().catch(() => {});
-    this.#decision = undefined;
-    if (this.#handle) {
-      try { await this.#adapter.stop(this.#handle, reason); }
-      catch (error) { cleanupError ??= error; }
-    }
-    if (cleanupError) throw cleanupError;
   }
 
   async release(reason = "Pi session disconnected"): Promise<void> {
@@ -519,7 +576,9 @@ export class Supervisor {
       ? this.#adapter.release
         ? this.#adapter.release(handle, reason)
         : this.#adapter.stop(handle, reason)
-      : this.#adapter.abortStart?.(reason) ?? Promise.resolve();
+      : this.#machine.state === "starting" || this.#startAbortController
+        ? this.abortStart(reason)
+        : Promise.resolve();
     await this.#decision?.close().catch(() => {});
     this.#decision = undefined;
     await withTimeout(this.#exclusive(async () => {
@@ -530,6 +589,16 @@ export class Supervisor {
   }
 
   async stop(reason = "human requested stop"): Promise<void> {
+    // A stop must be able to preempt startup rather than waiting behind a
+    // startup operation that is blocked in a provider or adapter call.
+    if (this.#machine.state === "starting") {
+      this.#startStopReason = reason;
+      this.#startAbortController?.abort(reason);
+      if (!this.#handle) {
+        await withTimeout(this.abortStart(reason), 15_000, "worker startup cancellation");
+        return;
+      }
+    }
     // Start the adapter stop immediately so a queued/hung send cannot delay
     // process termination. State/event changes still remain serialized below.
     if (!this.#preemptiveStop && this.#handle && ["starting", "running", "waiting", "paused"].includes(this.#machine.state)) {
@@ -542,12 +611,20 @@ export class Supervisor {
   async #stopInternal(reason: string, flushPendingEvents = true): Promise<void> {
     if (flushPendingEvents) await this.#flushPendingEvents();
     if (!this.#handle) throw new Error("no active task");
-    if (this.#machine.state === "stopped") return;
+    if (this.#machine.state === "stopped") {
+      const preemptiveStop = this.#preemptiveStop;
+      this.#preemptiveStop = undefined;
+      if (preemptiveStop) await preemptiveStop;
+      return;
+    }
     if (this.#machine.state === "failed") {
       // A failed startup or cleanup attempt may still retain a live handle.
       // Retry group termination during shutdown instead of treating the state
       // as fully reclaimed.
-      if (this.#handle) await this.#adapter.stop(this.#handle, reason);
+      const preemptiveStop = this.#preemptiveStop;
+      this.#preemptiveStop = undefined;
+      if (preemptiveStop) await preemptiveStop;
+      else if (this.#handle) await this.#adapter.stop(this.#handle, reason);
       await this.#decision?.close().catch(() => {});
       this.#decision = undefined;
       await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "")).catch(() => {});
@@ -615,6 +692,7 @@ export class Supervisor {
         await this.#drainOutputAfterStop(this.#handle);
         const cleanup = await this.#adapter.getStatus(this.#handle);
         if (cleanup.cleanupError) throw new Error(`worker cleanup failed after verification: ${cleanup.cleanupError}`);
+        if (cleanup.cgroupError && cleanup.cgroupRequired !== false) throw new Error(`worker cgroup cleanup failed after verification: ${cleanup.cgroupError}`);
         if (this.#handle.ownership === "owned" && (cleanup.running || cleanup.processGroupCleaned !== true)) {
           throw new Error("owned worker cleanup was not confirmed after verification");
         }
