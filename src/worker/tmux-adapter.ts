@@ -699,14 +699,27 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   }
 
   async #markReplacement(record: TmuxRecord, pid: number): Promise<void> {
-    const identity = await processIdentity(pid);
-    if (identity) {
-      record.replacementPaneStartTime = identity.startTime;
-      record.replacementPaneCommand = identity.command;
-      record.cleanupError = new Error(`owned tmux cleanup refused replacement pane process pid=${pid} start=${identity.startTime} command=${identity.command}`);
-    } else {
-      record.cleanupError = new Error(`owned tmux cleanup refused an unverified replacement pane process pid=${pid}`);
+    // /proc can be transiently unreadable while tmux is reaping a pane. Do
+    // not turn that narrow exit race into a replacement alarm, but never
+    // guess that a still-signalable unknown PID is safe either.
+    let identity = await processIdentity(pid);
+    for (let attempt = 0; !identity && attempt < 10; attempt += 1) {
+      try { process.kill(pid, 0); }
+      catch (error) {
+        if (error instanceof Error && /ESRCH/u.test(error.message)) return;
+        throw error;
+      }
+      await delay(25);
+      identity = await processIdentity(pid);
     }
+    if (!identity) {
+      record.cleanupError = new Error(`owned tmux cleanup refused an unverified replacement pane process pid=${pid}`);
+      return;
+    }
+    if (identity.state === "Z" || identity.state === "X") return;
+    record.replacementPaneStartTime = identity.startTime;
+    record.replacementPaneCommand = identity.command;
+    record.cleanupError = new Error(`owned tmux cleanup refused replacement pane process pid=${pid} start=${identity.startTime} command=${identity.command}`);
   }
 
   #assertNotAborted(record: TmuxRecord): void {
