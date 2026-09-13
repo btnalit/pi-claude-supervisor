@@ -49,6 +49,51 @@ test("tmux adapter owns a private PTY, completes turns, and preserves output", {
   }
 });
 
+test("owned tmux identity can be re-adopted after restart", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-re-adopt-test-"));
+  const claudeBinary = join(stateDir, "claude");
+  await copyFile(process.execPath, claudeBinary);
+  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000 });
+  let handle;
+  try {
+    handle = await adapter.start({
+      task: "owned task",
+      cwd: process.cwd(),
+      command: claudeBinary,
+      args: ["-e", "process.stdout.write('>\\n'); process.stdin.resume();"],
+      sendInitialInput: false,
+    });
+    assert.equal(handle.ownership, "owned");
+    assert.match(handle.tmuxPaneId ?? "", /^%[0-9]+$/u);
+    await adapter.release(handle, "simulate Pi restart");
+    const readoptedAdapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000 });
+    const readopted = await readoptedAdapter.start({
+      task: "owned task must not replay",
+      cwd: process.cwd(),
+      command: "claude",
+      tmuxSession: handle.sessionName,
+      tmuxSocket: handle.tmuxSocket,
+      tmuxExpectedIdentity: {
+        pid: handle.pid,
+        startTime: handle.paneStartTime,
+        tmuxTarget: handle.tmuxTarget,
+        tmuxPaneId: handle.tmuxPaneId,
+        paneStartTime: handle.paneStartTime,
+        paneCommand: handle.paneCommand,
+      },
+      sendInitialInput: false,
+    });
+    assert.equal(readopted.ownership, "adopted");
+    await readoptedAdapter.stop(readopted, "detach after re-adopt");
+  } finally {
+    if (handle) {
+      await adapter.stop(handle, "owned re-adopt test complete").catch(() => {});
+      if (handle.tmuxSocket && handle.sessionName) spawnSync("tmux", ["-S", handle.tmuxSocket, "kill-session", "-t", handle.sessionName], { stdio: "ignore" });
+    }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("explicit idle startup does not submit a blank turn", { skip: !tmuxAvailable, concurrency: false }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-idle-test-"));
   const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000 });

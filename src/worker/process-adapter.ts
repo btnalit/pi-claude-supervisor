@@ -29,6 +29,8 @@ export interface ProcessWorkerAdapterOptions {
   inputWriteTimeoutMs?: number;
   /** Linux descendant cleanup mode; auto uses cgroup v2 when available. */
   cgroupMode?: "off" | "auto" | "required";
+  /** Override the detected cgroup parent for controlled integration tests. */
+  cgroupParentPath?: string;
 }
 
 interface ProcessRecord {
@@ -61,6 +63,10 @@ interface ProcessRecord {
   listeners: Set<WorkerEventListener>;
   permissionResponses: Set<string>;
   stopping?: boolean;
+  starting: boolean;
+  abortRequested: boolean;
+  startupToken?: string;
+  abortListener?: () => void;
 }
 
 /**
@@ -79,6 +85,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   readonly #maxOutputBytes: number;
   readonly #inputWriteTimeoutMs: number;
   readonly #cgroupMode: "off" | "auto" | "required";
+  readonly #cgroupParentPath?: string;
 
   constructor(options: ProcessWorkerAdapterOptions = {}) {
     this.#mode = options.mode ?? "process-pipe";
@@ -88,6 +95,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     this.#maxOutputBytes = boundedPositiveInteger(options.maxOutputBytes ?? 8 * 1024 * 1024, "maxOutputBytes");
     this.#inputWriteTimeoutMs = boundedDelay(options.inputWriteTimeoutMs ?? 10_000);
     this.#cgroupMode = options.cgroupMode ?? "auto";
+    this.#cgroupParentPath = options.cgroupParentPath;
   }
 
   capabilities(): WorkerCapabilities {
@@ -101,6 +109,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   }
 
   async start(input: WorkerStartInput): Promise<WorkerHandle> {
+    if (input.abortSignal?.aborted) throw new Error("worker startup aborted before spawn");
     const args = this.#mode === "claude-jsonl" ? claudeJsonlArgs(input.args) : (input.args ?? []);
     assertSafeWorkerCommand(input.command, args, input.approval);
     const handle: WorkerHandle = {
@@ -141,8 +150,21 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       inputTail: Promise.resolve(),
       listeners: new Set(input.eventListener ? [input.eventListener] : []),
       permissionResponses: new Set(),
+      starting: true,
+      abortRequested: false,
+      startupToken: input.startupToken,
     };
+    const abortListener = () => {
+      record.abortRequested = true;
+      record.stopping = true;
+      if (record.exitCode === undefined) {
+        try { record.child.kill("SIGTERM"); } catch { /* cleanup below remains authoritative */ }
+      }
+    };
+    record.abortListener = abortListener;
+    input.abortSignal?.addEventListener("abort", abortListener, { once: true });
     this.#records.set(handle.id, record);
+    if (input.abortSignal?.aborted) abortListener();
     const capture = (stream: "stdout" | "stderr") => (chunk: Buffer | string) => {
       const text = String(chunk);
       record.lastOutputAt = new Date().toISOString();
@@ -187,37 +209,69 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       });
     });
     try {
-      await record.spawned;
-      await this.#attachCgroup(record);
-    } catch (error) {
-      try { await this.#ensureGroupCleanup(record); } catch (cleanupError) { record.cleanupError = cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError)); }
-      const startupError = error instanceof Error ? error : new Error(String(error));
-      if (record.cleanupError) {
-        startupError.message = `${startupError.message}; startup cleanup failed: ${record.cleanupError.message}`;
-        Object.defineProperty(startupError, "workerHandle", { value: handle, enumerable: false });
-        Object.defineProperty(startupError, "workerCleanupRequired", { value: true, enumerable: false });
-      }
-      throw startupError;
-    }
-    if (input.task) {
-      record.lastInputAt = new Date().toISOString();
       try {
-        await this.#writeInput(record, this.#encodeMessage(input.task));
+        await record.spawned;
+        this.#assertNotAborted(record);
+        await this.#attachCgroup(record);
+        this.#assertNotAborted(record);
       } catch (error) {
-        let cleanupError: unknown;
-        try { await this.stop(handle, "initial worker input failed"); }
-        catch (stopError) { cleanupError = stopError; }
-        if (cleanupError) {
-          const startupError = error instanceof Error ? error : new Error(String(error));
-          startupError.message = `${startupError.message}; startup cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
+        try {
+          await this.#ensureGroupCleanup(record);
+        } catch (cleanupError) {
+          record.cleanupError = cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError));
+        }
+        const startupError = error instanceof Error ? error : new Error(String(error));
+        if (record.cleanupError) {
+          startupError.message = `${startupError.message}; startup cleanup failed: ${record.cleanupError.message}`;
           Object.defineProperty(startupError, "workerHandle", { value: handle, enumerable: false });
           Object.defineProperty(startupError, "workerCleanupRequired", { value: true, enumerable: false });
-          throw startupError;
         }
-        throw error;
+        throw startupError;
+      }
+      if (input.task) {
+        this.#assertNotAborted(record);
+        record.lastInputAt = new Date().toISOString();
+        try {
+          await this.#writeInput(record, this.#encodeMessage(input.task));
+        } catch (error) {
+          let cleanupError: unknown;
+          try { await this.stop(handle, "initial worker input failed"); }
+          catch (stopError) { cleanupError = stopError; }
+          if (cleanupError) {
+            const startupError = error instanceof Error ? error : new Error(String(error));
+            startupError.message = `${startupError.message}; startup cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
+            Object.defineProperty(startupError, "workerHandle", { value: handle, enumerable: false });
+            Object.defineProperty(startupError, "workerCleanupRequired", { value: true, enumerable: false });
+            throw startupError;
+          }
+          throw error;
+        }
+      }
+      return handle;
+    } finally {
+      record.starting = false;
+      if (record.abortListener) input.abortSignal?.removeEventListener("abort", record.abortListener);
+      record.abortListener = undefined;
+    }
+  }
+
+  async abortStart(reason = "startup aborted", startupToken?: string): Promise<void> {
+    const records = [...this.#records.values()].filter((record) => record.starting && (startupToken === undefined || record.startupToken === startupToken));
+    for (const record of records) {
+      record.abortRequested = true;
+      record.stopping = true;
+      if (record.exitCode === undefined) {
+        try { record.child.kill("SIGTERM"); } catch { /* cleanup below remains authoritative */ }
       }
     }
-    return handle;
+    const deadline = Date.now() + Math.max(this.#terminationGraceMs, 1_000);
+    while (records.some((record) => record.starting) && Date.now() < deadline) await delay(10);
+    for (const record of records) {
+      if (record.exitCode === undefined) {
+        try { await this.#ensureGroupCleanup(record); }
+        catch (error) { record.cleanupError = error instanceof Error ? error : new Error(`${reason}: ${String(error)}`); }
+      }
+    }
   }
 
   async getStatus(handle: WorkerHandle): Promise<WorkerStatus> {
@@ -241,6 +295,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       exitReason: running ? undefined : record.signal ? "crashed" : record.exitCode === 0 ? "completed" : "failed",
       processGroupCleaned: record.groupCleanupComplete,
       cgroupCleaned: record.cgroupPath ? record.groupCleanupComplete : undefined,
+      cgroupRequired: this.#cgroupMode === "required",
       cgroupError: record.cgroupError?.message,
       cleanupError: record.cleanupError?.message,
       runtimeError: record.runtimeError?.message,
@@ -356,6 +411,10 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     throw new Error("process-pipe transport does not support session resume");
   }
 
+  #assertNotAborted(record: ProcessRecord): void {
+    if (record.abortRequested) throw new Error("worker startup aborted");
+  }
+
   async #writeInput(record: ProcessRecord, message: string): Promise<void> {
     const stdin = record.child.stdin;
     if (record.stdinError) throw new Error(`worker stdin is unavailable: ${record.stdinError.message}`);
@@ -464,14 +523,27 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   }
 
   async #attachCgroup(record: ProcessRecord): Promise<void> {
-    if (this.#cgroupMode === "off" || process.platform !== "linux" || !record.handle.pid) return;
+    if (this.#cgroupMode === "off") return;
+    if (!record.handle.pid) {
+      const error = new Error("worker pid was unavailable for cgroup attachment");
+      record.cgroupError = error;
+      if (this.#cgroupMode === "required") throw new Error(`unable to attach worker to a cgroup: ${error.message}`, { cause: error });
+      throw error;
+    }
+    if (process.platform !== "linux") {
+      const error = new Error("cgroups are unavailable on this platform");
+      record.cgroupError = error;
+      if (this.#cgroupMode === "required") throw new Error(`unable to attach worker to a cgroup: ${error.message}`, { cause: error });
+      return;
+    }
     let path: string | undefined;
     try {
-      const parent = await currentCgroupPath();
+      const parent = this.#cgroupParentPath ?? await currentCgroupPath();
       path = `${parent}/pi-claude-supervisor-${record.handle.id}`;
       await mkdir(path);
       await writeFile(`${path}/cgroup.procs`, `${record.handle.pid}\n`);
       record.cgroupPath = path;
+      record.handle.cgroupPath = path;
     } catch (error) {
       if (path) await rm(path, { recursive: true, force: true }).catch(() => {});
       record.cgroupError = error instanceof Error ? error : new Error(String(error));

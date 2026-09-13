@@ -39,8 +39,9 @@ are also awaited during Pi shutdown.
 
 This is a control-boundary fixture and headless transport. It does not emulate a
 terminal. Manual compatibility mode remains `process-pipe`; automatic mode
-(`PI_CLAUDE_SUPERVISOR_MODE=auto`) forces Claude JSONL and uses the CLI contract
-validated by the fixed-version spike.
+(`PI_CLAUDE_SUPERVISOR_MODE=auto`) defaults to Claude JSONL and uses the CLI
+contract validated by the fixed-version spike; an explicit tmux transport remains
+screen-based.
 
 A worker exit automatically triggers cleanup, and terminal status waits for
 that cleanup to be confirmed (or reports a cleanup error). On Linux the adapter
@@ -62,11 +63,14 @@ signals.
 ## tmux/PTY transport
 
 `TmuxWorkerAdapter` is an explicit second transport, selected with
-`PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`. An owned worker gets a private tmux
-server/socket and a launcher file containing only the validated command, args and
-cwd. The worker environment is supplied to the tmux server through the same
-least-privilege environment builder; environment credentials are not copied into
-the launcher file; credential-shaped command arguments are rejected.
+`PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`. Because tmux has no equivalent cgroup
+containment boundary, `PI_CLAUDE_SUPERVISOR_CGROUP_MODE=required` is rejected
+with this transport; use `auto`/`off` only when the tmux boundary is acceptable.
+An owned worker gets a private tmux server/socket and executes the validated Claude command directly in the pane,
+so its pane identity remains re-adoptable after a Pi restart. The worker
+environment is supplied to the tmux server through the same least-privilege
+environment builder; credentials are not copied into a file; credential-shaped
+command arguments are rejected.
 `load-buffer`, bracketed `paste-buffer` and `send-keys Enter` provide the input
 boundary without interpolating a task into a shell command. C0/C1 terminal
 control bytes are rejected; CRLF is normalized to a newline.
@@ -113,6 +117,34 @@ watchdog and shutdown work cannot produce duplicate terminal transitions. If a
 lifecycle event append fails after the state transition, it remains pending and
 is retried before the next lifecycle operation; output events restore their
 chunks for a lossless retry.
+
+### Cross-process cwd leases and startup cancellation
+
+Every start and explicit recovery acquires an atomic lease in the shared lease
+registry before spawning Claude. The default registry is
+`~/.pi/agent/claude-supervisor/cwd-leases`; `PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR`
+may point all Pi processes at an alternate shared directory. Canonical paths
+conflict with both their parents and descendants, and the registry lock
+serializes acquisition across independent Pi processes. A lease is released
+only after the adapter confirms the worker and its descendant cleanup; an
+unconfirmed lease left by a crashed Pi is intentionally retained and requires
+operator verification/manual cleanup rather than unsafe automatic reclamation.
+An explicitly adopted tmux session may hand off an existing lease only after
+its owner identity is no longer live and its canonical cwd, tmux session/socket,
+pane id, pane PID/start time, and pane command all match; ordinary starts
+cannot consume another task's lease. If post-start worker identity registration
+fails, owned workers are stopped before the lease is released; cleanup failure
+retains both the worker and lease fail-closed. Explicit `stop` cleans owned tmux
+sessions, while Pi shutdown detaches persistent sessions so they remain explicitly
+re-adoptable.
+
+Startup owns an `AbortController` and passes its signal to the adapter. A stop
+or shutdown request aborts the controller and calls the adapter's out-of-band
+startup cleanup without waiting behind the serialized start operation. Each
+startup carries an opaque token, so cancelling one concurrent session cannot
+abort another. Process and tmux adapters terminate or detach their startup
+work, and the Supervisor rechecks cancellation before reporting `running`; a cancelled startup becomes
+`stopped` and never reports a worker that was not cleanup-verified.
 
 ## Event log
 

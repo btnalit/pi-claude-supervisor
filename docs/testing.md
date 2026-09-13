@@ -49,8 +49,11 @@ non-sensitive prompt, and prints protocol metadata rather than raw model output.
 It must not be added to the normal CI gate because authentication is an owner
 controlled prerequisite.
 
-The current fixtures validate one prompt, multiple turns, session resume,
+The historical fixtures validate one prompt, multiple turns, session resume,
 permission allow/deny and SIGTERM/SIGINT behavior with Claude Code 2.1.268.
+The current release validation uses Claude Code 2.1.270 at
+`/home/yancao/.local/share/mise/installs/claude/2.1.270/claude`, including real
+owned tmux turns, pause/resume, and restart re-adoption.
 The adapter regression suite also verifies event subscription, parsed
 `permission_request` events, and the exact nested `control_response` envelope.
 The automation spike additionally exercises a real Pi SDK Decision Worker with
@@ -70,10 +73,15 @@ npm run spike:signals
 npm run spike:automation
 SPIKE_AUTOMATION_PERMISSION=1 npm run spike:automation
 SPIKE_AUTOMATION_QUESTION=1 npm run spike:automation
+PI_CLAUDE_SUPERVISOR_REAL_CLAUDE=1 npm run spike:tmux
 ```
 
-For this release, pin and record Claude Code `2.1.268` and its resolved
-executable path. Record:
+The tmux spike is gated, authenticated, and excluded from normal CI. It uses
+plan mode, records only protocol metadata, and verifies two real Claude turns,
+pause/resume, owned detach, and identity-bound restart re-adoption.
+
+For each release, pin and record the validated Claude Code version and resolved
+executable path. For this release the validated version is `2.1.270`. Record:
 
 1. exact version and resolved executable path;
 2. license and source revision;
@@ -86,9 +94,10 @@ executable path. Record:
 A passing worker task is not sufficient. The independent verifier must repeat the
 relevant checks from a clean host perspective.
 
-Automatic mode is enabled with `PI_CLAUDE_SUPERVISOR_MODE=auto`; it forces JSONL
-and routes `result`, permission, and process-exit events to the persistent Pi
-Decision Worker. `process-pipe` remains the manual compatibility mode. Human
+Automatic mode is enabled with `PI_CLAUDE_SUPERVISOR_MODE=auto`; it defaults to
+JSONL and routes `result`, permission, and process-exit events to the persistent
+Pi Decision Worker. An explicit `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux` selection
+remains screen-based and does not use the JSONL permission protocol. `process-pipe` remains the manual compatibility mode. Human
 escalation is outbound-only through `PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL`;
 approval callbacks are deliberately not accepted without a separately
 authenticated endpoint.

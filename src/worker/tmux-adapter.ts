@@ -34,6 +34,7 @@ interface TmuxRecord {
   sessionName: string;
   socketPath?: string;
   target: string;
+  expectedIdentity?: WorkerStartInput["tmuxExpectedIdentity"];
   logPath: string;
   runtimeDir: string;
   owned: boolean;
@@ -60,6 +61,8 @@ interface TmuxRecord {
   stopping: boolean;
   starting: boolean;
   abortRequested: boolean;
+  startupToken?: string;
+  abortListener?: () => void;
   released: boolean;
   cleanupComplete: boolean;
   sessionCreated?: boolean;
@@ -133,12 +136,14 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       sessionName,
       tmuxSocket: socketPath,
       ownership: owned ? "owned" : "adopted",
+      tmuxTarget: target,
     };
     const record: TmuxRecord = {
       handle,
       sessionName,
       socketPath,
       target,
+      expectedIdentity: input.tmuxExpectedIdentity,
       logPath,
       runtimeDir,
       owned,
@@ -159,10 +164,18 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       stopping: false,
       starting: true,
       abortRequested: false,
+      startupToken: input.startupToken,
       released: false,
       cleanupComplete: false,
     };
+    const abortListener = () => {
+      record.abortRequested = true;
+      record.stopping = true;
+    };
+    record.abortListener = abortListener;
+    input.abortSignal?.addEventListener("abort", abortListener, { once: true });
     this.#records.set(id, record);
+    if (input.abortSignal?.aborted) abortListener();
 
     try {
       await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
@@ -170,15 +183,13 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       if (owned) {
         assertSafeWorkerCommand(input.command, input.args ?? [], input.approval);
         assertNoCredentialArguments(input.command, input.args ?? []);
-        const launcherPath = join(runtimeDir!, "launcher.mjs");
-        await writeFile(launcherPath, launcherSource({ command: input.command, args: input.args ?? [], cwd: input.cwd }), { mode: 0o600 });
         const env = workerEnvironment(process.env, input.env);
         // Create the window with its shell first so remain-on-exit is set
         // before the launcher can finish instantly.
         await this.#run(record, ["new-session", "-d", "-s", sessionName, "-x", "140", "-y", "40", "-c", input.cwd], undefined, env);
         record.sessionCreated = true;
         await this.#run(record, ["set-window-option", "-t", sessionName, "remain-on-exit", "on"]);
-        await this.#run(record, ["respawn-pane", "-k", "-t", target, "--", process.execPath, launcherPath]);
+        await this.#run(record, ["respawn-pane", "-k", "-t", target, "--", input.command, ...(input.args ?? [])], undefined, env);
         await this.#pinTarget(record);
         const ownedPane = await this.#paneStatus(record);
         record.paneDead = ownedPane.dead;
@@ -228,11 +239,14 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       if (cleanupMessage) startupError.message = `${startupError.message}; startup cleanup failed: ${cleanupMessage}`;
       Object.defineProperty(startupError, "workerHandle", { value: handle, enumerable: false });
       throw startupError;
+    } finally {
+      if (record.abortListener) input.abortSignal?.removeEventListener("abort", record.abortListener);
+      record.abortListener = undefined;
     }
   }
 
-  async abortStart(_reason: string): Promise<void> {
-    const starts = [...this.#records.values()].filter((record) => record.starting);
+  async abortStart(_reason: string, startupToken?: string): Promise<void> {
+    const starts = [...this.#records.values()].filter((record) => record.starting && (startupToken === undefined || record.startupToken === startupToken));
     for (const record of starts) {
       record.abortRequested = true;
       record.stopping = true;
@@ -240,7 +254,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       else await this.#detachPipe(record);
     }
     const deadline = Date.now() + 25_000;
-    while ([...this.#records.values()].some((record) => record.starting) && Date.now() < deadline) await delay(25);
+    while (starts.some((record) => record.starting) && Date.now() < deadline) await delay(25);
   }
 
   async getStatus(handle: WorkerHandle): Promise<WorkerStatus> {
@@ -460,11 +474,11 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   async #sendRaw(record: TmuxRecord, message: string): Promise<void> {
     const safeMessage = safeTmuxMessage(message);
     const bufferName = `pi-cs-${record.handle.id}`;
-    // Bracketed paste keeps newlines and ordinary text from being interpreted
-    // as individual terminal key presses by Claude's TUI.
-    const pasted = `\u001b[200~${safeMessage}\u001b[201~`;
-    await this.#run(record, ["load-buffer", "-b", bufferName, "-"], pasted);
-    await this.#run(record, ["paste-buffer", "-d", "-b", bufferName, "-t", record.target]);
+    // Ask tmux to emit a real bracketed paste. Embedding the escape markers
+    // in the buffer makes Claude's TUI render them literally instead of
+    // entering paste mode.
+    await this.#run(record, ["load-buffer", "-b", bufferName, "-"], safeMessage);
+    await this.#run(record, ["paste-buffer", "-p", "-d", "-b", bufferName, "-t", record.target]);
     await this.#run(record, ["send-keys", "-t", record.target, "Enter"]);
   }
 
@@ -562,6 +576,8 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   async #assertExistingSession(record: TmuxRecord, cwd: string, approval?: { actor: "human"; reason: string }): Promise<void> {
     await this.#pinTarget(record);
     const pane = await this.#paneStatus(record);
+    const expected = record.expectedIdentity;
+    if (expected?.pid !== undefined && pane.pid !== expected.pid) throw new Error("tmux pane pid changed; refusing identity-unverified handoff");
     if (pane.dead) throw new Error("cannot adopt a dead tmux pane");
     record.handle.pid = pane.pid;
     const currentPath = await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_current_path}"]);
@@ -584,12 +600,18 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     }
     assertSafeWorkerCommand(command, [argsText], approval);
     await this.#rememberPaneIdentity(record, pane.pid);
+    if (expected?.startTime && record.paneStartTime !== expected.startTime) throw new Error("tmux pane process start time changed; refusing identity-unverified handoff");
+    if (expected?.paneStartTime && record.paneStartTime !== expected.paneStartTime) throw new Error("tmux pane identity changed; refusing identity-unverified handoff");
+    if (expected?.paneCommand && record.paneCommand !== expected.paneCommand) throw new Error("tmux pane command changed; refusing identity-unverified handoff");
   }
 
   async #pinTarget(record: TmuxRecord): Promise<void> {
+    if (record.expectedIdentity?.tmuxTarget && record.expectedIdentity.tmuxTarget !== record.sessionName) throw new Error("tmux session target changed; refusing identity-unverified handoff");
     const pane = await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_id}"]);
     const paneId = pane.stdout.trim();
     if (!/^%[0-9]+$/u.test(paneId)) throw new Error("tmux did not return a stable pane id");
+    if (record.expectedIdentity?.tmuxPaneId && record.expectedIdentity.tmuxPaneId !== paneId) throw new Error("tmux pane target changed; refusing identity-unverified handoff");
+    record.handle.tmuxPaneId = paneId;
     record.target = paneId;
   }
 
@@ -622,6 +644,8 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       }
       record.paneStartTime = startTime;
       record.paneCommand = command;
+      record.handle.paneStartTime = startTime;
+      record.handle.paneCommand = command;
     } catch (error) {
       if (error instanceof Error && /tmux pane identity changed/u.test(error.message)) throw error;
       throw new Error(`tmux pane identity unavailable for pid ${pid}`);
@@ -671,14 +695,14 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       record.cleanupError = new Error("owned tmux cleanup lacks a verifiable pane identity");
       return;
     }
-    if (!isPidAlive(pid)) return;
+    if (!isPidAlive(pid) || await isZombie(pid)) return;
     if (!(await sameProcess(record, pid))) {
       await this.#markReplacement(record, pid);
       return;
     }
     signalProcessGroup(pid, "SIGTERM");
     for (let attempt = 0; attempt < 10 && isPidAlive(pid); attempt += 1) await delay(50);
-    if (isPidAlive(pid)) {
+    if (isPidAlive(pid) && !(await isZombie(pid))) {
       if (!(await sameProcess(record, pid))) {
         await this.#markReplacement(record, pid);
         return;
@@ -686,21 +710,26 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       signalProcessGroup(pid, "SIGKILL");
     }
     for (let attempt = 0; attempt < 10 && isPidAlive(pid); attempt += 1) await delay(50);
-    if (isPidAlive(pid)) {
+    if (isPidAlive(pid) && !(await isZombie(pid))) {
       if (await sameProcess(record, pid)) record.cleanupError = new Error(`tmux pane process did not exit: ${pid}`);
       else await this.#markReplacement(record, pid);
     }
   }
 
   async #markReplacement(record: TmuxRecord, pid: number): Promise<void> {
-    const identity = await processIdentity(pid);
-    if (identity) {
-      record.replacementPaneStartTime = identity.startTime;
-      record.replacementPaneCommand = identity.command;
-      record.cleanupError = new Error(`owned tmux cleanup refused replacement pane process pid=${pid} start=${identity.startTime} command=${identity.command}`);
-    } else {
-      record.cleanupError = new Error(`owned tmux cleanup refused an unverified replacement pane process pid=${pid}`);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      if (await isZombie(pid)) return;
+      const identity = await processIdentity(pid);
+      if (identity) {
+        record.replacementPaneStartTime = identity.startTime;
+        record.replacementPaneCommand = identity.command;
+        record.cleanupError = new Error(`owned tmux cleanup refused replacement pane process pid=${pid} start=${identity.startTime} command=${identity.command}`);
+        return;
+      }
+      if (!isPidAlive(pid)) return;
+      await delay(25);
     }
+    record.cleanupError = new Error(`owned tmux cleanup refused an unverified replacement pane process pid=${pid}`);
   }
 
   #assertNotAborted(record: TmuxRecord): void {
@@ -844,10 +873,6 @@ export function attachCommand(handle: Pick<WorkerHandle, "tmuxSocket" | "session
   return handle.tmuxSocket ? `tmux -S ${shellQuote(handle.tmuxSocket)} attach -t ${target}` : `tmux attach -t ${target}`;
 }
 
-function launcherSource(spec: { command: string; args: string[]; cwd: string }): string {
-  return `import { spawn } from "node:child_process";\nconst spec = ${JSON.stringify(spec)};\nconst child = spawn(spec.command, spec.args, { cwd: spec.cwd, env: process.env, stdio: "inherit" });\nchild.once("error", (error) => { console.error(error.message); process.exitCode = 127; });\nchild.once("exit", (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1; });\n`;
-}
-
 function runCommand(command: string, args: string[], input: string | undefined, env: NodeJS.ProcessEnv, timeoutMs: number): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { env, stdio: ["pipe", "pipe", "pipe"] });
@@ -962,6 +987,17 @@ function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
 interface ProcessIdentity {
   startTime: string;
   command: string;
+}
+
+async function isZombie(pid: number): Promise<boolean> {
+  try {
+    const statText = await readFile(`/proc/${pid}/stat`, "utf8");
+    const closeParen = statText.lastIndexOf(")");
+    const fields = closeParen >= 0 ? statText.slice(closeParen + 2).trim().split(/\s+/u) : [];
+    return fields[0] === "Z";
+  } catch {
+    return false;
+  }
 }
 
 async function processIdentity(pid: number): Promise<ProcessIdentity | undefined> {
