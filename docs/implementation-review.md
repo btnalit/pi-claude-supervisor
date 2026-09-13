@@ -62,6 +62,6 @@ The local evidence for the current hardening baseline was collected on Node
 `v26.8.1` with npm `11.19.0`. The release CI additionally validates Node
 `22.19.0` and Node `24`, including package-install and Pi-registration smoke
 tests. The prior release push had a flaky cwd-reservation test failure; the
-follow-up stabilization was merged in PR #14 and its CI passed. ARM64 remains
-covered by the architecture-aware actionlint check but has not been used for
-the full hosted CI matrix.
+follow-up stabilization was merged in PR #14 and its CI passed. The actionlint script contains a verified ARM64 asset branch, but hosted CI
+currently executes only on x86_64; ARM64 has not been used for the full hosted
+CI matrix.
