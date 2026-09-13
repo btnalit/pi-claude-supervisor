@@ -28,12 +28,18 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   if (!(["process-pipe", "jsonl", "tmux"] as string[]).includes(transport)) {
     throw new Error(`Unsupported PI_CLAUDE_SUPERVISOR_TRANSPORT: ${transport}; expected process-pipe, jsonl, or tmux`);
   }
+  const configuredCgroupMode = process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE;
+  const cgroupMode = configuredCgroupMode ?? "required";
+  if (!("off" === cgroupMode || cgroupMode === "auto" || cgroupMode === "required")) {
+    throw new Error(`Unsupported PI_CLAUDE_SUPERVISOR_CGROUP_MODE: ${cgroupMode}; expected off, auto, or required`);
+  }
   const adapter = transport === "tmux"
     ? new TmuxWorkerAdapter({ stateDir })
     : new ProcessWorkerAdapter({
       // Automatic decisions require Claude's structured event stream. The pipe
       // transport remains available for manual/compatibility sessions.
       mode: automation || transport === "jsonl" ? "claude-jsonl" : "process-pipe",
+      cgroupMode: cgroupMode as "off" | "auto" | "required",
     });
   const humanWebhook = new HumanWebhookNotifier({
     url: process.env.PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL,
@@ -65,7 +71,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
       }
       try {
         const status = await adapter.getStatus(session.handle);
-        if (!status.running && status.processGroupCleaned === true && !status.cleanupError) reservedCwds.delete(taskId);
+        if (!status.running && status.processGroupCleaned === true && !status.cleanupError && !status.cgroupError) reservedCwds.delete(taskId);
       } catch {
         // Keep the reservation when cleanup status cannot be confirmed.
       }
@@ -97,7 +103,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     while (Date.now() <= deadline) {
       try {
         const status = await adapter.getStatus(handle);
-        if (!status.running && status.processGroupCleaned === true && !status.cleanupError) {
+        if (!status.running && status.processGroupCleaned === true && !status.cleanupError && !status.cgroupError) {
           if (lifecycleError) throw lifecycleError;
           return;
         }

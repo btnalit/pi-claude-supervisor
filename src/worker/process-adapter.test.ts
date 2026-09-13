@@ -14,6 +14,44 @@ test("process adapter reports spawn failures instead of leaving a running record
   }), /ENOENT|spawn/u);
 });
 
+test("required cgroup mode fails closed when the host cannot attach workers", { skip: process.platform !== "linux" || requiredCgroupTestAvailable }, async () => {
+  const adapter = new ProcessWorkerAdapter({ cgroupMode: "required", terminationGraceMs: 25, killGraceMs: 50 });
+  let failure: unknown;
+  try {
+    await adapter.start({
+      task: "required cgroup unavailable",
+      cwd: process.cwd(),
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure instanceof Error);
+  assert.match(failure.message, /unable to attach worker to a cgroup/u);
+  assert.match(failure.message, /cleanup failed|descendant cleanup is not confirmed/u);
+  const pid = (failure as Error & { workerHandle?: { pid?: number } }).workerHandle?.pid;
+  if (pid) {
+    try { process.kill(pid, "SIGKILL"); } catch (error) { if (!(error instanceof Error) || !/ESRCH/u.test(error.message)) throw error; }
+  }
+});
+
+test("auto cgroup fallback remains visible after process-group cleanup", { skip: process.platform !== "linux" || requiredCgroupTestAvailable }, async () => {
+  const adapter = new ProcessWorkerAdapter({ cgroupMode: "auto", terminationGraceMs: 25, killGraceMs: 100 });
+  const handle = await adapter.start({
+    task: "explicit fallback",
+    cwd: process.cwd(),
+    command: process.execPath,
+    args: ["-e", "setInterval(() => {}, 1000)"],
+  });
+  const started = await adapter.getStatus(handle);
+  assert.match(started.cgroupError ?? "", /EACCES|permission|cgroup/u);
+  await adapter.stop(handle, "fallback visibility test");
+  const stopped = await adapter.getStatus(handle);
+  assert.equal(stopped.processGroupCleaned, true);
+  assert.ok(stopped.cgroupError);
+});
+
 test("approved review-level worker command passes the adapter gate", async () => {
   const adapter = new ProcessWorkerAdapter();
   const handle = await adapter.start({

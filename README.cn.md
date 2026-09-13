@@ -16,7 +16,7 @@
 - 不经过 shell 启动子进程。
 - Worker 只继承最小环境；凭据必须由调用方显式传入。
 - 破坏性命令和绕过权限的 Worker 参数默认拒绝；需要复核的启动命令会请求用户批准，不会一律拒绝。
-- Linux 上优先使用可写的 cgroup v2 清理后代进程，包括 `setsid()` 后代；不可用时回退到进程组清理。需要强制失败闭环时，embedding 集成可使用 `cgroupMode: "required"`。
+- Pi 扩展默认使用 `cgroupMode: "required"`，Linux 上无法建立可写 cgroup v2 边界时拒绝启动。`PI_CLAUDE_SUPERVISOR_CGROUP_MODE=auto` 只是显式兼容模式，可能回退到非递归进程组清理，会保留 cgroup 错误，不能视为后代进程已安全清理。
 - 普通联网查询不因联网本身被拒绝；下载后直接交给 shell 等高风险模式仍需人工复核。
 - Worker 声称完成只会进入 `verifying`，不能作为成功证据。
 - 默认独立验收命令为 `git diff --check`。

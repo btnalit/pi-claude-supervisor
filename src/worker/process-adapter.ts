@@ -51,6 +51,8 @@ interface ProcessRecord {
   cleanupError?: Error;
   cgroupPath?: string;
   cgroupError?: Error;
+  /** Required cgroup setup failed; process-group cleanup cannot prove descendants are gone. */
+  cgroupRequiredUnavailable?: boolean;
   runtimeError?: Error;
   spawned: Promise<void>;
   spawnedSuccessfully: boolean;
@@ -464,9 +466,11 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   }
 
   async #attachCgroup(record: ProcessRecord): Promise<void> {
-    if (this.#cgroupMode === "off" || process.platform !== "linux" || !record.handle.pid) return;
+    if (this.#cgroupMode === "off") return;
     let path: string | undefined;
     try {
+      if (process.platform !== "linux") throw new Error("cgroup v2 descendant cleanup requires Linux");
+      if (!record.handle.pid) throw new Error("worker PID is unavailable for cgroup attachment");
       const parent = await currentCgroupPath();
       path = `${parent}/pi-claude-supervisor-${record.handle.id}`;
       await mkdir(path);
@@ -476,6 +480,12 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       if (path) await rm(path, { recursive: true, force: true }).catch(() => {});
       record.cgroupError = error instanceof Error ? error : new Error(String(error));
       if (this.#cgroupMode === "required") {
+        // A fast-exiting leader may have started best-effort cleanup from its
+        // exit handler before attachment failed. Invalidate that result: a
+        // required boundary failure must never inherit a fallback success.
+        record.cgroupRequiredUnavailable = true;
+        record.groupCleanupComplete = false;
+        record.groupCleanup = undefined;
         throw new Error(`unable to attach worker to a cgroup: ${record.cgroupError.message}`, { cause: record.cgroupError });
       }
     }
@@ -501,21 +511,26 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   }
 
   async #cleanupProcessGroup(record: ProcessRecord): Promise<void> {
+    if (record.cgroupRequiredUnavailable) {
+      await this.#bestEffortProcessGroupKill(record);
+      throw new Error(`required cgroup cleanup was unavailable; descendant cleanup is not confirmed${record.cgroupError ? `: ${record.cgroupError.message}` : ""}`);
+    }
     if (record.cgroupPath) {
       await cleanupCgroup(record.cgroupPath, this.#killGraceMs);
       record.groupCleanupComplete = true;
       return;
     }
+    await this.#bestEffortProcessGroupKill(record);
+    record.groupCleanupComplete = true;
+  }
+
+  async #bestEffortProcessGroupKill(record: ProcessRecord): Promise<void> {
     const pid = record.handle.pid;
-    if (!pid) {
-      record.groupCleanupComplete = true;
-      return;
-    }
+    if (!pid) return;
     try {
       process.kill(-pid, "SIGKILL");
     } catch (error) {
       if (!(error instanceof Error) || !/ESRCH/u.test(error.message)) throw error;
-      record.groupCleanupComplete = true;
       return;
     }
     const deadline = Date.now() + this.#killGraceMs;
@@ -523,10 +538,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       try {
         process.kill(-pid, 0);
       } catch (error) {
-        if (error instanceof Error && /ESRCH/u.test(error.message)) {
-          record.groupCleanupComplete = true;
-          return;
-        }
+        if (error instanceof Error && /ESRCH/u.test(error.message)) return;
         throw error;
       }
       await delay(Math.min(10, Math.max(1, deadline - Date.now())));
@@ -576,7 +588,11 @@ async function cleanupCgroup(path: string, graceMs: number): Promise<void> {
     if (error instanceof Error && /ENOENT/u.test(error.message)) return;
     throw error;
   }
-  const deadline = Date.now() + graceMs;
+  // cgroup.kill is asynchronous and the kernel may need more than the
+  // process-group grace period to reap descendants under load. Keep the
+  // cleanup bounded, but do not make a 25/100ms test or embedding delay the
+  // deadline for the descendant boundary itself.
+  const deadline = Date.now() + Math.max(graceMs, 2_000);
   while (Date.now() <= deadline) {
     try {
       const events = await readFile(`${path}/cgroup.events`, "utf8");

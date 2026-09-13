@@ -117,9 +117,11 @@ workers, lifecycle serialization and stop races.
 Before release, manually test at least: immediate crash, hung process, malformed
 output, duplicate send, send/exit race, Pi `SIGTERM`/`SIGINT` shutdown,
 verification failure, blocked stdin writes/stop preemption, corrupt event-log
-tails, and descendants that call `setsid()` when cgroup mode is unavailable (expected
-fallback limitation). The cgroup test proves cleanup after attachment but does
-not eliminate the post-spawn attachment window. `SIGSTOP` and `SIGKILL` of the Pi host cannot be handled;
-verify and document the resulting orphan behavior.
-Default behavior must be fail-closed and leave no orphaned worker process within
-the managed process group.
+tails, and descendants that call `setsid()` when cgroup mode is unavailable.
+The required-mode test proves fail-closed startup and cleanup after attachment,
+but does not eliminate the post-spawn attachment window. Explicit `auto` mode
+must be treated as a compatibility fallback: its cgroup error remains visible
+and cwd reuse is blocked until cleanup is independently confirmed. `SIGSTOP` and
+`SIGKILL` of the Pi host cannot be handled; verify and document the resulting
+orphan behavior. Default behavior must be fail-closed and leave no orphaned
+worker process within the managed process group.

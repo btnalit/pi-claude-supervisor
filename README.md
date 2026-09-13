@@ -27,7 +27,7 @@ worker remains an explicitly started child process.
 - Verification is an independent host command (default: `git diff --check`).
 - The extension never performs merge, deploy, release, or publish at runtime. Repository releases are automated only after a maintainer merges a Release Please PR and the full CI gate passes.
 - A 4-hour wall-clock and 20-minute no-output watchdog stop a worker by default for long development tasks; embedding callers can set either to `0` to disable.
-- On Linux, the adapter automatically uses a writable cgroup v2 for descendant cleanup, including `setsid()` descendants; it falls back to process-group cleanup when unavailable. Use the adapter's `cgroupMode: "required"` for a fail-closed integration.
+- The Pi extension defaults Process Worker startup to `cgroupMode: "required"` and refuses to start when a writable Linux cgroup v2 boundary is unavailable. Setting `PI_CLAUDE_SUPERVISOR_CGROUP_MODE=auto` is an explicit compatibility opt-in: it may fall back to non-recursive process-group cleanup, reports the cgroup error, and must not be treated as descendant-safe.
 - Events are append-only JSONL records in `~/.pi/agent/claude-supervisor/events.jsonl`.
 
 ## Install

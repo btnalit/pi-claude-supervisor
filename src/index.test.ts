@@ -16,17 +16,32 @@ test("index rejects an unknown worker transport instead of falling back", () => 
   }
 });
 
+test("index rejects an unknown cgroup mode instead of falling back", () => {
+  const previous = process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE;
+  process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "unsafe-fallback";
+  try {
+    assert.throws(() => extension({} as never), /Unsupported PI_CLAUDE_SUPERVISOR_CGROUP_MODE/u);
+  } finally {
+    if (previous === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE;
+    else process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = previous;
+  }
+});
+
 test("index releases a confirmed-clean failed worker cwd reservation", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-index-"));
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-state-"));
   const previousWorker = process.env.PI_CLAUDE_SUPERVISOR_WORKER;
   const previousStateDir = process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR;
   const previousTransport = process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
+  const previousCgroupMode = process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE;
   const previousMode = process.env.PI_CLAUDE_SUPERVISOR_MODE;
   const previousAutomation = process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION;
   process.env.PI_CLAUDE_SUPERVISOR_WORKER = `${process.execPath} -e "const { existsSync } = require('node:fs'); const timer = setInterval(() => { if (existsSync('.worker-failed')) { clearInterval(timer); process.exit(1); } }, 10)"`;
   process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
   process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "process-pipe";
+  // This test exercises process-group cleanup on hosts without a writable
+  // cgroup; production defaults to required and fails closed instead.
+  process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "off";
   process.env.PI_CLAUDE_SUPERVISOR_MODE = "manual";
   process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "0";
 
@@ -91,6 +106,8 @@ test("index releases a confirmed-clean failed worker cwd reservation", async () 
     else process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = previousStateDir;
     if (previousTransport === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
     else process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = previousTransport;
+    if (previousCgroupMode === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE;
+    else process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = previousCgroupMode;
     if (previousMode === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_MODE;
     else process.env.PI_CLAUDE_SUPERVISOR_MODE = previousMode;
     if (previousAutomation === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION;

@@ -43,18 +43,22 @@ terminal. Manual compatibility mode remains `process-pipe`; automatic mode
 validated by the fixed-version spike.
 
 A worker exit automatically triggers cleanup, and terminal status waits for
-that cleanup to be confirmed (or reports a cleanup error). On Linux the adapter
-uses cgroup v2 automatically when the current user cgroup is writable; the
-`required` mode fails startup if cgroup attachment is unavailable. Cgroup
-cleanup kills descendants even when they call `setsid()` or create another
-process group. Attachment occurs immediately after spawn, so a worker that
-forks before attachment remains a documented startup-window limitation.
+that cleanup to be confirmed (or reports a cleanup error). The Pi extension
+constructs Process Worker adapters with cgroup mode `required` by default. On
+Linux this creates a private cgroup v2 boundary and refuses startup if the
+boundary cannot be attached. Cgroup cleanup kills descendants even when they
+call `setsid()` or create another process group. Attachment occurs immediately
+after spawn, so a worker that forks before attachment remains a documented
+startup-window limitation; an atomic boundary still requires a service-manager
+scope, container, Job Object, pidfd-aware reaper, or equivalent host facility.
 
-When cgroup v2 is unavailable, the adapter falls back to detached
-process-group cleanup. That fallback is not recursive: `setsid()` descendants
-can escape, and PID reuse between leader exit and cleanup is a host-level
-limitation. Production deployments that require an atomic boundary should use a
-service-manager scope, Job Object, pidfd-aware reaper, or equivalent supervisor.
+The adapter's `auto` mode is an explicit compatibility fallback. It uses
+detached process-group cleanup when cgroup v2 is unavailable, records the
+cgroup error in status, and the Pi host retains the cwd reservation rather than
+claiming descendant cleanup was safe. That fallback is not recursive:
+`setsid()` descendants can escape, and PID reuse between leader exit and cleanup
+is a host-level limitation. `required` mode also refuses to report cleanup as
+complete when its cgroup attachment failed.
 The Pi host installs graceful `SIGTERM`/`SIGINT` handlers, but `SIGSTOP` and
 `SIGKILL` cannot be handled; no orphan guarantee is claimed for those host-fatal
 signals.

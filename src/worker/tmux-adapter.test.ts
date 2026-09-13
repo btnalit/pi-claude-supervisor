@@ -49,6 +49,31 @@ test("tmux adapter owns a private PTY, completes turns, and preserves output", {
   }
 });
 
+test("owned cleanup remains confirmed when the pane exits before stop", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-exit-test-"));
+  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000, terminationGraceMs: 100 });
+  let handle;
+  try {
+    handle = await adapter.start({
+      task: "early pane exit",
+      cwd: process.cwd(),
+      command: process.execPath,
+      args: ["-e", "process.stdout.write('>\\n'); setTimeout(() => process.exit(0), 100)"],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await adapter.stop(handle, "pane exited before stop");
+    const status = await adapter.getStatus(handle);
+    assert.equal(status.running, false);
+    assert.equal(status.processGroupCleaned, true);
+    assert.equal(status.cleanupError, undefined);
+  } finally {
+    if (handle) {
+      try { await adapter.stop(handle, "early exit test cleanup"); } catch { /* preserve the test failure */ }
+    }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("explicit idle startup does not submit a blank turn", { skip: !tmuxAvailable, concurrency: false }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-idle-test-"));
   const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000 });

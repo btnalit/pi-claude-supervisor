@@ -671,22 +671,22 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       record.cleanupError = new Error("owned tmux cleanup lacks a verifiable pane identity");
       return;
     }
-    if (!isPidAlive(pid)) return;
+    if (!(await isPidAlive(pid))) return;
     if (!(await sameProcess(record, pid))) {
       await this.#markReplacement(record, pid);
       return;
     }
     signalProcessGroup(pid, "SIGTERM");
-    for (let attempt = 0; attempt < 10 && isPidAlive(pid); attempt += 1) await delay(50);
-    if (isPidAlive(pid)) {
+    for (let attempt = 0; attempt < 10 && await isPidAlive(pid); attempt += 1) await delay(50);
+    if (await isPidAlive(pid)) {
       if (!(await sameProcess(record, pid))) {
         await this.#markReplacement(record, pid);
         return;
       }
       signalProcessGroup(pid, "SIGKILL");
     }
-    for (let attempt = 0; attempt < 10 && isPidAlive(pid); attempt += 1) await delay(50);
-    if (isPidAlive(pid)) {
+    for (let attempt = 0; attempt < 10 && await isPidAlive(pid); attempt += 1) await delay(50);
+    if (await isPidAlive(pid)) {
       if (await sameProcess(record, pid)) record.cleanupError = new Error(`tmux pane process did not exit: ${pid}`);
       else await this.#markReplacement(record, pid);
     }
@@ -962,6 +962,7 @@ function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
 interface ProcessIdentity {
   startTime: string;
   command: string;
+  state: string;
 }
 
 async function processIdentity(pid: number): Promise<ProcessIdentity | undefined> {
@@ -969,9 +970,10 @@ async function processIdentity(pid: number): Promise<ProcessIdentity | undefined
     const statText = await readFile(`/proc/${pid}/stat`, "utf8");
     const closeParen = statText.lastIndexOf(")");
     const fields = closeParen >= 0 ? statText.slice(closeParen + 2).trim().split(/\s+/u) : [];
+    const state = fields[0];
     const startTime = fields[19];
     const command = (await readFile(`/proc/${pid}/comm`, "utf8")).trim();
-    return startTime && command ? { startTime, command } : undefined;
+    return startTime && command && state ? { startTime, command, state } : undefined;
   } catch {
     return undefined;
   }
@@ -982,9 +984,13 @@ async function sameProcess(record: TmuxRecord, pid: number): Promise<boolean> {
   return Boolean(identity && identity.startTime === record.paneStartTime && (!record.paneCommand || identity.command === record.paneCommand));
 }
 
-function isPidAlive(pid: number): boolean {
+async function isPidAlive(pid: number): Promise<boolean> {
+  const identity = await processIdentity(pid);
+  if (identity) return identity.state !== "Z" && identity.state !== "X";
   try {
     process.kill(pid, 0);
+    // The PID is signalable but /proc was not readable. Treat it as alive so
+    // cleanup fails closed instead of guessing that a replacement is gone.
     return true;
   } catch (error) {
     return error instanceof Error && /EPERM/u.test(error.message);
