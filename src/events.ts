@@ -1,5 +1,6 @@
 import { appendFile, chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { redactSensitive } from "./redaction.ts";
 
 export interface SupervisorEvent {
   seq: number;
@@ -160,20 +161,5 @@ function delay(ms: number): Promise<void> {
 }
 
 function redactEvent<T extends Omit<SupervisorEvent, "seq" | "at">>(event: T): T {
-  return redactValue(event, undefined) as T;
-}
-
-function redactValue(value: unknown, key: string | undefined): unknown {
-  if (typeof value === "string") {
-    if (key && /(password|secret|token|api[-_]?key|authorization|credential)/iu.test(key)) return "[REDACTED]";
-    return value
-      .replace(/\b(sk-ant-[A-Za-z0-9_-]+)\b/gu, "[REDACTED]")
-      .replace(/\b(Bearer\s+)[^\s]+/giu, "$1[REDACTED]")
-      .replace(/\b((?:ANTHROPIC|OPENAI|AWS)_[A-Z0-9_]*(?:KEY|TOKEN|SECRET))=([^\s]+)/gu, "$1=[REDACTED]");
-  }
-  if (Array.isArray(value)) return value.map((item) => redactValue(item, key));
-  if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([childKey, childValue]) => [childKey, redactValue(childValue, childKey)]));
-  }
-  return value;
+  return redactSensitive(event) as T;
 }

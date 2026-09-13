@@ -11,6 +11,7 @@ test("Decision Worker session registry survives a fresh store instance", async (
   const directory = await mkdtemp(join(tmpdir(), "pi-claude-decision-store-"));
   const store = new DecisionSessionStore(directory);
   const sessionFile = join(store.sessionDirectory(taskId), "session.jsonl");
+  await mkdir(store.sessionDirectory(taskId), { recursive: true });
   await store.save({
     taskId,
     task: "recover the fixture",
@@ -48,6 +49,7 @@ test("Decision Worker session registry survives a fresh store instance", async (
 test("Decision Worker session registry ignores corrupt records during discovery", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-claude-decision-store-corrupt-"));
   const store = new DecisionSessionStore(directory);
+  await mkdir(store.sessionDirectory(taskId), { recursive: true });
   await store.save({
     taskId,
     task: "valid",

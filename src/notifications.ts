@@ -1,5 +1,6 @@
 import { createHmac, randomUUID } from "node:crypto";
 import type { HumanInterventionNotice } from "./supervisor.ts";
+import { redactSensitive } from "./redaction.ts";
 
 export interface HumanWebhookOptions {
   url?: string;
@@ -68,19 +69,10 @@ function toWeCom(notice: HumanInterventionNotice): Record<string, unknown> {
 }
 
 function sanitize(value: unknown, key?: string): unknown {
-  if (key && /(password|secret|token|api[-_]?key|authorization|credential)/iu.test(key)) return "[REDACTED]";
-  if (typeof value === "string") {
-    return value
-      .replace(/\b(sk-ant-[A-Za-z0-9_-]+)\b/gu, "[REDACTED]")
-      .replace(/\b(Bearer\s+)[^\s]+/giu, "$1[REDACTED]")
-      .replace(/\b((?:[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)))=([^\s]+)/gu, "$1=[REDACTED]")
-      .replace(/\b((?:authorization|x-api-key|api-key)\s*:\s*)[^\s]+/giu, "$1[REDACTED]")
-      .replace(/(--?(?:token|api[-_]?key|secret|password|authorization)(?:=|\s+))[^\s]+/giu, "$1[REDACTED]")
-      .slice(0, 4_000);
-  }
+  if (typeof value === "string") return String(redactSensitive(value, key)).slice(0, 4_000);
   if (Array.isArray(value)) return value.slice(0, 50).map((item) => sanitize(item, key));
   if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).slice(0, 50).map(([childKey, childValue]) => [childKey, sanitize(childValue, childKey)]));
-  return value;
+  return redactSensitive(value, key);
 }
 
 function safeText(value: unknown): string {

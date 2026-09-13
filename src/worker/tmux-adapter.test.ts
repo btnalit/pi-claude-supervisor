@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -8,7 +8,7 @@ import { TmuxWorkerAdapter } from "./tmux-adapter.ts";
 
 const tmuxAvailable = spawnSync("tmux", ["-V"], { stdio: "ignore" }).status === 0;
 
-test("tmux adapter owns a private PTY, completes turns, and preserves output", { skip: !tmuxAvailable }, async () => {
+test("tmux adapter owns a private PTY, completes turns, and preserves output", { skip: !tmuxAvailable, concurrency: false }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-test-"));
   const events: Array<{ type: string }> = [];
   const adapter = new TmuxWorkerAdapter({
@@ -49,7 +49,7 @@ test("tmux adapter owns a private PTY, completes turns, and preserves output", {
   }
 });
 
-test("explicit idle startup does not submit a blank turn", { skip: !tmuxAvailable }, async () => {
+test("explicit idle startup does not submit a blank turn", { skip: !tmuxAvailable, concurrency: false }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-idle-test-"));
   const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000 });
   let handle;
@@ -71,15 +71,12 @@ test("explicit idle startup does not submit a blank turn", { skip: !tmuxAvailabl
   }
 });
 
-test("adoption setup failure leaves the user's tmux server alive", { skip: !tmuxAvailable }, async () => {
+test("adoption setup failure leaves the user's tmux server alive", { skip: !tmuxAvailable, concurrency: false }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-adopt-failure-test-"));
   const sessionName = `pi-adopt-failure-${process.pid}-${Date.now()}`;
-  const claudeScript = join(stateDir, "claude");
-  await writeFile(claudeScript, `#!/bin/sh
-node -e "process.stdout.write('>\\n'); setInterval(() => {}, 1000)"
-`);
-  await chmod(claudeScript, 0o700);
-  const created = spawnSync("tmux", ["new-session", "-d", "-s", sessionName, "-c", process.cwd(), claudeScript], { encoding: "utf8" });
+  const claudeBinary = join(stateDir, "claude");
+  await copyFile(process.execPath, claudeBinary);
+  const created = spawnSync("tmux", ["new-session", "-d", "-s", sessionName, "-c", process.cwd(), claudeBinary, "-e", "process.stdout.write('>\\n'); setInterval(() => {}, 1000)"], { encoding: "utf8" });
   assert.equal(created.status, 0, created.stderr);
   const pipePath = join(stateDir, "existing-pipe.log");
   spawnSync("tmux", ["pipe-pane", "-t", sessionName, `cat >> '${pipePath.replaceAll("'", "'\\''")}'`], { encoding: "utf8" });
@@ -94,15 +91,27 @@ node -e "process.stdout.write('>\\n'); setInterval(() => {}, 1000)"
   }
 });
 
-test("adopting a tmux session never kills the user's session on stop", { skip: !tmuxAvailable }, async () => {
+test("adoption rejects a node process that only mentions claude in its arguments", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-adopt-node-test-"));
+  const sessionName = `pi-adopt-node-${process.pid}-${Date.now()}`;
+  const created = spawnSync("tmux", ["new-session", "-d", "-s", sessionName, "-c", process.cwd(), process.execPath, "-e", "process.stdout.write('>\\n'); setInterval(() => {}, 1000); console.log('claude')"], { encoding: "utf8" });
+  assert.equal(created.status, 0, created.stderr);
+  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000 });
+  try {
+    await assert.rejects(() => adapter.start({ task: "must not adopt node", cwd: process.cwd(), command: "claude", tmuxSession: sessionName, sendInitialInput: false }), /not a Claude Code executable/u);
+    assert.equal(spawnSync("tmux", ["has-session", "-t", sessionName], { stdio: "ignore" }).status, 0);
+  } finally {
+    spawnSync("tmux", ["kill-session", "-t", sessionName], { stdio: "ignore" });
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("adopting a tmux session never kills the user's session on stop", { skip: !tmuxAvailable, concurrency: false }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-adopt-test-"));
   const sessionName = `pi-adopt-test-${process.pid}-${Date.now()}`;
-  const claudeScript = join(stateDir, "claude");
-  await writeFile(claudeScript, `#!/bin/sh
-node -e "process.stdout.write('>\\n'); process.stdin.setEncoding('utf8'); process.stdin.on('data', d => { for (const line of d.split('\\n').filter(Boolean)) process.stdout.write('DONE:' + line + '\\n>\\n'); });"
-`);
-  await chmod(claudeScript, 0o700);
-  const created = spawnSync("tmux", ["new-session", "-d", "-s", sessionName, "-c", process.cwd(), claudeScript], { encoding: "utf8" });
+  const claudeBinary = join(stateDir, "claude");
+  await copyFile(process.execPath, claudeBinary);
+  const created = spawnSync("tmux", ["new-session", "-d", "-s", sessionName, "-c", process.cwd(), claudeBinary, "-e", "process.stdout.write('>\\n'); process.stdin.setEncoding('utf8'); process.stdin.on('data', d => { for (const line of d.split('\\n').filter(Boolean)) process.stdout.write('DONE:' + line + '\\n>\\n'); }); setInterval(() => {}, 1000);"], { encoding: "utf8" });
   assert.equal(created.status, 0, created.stderr);
   const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000 });
   try {

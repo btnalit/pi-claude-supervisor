@@ -13,6 +13,7 @@ import type {
   WorkerStatus,
 } from "../types.ts";
 import { assertSafeWorkerCommand } from "../policy.ts";
+import { redactSensitive } from "../redaction.ts";
 import { workerEnvironment } from "./environment.ts";
 
 export interface TmuxWorkerAdapterOptions {
@@ -187,7 +188,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
           await this.#rememberPaneIdentity(record, ownedPane.pid);
         }
       } else {
-        await this.#assertExistingSession(record, input.cwd);
+        await this.#assertExistingSession(record, input.cwd, input.approval);
         const pipe = await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_pipe}"]);
         if (pipe.stdout.trim() === "1") throw new Error("cannot adopt a tmux pane that already has an output pipe");
       }
@@ -383,7 +384,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       try { await this.#flushOutput(record); }
       catch (error) { record.cleanupError ??= asError(error); }
     }
-    if (!record.owned) await rm(record.runtimeDir, { recursive: true, force: true }).catch(() => {});
+    if (!record.owned) {
+      try { await rm(record.runtimeDir, { recursive: true, force: true }); }
+      catch (error) { record.cleanupError ??= asError(error); }
+    }
     if (record.cleanupError) throw new Error(`tmux supervision release failed: ${record.cleanupError.message}`);
     // A released tmux worker is intentionally left running. It can be adopted
     // again explicitly after Pi restarts, and the user's attached window stays open.
@@ -555,20 +559,31 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     }
   }
 
-  async #assertExistingSession(record: TmuxRecord, cwd: string): Promise<void> {
+  async #assertExistingSession(record: TmuxRecord, cwd: string, approval?: { actor: "human"; reason: string }): Promise<void> {
     await this.#pinTarget(record);
     const pane = await this.#paneStatus(record);
     if (pane.dead) throw new Error("cannot adopt a dead tmux pane");
     record.handle.pid = pane.pid;
-    await this.#rememberPaneIdentity(record, pane.pid);
     const currentPath = await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_current_path}"]);
     if (currentPath.stdout.trim() !== cwd) throw new Error(`tmux session cwd mismatch: expected ${cwd}, got ${currentPath.stdout.trim()}`);
-    const command = await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_current_command}"]);
-    const processArgs = pane.pid
-      ? await runCommand("ps", ["-o", "args=", "-p", String(pane.pid)], undefined, workerEnvironment(process.env), this.#commandTimeoutMs).catch(() => ({ stdout: "", stderr: "" }))
-      : { stdout: "", stderr: "" };
-    const commandLine = `${command.stdout.trim()} ${processArgs.stdout.trim()}`;
-    if (!/(?:^|[\\/\\s])claude(?:$|[\\s./])/iu.test(commandLine)) throw new Error(`tmux pane is not a Claude Code process: ${redactSensitiveText(commandLine.trim() || "unknown")}`);
+    const command = (await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_current_command}"])).stdout.trim();
+    let processArgs: { stdout: string; stderr: string };
+    if (!pane.pid) throw new Error("tmux pane pid is unavailable; refusing to adopt without command inspection");
+    try {
+      processArgs = await runCommand("ps", ["-o", "args=", "-p", String(pane.pid)], undefined, workerEnvironment(process.env), this.#commandTimeoutMs);
+    } catch (error) {
+      throw new Error(`cannot inspect tmux pane command: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const commandName = command.split(/[\\/]/u).at(-1) ?? command;
+    const argsText = processArgs.stdout.trim();
+    const processExecutable = argsText.split(/\s+/u)[0] ?? "";
+    const processExecutableName = processExecutable.split(/[\\/]/u).at(-1) ?? processExecutable;
+    const commandLine = `${command} ${argsText}`.trim();
+    if (commandName !== "claude" || !argsText || processExecutableName !== "claude") {
+      throw new Error(`tmux pane is not a Claude Code executable: ${redactSensitiveText(commandLine || "unknown")}`);
+    }
+    assertSafeWorkerCommand(command, [argsText], approval);
+    await this.#rememberPaneIdentity(record, pane.pid);
   }
 
   async #pinTarget(record: TmuxRecord): Promise<void> {
@@ -625,7 +640,8 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       await this.#detachPipe(record);
       try { await this.#flushOutput(record); }
       catch (error) { record.cleanupError ??= asError(error); }
-      await rm(record.runtimeDir, { recursive: true, force: true }).catch(() => {});
+      try { await rm(record.runtimeDir, { recursive: true, force: true }); }
+      catch (error) { record.cleanupError ??= asError(error); }
       record.cleanupComplete = !record.cleanupError;
       return;
     }
@@ -643,7 +659,8 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       else record.cleanupError = asError(error);
     }
     await this.#ensurePaneGone(record);
-    await rm(record.runtimeDir, { recursive: true, force: true }).catch(() => {});
+    try { await rm(record.runtimeDir, { recursive: true, force: true }); }
+    catch (error) { record.cleanupError ??= asError(error); }
     record.cleanupComplete = !record.cleanupError && Boolean(record.paneStartTime || (record.serverKilled && (!record.sessionCreated || record.paneDead)));
   }
 
@@ -906,10 +923,7 @@ function assertNoCredentialArguments(command: string, args: string[]): void {
 }
 
 function redactSensitiveText(value: string): string {
-  return value
-    .replace(/\b(sk-ant-[A-Za-z0-9_-]+)\b/gu, "[REDACTED]")
-    .replace(/\b((?:ANTHROPIC|OPENAI|AWS)_[A-Z0-9_]*(?:KEY|TOKEN|SECRET))=([^\s]+)/gu, "$1=[REDACTED]")
-    .replace(/(--?(?:token|api[-_]?key|secret|password|authorization)(?:=|\s+))[^\s]+/giu, "$1[REDACTED]");
+  return String(redactSensitive(value));
 }
 
 function safeTmuxMessage(value: string): string {

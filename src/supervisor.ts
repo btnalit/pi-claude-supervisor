@@ -5,6 +5,7 @@ import { SupervisorStateMachine } from "./state.ts";
 import { evaluatePermission } from "./policy.ts";
 import { PiDecisionWorker, type DecisionAction } from "./decision-worker.ts";
 import { verify, type VerificationCommand } from "./verifier.ts";
+import { redactSensitive } from "./redaction.ts";
 import type {
   TaskContext,
   VerificationResult,
@@ -299,7 +300,7 @@ export class Supervisor {
     }
     try {
       if (this.#onHumanRequired) await this.#onHumanRequired(notice);
-      else console.error(`pi-claude-supervisor human intervention required: ${reason}`);
+      else console.error(`pi-claude-supervisor human intervention required: ${safeMessage(reason)}`);
     } catch (notifyError) {
       console.error(`pi-claude-supervisor human intervention notification failed: ${safeMessage(notifyError)}`);
     }
@@ -408,7 +409,7 @@ export class Supervisor {
     // Alert delivery is independent from event-log persistence: a broken audit
     // path must not suppress the operator notification.
     if (this.#onHumanRequired) await this.#onHumanRequired(notice);
-    else console.error(`pi-claude-supervisor human intervention required: ${reason}`);
+    else console.error(`pi-claude-supervisor human intervention required: ${safeMessage(reason)}`);
     if (logError) throw logError;
   }
 
@@ -497,11 +498,19 @@ export class Supervisor {
   async abortStart(reason = "startup aborted"): Promise<void> {
     // This path intentionally bypasses #exclusive(): start() may be blocked in
     // a Decision Worker model call and shutdown must still dispose that session.
+    let cleanupError: unknown;
     const abort = this.#adapter.abortStart?.(reason);
-    if (abort) await abort.catch(() => {});
+    if (abort) {
+      try { await abort; }
+      catch (error) { cleanupError = error; }
+    }
     await this.#decision?.close().catch(() => {});
     this.#decision = undefined;
-    if (this.#handle) await this.#adapter.stop(this.#handle, reason).catch(() => {});
+    if (this.#handle) {
+      try { await this.#adapter.stop(this.#handle, reason); }
+      catch (error) { cleanupError ??= error; }
+    }
+    if (cleanupError) throw cleanupError;
   }
 
   async release(reason = "Pi session disconnected"): Promise<void> {
@@ -753,5 +762,5 @@ function workerEventKey(event: WorkerEvent): string {
 }
 
 function safeMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return String(redactSensitive(error instanceof Error ? error.message : String(error)));
 }

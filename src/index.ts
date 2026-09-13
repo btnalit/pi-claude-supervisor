@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { realpath } from "node:fs/promises";
 import { EventLog } from "./events.ts";
+import { redactSensitive } from "./redaction.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
 import { TmuxWorkerAdapter, attachCommand } from "./worker/tmux-adapter.ts";
 import { Supervisor } from "./supervisor.ts";
@@ -51,7 +52,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   let shutdownPromise: Promise<void> | undefined;
 
   const notify = (ctx: ExtensionContext, message: string, type: "info" | "warning" = "info") => {
-    if (ctx.hasUI) ctx.ui.notify(message, type);
+    if (ctx.hasUI) ctx.ui.notify(redactText(message), type);
   };
   const activeSessions = () => [...sessions.entries()].filter(([, session]) =>
     ["starting", "running", "waiting", "paused"].includes(session.state));
@@ -96,7 +97,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     while (Date.now() <= deadline) {
       try {
         const status = await adapter.getStatus(handle);
-        if (!status.running && status.processGroupCleaned === true) {
+        if (!status.running && status.processGroupCleaned === true && !status.cleanupError) {
           if (lifecycleError) throw lifecycleError;
           return;
         }
@@ -133,8 +134,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           if (!command) throw new Error("PI_CLAUDE_SUPERVISOR_WORKER must contain an executable");
           const policy = evaluateCommand(command, workerArgs);
           let approval: { actor: "human"; reason: string } | undefined;
-          if (!tmuxSession && policy.decision === "deny") throw new Error(`Worker command denied: ${policy.reason}`);
-          if (!tmuxSession && policy.decision === "review") {
+          if (policy.decision === "deny") throw new Error(`Worker command denied: ${policy.reason}`);
+          if (policy.decision === "review") {
             if (!ctx.hasUI) throw new Error(`Worker command requires interactive approval: ${policy.reason}`);
             const approved = await ctx.ui.confirm(
               "Approve Claude worker command?",
@@ -154,15 +155,15 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
             onHumanRequired: async (notice) => {
-              if (ctx.hasUI) ctx.ui.notify(`Claude Worker needs human intervention: ${notice.reason}`, "warning");
+              if (ctx.hasUI) notify(ctx, `Claude Worker needs human intervention: ${notice.reason}`, "warning");
               if (humanWebhook.enabled) {
                 try {
                   await humanWebhook.notify(notice);
                 } catch (error) {
-                  console.error(`pi-claude-supervisor human webhook failed: ${error instanceof Error ? error.message : String(error)}`);
+                  console.error(`pi-claude-supervisor human webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`);
                 }
               } else {
-                console.error(`pi-claude-supervisor human intervention required: ${notice.reason}`);
+                console.error(`pi-claude-supervisor human intervention required: ${redactText(notice.reason)}`);
               }
             },
           });
@@ -284,12 +285,12 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
             onHumanRequired: async (notice) => {
-              if (ctx.hasUI) ctx.ui.notify(`Claude Worker needs human intervention: ${notice.reason}`, "warning");
+              if (ctx.hasUI) notify(ctx, `Claude Worker needs human intervention: ${notice.reason}`, "warning");
               if (humanWebhook.enabled) {
                 try { await humanWebhook.notify(notice); }
-                catch (error) { console.error(`pi-claude-supervisor human webhook failed: ${error instanceof Error ? error.message : String(error)}`); }
+                catch (error) { console.error(`pi-claude-supervisor human webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`); }
               } else {
-                console.error(`pi-claude-supervisor human intervention required: ${notice.reason}`);
+                console.error(`pi-claude-supervisor human intervention required: ${redactText(notice.reason)}`);
               }
             },
           });
@@ -423,18 +424,20 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     shuttingDown = true;
     shutdownPromise = (async () => {
       const pending = [...pendingStarts];
+      let startupFailures: PromiseRejectedResult[] = [];
       await Promise.race([Promise.allSettled(pending), delay(5_000)]);
       if (pendingStarts.size > 0) {
-        await Promise.allSettled([...pendingStartSessions].map((session) => session.abortStart("Pi session shutdown during startup")));
+        const abortResults = await Promise.allSettled([...pendingStartSessions].map((session) => session.abortStart("Pi session shutdown during startup")));
+        startupFailures = abortResults.filter((result): result is PromiseRejectedResult => result.status === "rejected");
         // Startup adapters own their cleanup and expose bounded cancellation;
         // do not exit while one of those cleanups is still in flight. A model
         // provider can still fail to honor disposal, so retain a final bound.
         await Promise.race([Promise.allSettled([...pendingStarts]), delay(30_000)]);
       }
       const results = await Promise.allSettled([...sessions.values()].map((session) => stopSession(session, "Pi session shutdown")));
-      const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+      const failures = [...startupFailures, ...results.filter((result): result is PromiseRejectedResult => result.status === "rejected")];
       if (failures.length > 0) {
-        for (const failure of failures) console.error(`pi-claude-supervisor shutdown cleanup failed: ${failure.reason instanceof Error ? failure.reason.message : String(failure.reason)}`);
+        for (const failure of failures) console.error(`pi-claude-supervisor shutdown cleanup failed: ${redactText(failure.reason instanceof Error ? failure.reason.message : String(failure.reason))}`);
         if (exitCode === undefined) process.exitCode = 1;
       }
       if (exitCode !== undefined) process.exitCode = exitCode;
@@ -518,8 +521,5 @@ function delay(ms: number): Promise<void> {
 }
 
 function redactText(value: string): string {
-  return value
-    .replace(/\b(sk-ant-[A-Za-z0-9_-]+)\b/gu, "[REDACTED]")
-    .replace(/\b(Bearer\s+)[^\s]+/giu, "$1[REDACTED]")
-    .replace(/(--?(?:token|api[-_]?key|secret|password|authorization)(?:=|\s+))[^\s]+/giu, "$1[REDACTED]");
+  return String(redactSensitive(value));
 }
