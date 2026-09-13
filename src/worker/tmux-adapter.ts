@@ -716,7 +716,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       record.cleanupError = new Error(`owned tmux cleanup refused an unverified replacement pane process pid=${pid}`);
       return;
     }
-    if (identity.state === "Z" || identity.state === "X") return;
+    if (identity.state === "Z") return;
     record.replacementPaneStartTime = identity.startTime;
     record.replacementPaneCommand = identity.command;
     record.cleanupError = new Error(`owned tmux cleanup refused replacement pane process pid=${pid} start=${identity.startTime} command=${identity.command}`);
@@ -1006,7 +1006,7 @@ async function sameProcess(record: TmuxRecord, pid: number): Promise<boolean> {
 
 async function isPidAlive(pid: number): Promise<boolean> {
   const identity = await processIdentity(pid);
-  if (identity) return identity.state !== "Z" && identity.state !== "X";
+  if (identity) return identity.state !== "Z";
   try {
     process.kill(pid, 0);
     // The PID is signalable but /proc was not readable. Treat it as alive so
