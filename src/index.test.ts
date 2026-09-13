@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -21,8 +21,14 @@ test("index releases a confirmed-clean failed worker cwd reservation", async () 
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-state-"));
   const previousWorker = process.env.PI_CLAUDE_SUPERVISOR_WORKER;
   const previousStateDir = process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR;
-  process.env.PI_CLAUDE_SUPERVISOR_WORKER = `${process.execPath} -e "process.exit(1)"`;
+  const previousTransport = process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
+  const previousMode = process.env.PI_CLAUDE_SUPERVISOR_MODE;
+  const previousAutomation = process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION;
+  process.env.PI_CLAUDE_SUPERVISOR_WORKER = `${process.execPath} -e "const { existsSync } = require('node:fs'); const timer = setInterval(() => { if (existsSync('.worker-failed')) { clearInterval(timer); process.exit(1); } }, 10)"`;
   process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
+  process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "process-pipe";
+  process.env.PI_CLAUDE_SUPERVISOR_MODE = "manual";
+  process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "0";
 
   const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
   const messages: string[] = [];
@@ -31,6 +37,7 @@ test("index releases a confirmed-clean failed worker cwd reservation", async () 
     hasUI: true,
     ui: { confirm: async () => false, notify: (message) => messages.push(message) },
   };
+  let shutdownHandler: (() => Promise<void>) | undefined;
   const fakePi = {
     registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) {
       registrations.commands.push({ name, definition });
@@ -46,6 +53,7 @@ test("index releases a confirmed-clean failed worker cwd reservation", async () 
     const shutdown = registrations.events.find(({ name }) => name === "session_shutdown")?.handler;
     assert.ok(command);
     assert.ok(shutdown);
+    shutdownHandler = shutdown;
 
     await command.handler("start failing worker", context);
     assert.match(messages.at(-1) ?? "", /^Worker started:/u);
@@ -53,10 +61,11 @@ test("index releases a confirmed-clean failed worker cwd reservation", async () 
     await command.handler("start overlapping worker", context);
     assert.match(messages.at(-1) ?? "", /overlapping cwd/u);
 
-    for (let attempt = 0; attempt < 30; attempt += 1) {
+    await writeFile(join(cwd, ".worker-failed"), "fail\n");
+    for (let attempt = 0; attempt < 200; attempt += 1) {
       await command.handler("poll", context);
       if ((messages.at(-1) ?? "").includes("running=false")) break;
-      await new Promise((resolve) => setTimeout(resolve, 15));
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
     assert.match(messages.at(-1) ?? "", /running=false/u);
 
@@ -69,10 +78,23 @@ test("index releases a confirmed-clean failed worker cwd reservation", async () 
     await shutdown();
     assert.throws(() => process.kill(pid, 0), /ESRCH/u);
   } finally {
+    if (shutdownHandler) {
+      try {
+        await shutdownHandler();
+      } catch (error) {
+        console.error(`index test cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     if (previousWorker === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_WORKER;
     else process.env.PI_CLAUDE_SUPERVISOR_WORKER = previousWorker;
     if (previousStateDir === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR;
     else process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = previousStateDir;
+    if (previousTransport === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
+    else process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = previousTransport;
+    if (previousMode === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_MODE;
+    else process.env.PI_CLAUDE_SUPERVISOR_MODE = previousMode;
+    if (previousAutomation === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION;
+    else process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = previousAutomation;
     await rm(cwd, { recursive: true, force: true });
     await rm(stateDir, { recursive: true, force: true });
   }
