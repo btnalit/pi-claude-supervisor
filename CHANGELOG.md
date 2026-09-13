@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.4.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.3.0...v0.4.0) (2026-09-13)
+
+
+### Features
+
+* add cross-process cwd leases and cancellable startup ([#17](https://github.com/btnalit/pi-claude-supervisor/issues/17)) ([448cbdb](https://github.com/btnalit/pi-claude-supervisor/commit/448cbdb4c6b5dd02b9ea07ba660d3689b7e2ace8))
+
 ## [0.3.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.2.2...v0.3.0) (2026-09-13)
 
 
