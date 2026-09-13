@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { access, constants, readFile } from "node:fs/promises";
 import test from "node:test";
+import type { WorkerHandle } from "../types.ts";
 import { ProcessWorkerAdapter as RealProcessWorkerAdapter, type ProcessWorkerAdapterOptions } from "./process-adapter.ts";
 
 const requiredCgroupTestAvailable = process.platform === "linux" && await canCreateCgroup();
@@ -37,7 +38,13 @@ test("required cgroup mode fails closed when the host cannot attach workers", { 
   assert.ok(failure instanceof Error);
   assert.match(failure.message, /unable to attach worker to a cgroup/u);
   assert.match(failure.message, /cleanup failed|descendant cleanup is not confirmed/u);
-  const pid = (failure as Error & { workerHandle?: { pid?: number } }).workerHandle?.pid;
+  const handle = (failure as Error & { workerHandle?: WorkerHandle }).workerHandle;
+  if (handle) {
+    const status = await adapter.getStatus(handle);
+    assert.equal(status.processGroupCleaned, false);
+    assert.ok(status.cleanupError);
+  }
+  const pid = handle?.pid;
   if (pid) {
     try { process.kill(pid, "SIGKILL"); } catch (error) { if (!(error instanceof Error) || !/ESRCH/u.test(error.message)) throw error; }
   }
@@ -196,7 +203,7 @@ test("stop escalates when the worker refuses SIGTERM", async () => {
 });
 
 test("leader exit automatically cleans descendants before status is terminal", async () => {
-  const adapter = new ProcessWorkerAdapter({ killGraceMs: 100 });
+  const adapter = new ProcessWorkerAdapter({ cgroupMode: "off", killGraceMs: 100 });
   const handle = await adapter.start({
     task: "early leader exit",
     cwd: process.cwd(),
@@ -248,7 +255,7 @@ test("required cgroup cleanup kills a setsid descendant", { skip: !requiredCgrou
 });
 
 test("stop cleans descendants after the worker leader exits", async () => {
-  const adapter = new ProcessWorkerAdapter();
+  const adapter = new ProcessWorkerAdapter({ cgroupMode: "off" });
   const handle = await adapter.start({
     task: "orphan cleanup",
     cwd: process.cwd(),

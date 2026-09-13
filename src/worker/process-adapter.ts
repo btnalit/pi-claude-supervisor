@@ -47,6 +47,7 @@ interface ProcessRecord {
   spawnError?: Error;
   stdinError?: Error;
   groupCleanup?: Promise<void>;
+  groupCleanupGeneration: number;
   groupCleanupComplete?: boolean;
   cleanupError?: Error;
   cgroupPath?: string;
@@ -138,6 +139,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       resolveExit,
       sentKeys: new Set(),
       groupCleanupComplete: child.pid === undefined,
+      groupCleanupGeneration: 0,
       spawned,
       spawnedSuccessfully: false,
       inputTail: Promise.resolve(),
@@ -485,6 +487,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
         // required boundary failure must never inherit a fallback success.
         record.cgroupRequiredUnavailable = true;
         record.groupCleanupComplete = false;
+        record.groupCleanupGeneration += 1;
         record.groupCleanup = undefined;
         throw new Error(`unable to attach worker to a cgroup: ${record.cgroupError.message}`, { cause: record.cgroupError });
       }
@@ -500,27 +503,38 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   #ensureGroupCleanup(record: ProcessRecord): Promise<void> {
     if (record.groupCleanup) return record.groupCleanup;
     record.cleanupError = undefined;
-    const cleanup = this.#cleanupProcessGroup(record);
-    record.groupCleanup = cleanup.catch((error) => {
+    const generation = record.groupCleanupGeneration;
+    const cleanup = this.#cleanupProcessGroup(record, generation);
+    const tracked = cleanup.catch((error) => {
       // A timed-out cleanup must remain retryable; callers such as shutdown
-      // may have a later opportunity to reap the group.
-      record.groupCleanup = undefined;
+      // may have a later opportunity to reap the group. Do not clear a newer
+      // retry that superseded this generation.
+      if (record.groupCleanup === tracked) record.groupCleanup = undefined;
       throw error;
     });
-    return record.groupCleanup;
+    record.groupCleanup = tracked;
+    return tracked;
   }
 
-  async #cleanupProcessGroup(record: ProcessRecord): Promise<void> {
+  async #cleanupProcessGroup(record: ProcessRecord, generation: number): Promise<void> {
     if (record.cgroupRequiredUnavailable) {
       await this.#bestEffortProcessGroupKill(record);
-      throw new Error(`required cgroup cleanup was unavailable; descendant cleanup is not confirmed${record.cgroupError ? `: ${record.cgroupError.message}` : ""}`);
+      throw requiredCgroupCleanupError(record);
     }
     if (record.cgroupPath) {
       await cleanupCgroup(record.cgroupPath, this.#killGraceMs);
+      if (generation !== record.groupCleanupGeneration || record.cgroupRequiredUnavailable) {
+        record.groupCleanupComplete = false;
+        throw requiredCgroupCleanupError(record);
+      }
       record.groupCleanupComplete = true;
       return;
     }
     await this.#bestEffortProcessGroupKill(record);
+    if (generation !== record.groupCleanupGeneration || record.cgroupRequiredUnavailable) {
+      record.groupCleanupComplete = false;
+      throw requiredCgroupCleanupError(record);
+    }
     record.groupCleanupComplete = true;
   }
 
@@ -620,6 +634,10 @@ function isPermissionRequest(event: Record<string, unknown>, request: unknown): 
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function requiredCgroupCleanupError(record: ProcessRecord): Error {
+  return new Error(`required cgroup cleanup was unavailable; descendant cleanup is not confirmed${record.cgroupError ? `: ${record.cgroupError.message}` : ""}`);
 }
 
 function boundedDelay(value: number): number {

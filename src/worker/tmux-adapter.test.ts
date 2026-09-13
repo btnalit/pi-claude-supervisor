@@ -59,6 +59,7 @@ test("owned cleanup remains confirmed when the pane exits before stop", { skip: 
       cwd: process.cwd(),
       command: process.execPath,
       args: ["-e", "process.stdout.write('>\\n'); setTimeout(() => process.exit(0), 100)"],
+      sendInitialInput: false,
     });
     await new Promise((resolve) => setTimeout(resolve, 250));
     await adapter.stop(handle, "pane exited before stop");

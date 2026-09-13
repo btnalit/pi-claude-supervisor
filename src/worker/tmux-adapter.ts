@@ -445,6 +445,12 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       record.inputAt = Date.now();
       try {
         await this.#sendRaw(record, message);
+        // The input commands are separate tmux operations, so identity cannot
+        // be made fully atomic with paste. Revalidate immediately afterward;
+        // a replacement is a safety failure, never a successful send.
+        const postSendPane = await this.#paneStatus(record);
+        if (postSendPane.dead) throw new Error("tmux worker pane exited during input delivery");
+        await this.#rememberPaneIdentity(record, postSendPane.pid);
         record.sentKeys.add(idempotencyKey);
         record.lastInputAt = new Date().toISOString();
       } catch (error) {
@@ -950,10 +956,7 @@ function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
   try { process.kill(-pid, signal); }
   catch (error) {
     if (error instanceof Error && /ESRCH/u.test(error.message)) {
-      try { process.kill(pid, signal); } catch (fallback) {
-        if (!(fallback instanceof Error) || !/ESRCH/u.test(fallback.message)) throw fallback;
-      }
-      return;
+      throw new Error(`tmux pane process group ${pid} disappeared; refusing unverified direct-PID signaling`, { cause: error });
     }
     throw error;
   }
@@ -972,7 +975,11 @@ async function processIdentity(pid: number): Promise<ProcessIdentity | undefined
     const fields = closeParen >= 0 ? statText.slice(closeParen + 2).trim().split(/\s+/u) : [];
     const state = fields[0];
     const startTime = fields[19];
-    const command = (await readFile(`/proc/${pid}/comm`, "utf8")).trim();
+    // Read the command from the same /proc/stat snapshot. A separate comm
+    // read can race with process exit and turn an already-gone pane into an
+    // "unverified replacement" false positive during cleanup.
+    const openParen = statText.indexOf("(");
+    const command = openParen >= 0 && closeParen > openParen ? statText.slice(openParen + 1, closeParen) : "";
     return startTime && command && state ? { startTime, command, state } : undefined;
   } catch {
     return undefined;
