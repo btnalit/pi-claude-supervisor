@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.3.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.2.2...v0.3.0) (2026-09-13)
+
+
+### Features
+
+* add safe tmux Claude worker transport ([1706153](https://github.com/btnalit/pi-claude-supervisor/commit/1706153289f9a6f7f9f59b2763ed98d061b79204))
+
 ## [0.2.2](https://github.com/btnalit/pi-claude-supervisor/compare/v0.2.1...v0.2.2) (2026-09-12)
 
 
