@@ -1,4 +1,9 @@
 const extension = await import(new URL("../src/index.ts", import.meta.url));
+const previousCgroupMode = process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE;
+// This smoke test intentionally exercises the explicit process-group fallback;
+// production defaults to required cgroup cleanup and fails closed when the host
+// cannot provide it.
+process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "off";
 const registrations = {commands: [], events: []};
 const fakePi = {
   registerCommand(name, definition) { registrations.commands.push({name, definition}); },
@@ -32,5 +37,7 @@ try {
   if (previousWorker === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_WORKER;
   else process.env.PI_CLAUDE_SUPERVISOR_WORKER = previousWorker;
   await registrations.events.find(({name}) => name === "session_shutdown").handler();
+  if (previousCgroupMode === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE;
+  else process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = previousCgroupMode;
 }
 console.log("Pi extension registration and command smoke tests passed");
