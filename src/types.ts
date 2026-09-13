@@ -36,6 +36,12 @@ export interface WorkerStartInput {
   env?: NodeJS.ProcessEnv;
   approval?: { actor: "human"; reason: string };
   eventListener?: WorkerEventListener;
+  /** Attach to an existing tmux session instead of starting a new worker. */
+  tmuxSession?: string;
+  /** Optional tmux socket path; omitted means the user's default server. */
+  tmuxSocket?: string;
+  /** Adopted sessions must not replay the task as a new user message. */
+  sendInitialInput?: boolean;
 }
 
 export interface WorkerHandle {
@@ -44,6 +50,9 @@ export interface WorkerHandle {
   startedAt: string;
   cwd: string;
   sessionId?: string;
+  sessionName?: string;
+  tmuxSocket?: string;
+  ownership?: "owned" | "adopted";
 }
 
 export interface WorkerStatus {
@@ -75,6 +84,8 @@ export interface PermissionDecision {
 export interface WorkerAdapter {
   capabilities(): WorkerCapabilities;
   start(input: WorkerStartInput): Promise<WorkerHandle>;
+  /** Cancel adapter-owned startup work before a WorkerHandle is returned. */
+  abortStart?(reason: string): Promise<void>;
   getStatus(handle: WorkerHandle): Promise<WorkerStatus>;
   readOutput(handle: WorkerHandle): Promise<WorkerOutputChunk[]>;
   /** Restore chunks when diagnostic event persistence fails before acknowledgement. */
@@ -87,6 +98,8 @@ export interface WorkerAdapter {
   pause(handle: WorkerHandle): Promise<void>;
   resume(handle: WorkerHandle): Promise<void>;
   stop(handle: WorkerHandle, reason: string): Promise<void>;
+  /** Disconnect the supervisor without stopping a persistent worker, if supported. */
+  release?(handle: WorkerHandle, reason: string): Promise<void>;
   killProcessGroup(handle: WorkerHandle, reason: string): Promise<void>;
   resumeSession(sessionId: string): Promise<WorkerHandle>;
 }
@@ -98,11 +111,13 @@ export interface WorkerOutputChunk {
 }
 
 export interface WorkerCapabilities {
-  transport: "process-pipe" | "pty" | "jsonl";
+  transport: "process-pipe" | "pty" | "jsonl" | "tmux";
   interactiveInput: boolean;
   pause: boolean;
   resumeSession: boolean;
   processGroupControl: boolean;
+  /** The worker can remain alive while Pi disconnects from it. */
+  persistentSession?: boolean;
 }
 
 export interface TaskContext {

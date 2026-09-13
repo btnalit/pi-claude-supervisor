@@ -46,23 +46,23 @@ function toGeneric(notice: HumanInterventionNotice): Record<string, unknown> {
     eventId: randomUUID(),
     event: "human_intervention_required",
     occurredAt: new Date().toISOString(),
-    task: { id: notice.taskId, goal: notice.task, cwd: notice.cwd },
-    worker: { id: notice.workerId },
-    reason: notice.reason,
-    question: notice.question,
-    permission: notice.permission ? { ...notice.permission, input: sanitize(notice.permission.input) } : undefined,
+    task: { id: sanitize(notice.taskId), goal: sanitize(notice.task), cwd: sanitize(notice.cwd) },
+    worker: { id: sanitize(notice.workerId) },
+    reason: sanitize(notice.reason),
+    question: sanitize(notice.question),
+    permission: notice.permission ? sanitize(notice.permission) : undefined,
     actions: ["approve_or_deny_permission", "send_instruction", "stop_worker", "takeover"],
     note: "This is an outbound notification. Use the Pi session or a separately authenticated callback service to approve actions.",
   };
 }
 
 function toWeCom(notice: HumanInterventionNotice): Record<string, unknown> {
-  const permission = notice.permission ? `\n工具: ${notice.permission.toolName}\n请求 ID: ${notice.permission.requestId}` : "";
-  const question = notice.question ? `\n问题: ${notice.question}` : "";
+  const permission = notice.permission ? `\n工具: ${safeText(notice.permission.toolName)}\n请求 ID: ${safeText(notice.permission.requestId)}` : "";
+  const question = notice.question ? `\n问题: ${safeText(notice.question)}` : "";
   return {
     msgtype: "markdown",
     markdown: {
-      content: `### Claude Supervisor 需要人工介入\n> 任务: ${escapeMarkdown(notice.task)}\n> Task ID: ${notice.taskId}\n> 原因: ${escapeMarkdown(notice.reason)}${escapeMarkdown(question)}${escapeMarkdown(permission)}\n\n请在 Pi 中执行对应的 approve/deny、send、stop 或 takeover 操作。`,
+      content: `### Claude Supervisor 需要人工介入\n> 任务: ${safeText(notice.task)}\n> Task ID: ${safeText(notice.taskId)}\n> 原因: ${safeText(notice.reason)}${escapeMarkdown(question)}${escapeMarkdown(permission)}\n\n请在 Pi 中执行对应的 approve/deny、send、stop 或 takeover 操作。`,
     },
   };
 }
@@ -71,13 +71,20 @@ function sanitize(value: unknown, key?: string): unknown {
   if (key && /(password|secret|token|api[-_]?key|authorization|credential)/iu.test(key)) return "[REDACTED]";
   if (typeof value === "string") {
     return value
-      .replace(/\\b(sk-ant-[A-Za-z0-9_-]+)\\b/gu, "[REDACTED]")
-      .replace(/\\b(Bearer\\s+)[^\\s]+/giu, "$1[REDACTED]")
+      .replace(/\b(sk-ant-[A-Za-z0-9_-]+)\b/gu, "[REDACTED]")
+      .replace(/\b(Bearer\s+)[^\s]+/giu, "$1[REDACTED]")
+      .replace(/\b((?:[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)))=([^\s]+)/gu, "$1=[REDACTED]")
+      .replace(/\b((?:authorization|x-api-key|api-key)\s*:\s*)[^\s]+/giu, "$1[REDACTED]")
+      .replace(/(--?(?:token|api[-_]?key|secret|password|authorization)(?:=|\s+))[^\s]+/giu, "$1[REDACTED]")
       .slice(0, 4_000);
   }
   if (Array.isArray(value)) return value.slice(0, 50).map((item) => sanitize(item, key));
   if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).slice(0, 50).map(([childKey, childValue]) => [childKey, sanitize(childValue, childKey)]));
   return value;
+}
+
+function safeText(value: unknown): string {
+  return String(sanitize(value));
 }
 
 function escapeMarkdown(value: string): string {

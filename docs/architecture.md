@@ -59,6 +59,44 @@ The Pi host installs graceful `SIGTERM`/`SIGINT` handlers, but `SIGSTOP` and
 `SIGKILL` cannot be handled; no orphan guarantee is claimed for those host-fatal
 signals.
 
+## tmux/PTY transport
+
+`TmuxWorkerAdapter` is an explicit second transport, selected with
+`PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`. An owned worker gets a private tmux
+server/socket and a launcher file containing only the validated command, args and
+cwd. The worker environment is supplied to the tmux server through the same
+least-privilege environment builder; environment credentials are not copied into
+the launcher file; credential-shaped command arguments are rejected.
+`load-buffer`, bracketed `paste-buffer` and `send-keys Enter` provide the input
+boundary without interpolating a task into a shell command. C0/C1 terminal
+control bytes are rejected; CRLF is normalized to a newline.
+
+The transport has three deliberately separate observations:
+
+- `pipe-pane` provides an append-only raw PTY log for output polling and audit;
+- `capture-pane` provides a bounded screen snapshot used only for stable prompt
+  detection and human display;
+- Claude's own transcript, when available, remains the structured history. The
+  screen is never relabeled as JSONL or permission evidence.
+
+For an owned initial turn, the adapter emits a synthetic `turn_completed` only
+after output activity and two stable input-prompt observations. Adopting an idle
+prompt remains inactive and emits no synthetic completion. This is a liveness
+signal, not proof that the task succeeded; the independent verifier remains
+mandatory. Interactive dialogs,
+trust prompts and ambiguous screens are not auto-approved. Human takeover sets a
+Supervisor gate that stops automatic messages until `resume-auto`.
+
+`/supervise adopt-tmux` is explicit and validates the pinned pane's cwd and
+process identity before attaching. Every later input, capture and signal uses
+that immutable pane target; a replacement process is refused. Adopted sessions
+are not owned: stop and Pi shutdown detach rather than kill them. Tmux commands
+and serialized input waits have bounded deadlines so shutdown cannot hang
+forever. Sessions started by the adapter also survive a Pi disconnect, but
+recovery after restart is explicit re-adoption; the extension never claims to
+attach to an arbitrary non-tmux PTY. A normal Claude
+`--resume` starts another process from history and is not a live PTY migration.
+
 ## State machine
 
 ```text

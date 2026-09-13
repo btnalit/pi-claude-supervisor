@@ -35,6 +35,7 @@ All notable changes to this project will be documented here.
 - Deterministic Policy Gate and independent verification phase.
 - Minimal worker environment, argv-aware permission policy, watchdog timeouts and startup cleanup.
 - Opt-in Claude JSONL framing with duplicate-message suppression and transport Spike evidence for prompt, multi-turn and session resume.
+- Opt-in tmux/PTY transport with private owned sessions, explicit existing-session adoption, human takeover and prompt-gated multi-line input.
 - Event-log sequence recovery and credential-shaped redaction.
 - Bounded output capture, stdin-write timeout, process-group cleanup retry and stop preemption.
 - Linux cgroup-v2 descendant cleanup, including a `setsid()` regression fixture, with required/auto modes.
@@ -47,5 +48,5 @@ All notable changes to this project will be documented here.
 
 ### Limitations
 
-- PTY transport and cross-version Claude CLI permission/session semantics are out of scope for this pinned release; Claude JSONL support remains opt-in outside automatic mode. The installed 2.1.268 CLI is covered by local permission and signal spikes, while the cgroup startup-attachment window remains.
+- tmux/PTY screen state is not Claude JSONL: trust, permission and ambiguous TUI states require human handling. Cross-version Claude CLI permission/session semantics remain outside the pinned compatibility claim. The installed 2.1.268 CLI is covered by local permission and signal spikes, while the cgroup startup-attachment window remains.
 - No automatic merge, deployment, release or publication is implemented.

@@ -311,6 +311,56 @@ test("supervisor retries a failed stop event on a later idempotent stop", async 
   assert.equal(log.events.filter((event) => event.type === "worker_stopped").length, 1);
 });
 
+test("verification stops an owned persistent worker before completion", async () => {
+  const handle: WorkerHandle = { id: "persistent-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
+  let stopped = false;
+  let stopCalls = 0;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running: !stopped, activeRequests: 0, processGroupCleaned: stopped }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { stopCalls += 1; stopped = true; },
+    release: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter);
+  await supervisor.start({ task: "fixture", cwd: "/tmp", command: "fixture", deadlineMs: 0, noOutputTimeoutMs: 0 });
+  await supervisor.poll();
+  const result = await supervisor.verify({ command: process.execPath, args: ["-e", "process.exit(0)"] });
+  assert.equal(result.ok, true);
+  assert.equal(stopCalls, 1);
+  assert.equal(supervisor.state, "completed");
+});
+
+test("verification policy rejection stops a persistent worker", async () => {
+  const handle: WorkerHandle = { id: "persistent-verification-rejection", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
+  let stopped = false;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running: !stopped, activeRequests: 0, processGroupCleaned: stopped }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { stopped = true; },
+    release: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter);
+  await supervisor.start({ task: "fixture", cwd: "/tmp", command: "fixture", deadlineMs: 0, noOutputTimeoutMs: 0 });
+  await supervisor.poll();
+  await assert.rejects(() => supervisor.verify({ command: "rm", args: ["-rf", "/tmp/should-not-run"] }), /destructive|unsafe|policy/u);
+  assert.equal(stopped, true);
+  assert.equal(supervisor.state, "failed");
+});
+
 test("supervisor requires independent verification after worker exit", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-"));
   const supervisor = new Supervisor(new ProcessWorkerAdapter());
