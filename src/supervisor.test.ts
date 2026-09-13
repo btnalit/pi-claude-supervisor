@@ -56,6 +56,39 @@ test("supervisor rejects spawn failure before reporting a worker start", async (
   assert.equal(supervisor.handle, undefined);
 });
 
+test("supervisor rejects invalid numeric lifecycle budgets", async () => {
+  const invalidOptions = [
+    { name: "maxTurns", value: Number.NaN },
+    { name: "maxTurns", value: 1.5 },
+    { name: "deadlineMs", value: Number.POSITIVE_INFINITY },
+    { name: "deadlineMs", value: -1 },
+    { name: "noOutputTimeoutMs", value: Number.NaN },
+    { name: "initialTurn", value: -1 },
+  ] as const;
+  for (const invalid of invalidOptions) {
+    const supervisor = new Supervisor(new ProcessWorkerAdapter());
+    await assert.rejects(() => supervisor.start({
+      task: "invalid budget",
+      cwd: process.cwd(),
+      command: process.execPath,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      [invalid.name]: invalid.value,
+    } as never), new RegExp(`${invalid.name} must be a finite, non-negative safe integer`, "u"));
+    assert.equal(supervisor.state, "idle");
+  }
+  const invalidDate = new Supervisor(new ProcessWorkerAdapter());
+  await assert.rejects(() => invalidDate.start({
+    task: "invalid date",
+    cwd: process.cwd(),
+    command: process.execPath,
+    startedAt: "not-a-date",
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+  }), /startedAt must be a valid date/u);
+  assert.equal(invalidDate.state, "idle");
+});
+
 test("startup failure events preserve pending lifecycle order", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-start-order-"));
   const log = new FlakyEventLog("task_started");

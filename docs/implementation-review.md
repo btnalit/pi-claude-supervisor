@@ -58,5 +58,10 @@ npm audit --audit-level=high
 npm run build
 ```
 
-All commands passed on Node `v26.8.1`; Node `>=22.19` remains the declared
-runtime target and still requires validation on the minimum supported version.
+The local evidence for the current hardening baseline was collected on Node
+`v26.8.1` with npm `11.19.0`. The release CI additionally validates Node
+`22.19.0` and Node `24`, including package-install and Pi-registration smoke
+tests. The prior release push had a flaky cwd-reservation test failure; the
+follow-up stabilization was merged in PR #14 and its CI passed. ARM64 remains
+covered by the architecture-aware actionlint check but has not been used for
+the full hosted CI matrix.

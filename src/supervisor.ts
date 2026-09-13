@@ -119,6 +119,12 @@ export class Supervisor {
   }
 
   async #startInternal(options: SupervisorStartOptions): Promise<WorkerHandle> {
+    const maxTurns = nonNegativeSafeInteger(options.maxTurns ?? 100, "maxTurns");
+    const deadlineMs = nonNegativeSafeInteger(options.deadlineMs ?? 4 * 60 * 60_000, "deadlineMs");
+    const noOutputTimeoutMs = nonNegativeSafeInteger(options.noOutputTimeoutMs ?? 20 * 60_000, "noOutputTimeoutMs");
+    const initialTurn = nonNegativeSafeInteger(options.initialTurn ?? 0, "initialTurn");
+    const startedAt = options.startedAt ?? new Date().toISOString();
+    if (!Number.isFinite(Date.parse(startedAt))) throw new Error("startedAt must be a valid date");
     await this.#flushPendingEvents();
     if (this.#machine.state === "completed" || this.#machine.state === "failed" || this.#machine.state === "stopped") this.#machine.reset();
     if (this.#machine.state !== "idle") throw new Error(`cannot start from ${this.#machine.state}`);
@@ -132,10 +138,10 @@ export class Supervisor {
     this.#handledEvents.clear();
     this.#pendingPermissions.clear();
     this.#humanRequired = false;
-    this.#task = { taskId, task: options.task, cwd: options.cwd, maxTurns: options.maxTurns ?? 100, startedAt: options.startedAt ?? new Date().toISOString() };
-    this.#turn = options.initialTurn ?? 0;
-    this.#deadlineMs = options.deadlineMs ?? 4 * 60 * 60_000;
-    this.#noOutputTimeoutMs = options.noOutputTimeoutMs ?? 20 * 60_000;
+    this.#task = { taskId, task: options.task, cwd: options.cwd, maxTurns, startedAt };
+    this.#turn = initialTurn;
+    this.#deadlineMs = deadlineMs;
+    this.#noOutputTimeoutMs = noOutputTimeoutMs;
     this.#clearWatchdog();
     this.#machine.transition("starting");
     try {
@@ -763,4 +769,9 @@ function workerEventKey(event: WorkerEvent): string {
 
 function safeMessage(error: unknown): string {
   return String(redactSensitive(error instanceof Error ? error.message : String(error)));
+}
+
+function nonNegativeSafeInteger(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${name} must be a finite, non-negative safe integer`);
+  return value;
 }
