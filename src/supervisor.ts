@@ -5,6 +5,7 @@ import { SupervisorStateMachine } from "./state.ts";
 import { evaluatePermission } from "./policy.ts";
 import { PiDecisionWorker, type DecisionAction } from "./decision-worker.ts";
 import { verify, type VerificationCommand } from "./verifier.ts";
+import { redactSensitive } from "./redaction.ts";
 import type {
   TaskContext,
   VerificationResult,
@@ -48,7 +49,13 @@ export interface SupervisorStartOptions {
   noOutputTimeoutMs?: number;
   /** Human approval for a review-level worker command. */
   approval?: { actor: "human"; reason: string };
-  /** Enable the event-driven Pi Decision Worker. Requires claude-jsonl. */
+  /** Adopt an existing tmux session instead of starting a new worker. */
+  tmuxSession?: string;
+  /** Optional socket path for an existing non-default tmux server. */
+  tmuxSocket?: string;
+  /** Do not replay the task when adopting an existing interactive session. */
+  sendInitialInput?: boolean;
+  /** Enable the event-driven Pi Decision Worker. Requires claude-jsonl or tmux. */
   automation?: boolean;
   /** Persistent Pi session location for the Decision Worker. */
   decisionSessionFile?: string;
@@ -141,8 +148,8 @@ export class Supervisor {
           ...(options.approval ? { approval: options.approval } : {}),
         },
       });
-      if (this.#automation && this.#adapter.capabilities().transport !== "jsonl") {
-        throw new Error("automatic supervision requires claude-jsonl transport");
+      if (this.#automation && !["jsonl", "tmux"].includes(this.#adapter.capabilities().transport)) {
+        throw new Error("automatic supervision requires claude-jsonl or tmux transport");
       }
       if (this.#automation) {
         this.#decision = new PiDecisionWorker({
@@ -173,6 +180,9 @@ export class Supervisor {
         args: options.args,
         env: options.env,
         approval: options.approval,
+        tmuxSession: options.tmuxSession,
+        tmuxSocket: options.tmuxSocket,
+        sendInitialInput: options.sendInitialInput,
         eventListener: (event) => this.#receiveWorkerEvent(event),
       };
       this.#handle = await this.#adapter.start(input);
@@ -181,8 +191,9 @@ export class Supervisor {
       this.#armWatchdog();
       return this.#handle;
     } catch (error) {
-      const startFailureHandle = (error as { workerHandle?: WorkerHandle }).workerHandle;
-      if (!this.#handle && startFailureHandle?.pid) this.#handle = startFailureHandle;
+      const startFailure = error as { workerHandle?: WorkerHandle; workerCleanupRequired?: boolean };
+      const startFailureHandle = startFailure.workerHandle;
+      if (!this.#handle && startFailureHandle && (startFailure.workerCleanupRequired || startFailureHandle.ownership || startFailureHandle.sessionName)) this.#handle = startFailureHandle;
       const handle = this.#handle;
       if (handle) {
         try {
@@ -289,7 +300,7 @@ export class Supervisor {
     }
     try {
       if (this.#onHumanRequired) await this.#onHumanRequired(notice);
-      else console.error(`pi-claude-supervisor human intervention required: ${reason}`);
+      else console.error(`pi-claude-supervisor human intervention required: ${safeMessage(reason)}`);
     } catch (notifyError) {
       console.error(`pi-claude-supervisor human intervention notification failed: ${safeMessage(notifyError)}`);
     }
@@ -350,6 +361,11 @@ export class Supervisor {
         return;
       }
       if (action.action === "verify") {
+        if (this.#machine.state === "waiting" && this.#adapter.capabilities().persistentSession) {
+          this.#machine.transition("verifying");
+          await this.#verifyInternal();
+          return;
+        }
         if (this.#machine.state === "waiting") {
           await this.#adapter.stop(handle, "Decision Worker requested verification");
           await this.#pollInternal(true);
@@ -393,7 +409,7 @@ export class Supervisor {
     // Alert delivery is independent from event-log persistence: a broken audit
     // path must not suppress the operator notification.
     if (this.#onHumanRequired) await this.#onHumanRequired(notice);
-    else console.error(`pi-claude-supervisor human intervention required: ${reason}`);
+    else console.error(`pi-claude-supervisor human intervention required: ${safeMessage(reason)}`);
     if (logError) throw logError;
   }
 
@@ -440,7 +456,9 @@ export class Supervisor {
     if (!["running", "waiting"].includes(this.#machine.state)) throw new Error(`cannot send from ${this.#machine.state}`);
     const status = await this.#adapter.getStatus(handle);
     if (status.activeRequests !== undefined && status.activeRequests > 0) {
-      throw new Error("worker has an active JSONL request; poll until its result before sending another turn");
+      throw new Error(this.#adapter.capabilities().transport === "jsonl"
+        ? "worker has an active JSONL request; poll until its result before sending the next turn"
+        : "worker has an active turn; wait until its interactive prompt or structured result is ready before sending another turn");
     }
     if (status.activeRequests === 0 && this.#machine.state === "running") {
       this.#machine.transition("waiting");
@@ -480,9 +498,35 @@ export class Supervisor {
   async abortStart(reason = "startup aborted"): Promise<void> {
     // This path intentionally bypasses #exclusive(): start() may be blocked in
     // a Decision Worker model call and shutdown must still dispose that session.
+    let cleanupError: unknown;
+    const abort = this.#adapter.abortStart?.(reason);
+    if (abort) {
+      try { await abort; }
+      catch (error) { cleanupError = error; }
+    }
     await this.#decision?.close().catch(() => {});
     this.#decision = undefined;
-    if (this.#handle) await this.#adapter.stop(this.#handle, reason).catch(() => {});
+    if (this.#handle) {
+      try { await this.#adapter.stop(this.#handle, reason); }
+      catch (error) { cleanupError ??= error; }
+    }
+    if (cleanupError) throw cleanupError;
+  }
+
+  async release(reason = "Pi session disconnected"): Promise<void> {
+    const handle = this.#handle;
+    const preemptiveRelease = handle
+      ? this.#adapter.release
+        ? this.#adapter.release(handle, reason)
+        : this.#adapter.stop(handle, reason)
+      : this.#adapter.abortStart?.(reason) ?? Promise.resolve();
+    await this.#decision?.close().catch(() => {});
+    this.#decision = undefined;
+    await withTimeout(this.#exclusive(async () => {
+      this.#clearWatchdog();
+      await preemptiveRelease;
+      if (handle) await this.#appendEvent({ type: "worker_released", taskId: this.#task?.taskId, workerId: handle.id, data: { reason } });
+    }), 15_000, "persistent worker release");
   }
 
   async stop(reason = "human requested stop"): Promise<void> {
@@ -509,17 +553,42 @@ export class Supervisor {
       await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "")).catch(() => {});
       return;
     }
+    if (this.#machine.state === "completed") {
+      if (this.#handle) {
+        await this.#adapter.stop(this.#handle, reason);
+        await this.#drainOutputAfterStop(this.#handle);
+      }
+      return;
+    }
     if (!["running", "waiting", "paused", "starting"].includes(this.#machine.state)) return;
     this.#clearWatchdog();
     const preemptiveStop = this.#preemptiveStop;
     this.#preemptiveStop = undefined;
     if (preemptiveStop) await preemptiveStop;
     else await this.#adapter.stop(this.#handle, reason);
+    let outputError: unknown;
+    try {
+      await this.#drainOutputAfterStop(this.#handle);
+    } catch (error) {
+      outputError = error;
+    }
     this.#machine.transition("stopped");
     await this.#appendEvent({ type: "worker_stopped", taskId: this.#task?.taskId, workerId: this.#handle.id, data: { reason } });
+    if (outputError) throw outputError;
     await this.#decision?.close().catch(() => {});
     this.#decision = undefined;
     await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "")).catch(() => {});
+  }
+
+  async #drainOutputAfterStop(handle: WorkerHandle): Promise<void> {
+    const output = await this.#adapter.readOutput(handle);
+    if (!output.length) return;
+    try {
+      await this.#appendEvent({ type: "worker_output", taskId: this.#task?.taskId, workerId: handle.id, data: { chunks: output } });
+    } catch (error) {
+      if (this.#adapter.restoreOutput) await this.#adapter.restoreOutput(handle, output).catch(() => {});
+      throw error;
+    }
   }
 
   async verify(command?: VerificationCommand): Promise<VerificationResult> {
@@ -529,15 +598,68 @@ export class Supervisor {
   async #verifyInternal(command?: VerificationCommand): Promise<VerificationResult> {
     await this.#flushPendingEvents();
     if (!this.#task) throw new Error("no active task");
+    if (this.#machine.state === "waiting" && this.#adapter.capabilities().persistentSession) this.#machine.transition("verifying");
     if (this.#machine.state !== "verifying") throw new Error(`cannot verify from ${this.#machine.state}`);
-    const result = await verify(this.#task.cwd, command);
+    let result: VerificationResult;
+    try {
+      result = await verify(this.#task.cwd, command);
+    } catch (error) {
+      await this.#failVerification(error);
+      throw error;
+    }
+    this.#clearWatchdog();
+    let cleanupError: unknown;
+    if (this.#handle) {
+      try {
+        await this.#adapter.stop(this.#handle, result.ok ? "verification passed" : "verification failed");
+        await this.#drainOutputAfterStop(this.#handle);
+        const cleanup = await this.#adapter.getStatus(this.#handle);
+        if (cleanup.cleanupError) throw new Error(`worker cleanup failed after verification: ${cleanup.cleanupError}`);
+        if (this.#handle.ownership === "owned" && (cleanup.running || cleanup.processGroupCleaned !== true)) {
+          throw new Error("owned worker cleanup was not confirmed after verification");
+        }
+      } catch (error) {
+        cleanupError = error;
+      }
+    }
     this.#lastVerification = result;
-    this.#machine.transition(result.ok ? "completed" : "failed");
-    await this.#appendEvent({ type: result.ok ? "verification_passed" : "verification_failed", taskId: this.#task.taskId, workerId: this.#handle?.id, data: { ...result } });
+    const verificationSucceeded = result.ok && !cleanupError;
+    this.#machine.transition(verificationSucceeded ? "completed" : "failed");
+    await this.#appendEvent({ type: verificationSucceeded ? "verification_passed" : "verification_failed", taskId: this.#task.taskId, workerId: this.#handle?.id, data: { ...result, ...(cleanupError ? { cleanupError: safeMessage(cleanupError) } : {}) } });
     await this.#decision?.close().catch(() => {});
     this.#decision = undefined;
     await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task.taskId)).catch(() => {});
+    if (cleanupError) throw cleanupError;
     return result;
+  }
+
+  async #failVerification(error: unknown): Promise<void> {
+    this.#clearWatchdog();
+    let cleanupError: unknown;
+    if (this.#handle) {
+      try {
+        await this.#adapter.stop(this.#handle, "verification failed");
+        await this.#drainOutputAfterStop(this.#handle);
+      } catch (stopError) {
+        cleanupError = stopError;
+      }
+    }
+    if (this.#machine.state === "verifying") this.#machine.transition("failed");
+    if (this.#task) {
+      try {
+        await this.#appendEvent({
+          type: "verification_failed",
+          taskId: this.#task.taskId,
+          workerId: this.#handle?.id,
+          data: { error: safeMessage(error), ...(cleanupError ? { cleanupError: safeMessage(cleanupError) } : {}) },
+        });
+      } catch {
+        // Preserve the verifier error; the event remains a pending lifecycle record.
+      }
+      await this.#decision?.close().catch(() => {});
+      this.#decision = undefined;
+      await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task.taskId)).catch(() => {});
+    }
   }
 
   #armWatchdog(): void {
@@ -618,6 +740,19 @@ export class Supervisor {
   }
 }
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function workerEventKey(event: WorkerEvent): string {
   if (event.type === "permission_request") return `${event.handle.id}:permission:${event.request.requestId}`;
   if (event.type === "turn_completed") return `${event.handle.id}:result:${event.sequence}`;
@@ -627,5 +762,5 @@ function workerEventKey(event: WorkerEvent): string {
 }
 
 function safeMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return String(redactSensitive(error instanceof Error ? error.message : String(error)));
 }

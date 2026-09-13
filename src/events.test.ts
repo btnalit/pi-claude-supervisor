@@ -57,9 +57,9 @@ test("event log resumes sequence and redacts credential-shaped values", async ()
   const first = new EventLog(path);
   await first.append({ type: "first", data: { token: "secret-value" } });
   const second = new EventLog(path);
-  const entry = await second.append({ type: "second", data: { output: "Bearer top-secret sk-ant-api-value" } });
+  const entry = await second.append({ type: "second", data: { output: "Bearer top-secret sk-ant-api-value ghp_123456789012345678901234567890123456 github_pat_12345678901234567890 xoxb-12345678901234567890 npm_123456789012345678901234567890123456 AKIA1234567890ABCDEF eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature" } });
   assert.equal(entry.seq, 2);
   const contents = await readFile(path, "utf8");
-  assert.doesNotMatch(contents, /secret-value|top-secret|sk-ant-api-value/u);
+  assert.doesNotMatch(contents, /secret-value|top-secret|sk-ant-api-value|ghp_123456789012345678901234567890123456|github_pat_12345678901234567890|xoxb-12345678901234567890|npm_123456789012345678901234567890123456|AKIA1234567890ABCDEF|eyJhbGciOiJIUzI1NiJ9/u);
   assert.match(contents, /REDACTED/u);
 });

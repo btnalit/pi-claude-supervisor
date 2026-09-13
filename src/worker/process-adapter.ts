@@ -192,7 +192,11 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     } catch (error) {
       try { await this.#ensureGroupCleanup(record); } catch (cleanupError) { record.cleanupError = cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError)); }
       const startupError = error instanceof Error ? error : new Error(String(error));
-      Object.defineProperty(startupError, "workerHandle", { value: handle, enumerable: false });
+      if (record.cleanupError) {
+        startupError.message = `${startupError.message}; startup cleanup failed: ${record.cleanupError.message}`;
+        Object.defineProperty(startupError, "workerHandle", { value: handle, enumerable: false });
+        Object.defineProperty(startupError, "workerCleanupRequired", { value: true, enumerable: false });
+      }
       throw startupError;
     }
     if (input.task) {
@@ -200,7 +204,16 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       try {
         await this.#writeInput(record, this.#encodeMessage(input.task));
       } catch (error) {
-        await this.stop(handle, "initial worker input failed");
+        let cleanupError: unknown;
+        try { await this.stop(handle, "initial worker input failed"); }
+        catch (stopError) { cleanupError = stopError; }
+        if (cleanupError) {
+          const startupError = error instanceof Error ? error : new Error(String(error));
+          startupError.message = `${startupError.message}; startup cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
+          Object.defineProperty(startupError, "workerHandle", { value: handle, enumerable: false });
+          Object.defineProperty(startupError, "workerCleanupRequired", { value: true, enumerable: false });
+          throw startupError;
+        }
         throw error;
       }
     }

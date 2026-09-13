@@ -97,6 +97,48 @@ Pass credentials through an explicit `WorkerStartInput.env` in an embedding
 integration. For the built-in command, opt in to named variables, for example
 `PI_CLAUDE_SUPERVISOR_WORKER_ENV=ANTHROPIC_API_KEY`.
 
+### tmux/PTY transport
+
+For an interactive Claude Code window, opt in to the tmux transport:
+
+```bash
+export PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux
+export PI_CLAUDE_SUPERVISOR_WORKER='claude --permission-mode plan'
+# Optional automatic Decision Worker (manual mode is the default):
+# export PI_CLAUDE_SUPERVISOR_MODE=auto
+# Optional, only when adopting a non-default tmux server:
+# export PI_CLAUDE_SUPERVISOR_TMUX_SOCKET=/path/to/tmux.sock
+```
+
+`/supervise start <task>` starts Claude in a private tmux server and reports a
+literal attach command. Use that command in another terminal to watch or
+manually interact with the same PTY. The adapter sends multi-line input through
+tmux buffers and Enter, never by interpolating the message into a shell command.
+It records the PTY stream with `pipe-pane`, uses `capture-pane` to detect a
+stable Claude input prompt, and feeds turn-completion events into the same
+watchdog, Decision Worker, audit and verification paths as JSONL.
+
+A session that you started yourself can be explicitly adopted without replaying
+the task:
+
+```text
+/supervise adopt-tmux <tmux-session-name> <task description>
+```
+
+Adoption checks the session's working directory and pane command, and refuses a
+pane that already has another output pipe. It does not claim ownership: `/supervise stop` and Pi shutdown detach supervision rather
+than killing the user's tmux session. Use `tmux kill-session` yourself when the
+adopted window should be closed. `/supervise takeover <task-id>` disables
+automatic Decision Worker messages; resume them only with
+`/supervise resume-auto <task-id>`.
+
+PTY screen text is not Claude JSONL. Permission dialogs, trust prompts and
+ambiguous TUI states are escalated to a human; tmux mode must not be treated as
+structured permission evidence. A normal terminal Claude process cannot be
+migrated into tmux, and `--resume` is historical recovery rather than live PTY
+attach. Owned tmux sessions survive a Pi disconnect and require an explicit
+`adopt-tmux` after restart. Use plan/read-only flags for live testing.
+
 ## Development
 
 ```bash

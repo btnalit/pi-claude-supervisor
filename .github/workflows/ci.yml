@@ -64,6 +64,8 @@ jobs:
         with:
           ref: ${{ env.CHECKOUT_REF }}
           persist-credentials: false
+      - name: Install tmux transport test dependency
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y tmux
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
         with:
           node-version: ${{ matrix.node }}
@@ -87,6 +89,8 @@ jobs:
         with:
           ref: ${{ env.CHECKOUT_REF }}
           persist-credentials: false
+      - name: Install tmux transport test dependency
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y tmux
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
         with:
           node-version: '24'

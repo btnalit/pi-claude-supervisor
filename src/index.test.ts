@@ -5,6 +5,17 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 import extension from "./index.ts";
 
+test("index rejects an unknown worker transport instead of falling back", () => {
+  const previous = process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
+  process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "not-a-transport";
+  try {
+    assert.throws(() => extension({} as never), /Unsupported PI_CLAUDE_SUPERVISOR_TRANSPORT/u);
+  } finally {
+    if (previous === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
+    else process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = previous;
+  }
+});
+
 test("index releases a confirmed-clean failed worker cwd reservation", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-index-"));
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-state-"));

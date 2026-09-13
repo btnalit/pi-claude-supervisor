@@ -84,6 +84,39 @@ Claude CLI `2.1.268` 运行，跨版本兼容性不在本轮范围内。
 再根据任务和仓库证据自动回答；无法确定时才升级人工。如需微信内闭环，需要另建带签名验证、
 一次性 action token 和重放保护的入站 callback 服务。
 
+### tmux/PTY 交互模式
+
+如果希望在可见的 Claude Code 终端中工作，可显式启用 tmux transport：
+
+```bash
+export PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux
+export PI_CLAUDE_SUPERVISOR_WORKER='claude --permission-mode plan'
+# 可选自动 Decision Worker（默认仍是人工模式）：
+# export PI_CLAUDE_SUPERVISOR_MODE=auto
+# 接管非默认 tmux server 时可选：
+# export PI_CLAUDE_SUPERVISOR_TMUX_SOCKET=/path/to/tmux.sock
+```
+
+`/supervise start <task>` 会在私有 tmux server 中启动 Claude，并返回可复制的 attach 命令。
+可以在另一个终端 attach 到同一个 PTY，观察或人工输入。多行消息通过 tmux buffer 和 Enter
+发送，不会把消息拼接进 shell 命令；`pipe-pane` 记录原始输出，`capture-pane` 检测稳定的 Claude
+输入提示，并复用 watchdog、Decision Worker、审计和独立验收流程。
+
+如果 Claude 已由你在 tmux 中启动，可以显式接管且不会重放原始任务：
+
+```text
+/supervise adopt-tmux <tmux-session-name> <task description>
+```
+
+接管会检查 cwd、pane 中的进程，并拒绝已有其他输出 pipe 的 pane；但不宣称拥有该 session。对被接管的 session，
+`/supervise stop` 和 Pi 关闭只会断开监督，不会杀掉你的 tmux 窗口；需要关闭时请由你执行
+`tmux kill-session`。`/supervise takeover <task-id>` 会暂停 Decision Worker 自动发送，只有
+`/supervise resume-auto <task-id>` 才恢复。
+
+PTY 屏幕文字不是 Claude JSONL。权限/信任对话框和无法确定的 TUI 状态必须升级人工，不能把
+屏幕文字当作结构化权限证据。普通终端里已经运行的 Claude 不能安全迁移进 tmux；`--resume`
+是读取历史的新进程，不是实时 attach。实时测试请使用 plan/read-only 参数。
+
 可以从不同工作目录启动多个任务会话；活动会话不能共享同一 cwd，建议每个任务使用独立 worktree：
 
 ```text

@@ -1,11 +1,13 @@
 import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { redactSensitive } from "./redaction.ts";
 
 const allowed = new Set([
   "PI_CLAUDE_SUPERVISOR_MODE",
   "PI_CLAUDE_SUPERVISOR_AUTOMATION",
   "PI_CLAUDE_SUPERVISOR_TRANSPORT",
+  "PI_CLAUDE_SUPERVISOR_TMUX_SOCKET",
   "PI_CLAUDE_SUPERVISOR_WORKER",
   "PI_CLAUDE_SUPERVISOR_STATE_DIR",
   "PI_CLAUDE_SUPERVISOR_WORKER_ENV",
@@ -29,7 +31,7 @@ export function loadSupervisorEnvironment(): string | undefined {
     }
     return path;
   } catch (error) {
-    console.error(`pi-claude-supervisor could not read env file ${path}: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`pi-claude-supervisor could not read env file ${String(redactSensitive(path))}: ${String(redactSensitive(error instanceof Error ? error.message : String(error)))}`);
     return undefined;
   }
 }

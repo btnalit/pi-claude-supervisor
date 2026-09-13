@@ -28,6 +28,12 @@ the published TypeScript source directly and there is no second runtime bundle.
 - `worker/process-adapter.test.ts`: spawn failure is observable, JSONL framing and
   idempotent duplicate suppression work, and a child does not remain indefinitely
   in a running state.
+- `worker/tmux-adapter.test.ts`: an owned private tmux socket accepts multi-line
+  input, emits a stable-prompt turn event, preserves PTY output and cleans its
+  session on stop. It also verifies explicit idle startup does not submit a
+  blank turn, idle adoption emits no synthetic completion, adopted pipe
+  detachment permits re-adoption, and adopted stop preserves the user's
+  session.
 - `worker/environment.test.ts`: unrelated host credentials are excluded unless
   explicitly supplied.
 - `supervisor.test.ts`: the no-output watchdog stops a stalled worker, lifecycle event failures are retried, and output is restored when event persistence fails.
@@ -86,6 +92,16 @@ Decision Worker. `process-pipe` remains the manual compatibility mode. Human
 escalation is outbound-only through `PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL`;
 approval callbacks are deliberately not accepted without a separately
 authenticated endpoint.
+
+The tmux transport is selected with `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`. Before
+release, manually verify: private-socket attach, multi-line paste, prompt
+stability while Claude is busy, trust/permission dialog takeover, duplicate
+send prevention, pane replacement refusal, pause/resume, owned-session stop,
+adopted-session detach/re-adoption, bounded shutdown, and Pi shutdown without
+closing an attached window. Use `--permission-mode plan`
+and read-only tools for live Claude checks. Do not run JSONL and tmux control
+against the same Claude process, and do not treat `capture-pane` text as a
+structured permission response.
 
 ## Failure injection
 

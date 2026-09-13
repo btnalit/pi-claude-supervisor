@@ -3,7 +3,9 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { realpath } from "node:fs/promises";
 import { EventLog } from "./events.ts";
+import { redactSensitive } from "./redaction.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
+import { TmuxWorkerAdapter, attachCommand } from "./worker/tmux-adapter.ts";
 import { Supervisor } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
@@ -20,17 +22,24 @@ import { DecisionSessionStore, type DecisionSessionRecord } from "./decision-ses
 export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   loadSupervisorEnvironment();
   const automation = process.env.PI_CLAUDE_SUPERVISOR_MODE === "auto" || process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION === "1";
-  const adapter = new ProcessWorkerAdapter({
-    // Automatic decisions require Claude's structured event stream. The pipe
-    // transport remains available for manual/compatibility sessions.
-    mode: automation || process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT === "jsonl" ? "claude-jsonl" : "process-pipe",
-  });
+  const stateDir = process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR ?? join(homedir(), ".pi", "agent", "claude-supervisor");
+  const configuredTransport = process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
+  const transport = configuredTransport ?? (automation ? "jsonl" : "process-pipe");
+  if (!(["process-pipe", "jsonl", "tmux"] as string[]).includes(transport)) {
+    throw new Error(`Unsupported PI_CLAUDE_SUPERVISOR_TRANSPORT: ${transport}; expected process-pipe, jsonl, or tmux`);
+  }
+  const adapter = transport === "tmux"
+    ? new TmuxWorkerAdapter({ stateDir })
+    : new ProcessWorkerAdapter({
+      // Automatic decisions require Claude's structured event stream. The pipe
+      // transport remains available for manual/compatibility sessions.
+      mode: automation || transport === "jsonl" ? "claude-jsonl" : "process-pipe",
+    });
   const humanWebhook = new HumanWebhookNotifier({
     url: process.env.PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL,
     format: process.env.PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_FORMAT === "wecom" ? "wecom" : "generic",
     secret: process.env.PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_SECRET,
   });
-  const stateDir = process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR ?? join(homedir(), ".pi", "agent", "claude-supervisor");
   const events = new EventLog(join(stateDir, "events.jsonl"));
   const decisionStore = new DecisionSessionStore(join(stateDir, "decision-sessions"));
   const sessions = new Map<string, Supervisor>();
@@ -43,7 +52,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   let shutdownPromise: Promise<void> | undefined;
 
   const notify = (ctx: ExtensionContext, message: string, type: "info" | "warning" = "info") => {
-    if (ctx.hasUI) ctx.ui.notify(message, type);
+    if (ctx.hasUI) ctx.ui.notify(redactText(message), type);
   };
   const activeSessions = () => [...sessions.entries()].filter(([, session]) =>
     ["starting", "running", "waiting", "paused"].includes(session.state));
@@ -63,6 +72,14 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     }
   };
   const stopSession = async (session: Supervisor, reason: string): Promise<void> => {
+    const handle = session.handle;
+    const persistent = adapter.capabilities().persistentSession && Boolean(handle);
+    const adoptedPersistent = persistent && handle?.ownership === "adopted";
+    const healthyPersistent = persistent && !["failed", "completed", "stopped"].includes(session.state);
+    if (adoptedPersistent || healthyPersistent) {
+      await session.release(reason);
+      return;
+    }
     let lifecycleError: unknown;
     try {
       await session.stop(reason);
@@ -70,7 +87,6 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
       lifecycleError = error;
     }
 
-    const handle = session.handle;
     if (!handle) {
       if (lifecycleError) throw lifecycleError;
       return;
@@ -81,7 +97,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     while (Date.now() <= deadline) {
       try {
         const status = await adapter.getStatus(handle);
-        if (!status.running && status.processGroupCleaned === true) {
+        if (!status.running && status.processGroupCleaned === true && !status.cleanupError) {
           if (lifecycleError) throw lifecycleError;
           return;
         }
@@ -109,9 +125,11 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         const tokens = args.trim() ? args.trim().split(/\s+/u) : [];
         const [operation = "status", ...rest] = tokens;
         let message = "";
-        if (operation === "start") {
+        if (operation === "start" || operation === "adopt-tmux") {
+          const tmuxSession = operation === "adopt-tmux" ? rest.shift() : undefined;
           const task = rest.join(" ").trim();
-          if (!task) throw new Error("Usage: /supervise start <task>");
+          if (!task) throw new Error(operation === "adopt-tmux" ? "Usage: /supervise adopt-tmux <tmux-session> <task>" : "Usage: /supervise start <task>");
+          if (operation === "adopt-tmux" && adapter.capabilities().transport !== "tmux") throw new Error("/supervise adopt-tmux requires PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux");
           const [command, ...workerArgs] = parseCommand(process.env.PI_CLAUDE_SUPERVISOR_WORKER ?? "claude");
           if (!command) throw new Error("PI_CLAUDE_SUPERVISOR_WORKER must contain an executable");
           const policy = evaluateCommand(command, workerArgs);
@@ -137,15 +155,15 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
             onHumanRequired: async (notice) => {
-              if (ctx.hasUI) ctx.ui.notify(`Claude Worker needs human intervention: ${notice.reason}`, "warning");
+              if (ctx.hasUI) notify(ctx, `Claude Worker needs human intervention: ${notice.reason}`, "warning");
               if (humanWebhook.enabled) {
                 try {
                   await humanWebhook.notify(notice);
                 } catch (error) {
-                  console.error(`pi-claude-supervisor human webhook failed: ${error instanceof Error ? error.message : String(error)}`);
+                  console.error(`pi-claude-supervisor human webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`);
                 }
               } else {
-                console.error(`pi-claude-supervisor human intervention required: ${notice.reason}`);
+                console.error(`pi-claude-supervisor human intervention required: ${redactText(notice.reason)}`);
               }
             },
           });
@@ -160,6 +178,9 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 env: selectedWorkerEnvironment(),
                 approval,
                 automation,
+                tmuxSession,
+                tmuxSocket: process.env.PI_CLAUDE_SUPERVISOR_TMUX_SOCKET,
+                sendInitialInput: !tmuxSession,
                 decisionSessionDir: decisionStore.directory,
                 onDecisionSessionReady: (info) => decisionStore.save({
                   taskId: info.taskId,
@@ -200,7 +221,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 }
                 throw new Error("Pi session shut down during worker start");
               }
-              message = `Worker started: task=${taskId} worker=${handle.id} (pid ${handle.pid ?? "unknown"}); transport=${adapter.capabilities().transport}`;
+              const attach = handle.sessionName ? ` attach=${attachCommand(handle)}` : "";
+              message = `${tmuxSession ? "Tmux worker adopted" : "Worker started"}: task=${taskId} worker=${handle.id} (pid ${handle.pid ?? "unknown"}); transport=${adapter.capabilities().transport}${attach}`;
             } catch (error) {
               // Register failed starts before the promise settles, so shutdown
               // cannot snapshot sessions before a returned handle is retained.
@@ -263,12 +285,12 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
             onHumanRequired: async (notice) => {
-              if (ctx.hasUI) ctx.ui.notify(`Claude Worker needs human intervention: ${notice.reason}`, "warning");
+              if (ctx.hasUI) notify(ctx, `Claude Worker needs human intervention: ${notice.reason}`, "warning");
               if (humanWebhook.enabled) {
                 try { await humanWebhook.notify(notice); }
-                catch (error) { console.error(`pi-claude-supervisor human webhook failed: ${error instanceof Error ? error.message : String(error)}`); }
+                catch (error) { console.error(`pi-claude-supervisor human webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`); }
               } else {
-                console.error(`pi-claude-supervisor human intervention required: ${notice.reason}`);
+                console.error(`pi-claude-supervisor human intervention required: ${redactText(notice.reason)}`);
               }
             },
           });
@@ -282,6 +304,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 // must explicitly send the next instruction.
                 task: record.task,
                 initialInput: "",
+                sendInitialInput: false,
                 cwd: record.cwd,
                 command: record.command,
                 args: record.args,
@@ -386,7 +409,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           } else if (operation === "resume-auto") {
             await session.resumeAutomation(); message = `Automatic decisions resumed: ${sessionId}.`;
           } else {
-            throw new Error("Usage: /supervise start|recover|sessions|status|poll [all|taskId]|send [taskId]|pause [taskId]|resume [taskId]|stop [taskId]|verify [taskId]|approve [taskId] <allow|deny>|takeover [taskId]|resume-auto [taskId]|capabilities");
+            throw new Error("Usage: /supervise start|adopt-tmux|recover|sessions|status|poll [all|taskId]|send [taskId]|pause [taskId]|resume [taskId]|stop [taskId]|verify [taskId]|approve [taskId] <allow|deny>|takeover [taskId]|resume-auto [taskId]|capabilities");
           }
         }
         notify(ctx, message);
@@ -401,15 +424,20 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     shuttingDown = true;
     shutdownPromise = (async () => {
       const pending = [...pendingStarts];
+      let startupFailures: PromiseRejectedResult[] = [];
       await Promise.race([Promise.allSettled(pending), delay(5_000)]);
       if (pendingStarts.size > 0) {
-        await Promise.allSettled([...pendingStartSessions].map((session) => session.abortStart("Pi session shutdown during startup")));
-        await Promise.race([Promise.allSettled([...pendingStarts]), delay(5_000)]);
+        const abortResults = await Promise.allSettled([...pendingStartSessions].map((session) => session.abortStart("Pi session shutdown during startup")));
+        startupFailures = abortResults.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+        // Startup adapters own their cleanup and expose bounded cancellation;
+        // do not exit while one of those cleanups is still in flight. A model
+        // provider can still fail to honor disposal, so retain a final bound.
+        await Promise.race([Promise.allSettled([...pendingStarts]), delay(30_000)]);
       }
       const results = await Promise.allSettled([...sessions.values()].map((session) => stopSession(session, "Pi session shutdown")));
-      const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+      const failures = [...startupFailures, ...results.filter((result): result is PromiseRejectedResult => result.status === "rejected")];
       if (failures.length > 0) {
-        for (const failure of failures) console.error(`pi-claude-supervisor shutdown cleanup failed: ${failure.reason instanceof Error ? failure.reason.message : String(failure.reason)}`);
+        for (const failure of failures) console.error(`pi-claude-supervisor shutdown cleanup failed: ${redactText(failure.reason instanceof Error ? failure.reason.message : String(failure.reason))}`);
         if (exitCode === undefined) process.exitCode = 1;
       }
       if (exitCode !== undefined) process.exitCode = exitCode;
@@ -493,8 +521,5 @@ function delay(ms: number): Promise<void> {
 }
 
 function redactText(value: string): string {
-  return value
-    .replace(/\b(sk-ant-[A-Za-z0-9_-]+)\b/gu, "[REDACTED]")
-    .replace(/\b(Bearer\s+)[^\s]+/giu, "$1[REDACTED]")
-    .replace(/(--?(?:token|api[-_]?key|secret|password|authorization)(?:=|\s+))[^\s]+/giu, "$1[REDACTED]");
+  return String(redactSensitive(value));
 }

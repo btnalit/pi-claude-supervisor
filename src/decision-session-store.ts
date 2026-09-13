@@ -1,5 +1,6 @@
 import { chmod, lstat, mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { redactSensitive } from "./redaction.ts";
 
 export interface DecisionSessionRecord {
   version: 1;
@@ -43,12 +44,16 @@ export class DecisionSessionStore {
   async save(record: Omit<DecisionSessionRecord, "version" | "updatedAt"> & Partial<Pick<DecisionSessionRecord, "updatedAt">>): Promise<void> {
     assertTaskId(record.taskId);
     const decisionSessionFile = resolve(record.decisionSessionFile);
+    await assertTaskDirectorySafe(this.#directory, record.taskId);
     assertSessionPath(decisionSessionFile, this.#directory, record.taskId);
+    assertNoCredentialPath(decisionSessionFile);
+    assertNoCredentialPath(record.cwd);
+    const safeRecord = redactRecord(record);
     const normalized: DecisionSessionRecord = {
-      ...record,
+      ...safeRecord,
       version: 1,
-      updatedAt: record.updatedAt ?? new Date().toISOString(),
-      args: [...record.args],
+      updatedAt: safeRecord.updatedAt ?? new Date().toISOString(),
+      args: [...safeRecord.args],
       decisionSessionFile,
     };
     await mkdir(this.#directory, { recursive: true, mode: 0o700 });
@@ -88,7 +93,8 @@ export class DecisionSessionStore {
     assertTaskId(taskId);
     try {
       const value = JSON.parse(await readFile(this.#recordPath(taskId), "utf8")) as Partial<DecisionSessionRecord>;
-      return normalizeRecord(value, this.#directory);
+      assertNoCredentialPath(typeof value.decisionSessionFile === "string" ? resolve(value.decisionSessionFile) : "");
+      return normalizeRecord(redactRecord(value), this.#directory);
     } catch (error) {
       if (error instanceof Error && /ENOENT/u.test(error.message)) return undefined;
       throw error;
@@ -102,7 +108,8 @@ export class DecisionSessionStore {
       for (const name of names.filter((item) => item.endsWith(".json"))) {
         try {
           const value = JSON.parse(await readFile(join(this.#directory, name), "utf8")) as Partial<DecisionSessionRecord>;
-          const record = normalizeRecord(value, this.#directory);
+          assertNoCredentialPath(typeof value.decisionSessionFile === "string" ? resolve(value.decisionSessionFile) : "");
+          const record = normalizeRecord(redactRecord(value), this.#directory);
           if (!options.activeOnly || record.state === "active") records.push(record);
         } catch {
           // A torn or manually edited registry record is not recoverable.
@@ -137,6 +144,8 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
   }
   const decisionSessionFile = resolve(value.decisionSessionFile);
   assertSessionPath(decisionSessionFile, directory, value.taskId);
+  assertNoCredentialPath(decisionSessionFile);
+  assertNoCredentialPath(value.cwd);
   return {
     version: 1,
     taskId: value.taskId,
@@ -156,13 +165,34 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
   };
 }
 
+function redactRecord<T extends Partial<DecisionSessionRecord>>(value: T): T {
+  const safe = redactSensitive(value) as T;
+  if (typeof value.cwd === "string") safe.cwd = value.cwd;
+  if (typeof value.decisionSessionFile === "string") safe.decisionSessionFile = value.decisionSessionFile;
+  return safe;
+}
+
+async function assertTaskDirectorySafe(directory: string, taskId: string): Promise<void> {
+  try {
+    const info = await lstat(resolve(directory, taskId));
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Decision Worker task session directory is not a real directory");
+  } catch (error) {
+    if (error instanceof Error && /ENOENT/u.test(error.message)) throw new Error("Decision Worker task session directory is missing");
+    throw error;
+  }
+}
+
+function assertNoCredentialPath(path: string): void {
+  if (!path || String(redactSensitive(path)) !== path) throw new Error("Decision Worker session path contains credential-shaped text");
+}
+
 function assertTaskId(taskId: string): void {
   if (!/^[0-9a-f-]{36}$/iu.test(taskId) || basename(taskId) !== taskId) throw new Error("invalid task id");
 }
 
 function assertSessionPath(sessionFile: string, directory: string, taskId: string): void {
-  const allowedPrefix = `${resolve(directory)}/${taskId}/`;
-  if (!sessionFile.startsWith(allowedPrefix)) throw new Error("Decision Worker session file is outside the task session directory");
+  const taskDirectory = resolve(directory, taskId);
+  if (dirname(sessionFile) !== taskDirectory) throw new Error("Decision Worker session file must be a direct child of its task session directory");
 }
 
 function validLimit(value: unknown, minimum: number): boolean {
