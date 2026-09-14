@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, readFileSync } from "node:fs";
 import { access, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { delimiter, isAbsolute, join } from "node:path";
 import type {
@@ -37,6 +37,12 @@ export interface ProcessWorkerAdapterOptions {
   cgroupParentPath?: string;
 }
 
+interface ProcessGroupIdentity {
+  pid: number;
+  pgid: number;
+  startTime: string;
+}
+
 interface ProcessRecord {
   child: ChildProcess;
   handle: WorkerHandle;
@@ -62,6 +68,8 @@ interface ProcessRecord {
   cleanupError?: Error;
   cgroupPath?: string;
   cgroupError?: Error;
+  processGroupIdentity?: ProcessGroupIdentity;
+  processGroupIdentityError?: Error;
   runtimeError?: Error;
   spawned: Promise<void>;
   spawnedSuccessfully: boolean;
@@ -207,6 +215,13 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     });
     child.once("spawn", () => {
       record.spawnedSuccessfully = true;
+      if (child.pid !== undefined && process.platform === "linux") {
+        try {
+          record.processGroupIdentity = readProcessGroupIdentitySync(child.pid);
+        } catch (error) {
+          record.processGroupIdentityError = error instanceof Error ? error : new Error(String(error));
+        }
+      }
       resolveSpawn();
     });
     child.once("error", (error) => {
@@ -657,21 +672,30 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   }
 
   async #cleanupProcessGroup(record: ProcessRecord): Promise<void> {
+    const errors: Error[] = [];
     if (record.cgroupPath) {
-      await cleanupCgroup(record.cgroupPath, this.#killGraceMs);
-      record.groupCleanupComplete = true;
-      return;
+      try { await cleanupCgroup(record.cgroupPath, this.#killGraceMs); }
+      catch (error) { errors.push(error instanceof Error ? error : new Error(String(error))); }
     }
+    try { await this.#cleanupProcessGroupOnly(record); }
+    catch (error) { errors.push(error instanceof Error ? error : new Error(String(error))); }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "worker descendant cleanup failed");
+    record.groupCleanupComplete = true;
+  }
+
+  async #cleanupProcessGroupOnly(record: ProcessRecord): Promise<void> {
     const pid = record.handle.pid;
-    if (!pid) {
-      record.groupCleanupComplete = true;
-      return;
+    if (!pid) return;
+    if (process.platform === "linux") {
+      await assertProcessGroupIdentity(record, pid);
     }
     try {
+      // detached:true binds this worker's process group to its handle PID;
+      // this second boundary catches descendants spawned before cgroup attach.
       process.kill(-pid, "SIGKILL");
     } catch (error) {
       if (!(error instanceof Error) || !/ESRCH/u.test(error.message)) throw error;
-      record.groupCleanupComplete = true;
       return;
     }
     const deadline = Date.now() + this.#killGraceMs;
@@ -679,10 +703,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       try {
         process.kill(-pid, 0);
       } catch (error) {
-        if (error instanceof Error && /ESRCH/u.test(error.message)) {
-          record.groupCleanupComplete = true;
-          return;
-        }
+        if (error instanceof Error && /ESRCH/u.test(error.message)) return;
         throw error;
       }
       await delay(Math.min(10, Math.max(1, deadline - Date.now())));
@@ -744,6 +765,39 @@ async function currentCgroupPath(): Promise<string> {
   // /proc/self/cgroup uses the same escaped component spelling as the cgroup
   // filesystem (for example, a literal `\\x2d` in a systemd scope name).
   return `/sys/fs/cgroup${match[1]}`;
+}
+
+function parseProcessGroupIdentity(contents: string, pid: number): ProcessGroupIdentity {
+  const closeParen = contents.lastIndexOf(")");
+  if (closeParen < 0) throw new Error(`unable to read process identity for ${pid}`);
+  const fields = contents.slice(closeParen + 2).trim().split(/\s+/u);
+  const pgid = Number(fields[2]);
+  const startTime = fields[19];
+  if (!Number.isSafeInteger(pgid) || !startTime) throw new Error(`invalid process identity for ${pid}`);
+  return { pid, pgid, startTime };
+}
+
+function readProcessGroupIdentitySync(pid: number): ProcessGroupIdentity {
+  return parseProcessGroupIdentity(readFileSync(`/proc/${pid}/stat`, "utf8"), pid);
+}
+
+async function readProcessGroupIdentity(pid: number): Promise<ProcessGroupIdentity> {
+  return parseProcessGroupIdentity(await readFile(`/proc/${pid}/stat`, "utf8"), pid);
+}
+
+async function assertProcessGroupIdentity(record: ProcessRecord, pid: number): Promise<void> {
+  const identity = record.processGroupIdentity;
+  if (record.processGroupIdentityError) throw new Error(`worker process-group identity unavailable: ${record.processGroupIdentityError.message}`);
+  if (!identity || identity.pid !== pid || identity.pgid !== pid) throw new Error(`worker process-group identity was not established for ${pid}`);
+  try {
+    const current = await readProcessGroupIdentity(pid);
+    if (current.startTime !== identity.startTime || current.pgid !== identity.pgid) {
+      throw new Error(`worker process-group identity changed for ${pid}`);
+    }
+  } catch (error) {
+    if (error instanceof Error && /ENOENT/u.test(error.message)) return;
+    throw error;
+  }
 }
 
 async function cleanupCgroup(path: string, graceMs: number): Promise<void> {

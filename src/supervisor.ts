@@ -361,6 +361,10 @@ export class Supervisor {
       await this.#appendEvent({ type: "worker_waiting", taskId, workerId: handle.id });
     }
     if (!status.running && ["running", "waiting", "paused"].includes(this.#machine.state)) {
+      // stop() starts adapter cleanup before its serialized state transition. If
+      // the adapter's exit event wins that race, leave classification to
+      // #stopInternal rather than turning an intentional stop into failure.
+      if (this.#stopRequested !== undefined || this.#preemptiveStop) return { status, output };
       this.#clearWatchdog();
       const cleanupSafe = !status.cleanupError
         && status.processGroupCleaned === true
@@ -684,9 +688,11 @@ export class Supervisor {
   }
 
   async stop(reason = "human requested stop", options: { preserveDecisionSession?: boolean } = {}): Promise<void> {
-    if (this.#machine.state === "verifying") {
+    if (["running", "waiting", "paused", "verifying"].includes(this.#machine.state)) {
+      // Record intent before starting adapter cleanup; exit events can arrive
+      // synchronously from stop() and must not win the lifecycle race.
       this.#stopRequested = reason;
-      this.#verificationAbortController?.abort(reason);
+      if (this.#machine.state === "verifying") this.#verificationAbortController?.abort(reason);
     }
     // A stop must be able to preempt startup rather than waiting behind a
     // startup operation that is blocked in a provider or adapter call.

@@ -128,13 +128,13 @@ ACCEPTANCE REPORT:
 ${boundedJson(input.acceptance)}
 
 REPOSITORY STATUS:
-${boundText(input.evidence.status, 8_000)}
+${boundText(redactText(input.evidence.status), 8_000)}
 
 REPOSITORY DIFF (HEAD-RELATIVE, UNTRUSTED):
-${boundText(input.evidence.diff, 16_000)}
+${boundText(redactText(input.evidence.diff), 16_000)}
 
 UNTRACKED FILE EVIDENCE (UNTRUSTED):
-${boundText(input.evidence.untracked ?? "(none)", 16_000)}
+${boundText(redactText(input.evidence.untracked ?? "(none)"), 16_000)}
 
 EVIDENCE COMPLETE:
 ${String(input.evidence.complete !== false && input.evidence.truncated !== true)}
