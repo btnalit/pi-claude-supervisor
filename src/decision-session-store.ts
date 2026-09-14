@@ -1,11 +1,14 @@
 import { chmod, lstat, mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { redactSensitive } from "./redaction.ts";
+import { normalizeTaskSpec } from "./acceptance.ts";
+import type { TaskSpec } from "./types.ts";
 
 export interface DecisionSessionRecord {
   version: 1;
   taskId: string;
   task: string;
+  spec?: TaskSpec;
   cwd: string;
   command: string;
   args: string[];
@@ -16,6 +19,8 @@ export interface DecisionSessionRecord {
   noOutputTimeoutMs: number;
   startedAt: string;
   turn: number;
+  repairRound?: number;
+  lastFindingSignature?: string;
   state: "active" | "closed";
   updatedAt: string;
 }
@@ -71,7 +76,7 @@ export class DecisionSessionStore {
     await this.save({ ...record, state: "closed", updatedAt: new Date().toISOString() });
   }
 
-  async update(taskId: string, patch: Partial<Pick<DecisionSessionRecord, "turn" | "updatedAt">>): Promise<void> {
+  async update(taskId: string, patch: Partial<Pick<DecisionSessionRecord, "turn" | "repairRound" | "lastFindingSignature" | "updatedAt">>): Promise<void> {
     const record = await this.load(taskId);
     if (!record || record.state !== "active") return;
     await this.save({ ...record, ...patch, updatedAt: patch.updatedAt ?? new Date().toISOString() });
@@ -94,7 +99,7 @@ export class DecisionSessionStore {
     try {
       const value = JSON.parse(await readFile(this.#recordPath(taskId), "utf8")) as Partial<DecisionSessionRecord>;
       assertNoCredentialPath(typeof value.decisionSessionFile === "string" ? resolve(value.decisionSessionFile) : "");
-      return normalizeRecord(redactRecord(value), this.#directory);
+      return normalizeRecord(redactRecord(value), this.#directory, taskId);
     } catch (error) {
       if (error instanceof Error && /ENOENT/u.test(error.message)) return undefined;
       throw error;
@@ -109,7 +114,8 @@ export class DecisionSessionStore {
         try {
           const value = JSON.parse(await readFile(join(this.#directory, name), "utf8")) as Partial<DecisionSessionRecord>;
           assertNoCredentialPath(typeof value.decisionSessionFile === "string" ? resolve(value.decisionSessionFile) : "");
-          const record = normalizeRecord(redactRecord(value), this.#directory);
+          const expectedTaskId = name.slice(0, -".json".length);
+          const record = normalizeRecord(redactRecord(value), this.#directory, expectedTaskId);
           if (!options.activeOnly || record.state === "active") records.push(record);
         } catch {
           // A torn or manually edited registry record is not recoverable.
@@ -132,14 +138,17 @@ async function writeJson(path: string, value: unknown): Promise<void> {
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
-function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: string): DecisionSessionRecord {
+function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: string, expectedTaskId?: string): DecisionSessionRecord {
+  if (expectedTaskId !== undefined && value.taskId !== expectedTaskId) throw new Error("Decision Worker session task id mismatch");
   if (value.version !== 1 || typeof value.taskId !== "string" || !/^[0-9a-f-]{36}$/iu.test(value.taskId)
     || typeof value.task !== "string" || typeof value.cwd !== "string" || typeof value.command !== "string"
     || !Array.isArray(value.args) || value.args.some((arg) => typeof arg !== "string")
     || typeof value.decisionSessionFile !== "string" || (value.state !== "active" && value.state !== "closed")
     || typeof value.updatedAt !== "string" || !Number.isFinite(Date.parse(value.updatedAt))
     || !validLimit(value.maxTurns, 0) || !validLimit(value.deadlineMs, 0) || !validLimit(value.noOutputTimeoutMs, 0)
-    || !validLimit(value.turn, 0) || (value.startedAt !== undefined && (typeof value.startedAt !== "string" || !Number.isFinite(Date.parse(value.startedAt))))) {
+    || !validLimit(value.turn, 0) || !validLimit(value.repairRound, 0)
+    || (value.lastFindingSignature !== undefined && (typeof value.lastFindingSignature !== "string" || value.lastFindingSignature.length > 128))
+    || (value.startedAt !== undefined && (typeof value.startedAt !== "string" || !Number.isFinite(Date.parse(value.startedAt))))) {
     throw new Error("invalid Decision Worker session record");
   }
   const decisionSessionFile = resolve(value.decisionSessionFile);
@@ -150,6 +159,7 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     version: 1,
     taskId: value.taskId,
     task: value.task,
+    spec: normalizeTaskSpec(value.spec, value.task),
     cwd: value.cwd,
     command: value.command,
     args: [...value.args],
@@ -160,6 +170,8 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     noOutputTimeoutMs: value.noOutputTimeoutMs ?? 20 * 60_000,
     startedAt: value.startedAt ?? value.updatedAt,
     turn: value.turn ?? 0,
+    repairRound: value.repairRound ?? 0,
+    ...(typeof value.lastFindingSignature === "string" ? { lastFindingSignature: value.lastFindingSignature } : {}),
     state: value.state,
     updatedAt: value.updatedAt,
   };

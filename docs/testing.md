@@ -49,9 +49,9 @@ non-sensitive prompt, and prints protocol metadata rather than raw model output.
 It must not be added to the normal CI gate because authentication is an owner
 controlled prerequisite.
 
-The historical fixtures validate one prompt, multiple turns, session resume,
-permission allow/deny and SIGTERM/SIGINT behavior with Claude Code 2.1.268.
-The current release validation uses Claude Code 2.1.270 at
+The transport fixtures validate one prompt, multiple turns, session resume,
+permission allow/deny and SIGTERM/SIGINT behavior. The current release validation
+uses Claude Code 2.1.270 at
 `/home/yancao/.local/share/mise/installs/claude/2.1.270/claude`, including real
 owned tmux turns, pause/resume, and restart re-adoption.
 The adapter regression suite also verifies event subscription, parsed
@@ -59,6 +59,11 @@ The adapter regression suite also verifies event subscription, parsed
 The automation spike additionally exercises a real Pi SDK Decision Worker with
 Claude: ordinary completion, harmless Bash permission approval, and an
 `AskUserQuestion` denial-to-text fallback followed by automatic verification.
+A local pinned-CLI run completed all three scenarios with `state=completed`,
+`verified=true`, and zero human interventions. Provider/model latency can still
+cause a later run to fail closed as human-required after the bounded Decision
+Worker or Reviewer timeout; this is evidence for the manual spike only, not a CI
+guarantee.
 The extension persists each automatic Decision Worker session as Pi JSONL plus a
 0600 task mapping. Recovery is explicit and safe: after an unclean Pi restart,
 `/supervise sessions` shows the task as `recoverable`, and `/supervise recover
@@ -144,3 +149,43 @@ not eliminate the post-spawn attachment window. `SIGSTOP` and `SIGKILL` of the P
 verify and document the resulting orphan behavior.
 Default behavior must be fail-closed and leave no orphaned worker process within
 the managed process group.
+
+## Near-term automation acceptance gate
+
+The next implementation milestone focuses on real stability for the pinned
+Claude Code `2.1.270` CLI. It does not add a multi-version matrix or wait for
+OS sandbox, low-privilege or network-isolation work.
+
+### Acceptance and Reviewer fixtures
+
+Deterministic tests must cover:
+
+- legacy text tasks normalized to a Goal with the default `git diff --check`;
+- multiple required/optional checks with bounded output, timeout and exit-code evidence;
+- independent read-only Reviewer pass/revise/human results;
+- invalid Reviewer JSON and Reviewer API failure escalating to human;
+- repair rounds, repeated finding detection, P0/P1 escalation and repair-budget exhaustion;
+- completion being impossible without passing all required checks and review.
+
+Reviewer sessions use only `read`, `grep`, `find` and `ls`; they must not modify
+the worktree or send Worker input. Decision Worker and Reviewer model calls are
+bounded; timeout or API failure escalates instead of auto-completing. Review reports
+are persisted as bounded event payloads and are not treated as permission grants.
+
+### JSONL protocol and replay fixtures
+
+The adapter/replay matrix must cover:
+
+- JSON split across stdout chunks and multiple records in one chunk;
+- malformed JSON between valid records without a false completion event;
+- duplicate result and permission records without duplicate actions;
+- duplicate Supervisor idempotency keys without duplicate input;
+- stop, SIGTERM, SIGINT and Pi shutdown while a JSONL request is active;
+- ordinary completion, low-risk permission allow, AskUserQuestion deny-to-text,
+  multi-turn, verifier failure/repair, takeover and explicit recovery.
+
+Real Claude tests remain authenticated manual Spikes and are pinned to
+`2.1.270`; they are not part of normal CI. Normal CI runs deterministic fake
+Worker and replay fixtures. Stability evidence should include ten consecutive
+ordinary automatic runs and at least five runs each for permission and question
+handling, with no duplicate action, false completion or unreaped Worker.

@@ -294,6 +294,171 @@ test("claude-jsonl result sequence distinguishes repeated session ids", async ()
   await adapter.stop(handle, "test complete");
 });
 
+test("claude-jsonl discards split continuations after an overlong protocol record", async () => {
+  const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl", maxProtocolBufferBytes: 128 });
+  const events: import("../types.ts").WorkerEvent[] = [];
+  const handle = await adapter.start({
+    task: "first",
+    cwd: process.cwd(),
+    command: process.execPath,
+    eventListener: (event) => { events.push(event); },
+    args: ["-e", "process.stdin.on('data', () => { const write = () => process.stdout.write(JSON.stringify({type:'result', uuid:'continuation'}) + '\\n', () => setTimeout(() => process.stdout.write(JSON.stringify({type:'result', uuid:'legitimate'}) + '\\n'), 10)); process.stdout.write('x'.repeat(100000), write); }); setInterval(() => {}, 1000)", "--"],
+  });
+  try {
+    for (let attempt = 0; attempt < 50 && events.filter((event) => event.type === "turn_completed").length < 1; attempt += 1) {
+      await adapter.readOutput(handle);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const completed = events.filter((event): event is Extract<import("../types.ts").WorkerEvent, { type: "turn_completed" }> => event.type === "turn_completed");
+    assert.equal(completed.length, 1);
+    assert.equal((completed[0].result as { uuid?: string }).uuid, "legitimate");
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+    assert.equal((await adapter.getStatus(handle)).outputTruncated, true);
+  } finally {
+    await adapter.stop(handle, "protocol buffer bound test complete");
+  }
+});
+
+test("claude-jsonl ignores unsolicited results when no request is active", async () => {
+  const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
+  const events: import("../types.ts").WorkerEvent[] = [];
+  const handle = await adapter.start({
+    task: "",
+    cwd: process.cwd(),
+    command: process.execPath,
+    eventListener: (event) => { events.push(event); },
+    args: ["-e", "setTimeout(() => process.stdout.write(JSON.stringify({type:'result', uuid:'stray-result'}) + '\\n'), 10); setInterval(() => {}, 1000)", "--"],
+  });
+  try {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      await adapter.readOutput(handle);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(events.filter((event) => event.type === "turn_completed").length, 0);
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+  } finally {
+    await adapter.stop(handle, "unsolicited result test complete");
+  }
+});
+
+test("claude-jsonl does not let an unsolicited result poison a later matching result", async () => {
+  const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
+  const events: import("../types.ts").WorkerEvent[] = [];
+  const handle = await adapter.start({
+    task: "",
+    cwd: process.cwd(),
+    command: process.execPath,
+    eventListener: (event) => { events.push(event); },
+    args: ["-e", "const result = JSON.stringify({type:'result', uuid:'collision-result'}); process.stdout.write(result + '\\n'); process.stdin.on('data', () => setTimeout(() => process.stdout.write(result + '\\n'), 10)); setInterval(() => {}, 1000)", "--"],
+  });
+  try {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      await adapter.readOutput(handle);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(events.filter((event) => event.type === "turn_completed").length, 0);
+    await adapter.send(handle, "second", "turn-2");
+    for (let attempt = 0; attempt < 40 && events.filter((event) => event.type === "turn_completed").length < 1; attempt += 1) {
+      await adapter.readOutput(handle);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(events.filter((event) => event.type === "turn_completed").length, 1);
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+  } finally {
+    await adapter.stop(handle, "result collision test complete");
+  }
+});
+
+test("claude-jsonl ignores malformed lines and duplicate result records", async () => {
+  const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
+  const events: import("../types.ts").WorkerEvent[] = [];
+  const handle = await adapter.start({
+    task: "malformed and duplicate result test",
+    cwd: process.cwd(),
+    command: process.execPath,
+    eventListener: (event) => { events.push(event); },
+    args: ["-e", `
+      process.stdin.once('data', () => {
+        const result = JSON.stringify({type:'result', uuid:'stable-result', result:'OK'});
+        process.stdout.write(result.slice(0, 8));
+        setTimeout(() => process.stdout.write(result.slice(8) + String.fromCharCode(10) + 'not-json' + String.fromCharCode(10) + result + String.fromCharCode(10)), 10);
+      });
+      setInterval(() => {}, 1000);
+    `, "--"],
+  });
+  try {
+    for (let attempt = 0; attempt < 50 && events.filter((event) => event.type === "turn_completed").length < 1; attempt += 1) {
+      await adapter.readOutput(handle);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const completed = events.filter((event) => event.type === "turn_completed");
+    assert.equal(completed.length, 1);
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+  } finally {
+    await adapter.stop(handle, "malformed/duplicate test complete");
+  }
+});
+
+test("claude-jsonl suppresses duplicate permission requests before response", async () => {
+  const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
+  const events: import("../types.ts").WorkerEvent[] = [];
+  const handle = await adapter.start({
+    task: "duplicate permission test",
+    cwd: process.cwd(),
+    command: process.execPath,
+    eventListener: (event) => { events.push(event); },
+    args: ["-e", `
+      const request = {type:'control_request', request_id:'duplicate-request', request:{subtype:'can_use_tool', tool_use_id:'tool-1', tool_name:'Bash', input:{command:'printf OK'}}};
+      const text = JSON.stringify(request) + String.fromCharCode(10) + JSON.stringify(request) + String.fromCharCode(10);
+      process.stdout.write(text);
+      process.stdin.resume();
+      setInterval(() => {}, 1000);
+    `, "--"],
+  });
+  try {
+    for (let attempt = 0; attempt < 30 && events.filter((event) => event.type === "permission_request").length < 1; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    const permissions = events.filter((event) => event.type === "permission_request");
+    assert.equal(permissions.length, 1);
+    assert.equal((permissions[0] as Extract<import("../types.ts").WorkerEvent, { type: "permission_request" }>).request.requestId, "duplicate-request");
+  } finally {
+    await adapter.stop(handle, "duplicate permission test complete");
+  }
+});
+
+test("claude-jsonl stop preempts an active request and confirms cleanup", async () => {
+  const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl", terminationGraceMs: 25, killGraceMs: 50 });
+  const handle = await adapter.start({
+    task: "active request stop",
+    cwd: process.cwd(),
+    command: process.execPath,
+    args: ["-e", "process.stdin.on('data', () => {}); setInterval(() => {}, 1000)", "--"],
+  });
+  assert.equal((await adapter.getStatus(handle)).activeRequests, 1);
+  await adapter.stop(handle, "active request shutdown");
+  const status = await adapter.getStatus(handle);
+  assert.equal(status.running, false);
+  assert.equal(status.processGroupCleaned, true);
+});
+
+test("claude-jsonl active requests survive no false completion across external signals", async () => {
+  for (const signal of ["SIGTERM", "SIGINT"] as const) {
+    const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl", terminationGraceMs: 25, killGraceMs: 50 });
+    const handle = await adapter.start({
+      task: "active request signal",
+      cwd: process.cwd(),
+      command: process.execPath,
+      args: ["-e", "process.stdin.on('data', () => {}); setInterval(() => {}, 1000)", "--"],
+    });
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 1);
+    assert.ok(handle.pid);
+    process.kill(handle.pid, signal);
+    const status = await waitForStatus(adapter, handle, (value) => !value.running);
+    assert.equal(status.signal, signal);
+    assert.equal(status.exitReason, "crashed");
+    await adapter.stop(handle, `cleanup after ${signal}`);
+  }
+});
+
 test("claude-jsonl status tracks active requests until a result record", async () => {
   const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
   const handle = await adapter.start({

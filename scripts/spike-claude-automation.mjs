@@ -1,6 +1,7 @@
 import { ProcessWorkerAdapter } from "../src/worker/process-adapter.ts";
 import { Supervisor } from "../src/supervisor.ts";
 import { EventLog } from "../src/events.ts";
+import { PiReadOnlyReviewer } from "../src/reviewer.ts";
 
 const cwd = process.env.SPIKE_AUTOMATION_CWD ?? process.cwd();
 const permission = process.env.SPIKE_AUTOMATION_PERMISSION === "1";
@@ -10,15 +11,18 @@ const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl", terminationGrac
 const human = [];
 const eventLogPath = process.env.SPIKE_EVENT_LOG ?? undefined;
 const supervisor = new Supervisor(adapter, new EventLog(eventLogPath), {
+  reviewer: new PiReadOnlyReviewer({ timeoutMs: Math.min(timeoutMs, 120_000) }),
   onHumanRequired: (notice) => { human.push(notice); console.error('HUMAN_REQUIRED', notice.reason); },
 });
+const task = question
+  ? "Ask one question about which database a local supervisor should use. The task context already prefers SQLite for a local single-user tool; use that answer and then stop. This is an automated question-handling test."
+  : permission
+    ? "Use Bash exactly to run: printf AUTO_PERMISSION_OK. Then report the output and stop. This is an automation permission test."
+    : "Reply with exactly AUTO_SUPERVISOR_SPIKE_OK. Do not use tools. This is an automation integration test.";
 
 await supervisor.start({
-  task: question
-    ? "Ask one question about which database a local supervisor should use. The task context already prefers SQLite for a local single-user tool; use that answer and then stop. This is an automated question-handling test."
-    : permission
-      ? "Use Bash exactly to run: printf AUTO_PERMISSION_OK. Then report the output and stop. This is an automation permission test."
-      : "Reply with exactly AUTO_SUPERVISOR_SPIKE_OK. Do not use tools. This is an automation integration test.",
+  task,
+  spec: { goal: task, constraints: ["Do not modify repository files; pre-existing worktree changes are outside this integration test."], maxRepairRounds: 0 },
   cwd,
   command: process.env.PI_CLAUDE_SUPERVISOR_WORKER_COMMAND ?? "claude",
   args: ["--safe-mode", "--no-session-persistence", "--tools", question ? "AskUserQuestion" : "Bash"],

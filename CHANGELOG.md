@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented here.
 
+## [Unreleased]
+
+### Added
+
+- Structured task specifications with Goal, scope, constraints, forbidden actions and multiple argv-based acceptance checks.
+- Independent read-only Reviewer results with bounded findings and automatic repair rounds.
+- JSONL malformed-record handling and duplicate result/permission suppression fixtures.
+- Active JSONL request shutdown coverage and deterministic acceptance/review tests.
+
 ## [0.4.1](https://github.com/btnalit/pi-claude-supervisor/compare/v0.4.0...v0.4.1) (2026-09-14)
 
 

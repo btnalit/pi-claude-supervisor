@@ -916,3 +916,66 @@ PTY 和 headless JSONL 只能选择一个作为 MVP 的主 transport，禁止两
 ## 附录 B：一句话版本
 
 > 先用最小、可审计、可接管的 Supervisor 闭环证明可靠性，再逐步开放 LLM 判断和自动化权限；不要从“自动化最多”开始，而要从“边界最清楚、证据最可靠”开始。
+
+## 20. 近期落地与剩余门禁：稳定的自动验收闭环
+
+本轮已落地 TaskSpec、多命令验收、独立只读 Reviewer、结构化 repair round、重复 finding/P0/P1 人工升级、JSONL 去重和确定性 replay fixture。剩余门禁是固定 CLI 的重复运行统计，而不是继续扩大安全边界。近期目标从“扩大安全边界”调整为先证明单一已验证 Claude CLI 版本上的真实功能稳定性。当前只验证固定的 Claude Code `2.1.270`，不把多版本兼容作为本阶段任务。OS sandbox、低权限用户、网络 allowlist、SBOM 和更深的供应链加固后置，不作为本阶段门禁；现有 no-shell、Policy Gate、人工接管和独立验收边界继续保留。
+
+### 20.1 Goal / Evidence / Sign-off 模型
+
+任务规格统一为：
+
+```yaml
+ goal: 实现用户邀请接口
+ scope:
+   - 新增接口
+   - 添加权限校验
+ constraints:
+   - 不修改核心数据库模型
+ forbidden:
+   - 不执行生产部署
+ acceptance:
+   - id: tests
+     command: npm
+     args: [test]
+   - id: typecheck
+     command: npm
+     args: [run, typecheck]
+   - id: diff-check
+     command: git
+     args: [diff, --check]
+ maxRepairRounds: 3
+```
+
+兼容旧任务时，普通任务文本作为 `goal`，默认验收仍为 `git diff --check`。所有验收命令使用 argv 和确定性 Policy Gate，不经过 shell。
+
+验收流程固定为：
+
+```text
+Worker result
+  → 多命令 acceptance checks
+  → 独立只读 Reviewer
+      ├── pass   → completed
+      ├── revise → 结构化修复指令 → Worker → 重新验收
+      └── human  → 人工接管
+```
+
+Reviewer 必须使用独立 Pi session，只允许 `read`、`grep`、`find`、`ls`，输出结构化 verdict 和 findings；不能修改工作树或直接批准权限。默认最多三轮修复；相同 finding 重复出现或出现 P0/P1 问题时升级人工。
+
+### 20.2 JSONL 稳定性证据
+
+只对 Claude Code `2.1.270` 建立证据，覆盖：
+
+- JSONL 跨 chunk 拆分、单 chunk 多记录和 malformed 行；malformed 行不能触发完成事件；
+- 重复 result、重复 permission request、重复 Supervisor idempotency key 不产生重复动作；
+- active request 期间的 SIGTERM、SIGINT、stop 和 Pi shutdown；
+- 普通完成、低风险 Bash allow、`AskUserQuestion` deny-to-text、多轮、验收失败修复和恢复回放。
+
+真实 Claude Spike 不进入普通 CI；确定性 fake Worker/replay fixture 进入 CI。自动模式继续保持显式 opt-in，直到以下门禁通过：普通任务连续十次成功，权限和问题转文本场景各至少五次成功，无重复动作、无错误 complete、无未清理 Worker，且关键事件可以完整回放。
+
+### 20.3 明确不属于本阶段
+
+- Claude CLI 多版本兼容；
+- OS sandbox、低权限执行和网络隔离；
+- 自动 merge、deploy、release、publish；
+- 多 Worker 在同一工作树协作。

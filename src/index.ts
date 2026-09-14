@@ -1,8 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { realpath } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { readFile, realpath } from "node:fs/promises";
 import { EventLog } from "./events.ts";
 import { redactSensitive } from "./redaction.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
@@ -13,6 +13,9 @@ import { HumanWebhookNotifier } from "./notifications.ts";
 import { loadSupervisorEnvironment } from "./config.ts";
 import { DecisionSessionStore, type DecisionSessionRecord } from "./decision-session-store.ts";
 import { CwdLeaseStore, type CwdLeaseHandle, pathsOverlap, workerIdentity } from "./cwd-lease.ts";
+import { normalizeTaskSpec } from "./acceptance.ts";
+import { PiReadOnlyReviewer } from "./reviewer.ts";
+import type { TaskSpec } from "./types.ts";
 
 /**
  * Pi Claude Supervisor.
@@ -53,6 +56,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   const events = new EventLog(join(stateDir, "events.jsonl"));
   const decisionStore = new DecisionSessionStore(join(stateDir, "decision-sessions"));
   const cwdLeaseStore = new CwdLeaseStore(process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR ?? join(homedir(), ".pi", "agent", "claude-supervisor", "cwd-leases"));
+  const reviewer = automation ? new PiReadOnlyReviewer() : undefined;
   const sessions = new Map<string, Supervisor>();
   const cwdLeases = new Map<string, CwdLeaseHandle>();
   const cleanupRequiredTasks = new Set<string>();
@@ -184,9 +188,17 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         const [operation = "status", ...rest] = tokens;
         let message = "";
         if (operation === "start" || operation === "adopt-tmux") {
+          let specPath: string | undefined;
+          if (rest[0] === "--spec") specPath = rest.splice(0, 2)[1];
+          else {
+            const specIndex = rest.findIndex((value) => value.startsWith("--spec="));
+            if (specIndex >= 0) specPath = rest.splice(specIndex, 1)[0]?.slice("--spec=".length);
+          }
           const tmuxSession = operation === "adopt-tmux" ? rest.shift() : undefined;
           const task = rest.join(" ").trim();
-          if (!task) throw new Error(operation === "adopt-tmux" ? "Usage: /supervise adopt-tmux <tmux-session> <task>" : "Usage: /supervise start <task>");
+          const spec = specPath ? await readTaskSpecFile(specPath, ctx.cwd) : undefined;
+          const goal = spec?.goal ?? task;
+          if (!goal) throw new Error(operation === "adopt-tmux" ? "Usage: /supervise adopt-tmux [--spec <file>] <tmux-session> <task>" : "Usage: /supervise start [--spec <file>] <task>");
           if (operation === "adopt-tmux" && adapter.capabilities().transport !== "tmux") throw new Error("/supervise adopt-tmux requires PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux");
           const [command, ...workerArgs] = parseCommand(process.env.PI_CLAUDE_SUPERVISOR_WORKER ?? "claude");
           if (!command) throw new Error("PI_CLAUDE_SUPERVISOR_WORKER must contain an executable");
@@ -221,6 +233,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           }
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
+            reviewer,
             onHumanRequired: async (notice) => {
               if (ctx.hasUI) notify(ctx, `Claude Worker needs human intervention: ${notice.reason}`, "warning");
               if (humanWebhook.enabled) {
@@ -240,7 +253,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             try {
               const handle = await session.start({
                 taskId,
-                task,
+                task: goal,
+                spec,
                 cwd: cwdKey,
                 command,
                 args: workerArgs,
@@ -262,6 +276,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 onDecisionSessionReady: (info) => decisionStore.save({
                   taskId: info.taskId,
                   task: info.task,
+                  spec: info.spec,
                   cwd: info.cwd,
                   command,
                   args: workerArgs,
@@ -272,9 +287,11 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                   noOutputTimeoutMs: info.noOutputTimeoutMs,
                   startedAt: info.startedAt,
                   turn: info.turn,
+                  repairRound: info.repairRound,
+                  ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}),
                   state: "active",
                 }),
-                onDecisionSessionProgress: (info) => decisionStore.update(info.taskId, { turn: info.turn }),
+                onDecisionSessionProgress: (info) => decisionStore.update(info.taskId, { turn: info.turn, repairRound: info.repairRound, ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}) }),
                 onDecisionSessionClosed: (taskId) => decisionStore.close(taskId),
               });
               const startedTaskId = session.task?.taskId;
@@ -411,6 +428,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           }
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
+            reviewer,
             onHumanRequired: async (notice) => {
               if (ctx.hasUI) notify(ctx, `Claude Worker needs human intervention: ${notice.reason}`, "warning");
               if (humanWebhook.enabled) {
@@ -430,7 +448,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 // Claude session resume is not supported by this adapter. Start
                 // idle so recovery never replays the original task; the operator
                 // must explicitly send the next instruction.
-                task: record.task,
+                task: record.spec?.goal ?? record.task,
+                spec: record.spec,
                 initialInput: "",
                 sendInitialInput: false,
                 cwd: cwdKey,
@@ -444,11 +463,14 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 noOutputTimeoutMs: record.noOutputTimeoutMs,
                 startedAt: record.startedAt,
                 initialTurn: record.turn,
+                initialRepairRound: record.repairRound,
+                initialFindingSignature: record.lastFindingSignature,
                 decisionSessionFile: record.decisionSessionFile,
                 decisionSessionDir: decisionStore.directory,
                 onDecisionSessionReady: (info) => decisionStore.save({
                   taskId: info.taskId,
                   task: info.task,
+                  spec: info.spec,
                   cwd: info.cwd,
                   command: record.command,
                   args: record.args,
@@ -459,9 +481,11 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                   noOutputTimeoutMs: info.noOutputTimeoutMs,
                   startedAt: info.startedAt,
                   turn: info.turn,
+                  repairRound: info.repairRound,
+                  ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}),
                   state: "active",
                 }),
-                onDecisionSessionProgress: (info) => decisionStore.update(info.taskId, { turn: info.turn }),
+                onDecisionSessionProgress: (info) => decisionStore.update(info.taskId, { turn: info.turn, repairRound: info.repairRound, ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}) }),
                 onDecisionSessionClosed: (closedTaskId) => decisionStore.close(closedTaskId),
               });
               try {
@@ -672,6 +696,12 @@ function selectedWorkerEnvironment(): NodeJS.ProcessEnv {
     if (process.env[name] !== undefined) result[name] = process.env[name];
   }
   return result;
+}
+
+async function readTaskSpecFile(path: string, cwd: string): Promise<TaskSpec> {
+  const file = resolve(cwd, path.replace(/^['"]|['"]$/gu, ""));
+  const value = JSON.parse(await readFile(file, "utf8")) as unknown;
+  return normalizeTaskSpec(value, "");
 }
 
 function parseCommand(value: string): string[] {

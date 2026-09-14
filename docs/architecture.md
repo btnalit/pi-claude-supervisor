@@ -181,6 +181,29 @@ human operator; it does not attempt a second LLM fallback. Alert delivery is
 kept independent from event-log persistence so an audit write failure cannot
 suppress the alert.
 
+## Acceptance, review and repair loop
+
+A task may provide a structured `TaskSpec` with `goal`, `scope`, `constraints`,
+`forbidden` and an ordered list of required or optional acceptance checks. A
+legacy plain-text task is normalized to a goal with the default `git diff
+--check` acceptance check. The verifier runs every configured check with argv,
+bounded output and the same deterministic command policy; a Worker completion
+claim never substitutes for these results.
+
+When automatic supervision is enabled, a successful check set is passed to a
+fresh read-only Reviewer session. The Reviewer receives the task specification, repository status/diff evidence,
+check results and bounded Worker completion evidence, but not the Decision Worker
+conversation or control channel. It can inspect only `read`, `grep`, `find` and `ls`, and must return
+`pass`, `revise` or `human` with bounded structured findings. Invalid Reviewer
+output or a Reviewer API failure is a human-required condition.
+
+A `revise` result produces an audited repair round and sends a bounded corrective
+instruction to a still-live JSONL/tmux Worker. Checks and review then run again.
+The repair budget defaults to three rounds; repeated findings and P0/P1 findings
+stop automation and escalate. A non-persistent Worker that has already exited
+cannot be silently recreated for repair; it remains failed/recoverable rather
+than replaying the original task.
+
 ## Deliberate non-goals
 
 - automatic merge/deploy/release;
@@ -192,4 +215,7 @@ suppress the alert.
 - shell command interpolation;
 - automatic network denial or a fake domain allowlist. Network access follows
   Claude's own permission model and the command policy; suspicious download-to-
-  shell patterns require human review rather than blanket network rejection.
+  shell patterns require human review rather than blanket network rejection;
+- Claude CLI multi-version compatibility in the current stability milestone;
+- OS sandbox, low-privilege execution and network isolation in the current
+  lifecycle milestone.
