@@ -633,6 +633,38 @@ test("stop aborts an in-flight acceptance command and wins verification", async 
   assert.equal(supervisor.state, "stopped");
 });
 
+test("stop aborts a hanging custom Reviewer without waiting for its promise", async () => {
+  const handle: WorkerHandle = { id: "hanging-reviewer-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
+  let running = true;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, repairableSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, undefined, { onHumanRequired: () => {}, reviewer: { review: async () => new Promise<never>(() => {}) } });
+  await supervisor.start({
+    task: "hanging reviewer",
+    cwd: "/tmp",
+    command: "fixture",
+    spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+  });
+  await supervisor.poll();
+  const verification = supervisor.verify();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  await supervisor.stop("operator cancelled hanging Reviewer");
+  await verification;
+  assert.equal(supervisor.state, "stopped");
+});
+
 test("automatic acceptance review requests a bounded repair before completing", async () => {
   const handle: WorkerHandle = { id: "review-repair-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
   let running = true;

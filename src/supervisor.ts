@@ -22,6 +22,8 @@ import type {
   WorkerStatus,
 } from "./types.ts";
 
+const REVIEW_TIMEOUT_MS = 120_000;
+
 export interface DecisionSessionReadyInfo {
   taskId: string;
   task: string;
@@ -849,7 +851,7 @@ export class Supervisor {
       let review;
       try {
         const evidence = redactRepositoryEvidence(await collectRepositoryEvidence(this.#task.cwd, { signal: verificationAbortController.signal }));
-        review = await this.#reviewer.review({
+        review = await withTimeout(this.#reviewer.review({
           taskId: this.#task.taskId,
           cwd: this.#task.cwd,
           spec: this.#task.spec,
@@ -859,8 +861,9 @@ export class Supervisor {
           workerResult: this.#lastWorkerResult ? redactSensitive(this.#lastWorkerResult) as Record<string, unknown> : undefined,
           round: this.#repairRound,
           signal: verificationAbortController.signal,
-        } satisfies ReviewInput);
+        } satisfies ReviewInput), REVIEW_TIMEOUT_MS, "independent Reviewer", verificationAbortController.signal);
       } catch (error) {
+        if (error instanceof Error && error.name === "TimeoutError") verificationAbortController.abort(error.message);
         review = { verdict: "human" as const, summary: `independent Reviewer failed: ${safeMessage(error)}`, findings: [], round: this.#repairRound, checkedAt: new Date().toISOString() };
       }
       const hasBlockingFinding = review.findings.some((finding) => finding.severity === "P0" || finding.severity === "P1");
@@ -1142,16 +1145,32 @@ export class Supervisor {
   }
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string, signal?: AbortSignal): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
+  let onAbort: (() => void) | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer = setTimeout(() => {
+      const error = new Error(`${label} timed out after ${timeoutMs}ms`);
+      error.name = "TimeoutError";
+      reject(error);
+    }, timeoutMs);
     timer.unref();
   });
+  const aborted = new Promise<never>((_, reject) => {
+    if (!signal) return;
+    onAbort = () => {
+      const error = new Error(`${label} aborted`);
+      error.name = "AbortError";
+      reject(error);
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
   try {
-    return await Promise.race([promise, timeout]);
+    return await Promise.race([promise, timeout, aborted]);
   } finally {
     if (timer) clearTimeout(timer);
+    if (signal && onAbort) signal.removeEventListener("abort", onAbort);
   }
 }
 
