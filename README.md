@@ -126,7 +126,8 @@ directory. After an unclean Pi restart, `/supervise sessions` lists recoverable
 tasks; `/supervise recover [--takeover] <task-id>` explicitly restores the Decision Worker
 context and starts a new Claude Worker. It never silently resumes or duplicates
 work. If the old Pi owner is dead, add `--takeover` only after the lease proves
-the old Worker's cgroup/process boundary is gone; a live or unverifiable Worker is refused.
+the old Worker's process group is gone and its cgroup is a real, readable empty
+boundary; missing or unverifiable Worker evidence is refused.
 For a persistent tmux Worker, use explicit `adopt-tmux` instead of takeover.
 The adapter intentionally does not inherit arbitrary host environment variables.
 Pass credentials through an explicit `WorkerStartInput.env` in an embedding

@@ -96,7 +96,7 @@ Claude CLI `2.1.270` 运行，跨版本兼容性不在本轮范围内。
 自动模式会将 Decision Worker 会话持久化到状态目录。Pi 非正常重启后，`/supervise sessions`
 会显示 `recoverable` 任务；显式执行 `/supervise recover [--takeover] <task-id>` 会恢复 Decision Worker 上下文并
 重新启动 Claude Worker，不会静默恢复或重复执行任务。旧 Pi 进程已退出且租约确认旧 Worker
-cgroup/进程边界已消失时，才可显式添加 `--takeover`；仍存活或无法确认的 Worker 会被拒绝。持久 tmux
+进程组已消失且 cgroup 仍是真实、可读取的空边界时，才可显式添加 `--takeover`；缺失、仍存活或无法确认的 Worker 会被拒绝。持久 tmux
 Worker 应使用 `adopt-tmux`，而不是 takeover。
 自动模式下，Decision Worker 可以安全拒绝 `AskUserQuestion`，让 Claude 将问题转成普通文本，
 再根据任务和仓库证据自动回答；无法确定时才升级人工。如需微信内闭环，需要另建带签名验证、

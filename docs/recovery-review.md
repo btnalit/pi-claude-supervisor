@@ -8,8 +8,9 @@ were addressed in this follow-up.
   owner PID/start time, are reconciled only after the old owner and Worker
   boundary are independently gone, and return to an explicit `interrupted`
   state.
-- `--takeover` requires a dead owner, dead Worker/process group, and a verified
-  cgroup boundary; missing or unverifiable Worker evidence is rejected.
+- `--takeover` requires a dead owner, dead Worker/process group, and a real,
+  readable empty cgroup boundary; missing or unverifiable Worker evidence is
+  rejected.
 - Worker registration and `recovered_idle` transitions require an active record,
   persist atomically, and are read back and checked before the recovered session
   is exposed.

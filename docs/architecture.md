@@ -151,9 +151,9 @@ serializes acquisition across independent Pi processes. A lease is released
 only after the adapter confirms the worker and its descendant cleanup. An
 unconfirmed lease left by a crashed Pi is intentionally retained. Ordinary
 recovery refuses it; an operator may use `recover --takeover` only when the old
-owner is dead and the lease independently proves the old Worker cgroup/process
-boundary is gone. Live or unverifiable Workers still require manual cleanup
-rather than unsafe reclamation.
+owner is dead, the Worker process group is gone, and the lease independently
+reads a real empty cgroup boundary for the old Worker. Missing or unverifiable
+Worker evidence still requires manual cleanup rather than unsafe reclamation.
 An explicitly adopted tmux session may hand off an existing lease only after
 its owner identity is no longer live and its canonical cwd, tmux session/socket,
 pane id, pane PID/start time, and pane command all match; ordinary starts

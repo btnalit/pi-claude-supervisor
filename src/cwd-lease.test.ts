@@ -62,11 +62,11 @@ test("cwd lease takeover requires an explicit dead-owner and dead-worker proof",
     () => store.acquire(cwd, "88888888-8888-4888-8888-888888888888", "process-pipe"),
     /working-directory lease is held/u,
   );
-  const recovered = await store.acquire(cwd, "88888888-8888-4888-8888-888888888888", "process-pipe", {
-    takeover: { taskId: old.record.taskId },
-  });
-  assert.equal(recovered.record.taskId, "88888888-8888-4888-8888-888888888888");
-  await recovered.release();
+  await assert.rejects(
+    () => store.acquire(cwd, "88888888-8888-4888-8888-888888888888", "process-pipe", { takeover: { taskId: old.record.taskId } }),
+    /working-directory lease is held/u,
+  );
+  await old.release();
 
   const noCgroup = await store.acquire(cwd, "99999999-9999-4999-8999-999999999999", "process-pipe");
   await noCgroup.updateWorker({ transport: "process-pipe", pid: 999999997, startTime: "1", ownership: "owned" });

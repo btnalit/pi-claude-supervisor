@@ -307,15 +307,23 @@ async function processGroupExists(pid: number): Promise<boolean> {
 
 async function cgroupHasProcesses(path: string): Promise<boolean> {
   // Lease files are untrusted state. Never read an arbitrary path during
-  // takeover; only the kernel cgroup hierarchy is eligible for this check.
+  // takeover; only a real, canonical cgroup below the kernel cgroup root is
+  // eligible for this check. Missing/unreadable evidence is not proof of an
+  // empty cgroup: a descendant may have escaped before the cgroup disappeared.
   const cgroupRoot = resolve("/sys/fs/cgroup");
   const cgroupPath = resolve(path);
-  if (!cgroupPath.startsWith(`${cgroupRoot}/`)) return true;
+  if (cgroupPath === cgroupRoot || !cgroupPath.startsWith(`${cgroupRoot}/`)) return true;
   try {
-    const contents = await readFile(join(cgroupPath, "cgroup.procs"), "utf8");
+    const cgroupInfo = await lstat(cgroupPath);
+    if (!cgroupInfo.isDirectory() || cgroupInfo.isSymbolicLink()) return true;
+    const canonicalPath = await realpath(cgroupPath);
+    if (canonicalPath !== cgroupPath || !canonicalPath.startsWith(`${cgroupRoot}/`)) return true;
+    const procsPath = join(canonicalPath, "cgroup.procs");
+    const procsInfo = await lstat(procsPath);
+    if (!procsInfo.isFile() || procsInfo.isSymbolicLink()) return true;
+    const contents = await readFile(procsPath, "utf8");
     return contents.split(/\s+/u).some((pid) => /^\d+$/u.test(pid));
-  } catch (error) {
-    if (error instanceof Error && /ENOENT/u.test(error.message)) return false;
+  } catch {
     return true;
   }
 }
