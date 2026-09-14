@@ -498,10 +498,12 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
             const resultId = jsonlRecordId(event, record.activeRequestSequence);
             if (!record.seenResultIds.has(resultId)) {
               rememberBounded(record.seenResultIds, resultId);
-              record.activeRequests = Math.max(0, record.activeRequests - 1);
-              record.activeRequestSequence = undefined;
-              record.turnSequence += 1;
-              this.#emit(record, { type: "turn_completed", handle: record.handle, result: event, sequence: record.turnSequence });
+              if (record.activeRequests > 0) {
+                record.activeRequests = Math.max(0, record.activeRequests - 1);
+                record.activeRequestSequence = undefined;
+                record.turnSequence += 1;
+                this.#emit(record, { type: "turn_completed", handle: record.handle, result: event, sequence: record.turnSequence });
+              }
             }
           }
         } catch {

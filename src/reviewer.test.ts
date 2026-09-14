@@ -21,6 +21,14 @@ test("invalid Reviewer output escalates to human", () => {
   }
 });
 
+test("Reviewer output and finding counts are bounded", () => {
+  const tooLarge = parseReview(JSON.stringify({ verdict: "pass", summary: "x".repeat(140_000) }), 0);
+  assert.equal(tooLarge.verdict, "human");
+  const tooManyFindings = Array.from({ length: 65 }, (_, index) => ({ id: `F${index}`, severity: "P2", message: "too many findings" }));
+  const bounded = parseReview(JSON.stringify({ verdict: "revise", summary: "too many", findings: tooManyFindings }), 0);
+  assert.equal(bounded.verdict, "human");
+});
+
 test("Reviewer pass with a blocking finding is normalized by the supervisor contract", () => {
   const report = parseReview(JSON.stringify({
     verdict: "pass",

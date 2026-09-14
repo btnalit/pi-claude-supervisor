@@ -3,6 +3,9 @@ import { redactSensitive } from "./redaction.ts";
 import type { AcceptanceReport, ReviewFinding, ReviewReport, TaskSpec } from "./types.ts";
 import type { RepositoryEvidence } from "./verifier.ts";
 
+const MAX_REVIEW_RESPONSE_BYTES = 128 * 1024;
+const MAX_REVIEW_FINDINGS = 64;
+
 export interface ReviewInput {
   taskId: string;
   cwd: string;
@@ -53,9 +56,16 @@ export class PiReadOnlyReviewer implements TaskReviewer {
       tools: ["read", "grep", "find", "ls"],
     });
     let text = "";
+    let responseTooLarge = false;
     const unsubscribe = session.subscribe((value) => {
       const record = value as unknown as { type?: string; assistantMessageEvent?: { type?: string; delta?: string } };
-      if (record.type === "message_update" && record.assistantMessageEvent?.type === "text_delta") text += record.assistantMessageEvent.delta ?? "";
+      if (record.type !== "message_update" || record.assistantMessageEvent?.type !== "text_delta" || responseTooLarge) return;
+      const delta = record.assistantMessageEvent.delta ?? "";
+      if (Buffer.byteLength(text, "utf8") + Buffer.byteLength(delta, "utf8") > MAX_REVIEW_RESPONSE_BYTES) {
+        responseTooLarge = true;
+        return;
+      }
+      text += delta;
     });
     try {
       await withTimeout(session.prompt(reviewPrompt(input)), this.#timeoutMs, "independent Reviewer");
@@ -66,7 +76,9 @@ export class PiReadOnlyReviewer implements TaskReviewer {
       unsubscribe();
       session.dispose();
     }
-    return parseReview(text, input.round);
+    return responseTooLarge
+      ? invalidReview(`Reviewer response exceeded ${MAX_REVIEW_RESPONSE_BYTES} bytes`, input.round, new Date().toISOString())
+      : parseReview(text, input.round);
   }
 }
 
@@ -108,6 +120,7 @@ ${input.round}`;
 
 export function parseReview(text: string, round: number): ReviewReport {
   const checkedAt = new Date().toISOString();
+  if (Buffer.byteLength(text, "utf8") > MAX_REVIEW_RESPONSE_BYTES) return invalidReview(`Reviewer response exceeded ${MAX_REVIEW_RESPONSE_BYTES} bytes`, round, checkedAt);
   const candidate = text.trim();
   if (!candidate) return invalidReview("Reviewer returned no JSON object", round, checkedAt);
   try {
@@ -117,6 +130,7 @@ export function parseReview(text: string, round: number): ReviewReport {
     if (verdict !== "pass" && verdict !== "revise" && verdict !== "human") throw new Error("unsupported verdict");
     const summary = typeof value.summary === "string" && value.summary.trim() ? value.summary.trim() : "no summary provided";
     if (value.findings !== undefined && !Array.isArray(value.findings)) throw new Error("findings must be an array");
+    if (Array.isArray(value.findings) && value.findings.length > MAX_REVIEW_FINDINGS) throw new Error(`findings exceed the limit of ${MAX_REVIEW_FINDINGS}`);
     const findings = (value.findings ?? []).map((finding, index) => parseFinding(finding, index));
     if (verdict === "revise" && findings.length === 0) throw new Error("revise verdict requires at least one finding");
     return { verdict, summary: boundText(summary, 4_000), findings, round, checkedAt };

@@ -99,7 +99,7 @@ export class DecisionSessionStore {
     try {
       const value = JSON.parse(await readFile(this.#recordPath(taskId), "utf8")) as Partial<DecisionSessionRecord>;
       assertNoCredentialPath(typeof value.decisionSessionFile === "string" ? resolve(value.decisionSessionFile) : "");
-      return normalizeRecord(redactRecord(value), this.#directory);
+      return normalizeRecord(redactRecord(value), this.#directory, taskId);
     } catch (error) {
       if (error instanceof Error && /ENOENT/u.test(error.message)) return undefined;
       throw error;
@@ -114,7 +114,8 @@ export class DecisionSessionStore {
         try {
           const value = JSON.parse(await readFile(join(this.#directory, name), "utf8")) as Partial<DecisionSessionRecord>;
           assertNoCredentialPath(typeof value.decisionSessionFile === "string" ? resolve(value.decisionSessionFile) : "");
-          const record = normalizeRecord(redactRecord(value), this.#directory);
+          const expectedTaskId = name.slice(0, -".json".length);
+          const record = normalizeRecord(redactRecord(value), this.#directory, expectedTaskId);
           if (!options.activeOnly || record.state === "active") records.push(record);
         } catch {
           // A torn or manually edited registry record is not recoverable.
@@ -137,7 +138,8 @@ async function writeJson(path: string, value: unknown): Promise<void> {
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
-function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: string): DecisionSessionRecord {
+function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: string, expectedTaskId?: string): DecisionSessionRecord {
+  if (expectedTaskId !== undefined && value.taskId !== expectedTaskId) throw new Error("Decision Worker session task id mismatch");
   if (value.version !== 1 || typeof value.taskId !== "string" || !/^[0-9a-f-]{36}$/iu.test(value.taskId)
     || typeof value.task !== "string" || typeof value.cwd !== "string" || typeof value.command !== "string"
     || !Array.isArray(value.args) || value.args.some((arg) => typeof arg !== "string")

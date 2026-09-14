@@ -49,6 +49,13 @@ test("Decision Worker session registry survives a fresh store instance", async (
   assert.match(await readFile(join(directory, `${taskId}.json`), "utf8"), /closed/u);
 });
 
+test("Decision Worker recovery rejects a record whose task id differs from its filename", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-claude-decision-store-mismatch-"));
+  const otherTaskId = "22222222-2222-4222-8222-222222222222";
+  await writeFile(join(directory, `${taskId}.json`), JSON.stringify({ taskId: otherTaskId, decisionSessionFile: "/tmp/session.jsonl" }));
+  await assert.rejects(() => new DecisionSessionStore(directory).load(taskId), /task id mismatch/u);
+});
+
 test("Decision Worker session registry ignores corrupt records during discovery", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-claude-decision-store-corrupt-"));
   const store = new DecisionSessionStore(directory);
