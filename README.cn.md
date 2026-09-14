@@ -108,7 +108,9 @@ export PI_CLAUDE_SUPERVISOR_WORKER='claude --permission-mode plan'
 /supervise adopt-tmux <tmux-session-name> <task description>
 ```
 
-接管会检查 cwd、pane 中的进程，并拒绝已有其他输出 pipe 的 pane；但不宣称拥有该 session。对被接管的 session，
+接管会检查 cwd、pane 中的进程，并拒绝已有其他输出 pipe 的 pane；但不宣称拥有该 session。owned session 使用自动生成的私有 tmux socket，
+请保存 `start` 输出的完整 `attach=...` 命令。Pi 重启后重新接管时，先把该命令中的 socket 路径设置到
+`PI_CLAUDE_SUPERVISOR_TMUX_SOCKET`；只有默认 server 才能只使用 session 名称。对被接管的 session，
 `/supervise stop` 和 Pi 关闭只会断开监督，不会杀掉你的 tmux 窗口；需要关闭时请由你执行
 `tmux kill-session`。`/supervise takeover <task-id>` 会暂停 Decision Worker 自动发送，只有
 `/supervise resume-auto <task-id>` 才恢复。

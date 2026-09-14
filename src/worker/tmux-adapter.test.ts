@@ -94,6 +94,28 @@ test("owned tmux identity can be re-adopted after restart", { skip: !tmuxAvailab
   }
 });
 
+test("released tmux identity mismatch retains live status and cleanup uncertainty", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-identity-mismatch-"));
+  const claudeBinary = join(stateDir, "claude");
+  await copyFile(process.execPath, claudeBinary);
+  const fixture = "process.stdout.write('>\\n--------------------\\n'); process.stdin.resume(); setInterval(() => {}, 10000);";
+  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000 });
+  let handle;
+  try {
+    handle = await adapter.start({ task: "identity mismatch", cwd: process.cwd(), command: claudeBinary, args: ["-e", fixture], sendInitialInput: false });
+    await adapter.release(handle, "identity mismatch probe");
+    const replacement = spawnSync("tmux", ["-S", handle.tmuxSocket!, "respawn-pane", "-k", "-t", handle.tmuxPaneId!, "--", claudeBinary, "-e", fixture], { encoding: "utf8" });
+    assert.equal(replacement.status, 0, replacement.stderr);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const status = await adapter.getStatus(handle);
+    assert.equal(status.running, true);
+    assert.match(status.cleanupError ?? "", /identity/u);
+  } finally {
+    if (handle?.tmuxSocket && handle.sessionName) spawnSync("tmux", ["-S", handle.tmuxSocket, "kill-session", "-t", handle.sessionName], { stdio: "ignore" });
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("explicit idle startup does not submit a blank turn", { skip: !tmuxAvailable, concurrency: false }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-idle-test-"));
   const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000 });

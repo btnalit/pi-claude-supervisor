@@ -73,19 +73,24 @@ npm run spike:signals
 npm run spike:automation
 SPIKE_AUTOMATION_PERMISSION=1 npm run spike:automation
 SPIKE_AUTOMATION_QUESTION=1 npm run spike:automation
+PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH=/home/yancao/.local/share/mise/installs/claude/2.1.270/claude \
 PI_CLAUDE_SUPERVISOR_REAL_CLAUDE=1 npm run spike:tmux
+PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH=/home/yancao/.local/share/mise/installs/claude/2.1.270/claude \
 PI_CLAUDE_SUPERVISOR_REAL_CLAUDE=1 npm run spike:tmux-interactive
 ```
 
 The tmux spike is gated, authenticated, and excluded from normal CI. It uses
-plan mode, records only protocol metadata, and verifies three real Claude turns,
-exact screen-result markers, pause/resume, human takeover, owned detach, and
-identity-bound restart re-adoption. The interactive spike uses a fresh temporary
+plan mode with a fixed `opus` model, records only protocol metadata, and
+verifies three real Claude turns, exact screen-result markers, pause/resume,
+automation enabled with human takeover, direct human PTY input, owned detach,
+and identity-bound restart re-adoption. The interactive spike uses a fresh temporary
 cwd to verify Claude's trust prompt, a real Bash permission prompt, an allow-once
 response, and an exact result marker; it also records metadata only.
 
-For each release, pin and record the validated Claude Code version and resolved
-executable path. For this release the validated version is `2.1.270`. Record:
+For each release, pin and record the validated Claude Code version, resolved
+executable path, and model. The spikes reject an unpinned/mismatched executable
+version. For this release the validated version is `2.1.270` with model `opus`.
+Record:
 
 1. exact version and resolved executable path;
 2. license and source revision;

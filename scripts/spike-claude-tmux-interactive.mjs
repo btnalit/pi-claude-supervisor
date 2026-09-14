@@ -9,8 +9,12 @@ if (process.env.PI_CLAUDE_SUPERVISOR_REAL_CLAUDE !== "1") {
   throw new Error("Set PI_CLAUDE_SUPERVISOR_REAL_CLAUDE=1 to run the authenticated Claude tmux interactive spike");
 }
 
-const claude = execFileSync("bash", ["-lc", "command -v claude"], { encoding: "utf8" }).trim();
+const claude = process.env.PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH;
+const expectedVersion = process.env.PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_VERSION ?? "2.1.270 (Claude Code)";
+const model = process.env.PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_MODEL ?? "opus";
+if (!claude) throw new Error("Set PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH to the pinned Claude executable");
 const version = execFileSync(claude, ["--version"], { encoding: "utf8" }).trim();
+assert.equal(version, expectedVersion, `unexpected Claude version: expected ${expectedVersion}, got ${version}`);
 const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-real-tmux-interactive-"));
 const cwd = await mkdtemp(join(root, "untrusted-cwd-"));
 const socket = join(root, "tmux.sock");
@@ -49,7 +53,7 @@ try {
   await writeFile(target, "permission-spike-target\n");
   tmux([
     "-f", "/dev/null", "new-session", "-d", "-s", session, "-x", "180", "-y", "50", "-c", cwd,
-    "--", claude, "--permission-mode", "default", "--tools", "Bash",
+    "--", claude, "--model", model, "--permission-mode", "default", "--tools", "Bash",
   ]);
   sessionStarted = true;
 
@@ -81,6 +85,7 @@ try {
   console.log(JSON.stringify({
     claudeVersion: version,
     claudePath: claude,
+    claudeModel: model,
     trustPrompt: true,
     permissionPrompt: true,
     permissionDecision: "allow-once",
