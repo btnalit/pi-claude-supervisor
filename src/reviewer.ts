@@ -130,7 +130,16 @@ ${boundedJson(input.acceptance)}
 REPOSITORY STATUS:
 ${boundText(redactText(input.evidence.status), 8_000)}
 
-REPOSITORY DIFF (HEAD-RELATIVE, UNTRUSTED):
+REPOSITORY BASE:
+${redactText(input.evidence.baseRef ?? "(unavailable; review current evidence)")}
+
+LOCAL BRANCH:
+${redactText(input.evidence.branch ?? "(detached or unavailable)")}
+
+COMMITS AFTER BASELINE (UNTRUSTED):
+${boundText(redactText(input.evidence.commits ?? "(none)"), 8_000)}
+
+REPOSITORY DIFF (BASELINE-RELATIVE, UNTRUSTED):
 ${boundText(redactText(input.evidence.diff), 16_000)}
 
 UNTRACKED FILE EVIDENCE (UNTRUSTED):

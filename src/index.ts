@@ -11,7 +11,7 @@ import { TmuxWorkerAdapter, attachCommand } from "./worker/tmux-adapter.ts";
 import { Supervisor, type DecisionSessionClosedInfo, type SupervisorProgress } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
-import { loadSupervisorEnvironment } from "./config.ts";
+import { autonomyDefaults, loadSupervisorEnvironment } from "./config.ts";
 import { DecisionSessionStore, type DecisionSessionRecord } from "./decision-session-store.ts";
 import { CwdLeaseStore, type CwdLeaseHandle, pathsOverlap, workerIdentity } from "./cwd-lease.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
@@ -115,7 +115,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   };
   const releaseSettledReservations = async (): Promise<void> => {
     for (const [taskId, session] of sessions) {
-      const terminal = ["completed", "stopped", "failed"].includes(session.state);
+      const terminal = ["completed", "blocked", "stopped", "failed"].includes(session.state);
       const detached = session.released;
       if (!terminal && !detached) continue;
       if (!session.handle) {
@@ -165,7 +165,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
       await session.release(reason);
       return;
     }
-    if (!handle && ["failed", "completed", "stopped"].includes(session.state)) return;
+    if (!handle && ["failed", "completed", "blocked", "stopped"].includes(session.state)) return;
     let lifecycleError: unknown;
     try {
       await session.stop(reason, { preserveDecisionSession });
@@ -228,24 +228,17 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           }
           const tmuxSession = operation === "adopt-tmux" ? rest.shift() : undefined;
           const task = rest.join(" ").trim();
-          const spec = specPath ? await readTaskSpecFile(specPath, ctx.cwd) : undefined;
-          const goal = spec?.goal ?? task;
+          const fileSpec = specPath ? await readTaskSpecFile(specPath, ctx.cwd) : undefined;
+          const spec = fileSpec ?? { autonomy: autonomyDefaults() };
+          const goal = fileSpec?.goal ?? task;
+          const taskAutomation = automation && spec.autonomy.unattended;
           if (!goal) throw new Error(operation === "adopt-tmux" ? "Usage: /supervise adopt-tmux [--spec <file>] <tmux-session> <task>" : "Usage: /supervise start [--spec <file>] <task>");
           if (operation === "adopt-tmux" && adapter.capabilities().transport !== "tmux") throw new Error("/supervise adopt-tmux requires PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux");
           const [command, ...workerArgs] = parseCommand(process.env.PI_CLAUDE_SUPERVISOR_WORKER ?? "claude");
           if (!command) throw new Error("PI_CLAUDE_SUPERVISOR_WORKER must contain an executable");
           const policy = evaluateCommand(command, workerArgs);
-          let approval: { actor: "human"; reason: string } | undefined;
+          const approval: { actor: "human"; reason: string } | undefined = undefined;
           if (policy.decision === "deny") throw new Error(`Worker command denied: ${policy.reason}`);
-          if (policy.decision === "review") {
-            if (!ctx.hasUI) throw new Error(`Worker command requires interactive approval: ${policy.reason}`);
-            const approved = await ctx.ui.confirm(
-              "Approve Claude worker command?",
-              `${redactText([command, ...workerArgs].join(" "))}\n\nReason: ${redactText(policy.reason)}`,
-            );
-            if (!approved) throw new Error("Worker command not approved");
-            approval = { actor: "human", reason: policy.reason };
-          }
           if (shuttingDown) throw new Error("Pi session is shutting down");
           const cwdKey = await canonicalCwd(ctx.cwd);
           await releaseSettledReservations();
@@ -266,16 +259,11 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
             reviewer,
-            onHumanRequired: async (notice) => {
-              if (ctx.hasUI) notify(ctx, `Claude Worker needs human intervention: ${notice.reason}`, "warning");
+            onCandidate: async (notice) => {
+              if (ctx.hasUI) notify(ctx, `Candidate ${notice.status}: ${notice.reason}`, notice.status === "ready" ? "info" : "warning");
               if (humanWebhook.enabled) {
-                try {
-                  await humanWebhook.notify(notice);
-                } catch (error) {
-                  console.error(`pi-claude-supervisor human webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`);
-                }
-              } else {
-                console.error(`pi-claude-supervisor human intervention required: ${redactText(notice.reason)}`);
+                try { await humanWebhook.notifyCandidate(notice); }
+                catch (error) { console.error(`pi-claude-supervisor candidate webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`); }
               }
             },
           });
@@ -293,7 +281,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 args: workerArgs,
                 env: selectedWorkerEnvironment(),
                 approval,
-                automation,
+                automation: taskAutomation,
                 tmuxSession,
                 tmuxSocket: process.env.PI_CLAUDE_SUPERVISOR_TMUX_SOCKET,
                 tmuxExpectedIdentity: tmuxSession && lease.record.worker ? {
@@ -321,6 +309,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                     deadlineMs: info.deadlineMs,
                     noOutputTimeoutMs: info.noOutputTimeoutMs,
                     startedAt: info.startedAt,
+                    ...(info.baseCommit ? { baseCommit: info.baseCommit } : {}),
+                    ...(info.baseBranch ? { baseBranch: info.baseBranch } : {}),
                     turn: info.turn,
                     repairRound: info.repairRound,
                     ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}),
@@ -455,16 +445,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           }
           const policy = evaluateCommand(record.command, record.args);
           if (policy.decision === "deny") throw new Error(`Worker command denied: ${policy.reason}`);
-          let approval = record.approval;
-          if (policy.decision === "review" && !approval) {
-            if (!ctx.hasUI) throw new Error(`Worker command requires interactive approval: ${policy.reason}`);
-            const approved = await ctx.ui.confirm(
-              "Approve recovered Claude worker command?",
-              `${redactText([record.command, ...record.args].join(" "))}\n\nReason: ${redactText(policy.reason)}`,
-            );
-            if (!approved) throw new Error("Worker command not approved");
-            approval = { actor: "human", reason: policy.reason };
-          }
+          const approval = record.approval;
           const lease = await cwdLeaseStore.acquire(cwdKey, record.taskId, adapter.capabilities().transport, takeover
             ? {
               takeover: {
@@ -491,13 +472,11 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
             reviewer,
-            onHumanRequired: async (notice) => {
-              if (ctx.hasUI) notify(ctx, `Claude Worker needs human intervention: ${notice.reason}`, "warning");
+            onCandidate: async (notice) => {
+              if (ctx.hasUI) notify(ctx, `Candidate ${notice.status}: ${notice.reason}`, notice.status === "ready" ? "info" : "warning");
               if (humanWebhook.enabled) {
-                try { await humanWebhook.notify(notice); }
-                catch (error) { console.error(`pi-claude-supervisor human webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`); }
-              } else {
-                console.error(`pi-claude-supervisor human intervention required: ${redactText(notice.reason)}`);
+                try { await humanWebhook.notifyCandidate(notice); }
+                catch (error) { console.error(`pi-claude-supervisor candidate webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`); }
               }
             },
           });
@@ -520,11 +499,13 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 args: record.args,
                 env: selectedWorkerEnvironment(),
                 approval,
-                automation: true,
+                automation: record.spec?.autonomy.unattended !== false,
                 maxTurns: record.maxTurns,
                 deadlineMs: record.deadlineMs,
                 noOutputTimeoutMs: record.noOutputTimeoutMs,
                 startedAt: record.startedAt,
+                baseCommit: record.baseCommit,
+                baseBranch: record.baseBranch,
                 initialTurn: record.turn,
                 initialRepairRound: record.repairRound,
                 initialFindingSignature: record.lastFindingSignature,
@@ -546,6 +527,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                     deadlineMs: info.deadlineMs,
                     noOutputTimeoutMs: info.noOutputTimeoutMs,
                     startedAt: info.startedAt,
+                    ...(info.baseCommit ? { baseCommit: info.baseCommit } : {}),
+                    ...(info.baseBranch ? { baseBranch: info.baseBranch } : {}),
                     turn: info.turn,
                     repairRound: info.repairRound,
                     ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}),

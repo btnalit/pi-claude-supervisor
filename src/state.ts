@@ -2,14 +2,15 @@ import type { SupervisorState } from "./types.ts";
 
 const transitions: Record<SupervisorState, readonly SupervisorState[]> = {
   idle: ["starting"],
-  starting: ["running", "failed", "stopped"],
-  running: ["waiting", "paused", "verifying", "failed", "stopped"],
-  waiting: ["running", "paused", "verifying", "failed", "stopped"],
-  paused: ["running", "stopped", "failed"],
-  verifying: ["completed", "running", "failed", "stopped"],
+  starting: ["running", "blocked", "failed", "stopped"],
+  running: ["waiting", "paused", "verifying", "blocked", "failed", "stopped"],
+  waiting: ["running", "paused", "verifying", "blocked", "failed", "stopped"],
+  paused: ["running", "blocked", "stopped", "failed"],
+  verifying: ["completed", "running", "blocked", "failed", "stopped"],
   completed: ["idle"],
+  blocked: ["idle"],
   failed: ["idle"],
-  stopped: ["idle"],
+  stopped: ["idle", "blocked"],
 };
 
 export class InvalidTransitionError extends Error {

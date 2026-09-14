@@ -27,6 +27,8 @@ export interface DecisionSessionRecord {
   deadlineMs: number;
   noOutputTimeoutMs: number;
   startedAt: string;
+  baseCommit?: string;
+  baseBranch?: string;
   turn: number;
   repairRound?: number;
   lastFindingSignature?: string;

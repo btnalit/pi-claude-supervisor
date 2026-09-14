@@ -1,9 +1,14 @@
 # Releasing
 
+Local automation may develop, test, repair and commit a candidate, but it does not
+push to a remote or merge into `main`. Remote repository entry and main-branch
+integration are independent protected boundaries; this release workflow is the
+publication path after those boundaries pass. See [the confirmed autonomy target](autonomy-target.md).
+
 ## Pull request gate
 
-All changes must enter `main` through a pull request. Use a Conventional Commit
-PR title, for example:
+All changes must enter `main` through a pull request and its independent CI/review
+boundary. Use a Conventional Commit PR title, for example:
 
 ```text
 feat: persist Decision Worker sessions

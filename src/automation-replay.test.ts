@@ -103,7 +103,7 @@ test("automation replay covers permission allow, result, acceptance and independ
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
-    spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
     decisionWorkerFactory: replayDecisionWorkerFactory(),
   });
 
@@ -147,7 +147,7 @@ test("automation replay repairs a required-check failure before reacceptance and
       automation: true,
       deadlineMs: 0,
       noOutputTimeoutMs: 0,
-      spec: { acceptance: [{ id: "repairable", name: "repairable", command: process.execPath, args: ["-e", checkScript], required: true, timeoutMs: 1_000 }] },
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "repairable", name: "repairable", command: process.execPath, args: ["-e", checkScript], required: true, timeoutMs: 1_000 }] },
       decisionWorkerFactory: replayDecisionWorkerFactory(),
     });
 
@@ -182,7 +182,7 @@ test("automation replay denies AskUserQuestion instead of inventing permission",
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
-    spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
     decisionWorkerFactory: replayDecisionWorkerFactory(),
   });
   adapter.emit({ type: "permission_request", request: { requestId: "question-1", toolUseId: "tool-question", toolName: "AskUserQuestion", input: { questions: [] }, raw: {} } });

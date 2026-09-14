@@ -6,6 +6,7 @@ export type SupervisorState =
   | "paused"
   | "verifying"
   | "completed"
+  | "blocked"
   | "failed"
   | "stopped";
 
@@ -166,6 +167,15 @@ export interface AcceptanceCheckResult {
   finishedAt: string;
 }
 
+export interface TaskAutonomy {
+  /** Local development continues without synchronous human approval. */
+  unattended: boolean;
+  /** The Worker should commit the candidate on its local branch before completion. */
+  requireLocalCommit: boolean;
+  /** Number of autonomous Decision Worker retries before parking a candidate. */
+  maxDecisionRetries: number;
+}
+
 export interface TaskSpec {
   goal: string;
   scope: string[];
@@ -173,7 +183,11 @@ export interface TaskSpec {
   forbidden: string[];
   acceptance: AcceptanceCheck[];
   maxRepairRounds: number;
+  autonomy: TaskAutonomy;
 }
+
+/** Public input shape; nested autonomy fields may be omitted and are defaulted. */
+export type TaskSpecInput = Partial<Omit<TaskSpec, "autonomy">> & { autonomy?: Partial<TaskAutonomy> };
 
 export type ReviewVerdict = "pass" | "revise" | "human";
 export type ReviewSeverity = "P0" | "P1" | "P2" | "P3";
@@ -203,6 +217,10 @@ export interface TaskContext {
   cwd: string;
   maxTurns: number;
   startedAt: string;
+  /** Repository HEAD before this task; used to review local commits as well as worktree changes. */
+  baseCommit?: string;
+  /** Non-protected local branch recorded before automatic work begins. */
+  baseBranch?: string;
   spec: TaskSpec;
   repairRound: number;
   lastFindingSignature?: string;

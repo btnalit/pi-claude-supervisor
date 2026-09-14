@@ -10,26 +10,32 @@ A policy-gated [Pi](https://pi.dev) extension for supervising a Claude Code work
 The MVP keeps Pi in control of lifecycle, state, policy and verification while the
 worker remains an explicitly started child process.
 
-> **Release status:** `v0.5.1` is the released single-Worker recovery baseline. The
+> **Release status:** `v0.5.2` is the released single-Worker recovery baseline. The
 > default manual transport is dependency-free process pipes, not PTY. Automatic
-> supervision uses Claude JSONL or tmux, and the current working-tree hardening
-> adds repairable-vs-persistent capabilities, cancellable verification, evidence
-> completeness gates, startup preflight and phase progress reporting. A real
-> edit-capable Claude Code `2.1.270` repair/reacceptance drill has passed in an
-> isolated temporary worktree; the exact-head independent review is the remaining
-> release gate. OS sandbox, low-privilege execution and network isolation remain
-> deferred.
+> supervision uses Claude JSONL or tmux, with repairable-vs-persistent capabilities,
+> cancellable verification, evidence completeness gates, startup preflight and phase
+> progress reporting. A real edit-capable Claude Code `2.1.270` repair/reacceptance
+> drill passed in an isolated temporary worktree. The confirmed product target is
+> unattended local development; see [the autonomy target](docs/autonomy-target.md).
+> Remote push and merge into the main/integration branch remain outside Worker authority
+> and must cross an independent boundary.
+>
+> **Autonomy status:** automatic mode continues local editing, testing, bounded repair,
+> acceptance, independent Review and local-commit enforcement without a synchronous human
+> callback. Unresolvable work is parked as a non-publishable candidate; optional outbound
+> notifications do not approve actions.
 
 ## Safety boundary
 
 - The extension never starts a worker automatically.
 - Worker commands are launched without a shell.
 - Workers receive a minimal environment; credentials must be explicitly supplied by the caller.
-- Destructive command patterns and permission-bypass worker flags are denied; review-level patterns request explicit user approval instead of being blanket-denied.
-- Ordinary network use is not denied merely because it is network use; download-to-shell patterns still require review.
+- Local command and permission behavior follows the configured task/runtime policy; actions outside that authority are rejected or parked without requiring a synchronous human response.
+- Ordinary network use is not denied merely because it is network use; download-to-shell patterns follow the configured policy or produce a parked candidate.
 - A worker completion is only a transition to `verifying`; it is not evidence of success.
 - Verification is an independent host command (default: `git diff --check`).
-- The extension never performs merge, deploy, release, or publish at runtime. Repository releases are automated only after a maintainer merges a Release Please PR and the full CI gate passes.
+- Target local development runs unattended after a task starts: the Worker may edit, test, repair and commit locally. The Worker must have no authority or credentials to push remotely or merge into `main`/an integration branch.
+- The extension never performs merge, deploy, release, or publish at runtime. Remote/main integration and repository releases cross independent protected boundaries.
 - A 4-hour wall-clock and 20-minute no-output watchdog stop a worker by default for long development tasks; embedding callers can set either to `0` to disable.
 - On Linux, the adapter automatically uses a writable cgroup v2 for descendant cleanup, including `setsid()` descendants; it falls back to process-group cleanup when unavailable. Use `cgroupMode: "required"` for a fail-closed integration; required mode is preflighted before Claude starts.
 - Acceptance commands, repository evidence collection and independent Review share an abort signal, so operator stop/shutdown does not wait for a full command or model timeout.
@@ -86,7 +92,12 @@ a shell), for example:
   "acceptance": [
     { "id": "tests", "name": "tests", "command": "npm", "args": ["test"], "required": true }
   ],
-  "maxRepairRounds": 3
+  "maxRepairRounds": 3,
+  "autonomy": {
+    "unattended": true,
+    "requireLocalCommit": true,
+    "maxDecisionRetries": 2
+  }
 }
 ```
 
@@ -109,21 +120,27 @@ worktrees; same-directory starts are rejected even when concurrent, and
 parallelism, not coordinated multi-worker collaboration. A future multi-worker
 milestone will add explicit parent/child task graphs, dependencies, bounded
 scheduling, structured handoffs, aggregate acceptance and graph-aware recovery;
-it will not relax the one-writer-per-worktree rule or enable automatic
-merge/publish. Unattended use still requires the remaining lifecycle, signal and
-recovery checks. Host permissions and network access follow explicit caller
-authorization and host policy; there is no automatic merge, deploy, release or
-publish.
+it will not grant any Worker remote push or main/integration merge authority.
+Unattended local development is the target operating mode; a blocked or failed
+candidate is parked with its evidence rather than made dependent on a human being
+online. Host permissions and network access follow the configured task/runtime policy.
+Set `PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=0` only for a task that intentionally
+produces no git candidate, or set `autonomy.requireLocalCommit` in its spec.
+`PI_CLAUDE_SUPERVISOR_UNATTENDED=0` opts a task out of automatic Decision Worker control;
+a required local commit is checked on a non-protected task branch;
+`PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES` bounds transient Decision Worker retries.
 
 The `v0.5.0` automation milestone adds a structured acceptance pipeline:
 multiple argv-based checks, an independent read-only Reviewer, bounded structured
 findings and repair rounds. Legacy text tasks keep the default `git diff --check`.
 The Reviewer only has `read`, `grep`, `find` and `ls`; it cannot edit files or grant
-permissions. The current hardening also requires complete HEAD-relative tracked and
-bounded untracked evidence, rejects P0/P1 or repeated findings, and only repairs a
-live `repairableSession` Worker. Automatic mode rejects explicit `process-pipe` and
-preflights runtime prerequisites. The real pinned Claude Code `2.1.270` disposable repair/reacceptance run has passed;
-the remaining gate is the exact-head independent review.
+permissions. Automatic mode requires complete baseline-relative tracked, commit and
+bounded untracked evidence, repairs a live `repairableSession` Worker within a
+bounded budget, enforces a local commit when enabled, and prevents a non-publishable
+candidate from crossing the remote/main boundary. Automatic mode rejects explicit
+`process-pipe` and preflights runtime prerequisites. Invalid output, unavailable
+evidence, duplicate findings, P0/P1 findings and exhausted repair budgets park the
+candidate without waiting for a human; see [the autonomy target](docs/autonomy-target.md).
 Coordinated multi-worker scheduling is a later milestone; CI uses deterministic fake
 Workers/replay fixtures, and real multi-worker Claude tests remain authenticated
 manual Spikes. CLI multi-version compatibility, sandboxing, low-privilege execution
@@ -158,7 +175,8 @@ export PI_CLAUDE_SUPERVISOR_WORKER='claude --permission-mode plan'
 
 `/supervise start <task>` starts Claude in a private tmux server and reports a
 literal attach command. Use that command in another terminal to watch or
-manually interact with the same PTY. The adapter sends multi-line input through
+manually interact with the same PTY; attaching is optional for unattended local
+development. The adapter sends multi-line input through
 tmux buffers and Enter, never by interpolating the message into a shell command.
 It records the PTY stream with `pipe-pane`, uses `capture-pane` to detect a
 stable Claude input prompt, and feeds turn-completion events into the same
@@ -183,12 +201,13 @@ kill-session` yourself when the adopted window should be closed.
 `/supervise takeover <task-id>` disables automatic Decision Worker messages;
 resume them only with `/supervise resume-auto <task-id>`.
 
-PTY screen text is not Claude JSONL. Permission dialogs, trust prompts and
-ambiguous TUI states are escalated to a human; tmux mode must not be treated as
-structured permission evidence. A normal terminal Claude process cannot be
-migrated into tmux, and `--resume` is historical recovery rather than live PTY
-attach. Owned tmux sessions survive a Pi disconnect and require an explicit
-`adopt-tmux` after restart. Use plan/read-only flags for live testing.
+PTY screen text is not Claude JSONL and must not be treated as structured
+permission evidence. TUI decisions follow the configured autonomy policy and are
+recorded; an unresolved task may be parked without requiring a human to remain
+online. A normal terminal Claude process cannot be migrated into tmux, and
+`--resume` is historical recovery rather than live PTY attach. Owned tmux sessions
+survive a Pi disconnect and require an explicit `adopt-tmux` after restart. Use
+plan/read-only flags for live testing.
 
 ## Development
 
@@ -202,7 +221,7 @@ npm run check:workflows
 npm run build
 ```
 
-See [the engineering plan](docs/engineering-plan.md), [the independent review](docs/independent-review.md),
+See [the engineering plan](docs/engineering-plan.md), [the confirmed autonomy target](docs/autonomy-target.md), [the independent review](docs/independent-review.md),
 [architecture](docs/architecture.md), [testing](docs/testing.md), and [releasing](docs/releasing.md).
 
 Pull requests are gated by the aggregated `CI / Quality gate`. Release Please

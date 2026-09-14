@@ -22,7 +22,7 @@ const task = question
 
 await supervisor.start({
   task,
-  spec: { goal: task, constraints: ["Do not modify repository files; pre-existing worktree changes are outside this integration test."], maxRepairRounds: 0 },
+  spec: { goal: task, constraints: ["Do not modify repository files; pre-existing worktree changes are outside this integration test."], maxRepairRounds: 0, autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 } },
   cwd,
   command: process.env.PI_CLAUDE_SUPERVISOR_WORKER_COMMAND ?? "claude",
   args: ["--safe-mode", "--no-session-persistence", "--tools", question ? "AskUserQuestion" : "Bash"],

@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import type { HumanInterventionNotice } from "./supervisor.ts";
+import type { CandidateNotice, HumanInterventionNotice } from "./supervisor.ts";
 import { redactSensitive } from "./redaction.ts";
 
 export interface HumanWebhookOptions {
@@ -9,7 +9,7 @@ export interface HumanWebhookOptions {
   timeoutMs?: number;
 }
 
-/** Outbound-only human escalation. Approval still happens through Pi/manual control. */
+/** Optional outbound candidate delivery. It never grants permission or controls the Worker. */
 export class HumanWebhookNotifier {
   readonly #url?: string;
   readonly #format: "generic" | "wecom";
@@ -28,42 +28,60 @@ export class HumanWebhookNotifier {
   async notify(notice: HumanInterventionNotice): Promise<void> {
     if (!this.#url) return;
     const body = this.#format === "wecom" ? JSON.stringify(toWeCom(notice)) : JSON.stringify(toGeneric(notice));
+    await this.#send(body);
+  }
+
+  async notifyCandidate(notice: CandidateNotice): Promise<void> {
+    if (!this.#url) return;
+    const body = this.#format === "wecom" ? JSON.stringify(toWeCom(notice)) : JSON.stringify(toGeneric(notice));
+    await this.#send(body);
+  }
+
+  async #send(body: string): Promise<void> {
     const headers: Record<string, string> = { "content-type": "application/json", "user-agent": "pi-claude-supervisor/0.1" };
     if (this.#secret) headers["x-pi-supervisor-signature"] = `sha256=${createHmac("sha256", this.#secret).update(body).digest("hex")}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
     try {
-      const response = await fetch(this.#url, { method: "POST", headers, body, signal: controller.signal });
-      if (!response.ok) throw new Error(`human webhook returned HTTP ${response.status}`);
+      const response = await fetch(this.#url!, { method: "POST", headers, body, signal: controller.signal });
+      if (!response.ok) throw new Error(`candidate webhook returned HTTP ${response.status}`);
     } finally {
       clearTimeout(timer);
     }
   }
 }
 
-function toGeneric(notice: HumanInterventionNotice): Record<string, unknown> {
+function toGeneric(notice: HumanInterventionNotice | CandidateNotice): Record<string, unknown> {
+  const candidate = "status" in notice;
   return {
-    schema: "pi-claude-supervisor/human-intervention/v1",
+    schema: candidate ? "pi-claude-supervisor/candidate/v1" : "pi-claude-supervisor/human-intervention/v1",
     eventId: randomUUID(),
-    event: "human_intervention_required",
+    event: candidate ? "candidate_status" : "human_intervention_required",
     occurredAt: new Date().toISOString(),
     task: { id: sanitize(notice.taskId), goal: sanitize(notice.task), cwd: sanitize(notice.cwd) },
     worker: { id: sanitize(notice.workerId) },
     reason: sanitize(notice.reason),
     question: sanitize(notice.question),
     permission: notice.permission ? sanitize(notice.permission) : undefined,
-    actions: ["approve_or_deny_permission", "send_instruction", "stop_worker", "takeover"],
-    note: "This is an outbound notification. Use the Pi session or a separately authenticated callback service to approve actions.",
+    ...(candidate ? { status: notice.status, deliverable: notice.deliverable } : { actions: ["approve_or_deny_permission", "send_instruction", "stop_worker", "takeover"] }),
+    note: candidate
+      ? "This is an optional candidate notification. It does not grant remote push or main/integration merge permission."
+      : "This is an outbound notification. Use the Pi session or a separately authenticated callback service to approve actions.",
   };
 }
 
-function toWeCom(notice: HumanInterventionNotice): Record<string, unknown> {
+function toWeCom(notice: HumanInterventionNotice | CandidateNotice): Record<string, unknown> {
+  const candidate = "status" in notice;
   const permission = notice.permission ? `\n工具: ${safeText(notice.permission.toolName)}\n请求 ID: ${safeText(notice.permission.requestId)}` : "";
   const question = notice.question ? `\n问题: ${safeText(notice.question)}` : "";
+  const title = candidate ? "Claude Supervisor 候选状态" : "Claude Supervisor 需要人工介入";
+  const suffix = candidate
+    ? `\n> 状态: ${safeText(notice.status)}\n> 可交付: ${notice.deliverable ? "yes" : "no"}\n\n该通知不授予远程 push 或 main/integration merge 权限。`
+    : "\n\n请在 Pi 中执行对应的 approve/deny、send、stop 或 takeover 操作。";
   return {
     msgtype: "markdown",
     markdown: {
-      content: `### Claude Supervisor 需要人工介入\n> 任务: ${safeText(notice.task)}\n> Task ID: ${safeText(notice.taskId)}\n> 原因: ${safeText(notice.reason)}${escapeMarkdown(question)}${escapeMarkdown(permission)}\n\n请在 Pi 中执行对应的 approve/deny、send、stop 或 takeover 操作。`,
+      content: `### ${title}\n> 任务: ${safeText(notice.task)}\n> Task ID: ${safeText(notice.taskId)}\n> 原因: ${safeText(notice.reason)}${escapeMarkdown(question)}${escapeMarkdown(permission)}${suffix}`,
     },
   };
 }

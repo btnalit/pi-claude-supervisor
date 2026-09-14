@@ -55,6 +55,7 @@ try {
   firstSupervisor = new Supervisor(firstAdapter, new EventLog(join(stateDir, "events.jsonl")));
   owned = await firstSupervisor.start({
     task: "interactive tmux validation",
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 } },
     initialInput: "",
     sendInitialInput: false,
     cwd,

@@ -12,7 +12,8 @@ const MAX_DECISION_FIELD_BYTES = 8 * 1024;
 export type DecisionAction =
   | { action: "continue" | "redirect" | "answer"; message: string; reason: string; confidence?: number }
   | { action: "allow_permission" | "deny_permission"; requestId: string; toolUseId: string; reason: string; confidence?: number }
-  | { action: "verify" | "retry" | "stop" | "ask_human" | "noop"; reason: string; question?: string; confidence?: number };
+  | { action: "verify" | "stop" | "park" | "ask_human" | "noop"; reason: string; question?: string; confidence?: number }
+  | { action: "retry"; reason: string; message?: string; confidence?: number };
 
 export interface DecisionContext {
   taskId: string;
@@ -130,18 +131,36 @@ export class PiDecisionWorker implements DecisionWorkerLike {
       const first = this.#seenEvents.values().next().value;
       if (first) this.#seenEvents.delete(first);
     }
-    this.#tail = this.#tail.then(async () => {
-      if (!this.#session || this.#closed) return;
-      const text = await askDecision(this.#session, event, this.#context, this.#timeoutMs);
-      const action = parseDecision(text, event);
-      await this.#options.onAction(action, event);
-    }).catch(async (error) => {
+    this.#tail = this.#tail.then(() => this.#processEvent(event)).catch(async (error) => {
       try {
         if (this.#options.onFailure) await this.#options.onFailure(event, error);
       } catch {
         // Alert failures must not create an unhandled rejection in the worker.
       }
     });
+  }
+
+  async #processEvent(event: WorkerEvent): Promise<void> {
+    if (!this.#session || this.#closed) return;
+    const maxRetries = this.#context.spec?.autonomy.maxDecisionRetries ?? 2;
+    let attempt = 0;
+    while (true) {
+      let text: string;
+      try {
+        text = await askDecision(this.#session, event, this.#context, this.#timeoutMs);
+      } catch (error) {
+        if (attempt >= maxRetries || this.#closed) throw error;
+        attempt += 1;
+        await new Promise<void>((resolve) => setTimeout(resolve, Math.min(1_000, 100 * attempt)));
+        if (!this.#session || this.#closed) return;
+        continue;
+      }
+      const action = parseDecision(text, event);
+      // An action handler may stop or close the session. Do not replay an
+      // already-decoded action if the handler itself fails.
+      await this.#options.onAction(action, event);
+      return;
+    }
   }
 
   get sessionFile(): string | undefined {
@@ -181,14 +200,20 @@ Current repair round: ${context.repairRound ?? 0}
 Task specification: ${boundedJson(context.spec ?? { goal: context.task })}
 
 Return exactly one JSON object and no markdown:
-{"action":"continue|redirect|answer|allow_permission|deny_permission|verify|retry|stop|ask_human|noop",...}
+{"action":"continue|redirect|answer|allow_permission|deny_permission|verify|retry|stop|park|noop",...}
 For continue/redirect/answer include message and reason. For permission actions include
-requestId and toolUseId. For ask_human optionally include question. Never choose allow_permission unless the request is low-risk, directly required by the task, and the policy evidence supports it.
-For AskUserQuestion, prefer deny_permission when the question can be converted into ordinary Claude text;
-then use answer on the resulting turn only when the task and repository make the answer unambiguous.
-Use verify when a turn result indicates the task is complete, even if Claude says it will stop; choose stop only for an explicit human stop, unrecoverable failure, or a safety reason.
-Use ask_human for product ambiguity, architecture tradeoffs with material risk, unknown tools,
-secrets, deployment, or any uncertainty. Never invent missing information.`;
+requestId and toolUseId. Retry may include a corrective message. Never choose allow_permission
+for a command that crosses the remote push or main/integration merge boundary; the deterministic
+policy will deny it.
+For AskUserQuestion, choose deny_permission when the question can be converted into ordinary
+Claude text, then use answer on the resulting turn. For product ambiguity or an architecture
+choice, inspect the repository and task evidence, select the best task-compatible option, state
+the assumption in reason, and instruct Claude Code with answer or redirect. Do not ask a human
+for ordinary uncertainty. Use verify when a turn result indicates the task is complete, even if
+Claude says it will stop; choose stop only for an explicit stop or technical containment reason.
+Use park only when the task cannot safely produce a candidate because required evidence,
+authority, or runtime capability is unavailable. A parked candidate is asynchronous and must not
+wait for a human to be online.`;
 }
 
 async function askDecision(session: AgentSession, event: WorkerEvent, context: DecisionContext, timeoutMs: number): Promise<string> {
@@ -249,12 +274,12 @@ function textFromMessage(content: unknown): string {
 
 function parseDecision(text: string, event: WorkerEvent): DecisionAction {
   const candidate = text.trim();
-  if (!candidate) return { action: "ask_human", reason: "Decision Worker returned no JSON action" };
+  if (!candidate) return { action: "park", reason: "Decision Worker returned no JSON action" };
   try {
     const value = JSON.parse(candidate) as Record<string, unknown>;
     const action = value.action;
     if (typeof action !== "string") throw new Error("missing action");
-    const allowed = new Set(["continue", "redirect", "answer", "allow_permission", "deny_permission", "verify", "retry", "stop", "ask_human", "noop"]);
+    const allowed = new Set(["continue", "redirect", "answer", "allow_permission", "deny_permission", "verify", "retry", "stop", "park", "ask_human", "noop"]);
     if (!allowed.has(action)) throw new Error(`unsupported action: ${action}`);
     const reason = typeof value.reason === "string" && value.reason.trim() ? boundedDecisionText(value.reason, "reason") : "no reason provided";
     const confidence = value.confidence === undefined ? undefined : typeof value.confidence === "number" && Number.isFinite(value.confidence) && value.confidence >= 0 && value.confidence <= 1
@@ -271,9 +296,12 @@ function parseDecision(text: string, event: WorkerEvent): DecisionAction {
       if (!requestId || !toolUseId) throw new Error("permission requestId/toolUseId required");
       return { action: action as "allow_permission" | "deny_permission", requestId, toolUseId, reason, confidence };
     }
-    return { action: action as "verify" | "retry" | "stop" | "ask_human" | "noop", reason, question: typeof value.question === "string" ? boundedDecisionText(value.question, "question") : undefined, confidence };
+    if (action === "retry") {
+      return { action, reason, message: typeof value.message === "string" ? boundedDecisionText(value.message, "message") : undefined, confidence };
+    }
+    return { action: action as "verify" | "stop" | "park" | "ask_human" | "noop", reason, question: typeof value.question === "string" ? boundedDecisionText(value.question, "question") : undefined, confidence };
   } catch (error) {
-    return { action: "ask_human", reason: `invalid Decision Worker action: ${error instanceof Error ? error.message : String(error)}` };
+    return { action: "park", reason: `invalid Decision Worker action: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 

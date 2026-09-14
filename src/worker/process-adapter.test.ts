@@ -55,17 +55,15 @@ test("startup cancellation only aborts the targeted concurrent start", async () 
   await adapter.stop(secondHandle, "cleanup second start");
 });
 
-test("approved review-level worker command passes the adapter gate", async () => {
+test("remote push is denied at the adapter gate even with legacy approval", async () => {
   const adapter = new ProcessWorkerAdapter();
-  const handle = await adapter.start({
-    task: "approved review command",
+  await assert.rejects(() => adapter.start({
+    task: "denied remote command",
     cwd: process.cwd(),
-    command: process.execPath,
-    args: ["-e", "setTimeout(() => {}, 100)", "git", "push"],
+    command: "git",
+    args: ["push"],
     approval: { actor: "human", reason: "explicit test approval" },
-  });
-  assert.equal((await adapter.getStatus(handle)).running, true);
-  await adapter.stop(handle, "test complete");
+  }), /blocked by policy \(deny\)/u);
 });
 
 test("external SIGINT and SIGKILL are reported as crashed worker exits", async () => {

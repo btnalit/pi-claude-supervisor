@@ -18,6 +18,7 @@ export function normalizeTaskSpec(value: unknown, fallbackGoal: string): TaskSpe
     forbidden: stringList(source.forbidden, "forbidden"),
     acceptance: normalizeChecks(source.acceptance),
     maxRepairRounds: normalizeRepairRounds(source.maxRepairRounds),
+    autonomy: normalizeAutonomy(source.autonomy),
   };
 }
 
@@ -81,4 +82,19 @@ function normalizeRepairRounds(value: unknown): number {
   if (value === undefined) return DEFAULT_MAX_REPAIR_ROUNDS;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > 10) throw new Error("maxRepairRounds must be between 0 and 10");
   return value;
+}
+
+function normalizeAutonomy(value: unknown): TaskSpec["autonomy"] {
+  if (value === undefined) return { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2 };
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("task spec autonomy must be an object");
+  const source = value as Record<string, unknown>;
+  if (source.unattended !== undefined && typeof source.unattended !== "boolean") throw new Error("task spec autonomy.unattended must be boolean");
+  if (source.requireLocalCommit !== undefined && typeof source.requireLocalCommit !== "boolean") throw new Error("task spec autonomy.requireLocalCommit must be boolean");
+  const retries = source.maxDecisionRetries ?? 2;
+  if (typeof retries !== "number" || !Number.isSafeInteger(retries) || retries < 0 || retries > 10) throw new Error("task spec autonomy.maxDecisionRetries must be between 0 and 10");
+  return {
+    unattended: source.unattended !== false,
+    requireLocalCommit: source.requireLocalCommit !== false,
+    maxDecisionRetries: retries,
+  };
 }

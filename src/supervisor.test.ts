@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import type { SupervisorEvent } from "./events.ts";
 import type { WorkerAdapter, WorkerHandle, WorkerOutputChunk, WorkerStatus } from "./types.ts";
 import { Supervisor } from "./supervisor.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
+
+const execFileAsync = promisify(execFile);
 
 class FlakyEventLog {
   readonly events: Array<Omit<SupervisorEvent, "seq" | "at">> = [];
@@ -568,7 +572,7 @@ test("non-persistent verification failure finalizes once and closes the decision
     cwd: "/tmp",
     command: "fixture",
     automation: true,
-    spec: { acceptance: [{ id: "fail", name: "fail", command: process.execPath, args: ["-e", "process.exit(7)"], required: true, timeoutMs: 1_000 }] },
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "fail", name: "fail", command: process.execPath, args: ["-e", "process.exit(7)"], required: true, timeoutMs: 1_000 }] },
     decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => { decisionClosed += 1; } }),
   });
   running = false;
@@ -576,9 +580,10 @@ test("non-persistent verification failure finalizes once and closes the decision
   assert.equal(supervisor.state, "verifying");
   const result = await supervisor.verify();
   assert.equal(result.ok, false);
-  assert.equal(supervisor.state, "failed");
+  assert.equal(supervisor.state, "blocked");
+  assert.equal(supervisor.candidateParked, true);
   assert.equal(decisionClosed, 1);
-  assert.ok(events.events.some((event) => event.type === "verification_failed"));
+  assert.ok(events.events.some((event) => event.type === "candidate_parked"));
 });
 
 test("stop from verifying performs cleanup and reaches stopped", async () => {
@@ -699,7 +704,7 @@ test("automatic acceptance review requests a bounded repair before completing", 
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
-    spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
     decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
   });
   await supervisor.poll();
@@ -715,6 +720,67 @@ test("automatic acceptance review requests a bounded repair before completing", 
   assert.equal(second.review?.verdict, "pass");
   assert.equal(reviews, 2);
   assert.equal(supervisor.state, "completed");
+});
+
+test("automatic candidates require and review a local commit", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-local-commit-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd });
+    await execFileAsync("git", ["config", "user.email", "test@example.invalid"], { cwd });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd });
+    await writeFile(join(cwd, "base.txt"), "base\\n");
+    await execFileAsync("git", ["add", "base.txt"], { cwd });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd });
+    await execFileAsync("git", ["switch", "-c", "worker/candidate"], { cwd });
+
+    const handle: WorkerHandle = { id: "local-commit-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    let sends = 0;
+    let reviewedCommits = "";
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async () => handle,
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+      readOutput: async () => [],
+      send: async () => {
+        sends += 1;
+        await execFileAsync("git", ["add", "candidate.txt"], { cwd });
+        await execFileAsync("git", ["commit", "-qm", "automatic local candidate"], { cwd });
+      },
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const supervisor = new Supervisor(adapter, undefined, {
+      reviewer: { review: async (input) => { reviewedCommits = input.evidence.commits ?? ""; return { verdict: "pass", summary: "verified", findings: [], round: input.round, checkedAt: new Date().toISOString() }; } },
+    });
+    await supervisor.start({
+      task: "commit the candidate locally",
+      cwd,
+      command: "fixture",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    });
+    await writeFile(join(cwd, "candidate.txt"), "candidate\\n");
+    await supervisor.poll();
+    const first = await supervisor.verify();
+    assert.equal(first.ok, true);
+    assert.equal(supervisor.state, "running");
+    assert.equal(sends, 1);
+
+    await supervisor.poll();
+    const second = await supervisor.verify();
+    assert.equal(second.ok, true);
+    assert.equal(supervisor.state, "completed");
+    assert.match(reviewedCommits, /automatic local candidate/u);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
 
 test("repeated Reviewer findings escalate instead of looping forever", async () => {
@@ -744,7 +810,7 @@ test("repeated Reviewer findings escalate instead of looping forever", async () 
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
-    spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
     decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
   });
   await supervisor.poll();
@@ -755,11 +821,13 @@ test("repeated Reviewer findings escalate instead of looping forever", async () 
   await supervisor.poll();
   const second = await supervisor.verify();
   assert.equal(second.review?.verdict, "human");
-  assert.equal(supervisor.humanRequired, true);
+  assert.equal(supervisor.humanRequired, false);
+  assert.equal(supervisor.candidateParked, true);
+  assert.equal(supervisor.state, "blocked");
   assert.equal(sends, 1);
 });
 
-test("repair-round exhaustion fails closed after the final automatic repair", async () => {
+test("repair-round exhaustion parks the candidate after the final automatic repair", async () => {
   const handle: WorkerHandle = { id: "exhausted-repair-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
   let running = true;
   let sends = 0;
@@ -798,7 +866,7 @@ test("repair-round exhaustion fails closed after the final automatic repair", as
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
-    spec: { maxRepairRounds: 1, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    spec: { maxRepairRounds: 1, autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
     decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
   });
   await supervisor.poll();
@@ -811,10 +879,11 @@ test("repair-round exhaustion fails closed after the final automatic repair", as
   const second = await supervisor.verify();
   assert.equal(second.ok, false);
   assert.equal(second.review?.verdict, "revise");
-  assert.equal(supervisor.state, "failed");
+  assert.equal(supervisor.state, "blocked");
+  assert.equal(supervisor.candidateParked, true);
   assert.equal(sends, 1);
   assert.ok(events.events.some((event) => event.type === "repair_round_exhausted"));
-  assert.ok(events.events.some((event) => event.type === "verification_failed"));
+  assert.ok(events.events.some((event) => event.type === "candidate_parked"));
 });
 
 test("P0 and P1 Reviewer findings never enter automatic repair", async () => {
@@ -843,17 +912,19 @@ test("P0 and P1 Reviewer findings never enter automatic repair", async () => {
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
-    spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
     decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
   });
   await supervisor.poll();
   const result = await supervisor.verify();
   assert.equal(result.review?.verdict, "human");
-  assert.equal(supervisor.humanRequired, true);
+  assert.equal(supervisor.humanRequired, false);
+  assert.equal(supervisor.candidateParked, true);
+  assert.equal(supervisor.state, "blocked");
   assert.equal(sends, 0);
 });
 
-test("Reviewer API failure is fail-closed and recorded as human review", async () => {
+test("Reviewer API failure parks a candidate without human review", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-reviewer-error-"));
   const supervisor = new Supervisor(new ProcessWorkerAdapter({ cgroupMode: "off" }), undefined, {
     onHumanRequired: () => {},
@@ -867,8 +938,9 @@ test("Reviewer API failure is fail-closed and recorded as human review", async (
   }
   const result = await supervisor.verify({ command: process.execPath, args: ["-e", "process.exit(0)"] });
   assert.equal(result.review?.verdict, "human");
-  assert.equal(supervisor.humanRequired, true);
-  assert.equal(supervisor.state, "failed");
+  assert.equal(supervisor.humanRequired, false);
+  assert.equal(supervisor.candidateParked, true);
+  assert.equal(supervisor.state, "blocked");
 });
 
 test("supervisor requires independent verification after worker exit", async () => {

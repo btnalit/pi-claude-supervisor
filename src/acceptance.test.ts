@@ -15,6 +15,7 @@ test("legacy tasks receive a default acceptance check", () => {
   assert.equal(spec.goal, "inspect the repository");
   assert.deepEqual(spec.acceptance.map((check) => check.id), ["diff-check"]);
   assert.equal(spec.maxRepairRounds, 3);
+  assert.deepEqual(spec.autonomy, { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2 });
 });
 
 test("task specs validate checks and reject duplicate ids", () => {
@@ -86,9 +87,34 @@ test("repository evidence includes staged and untracked changes", async () => {
 
     const evidence = await collectRepositoryEvidence(cwd);
     assert.equal(evidence.complete, true);
+    assert.ok(evidence.branch);
     assert.match(evidence.diff, /staged change/u);
     assert.match(evidence.untracked ?? "", /new\.txt/u);
     assert.match(evidence.untracked ?? "", /new file content/u);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("repository evidence includes commits after an explicit task baseline", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-evidence-commits-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd });
+    await execFileAsync("git", ["config", "user.email", "test@example.invalid"], { cwd });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd });
+    await writeFile(join(cwd, "tracked.txt"), "base\\n");
+    await execFileAsync("git", ["add", "tracked.txt"], { cwd });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd });
+    const base = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim();
+    await writeFile(join(cwd, "tracked.txt"), "candidate\\n");
+    await execFileAsync("git", ["add", "tracked.txt"], { cwd });
+    await execFileAsync("git", ["commit", "-qm", "candidate"], { cwd });
+
+    const evidence = await collectRepositoryEvidence(cwd, { baseRef: base });
+    assert.equal(evidence.complete, true);
+    assert.equal(evidence.baseRef, base);
+    assert.match(evidence.commits ?? "", /candidate/u);
+    assert.match(evidence.diff, /candidate/u);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

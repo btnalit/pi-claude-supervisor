@@ -1,6 +1,6 @@
 # Pi Claude Supervisor 完整方案
 
-> 文档状态：`v0.5.1` 已发布；Phase A–D 加固和真实 repair/reacceptance 已在当前工作树实现；待 exact-head 独立只读 Review 门禁
+> 文档状态：`v0.5.2` 已发布；Phase A–D 加固、真实 repair/reacceptance、exact-head 独立只读 Review 和受保护发布已完成。当前确认的产品目标是本地开发完全无人值守；代码进入远程仓库或 main/integration 分支必须经过独立边界。详见 [autonomy-target.md](autonomy-target.md)。
 > 目标项目目录：`pi-claude-supervisor`  
 > 适用对象：W、项目负责人、实现人员、评审人员
 
@@ -23,9 +23,9 @@ Claude Code Worker
 
 核心角色定义：
 
-- **Pi Supervisor**：负责任务约束、生命周期控制、停顿判断、人工升级、证据收集和最终验收。
-- **Claude Code Worker**：负责根据任务执行代码修改、运行测试和汇报当前状态。
-- **Human**：处理产品决策、架构分歧、危险操作和 Supervisor 无法可靠判断的问题。
+- **Pi Supervisor**：负责任务约束、生命周期控制、自动决策、证据收集和最终验收。
+- **Claude Code Worker**：负责根据任务执行代码修改、运行测试、修复问题和本地提交。
+- **Human / independent boundary**：不作为本地开发循环的同步依赖；负责或授权远程 push、main/integration merge，以及事后审查、关闭或拒绝候选。
 - **Independent Verifier**：在 Worker 声称完成后，以只读方式重新检查代码和验证结果。
 
 最终目标是让 Claude Code 能够在较长任务中持续工作，同时避免以下问题：
@@ -36,7 +36,7 @@ Claude Code Worker
 4. Supervisor 因误判导致无限循环、危险操作或不可审计的修改。
 5. 人工无法随时接管或恢复任务。
 
-**当前状态：`v0.5.1` 已正式发布，已完成固定 Claude Code `2.1.270` 稳定性统计、单 Worker recovery、真实只读 Review drill 和隔离临时 worktree 的允许编辑 repair/reacceptance drill。当前工作树已落实 repairable/persistent 能力拆分、verifying stop、paused watchdog、完整 repository evidence、可取消验收/Reviewer、启动 preflight、权限门禁修复和阶段进度通知；下一项也是发布前最后硬门禁的是当前 exact head 的独立只读 Review。协同多 Worker 仍延期；低权限用户、OS sandbox 与网络隔离仍是后续安全加固。**
+**当前状态：`v0.5.2` 已正式发布，已完成固定 Claude Code `2.1.270` 稳定性验证、单 Worker recovery、真实只读 Review drill、隔离临时 worktree 的允许编辑 repair/reacceptance drill、exact-head 独立 Review 和受保护发布。当前工作树已落实 repairable/persistent 能力拆分、verifying stop、paused watchdog、baseline-relative repository evidence、可取消验收/Reviewer、启动 preflight、无人值守权限决策、local-commit enforcement、候选挂起和阶段进度通知。Legacy human/takeover APIs 仅保留显式兼容控制；普通不确定性不再阻塞本地循环。协同多 Worker、低权限用户、OS sandbox 与网络隔离仍是独立后续里程碑。**
 
 ---
 
@@ -60,7 +60,7 @@ Claude Code 适合作为实际开发 Worker，但在长时间任务中可能出�
 
 本项目需要解决的是一个**工程控制问题**：
 
-> 在不剥夺人工控制权的前提下，让一个外部 Supervisor 观察和管理 Claude Code 的执行过程，并使用可靠证据判断任务是否真的完成。
+> 在保留最终远程 push/main merge 独立边界的前提下，让外部 Supervisor 无人值守地运行本地 Claude Code 开发循环，并使用可靠证据判断任务是否真的完成。
 
 ### 2.3 需求边界
 
@@ -69,9 +69,9 @@ Claude Code 适合作为实际开发 Worker，但在长时间任务中可能出�
 - 单仓库；
 - 每个任务一个 Claude Worker；
 - 每个并行任务使用独立 worktree/工作目录；
-- Pi 负责监督和验收；
-- 人工可以随时接管；
-- 不自动 merge、deploy 或 release。
+- Pi 负责监督、自动决策和验收；
+- 本地开发循环不依赖人工实时接管；
+- Worker 不拥有远程 push 或 main/integration merge 权限，进入远程和主分支必须经过独立边界。
 
 当前扩展已支持多个独立任务会话并行推进，但不允许活动会话共享同一
 工作目录。事件日志由跨进程锁协调，状态和 watchdog 按会话隔离。这里要区分两种
@@ -82,10 +82,10 @@ Worker**属于后续开发任务，不能通过简单地放宽 cwd 限制来实�
 
 - 多 Worker 在同一 worktree 的无协调协作；
 - 自动生产发布；
-- 自动处理所有架构和产品决策；
-- 将网络一律封禁或声称有未经验证的域名 allowlist；
-- 无人工审批的危险操作；
-- 用 Worker 自己的报告代替独立验收。
+- 用 Worker 自己的报告代替独立验收；
+- 把远程 push 或 main/integration merge 授权给 Worker。
+
+本地开发中的决策、命令、修复和提交由任务授权策略控制，不额外添加同步人工审批门。无法形成可交付候选时自动重试、失败或挂起并保留证据，不能因此进入远程或主分支。
 
 ---
 
@@ -97,18 +97,17 @@ Claude 负责执行，Pi 负责控制和判断。不能让 Worker 自己同时�
 
 ### 3.2 确定性策略优先于 LLM 判断
 
-LLM 可以帮助理解上下文，但不能绕过硬性安全策略。所有高风险动作必须先经过确定性 Policy Gate。
+LLM 可以帮助理解上下文，但不能绕过远程/main 权限边界和证据要求。确定性策略负责能力边界、任务授权和进程安全；它不应把普通本地开发动作自动升级为同步人工审批。
 
 ```text
 事件
   │
   ▼
-确定性 Policy Gate
+任务授权 / 确定性能力边界
   │
-  ├── 明确禁止：拒绝
-  ├── 必须人工：升级
-  ├── 低风险且白名单：允许
-  └── 需要语义理解：交给 Supervisor LLM
+  ├── 远程 push / main merge：无 Worker 权限，交给独立边界
+  ├── 本地开发动作：按任务授权自动允许、重试或记录
+  └── 无法形成候选：自动失败/挂起，保留证据，不要求人工在线
 ```
 
 ### 3.3 证据优先于声明
@@ -122,22 +121,23 @@ Worker 说“完成了”不是完成证据。最终状态必须由以下信息�
 - 约束检查结果；
 - 独立 Reviewer 报告。
 
-### 3.4 人工拥有最高控制权
+### 3.4 本地开发无人值守，远程边界独立
 
-人工可以：
+本地开发循环不是人工实时审批流程。Worker 可以在任务授权范围内修改、测试、修复和本地提交；Decision Worker 负责普通决策并记录假设、证据和结果。
 
-- 暂停 Worker；
-- 修改 Supervisor 指令；
-- 直接回答问题；
-- 接管终端；
-- 强制终止任务；
-- 否决 Supervisor 的继续决定。
+人工或独立边界保留以下权力：
 
-Supervisor 任何时候都不能阻止人工接管。
+- 关闭或停止任务；
+- 审查候选和证据；
+- 授权或执行远程 push；
+- 授权或执行 main/integration merge；
+- 拒绝或丢弃候选。
 
-### 3.5 默认保守，逐步自动化
+这些权力不能被本地 Worker 或模型响应绕过，但不要求人工持续在线观察开发过程。
 
-MVP 只自动处理低风险、可逆、规则明确的情况。随着测试和审计证据增加，再逐步开放更多自动化能力。
+### 3.5 以证据约束自动化，而不是以人工门限制自动化
+
+自动化应覆盖本地编辑、命令、测试、修复、验收、Review 和本地提交。时间、轮数、输出、清理和证据完整性是可靠性约束；它们不自动变成同步人工审批。无法完成的任务自动失败或挂起，只有通过独立验收的候选才可进入远程/main 边界。
 
 ### 3.6 所有重要动作可追溯
 
@@ -251,15 +251,15 @@ RUNNING
 WAITING ────────────────┐
   │                     │
   ├── CONTINUE ─────────┘
-  ├── ANSWER ────────────> RUNNING
+  ├── ANSWER / ASSUME ───> RUNNING
   ├── REDIRECT ──────────> RUNNING
-  └── ESCALATE ──────────> HUMAN_REQUIRED
+  └── PARK ───────────────> BLOCKED / REVIEW_PENDING
 
 RUNNING ── Worker 报告完成 ──> VERIFYING
-VERIFYING ── 通过 ──> COMPLETE
-VERIFYING ── 失败 ──> REJECTED
+VERIFYING ── 通过 ──> COMPLETE (local candidate)
+VERIFYING ── 失败 ──> REJECTED / CANDIDATE_FAILED
 REJECTED ── 修复 ──> RUNNING
-HUMAN_REQUIRED ── 人工决定 ──> RUNNING / STOPPED
+BLOCKED / REVIEW_PENDING ── 恢复条件满足 ──> RUNNING
 ```
 
 ### 5.2 状态说明
@@ -270,12 +270,12 @@ HUMAN_REQUIRED ── 人工决定 ──> RUNNING / STOPPED
 | `STARTING` | 正在启动 Worker | 等待启动事件 |
 | `RUNNING` | Worker 正在工作 | 采集输出和指标 |
 | `WAITING` | Worker 正常等待输入 | 判断是否可自动处理 |
-| `BLOCKED` | Worker 被异常、环境或依赖阻塞 | 收集原因并升级 |
-| `DECISION_REQUIRED` | 需要架构/产品/权限决策 | 默认人工审批 |
-| `HUMAN_REQUIRED` | 已明确升级人工 | 暂停自动动作 |
+| `BLOCKED` | Worker 被异常、环境或依赖阻塞 | 记录原因并自动挂起，不要求人工在线 |
+| `DECISION_REQUIRED` | 需要基于任务证据作本地决策 | Decision Worker 自动选择并记录假设；无法选择则挂起 |
+| `HUMAN_REQUIRED` | 兼容旧协议或显式 takeover 控制态 | 不自动放行；不是普通本地开发的同步依赖 |
 | `VERIFYING` | 执行独立验收 | 只执行验证流程 |
-| `REJECTED` | 验收失败，需要修复 | 生成修复任务 |
-| `COMPLETE` | 所有目标和验收证据满足 | 允许 sign-off |
+| `REJECTED` | 验收失败，需要修复 | 生成有限修复任务或候选失败 |
+| `COMPLETE` | 所有目标和验收证据满足 | 生成本地候选，不能自行 push/merge |
 | `FAILED` | 系统或 Worker 不可恢复失败 | 保留现场并报告 |
 | `STOPPED` | 用户或策略主动停止 | 不再自动恢复 |
 
@@ -288,7 +288,7 @@ HUMAN_REQUIRED ── 人工决定 ──> RUNNING / STOPPED
   "event": "STATE_CHANGED",
   "from": "WAITING",
   "to": "DECISION_REQUIRED",
-  "reason": "Worker 提出架构选择",
+  "reason": "Worker 提出架构选择；Decision Worker 将按任务证据选择或挂起",
   "actor": "supervisor",
   "timestamp": "2026-01-01T00:00:00Z",
   "evidenceRefs": ["event-123", "diff-456"]
@@ -341,25 +341,18 @@ STOP
 
 ### 6.3 自动继续规则
 
-可以自动 `CONTINUE` 的条件：
+自动决策应覆盖任务授权范围内的本地开发动作，包括继续、回答、重定向、测试、修复和本地提交。Decision Worker 必须结合任务规格、仓库证据、当前 diff 和预算做决定，并记录选择和假设。
 
-- Worker 只是询问是否继续当前已经批准的步骤；
-- 当前动作属于任务清单中的低风险动作；
-- 没有新的架构或产品选择；
-- 没有删除、发布、外网、权限和密钥操作；
-- 没有超过预算和最大轮数；
-- 最近没有重复的相同停顿。
+以下情况不应要求人工实时在线，而应进入自动处理路径：
 
-必须升级人工的情况：
+- 架构方案二选一：按任务约束选择并记录假设；
+- 需求存在歧义：采用可回溯假设，或将候选挂起；
+- 测试失败：在 repair budget 内继续修复；
+- 外部服务、权限或凭据：按任务授权策略处理，无法处理则自动失败/挂起；
+- Supervisor 置信度不足：有限重试后形成 `blocked`/`review_pending` 候选，不得 push/merge；
+- Worker 连续失败或重复提问：停止该自动循环并保留证据，不要求人工立即接管。
 
-- 架构方案二选一；
-- 需求存在歧义；
-- 删除数据、删除文件或大范围重构；
-- 修改权限、CI/CD、部署和生产配置；
-- 访问外部服务或使用敏感凭据；
-- 测试与需求冲突；
-- Supervisor 置信度不足；
-- Worker 连续多次失败或重复提问。
+唯一不可由本地 Worker 决定的权限边界是远程 push 和 main/integration merge。其他限制必须来自明确的任务授权或运行时能力配置，而不是默认增加同步人工审批。
 
 ### 6.4 LLM 判断的安全边界
 
@@ -424,9 +417,9 @@ Worker 的自然语言总结只能作为辅助信息，不能单独作为证据�
 2. 禁止事项没有被违反；
 3. 验收命令全部通过；
 4. 当前 diff 在预期范围内；
-5. 没有未解决的人工决策；
-6. 独立 Reviewer 没有 P0/P1 阻塞项；
-7. 未超出时间、轮数和费用预算。
+5. 没有未解决的阻塞性证据或任务授权冲突；本地决策和假设已经记录；
+6. 独立 Reviewer 没有未解决的阻塞项；
+7. 未超出时间、轮数和费用预算；候选尚未越过远程 push/main merge 独立边界。
 
 ---
 
@@ -500,7 +493,7 @@ Worker 声称完成
 - 读取实时输出；
 - 发送输入；
 - 检测退出和异常；
-- 实现人工接管；
+- 实现可选人工接管和明确的远程/main 独立边界；
 - 验证 session resume；
 - 保存最小事件日志。
 
@@ -520,18 +513,18 @@ Worker 声称完成
 - 单 Worker；
 - 单 worktree；
 - 单任务；
-- 低风险自动 continue；
-- 高风险人工升级；
+- 本地开发动作按任务授权自动 continue、修复或挂起；
+- 远程 push/main merge 不授予 Worker，交给独立边界；
 - 最大执行时间和最大轮数；
 - 基础 Goal / Evidence / Sign-off；
 - 基础验证命令。
 
 暂不做：
 
-- 自由 LLM 决策；
-- 自动修复；
+- 无任务证据约束的自由 LLM 决策；
+- 无预算的自动修复；
 - 多 Worker；
-- 自动 merge/deploy。
+- Worker 远程 push 或 main/integration merge；这些动作必须经过独立边界。
 
 ### Phase 2：Supervisor 决策层
 
@@ -567,11 +560,11 @@ Worker 声称完成
 - 监控和告警；
 - 费用控制；
 - 灰度运行；
-- 故障恢复和人工值守。
+- 故障恢复、候选挂起和可选通知。
 
 本阶段不阻塞当前 Supervisor 功能、Worker 生命周期、进程组清理、resume
-和独立验收工作。Worker 可在用户明确授权及宿主机策略允许的权限范围内运行，
-但不自动 merge、deploy、release 或 publish。
+和独立验收工作。Worker 可在任务授权及宿主机策略允许的权限范围内运行，
+并可本地修改、测试、修复和提交；但不拥有远程 push 或 main/integration merge 权限。
 
 ---
 
@@ -581,13 +574,13 @@ Worker 声称完成
 |---|---|---|
 | 正常完成 | Worker 完成任务并退出 | Supervisor 收集 diff 和测试证据 |
 | 普通确认 | Worker 询问是否继续已批准步骤 | 自动发送一次 continue |
-| 架构决策 | Worker 提出两种实现方案 | 升级人工，不自动选择 |
+| 架构决策 | Worker 提出两种实现方案 | 按任务约束选择并记录假设；无法选择则挂起候选 |
 | 长时间无输出 | Worker 无输出但进程仍在 | 触发 watchdog，先检查再决定 |
 | Worker 崩溃 | 进程异常退出 | 记录退出原因，可恢复或升级 |
 | 测试失败 | Worker 声称完成但测试失败 | 进入 REJECTED 或修复轮次 |
-| 重复提问 | Worker 多轮重复等待 | 触发人工升级，禁止无限 continue |
+| 重复提问 | Worker 多轮重复等待 | 有限重试后挂起候选，禁止无限 continue |
 | 危险命令 | 删除、发布、使用密钥等 | 被 Policy Gate 拦截 |
-| 人工接管 | 用户接管终端 | Supervisor 停止自动发送指令 |
+| 人工接管 | 用户显式接管终端 | Supervisor 停止自动发送指令；这是控制路径而非日常依赖 |
 | session 恢复 | Supervisor 重启 | 根据持久化状态恢复或安全暂停 |
 
 ---
@@ -600,10 +593,10 @@ Worker 声称完成
 
 - Claude Code 自身负责工具级权限请求和用户交互；
 - Supervisor 对 Worker 启动命令做确定性分类；
-- 明确破坏性或绕过权限的参数仍拒绝；
-- `review` 命令通过 Pi UI 请求用户批准，批准结果写入事件日志；
-- 普通联网命令默认不因“联网”本身拒绝，下载后直接交给 shell 的模式要求人工复核；
-- 无交互 UI 时不能伪造批准，review 命令失败关闭。
+- 明确超出任务授权或绕过权限的参数按策略拒绝或挂起；
+- `review` 命令按任务授权策略自动处理并写入事件日志，不能绕过远程/main 独立边界；
+- 普通联网命令默认不因“联网”本身拒绝，下载后直接交给 shell 的模式按配置处理，无法安全处理则挂起候选；
+- 无交互 UI 时不能伪造批准，也不能把缺少批准转换为远程/main 权限。
 
 ### 11.1.1 多会话与活跃请求
 
@@ -621,21 +614,24 @@ MVP 默认：
 - 使用独立 worktree，活动会话之间不得共享或重叠工作目录；
 - 权限和网络不作一律封禁，由调用者显式配置并承担宿主机权限责任；
 - 凭据仍按最小必要继承，避免无意泄露；
-- 明确危险命令、权限绕过参数和生产发布动作仍需 Policy Gate/人工批准；
-- 不自动 merge、deploy、release 或 publish。
+- 明确超出任务授权的命令、权限绕过参数和生产发布动作仍由 Policy Gate/独立流程控制；
+- Worker 不得远程 push 或 merge 到 main/integration 分支。
 
-### 11.2 危险操作
+### 11.2 本地能力与远程边界
 
-以下操作必须人工确认：
+本地开发动作按任务规格和运行时授权策略自动处理，不把下列动作默认改成同步人工确认：
 
-- `rm`、批量删除、数据库迁移破坏性操作；
-- `git reset --hard`、强制 push；
-- 修改 CI/CD、部署和生产配置；
-- 发送外部请求；
-- 读取或写入密钥；
-- 发布 npm/package/release；
-- 自动 merge；
-- 启动高权限命令。
+- 文件修改、删除、重构、数据库迁移和测试；
+- 本地分支操作、提交、回滚和修复；
+- 任务授权范围内的外部请求、凭据使用和 CI/配置修改。
+
+Worker 的硬权限边界是：
+
+- 不得远程 `push`，尤其不得强制 push；
+- 不得 merge 到 `main` 或其他 integration 分支；
+- 不得绕过独立 Review、CI 或其他配置的独立边界。
+
+本地策略仍可按任务需要配置更窄的权限；这属于任务授权，不是本项目额外规定的同步人工门。发布和生产流程继续由其已有的独立受保护工作流处理。
 
 ### 11.3 Prompt Injection 防护
 
@@ -675,10 +671,10 @@ limits:
 控制规则：
 
 - 相同输出和相同停顿不得无限触发 continue；
-- 超过最大轮数必须升级人工；
-- Supervisor 自身异常时默认暂停 Worker，而不是继续放行；
+- 超过最大轮数自动生成 `blocked`/`candidate_failed` 候选并保留证据，不得 push/merge；
+- Supervisor 自身异常时自动暂停或挂起 Worker，而不是继续放行；
 - Worker 重启必须保存原始现场；
-- 任务恢复时先进入 `HUMAN_REQUIRED` 或 `VERIFYING`，不能盲目继续；
+- 任务恢复时先进入可验证的恢复/Review 状态，不能盲目继续，也不要求人工在线；
 - 时间、自动轮数和重试次数必须记录；模型供应商自身的上下文/token 限制不由本项目重复管理。
 
 ---
@@ -743,14 +739,14 @@ TASK_STOPPED
 |---|---:|---|
 | package API 与文档不一致 | P1 | 固定版本，先做 Spike，不直接承诺兼容 |
 | PTY 输出解析不稳定 | P1 | Worker Adapter + 事件归一化 + 回放测试 |
-| LLM 错误判断 | P1 | Policy Gate、人工升级、置信度阈值 |
+| LLM 错误判断 | P1 | 任务授权、证据门、有限重试、候选挂起和独立 Review |
 | 无限 continue 循环 | P1 | 最大轮数、重复检测、冷却时间 |
 | Worker 输出 prompt injection | P1 | 输出不可信化、工具调用前策略拦截 |
 | Reviewer 不够独立 | P1 | 独立上下文、只读验收、证据重新采集 |
-| 误操作生产环境 | P0 | 人工审批、独立验收、禁止自动 merge/deploy/release/publish；sandbox/白名单作为后续加固 |
+| 误操作生产环境 | P0 | 任务授权、独立验收、远程/main 独立边界；sandbox/白名单作为后续独立加固 |
 | Worker 崩溃后状态丢失 | P2 | Decision Worker session/task mapping 持久化，异常重启后显式 recovery；Claude Worker 本身不静默 resume |
 | 多会话互相覆盖 | P1 | 独立 cwd/worktree 检测、共享事件锁、会话级 watchdog |
-| Decision Worker/API 不可用 | P1 | 直接记录事件并通过人工通知通道告警，不尝试第二个 LLM fallback |
+| Decision Worker/API 不可用 | P1 | 记录事件，按有限重试和候选挂起策略处理；通知是可选投递，不是同步控制依赖 |
 | 审计无法复现 | P2 | 保存事件、输入、输出摘要、diff 和验证结果 |
 
 ---
@@ -774,11 +770,11 @@ MVP 必须满足：
 
 ### 安全验收
 
-- [ ] 危险命令会被拦截或升级人工。
+- [ ] 超出任务授权的命令会被拦截或挂起，不要求人工在线。
 - [ ] 人工接管后不再自动发送指令。
 - [ ] 有最大时间、轮数和重试限制。
 - [ ] 日志不会泄露密钥和 token。
-- [ ] Decision Worker API 失败会直接触发人工通知。
+- [ ] Decision Worker API 失败会按有限重试/候选挂起处理；通知是可选的。
 - [ ] Worker 输出不能覆盖 Supervisor 的安全策略。
 - [ ] Supervisor 故障时默认采取 fail-closed 行为。
 
@@ -821,30 +817,30 @@ MVP 必须满足：
 
 ---
 
-## 17. 待确认问题
+## 17. 已确认的产品边界与待实现项
 
-在进入正式开发前，需要 W 明确：
+以下边界已经确认，不再作为本地开发是否允许无人值守的待决问题：
 
-1. 第一阶段是否只支持 Claude Code CLI？
-2. 是否必须支持人工实时接管？
-3. Worker 是否允许联网？允许哪些域名？
-4. 哪些命令被视为高风险？
-5. Reviewer 是否必须使用不同模型或不同上下文？
-6. 是否允许 Reviewer 生成修复建议但不直接改代码？
-7. 任务最大运行时间和费用预算是多少？
-8. 验收命令由谁提供？项目是否已有统一测试脚本？
-9. 第一版是否需要 session resume？
-10. 是否要求产出完整的审计日志和任务报告？
+1. 本地编辑、命令、测试、修复和本地提交可以完全无人值守；
+2. Decision Worker 可以在任务授权和仓库证据范围内选择实现方案，并记录假设和理由；
+3. 无法形成可靠候选时自动重试、失败或挂起，不能要求人工必须在线；
+4. Worker 不拥有远程 push 或 main/integration merge 权限；代码进入远程和主分支必须经过独立边界；
+5. 验收、独立 Reviewer、有限修复和证据完整性仍是候选完成条件；
+6. stop、cleanup、kill、恢复和审计是系统控制能力，不等同于逐动作人工审批。
+
+仍可由任务或集成方配置的工程参数包括 transport、CLI 版本、任务预算、验收命令、
+运行时能力和是否发送通知；这些参数不能削弱远程/main 独立边界，也不能把旧的
+同步 human gate 重新作为默认本地开发控制流。
 
 ---
 
 ## 18. 给 W 的最终结论
 
-> 这个方向可以做，但当前调研文档不能直接作为生产实施方案。建议先固定 Pi、Claude Code 和相关 package 的版本，完成一个真实任务的兼容性 Spike，证明系统能够稳定完成“启动—观察—提问—接管—恢复—独立验收”闭环。
+> 这个方向已经完成生命周期、恢复、验收、独立 Review 和本地无人值守闭环。实现路径是“自动决策—本地编辑/测试/修复/提交—证据验收—候选挂起或交付”；远程 push 和 main/integration merge 仍由独立边界控制。
 >
-> 第一版应采用“确定性策略 + LLM 辅助判断 + 人工升级 + 可复现验收”，而不是让 LLM 自由决定所有动作。`pi-goals` 的 Goal / Evidence / Sign-off 思想值得吸收，但 PTY、watchdog 和 delegate 能力必须通过统一 Worker Adapter 组合。
+> 采用“确定性能力边界 + LLM 辅助判断 + 可复现验收 + 独立远程/main 边界”，而不是让 LLM 获得远程写权限。`pi-goals` 的 Goal / Evidence / Sign-off 思想继续适用，PTY、watchdog 和 delegate 能力必须通过统一 Worker Adapter 组合。
 >
-> 最终判断：**架构方向 GO；先完成生命周期和故障恢复主线。低权限用户、sandbox 与网络隔离属于后续安全加固，不作为当前主线阻塞；在明确授权下仍禁止自动发布类动作。**
+> 最终判断：**本地开发完全自动化；远程仓库和 main/integration 分支保持独立边界。**
 
 ---
 
@@ -869,7 +865,7 @@ MVP 中必须保证：
 
 - `WorkerAdapter` 唯一负责 spawn、stop、kill process group 和 transport 细节；
 - Supervisor 唯一负责 watchdog、状态机、Policy Gate 和自动指令；
-- Human 始终拥有最高控制权；
+- Human/独立边界控制远程 push、main/integration merge 和显式停止；本地 Worker 不拥有这些权限；
 - Independent Verifier 唯一负责最终验收证据；
 - 任何扩展不能暗中重复执行 resume、retry 或 stop。
 
@@ -894,8 +890,8 @@ PTY 和 headless JSONL 只能选择一个作为 MVP 的主 transport，禁止两
 
 1. 立即停止自动发送；
 2. 保留 worktree、日志和原始输出；
-3. 进入 `HUMAN_REQUIRED`；
-4. 人工接管或使用基础 Claude CLI Adapter；
+3. 进入 `BLOCKED`/`CANDIDATE_FAILED` 并保留现场；
+4. 可选人工接管或使用基础 Claude CLI Adapter；
 5. 完成根因分析前关闭自动化开关。
 
 详细独立评审记录见：`docs/independent-review.md`。
@@ -906,11 +902,11 @@ PTY 和 headless JSONL 只能选择一个作为 MVP 的主 transport，禁止两
 |---|---|
 | Pi 是否作为外部 Supervisor | 是 |
 | Claude Code 是否继续作为 Worker | 是 |
-| 是否默认自动选择架构方案 | 否，升级人工 |
+| 是否默认自动选择架构方案 | 是，在任务授权和证据范围内选择并记录假设；无法选择则挂起 |
 | 是否只相信 Worker 的完成声明 | 否 |
 | 是否必须独立验收 | 是 |
 | Reviewer 是否默认直接改代码 | 否 |
-| 是否自动 merge/deploy | MVP 阶段否 |
+| Worker 是否拥有远程 push/main merge | 否，必须经过独立边界 |
 | 是否需要统一 Adapter | 是 |
 | 是否允许人工接管 | 必须支持 |
 | 是否先做 Spike | 必须 |
@@ -921,7 +917,7 @@ PTY 和 headless JSONL 只能选择一个作为 MVP 的主 transport，禁止两
 
 ## 20. 近期落地与剩余门禁：稳定的自动验收闭环
 
-本轮已落地 TaskSpec、多命令验收、独立只读 Reviewer、结构化 repair round、重复 finding/P0/P1 人工升级、JSONL 去重和确定性 replay fixture。剩余门禁是固定 CLI 的重复运行统计，而不是继续扩大安全边界。近期目标从“扩大安全边界”调整为先证明单一已验证 Claude CLI 版本上的真实功能稳定性。当前只验证固定的 Claude Code `2.1.270`，不把多版本兼容作为本阶段任务。OS sandbox、低权限用户、网络 allowlist、SBOM 和更深的供应链加固后置，不作为本阶段门禁；现有 no-shell、Policy Gate、人工接管和独立验收边界继续保留。
+本轮已落地 TaskSpec 多命令验收和 autonomy 字段、独立只读 Reviewer、结构化 repair round、重复 finding/P0/P1 候选挂起、JSONL 去重、baseline-relative commit evidence 和确定性 replay fixture。剩余门禁是固定 CLI 的重复运行统计，而不是继续扩大本地同步安全边界。当前只验证固定的 Claude Code `2.1.270`，不把多版本兼容作为本阶段任务。OS sandbox、低权限用户、network allowlist、SBOM 和更深的供应链加固后置，不作为本阶段门禁；远程 push/main merge、保护 CI 和发布仍保持独立边界。
 
 ### 20.1 Goal / Evidence / Sign-off 模型
 
@@ -957,12 +953,12 @@ PTY 和 headless JSONL 只能选择一个作为 MVP 的主 transport，禁止两
 Worker result
   → 多命令 acceptance checks
   → 独立只读 Reviewer
-      ├── pass   → completed
+      ├── pass   → local candidate
       ├── revise → 结构化修复指令 → Worker → 重新验收
-      └── human  → 人工接管
+      └── human/invalid → parked candidate
 ```
 
-Reviewer 必须使用独立 Pi session，只允许 `read`、`grep`、`find`、`ls`，输出结构化 verdict 和 findings；不能修改工作树或直接批准权限。默认最多三轮修复；相同 finding 重复出现或出现 P0/P1 问题时升级人工。
+Reviewer 必须使用独立 Pi session，只允许 `read`、`grep`、`find`、`ls`，输出结构化 verdict 和 findings；不能修改工作树或直接批准权限。默认最多三轮修复；相同 finding 重复出现或出现 P0/P1 问题时挂起不可发布候选，不要求人工在线。
 
 ### 20.2 JSONL 稳定性证据
 
@@ -973,18 +969,20 @@ Reviewer 必须使用独立 Pi session，只允许 `read`、`grep`、`find`、`l
 - active request 期间的 SIGTERM、SIGINT、stop 和 Pi shutdown；
 - 普通完成、低风险 Bash allow、`AskUserQuestion` deny-to-text、多轮、验收失败修复和恢复回放。
 
-真实 Claude Spike 不进入普通 CI；确定性 fake Worker/replay fixture 进入 CI。自动模式继续保持显式 opt-in，直到以下门禁通过：普通任务连续十次成功，权限和问题转文本场景各至少五次成功，无重复动作、无错误 complete、无未清理 Worker，且关键事件可以完整回放。
+真实 Claude Spike 不进入普通 CI；确定性 fake Worker/replay fixture 进入 CI。当前自动模式仍需显式启用是实现状态，不是本地开发目标的额外人工门；后续应补齐任务级自治配置和正常完成、修复、歧义、候选挂起的回放/真实 Claude 演练。门禁仍要求无重复动作、无错误 complete、无未清理 Worker，且关键事件可以完整回放。
 
 ### 20.3 明确不属于本阶段
 
 - Claude CLI 多版本兼容；
 - OS sandbox、低权限执行和网络隔离；
-- 自动 merge、deploy、release、publish；
+- Worker 获得远程 push 或 main/integration merge 权限；
 - 多 Worker 在同一工作树协作。
+
+本地开发自动化不属于可选的后续限制，而是已确认的目标；本节列出的技术项目不能被用来要求人工在线。
 
 ## 21. 后续开发路线图
 
-`v0.5.0` 的发布不代表所有自动化目标都已完成。后续任务按“稳定性 → 恢复 → 协同
+`v0.5.2` 的发布不代表所有自动化目标都已完成。后续任务按“自治决策与候选挂起 → 稳定性/恢复 → 协同
 调度 → 安全加固”推进；多 Worker 可以纳入开发任务，但应作为独立阶段，不能与当前
 单 Worker 稳定性门禁混在一起。
 
@@ -993,7 +991,7 @@ Reviewer 必须使用独立 Pi session，只允许 `read`、`grep`、`find`、`l
 - 完成真实 Claude Code `2.1.270` 重复 Spike：普通任务连续 10 次，权限和问题回退各至少 5 次；
 - 补齐 replay：多轮修复、验收失败修复、repair budget 耗尽、takeover、recover 和 Pi shutdown；
 - 补齐边界测试：Reviewer 流式输出上限、`DecisionSessionStore.list()` 任务 ID 校验、跨进程恢复和超时/输出截断；
-- 继续观察 npm `0.5.0`、GitHub Release 资产、provenance 和回滚路径；
+- 继续观察 npm `0.5.2`、GitHub Release 资产、provenance 和回滚路径；
 - 验收标准：无重复动作、错误 complete、未清理 Worker 或未审计的自动放行。
 
 ### 21.2 中期：恢复能力
@@ -1001,7 +999,7 @@ Reviewer 必须使用独立 Pi session，只允许 `read`、`grep`、`find`、`l
 - 设计安全的 Claude session resume；明确 `--resume` 与实时 PTY attach 的边界；
 - 完善 takeover、recover、Pi shutdown、Worker 崩溃和部分完成的状态语义；
 - 增加跨进程恢复端到端测试，包括 cwd lease、Decision Worker session、Worker 身份和事件日志一致性；
-- 恢复失败必须进入 `HUMAN_REQUIRED`，不能静默重放原始任务或重复发送输入。
+- 恢复失败必须进入 `BLOCKED`/`CANDIDATE_FAILED`，不能静默重放原始任务或重复发送输入；后续人工接管是可选恢复路径。
 
 ### 21.3 后续：多 Worker 协作与调度
 
@@ -1015,11 +1013,11 @@ Reviewer 必须使用独立 Pi session，只允许 `read`、`grep`、`find`、`l
 3. **结构化交接**：Worker 之间只通过受限 artifact、事件引用和验收报告交接，不直接共享
    控制通道；交接内容必须经过 schema 校验和大小限制。
 4. **汇总验收**：每个 child 先独立验收，root task 再汇总目标、diff、测试和 Reviewer 结果；
-   冲突、缺失证据或任一 P0/P1 自动升级人工。
+   冲突、缺失证据或任一 P0/P1 自动阻止候选并挂起，不要求人工在线。
 5. **恢复与关闭**：支持单个 child、整棵任务图和 Pi shutdown 的一致性恢复；父任务不能在
    子任务状态未知时报告 `completed`。
-6. **冲突检测和人工整合**：只允许在独立 integration worktree 中进行显式整合；不自动
-   merge/publish，冲突和整合动作必须保留人工控制权。
+6. **冲突检测和独立整合**：只允许在独立 integration worktree 中进行整合；Worker 不
+   得 push 或 merge，冲突和整合动作必须经过独立远程/main 边界。
 
 多 Worker 阶段的最小验收矩阵：两个独立 Worker 并行、依赖顺序、一个 Worker 失败、取消
 传播、重复交接、工作树冲突、单 child 恢复、整棵任务图恢复和 shutdown 中断。通过这些
@@ -1031,24 +1029,24 @@ Reviewer 必须使用独立 Pi session，只允许 `read`、`grep`、`find`、`l
 - OS sandbox、低权限执行、网络隔离/allowlist；
 - 更深的供应链、SBOM、密钥隔离和生产监控。
 
-## 22. v0.5.1 真实演练后的自动化加固计划
+## 22. v0.5.2 发布后的自动化自治计划
 
 `v0.5.1` 发布后的真实 Claude Code `2.1.270` 演练完成了
-Worker → 验收 → 独立 Reviewer → fail-closed 人工介入链路。验收六项全部通过，
+Worker → 验收 → 独立 Reviewer → fail-closed 候选挂起链路。验收六项全部通过，
 但发现两个 P1 和两个 P2 生命周期/证据问题。正式记录、复现结果、实施阶段和门禁
 见 [`docs/automation-hardening-plan.md`](automation-hardening-plan.md)。
 
-本轮实现顺序固定为：
+已完成的加固和下一轮自治实现顺序为：
 
 1. **生命周期与能力模型**：拆分 `persistentSession` 与 `repairableSession`，修复非持久
    JSONL repair 的非法终态转换，并支持 `verifying` 状态的 stop/shutdown；
-2. **watchdog 与证据完整性**：暂停 no-output 时钟，补齐 HEAD-relative staged/unstaged
-   diff 和安全的 untracked evidence；
+2. **watchdog 与证据完整性**：暂停 no-output 时钟，记录 task baseline，补齐
+   baseline-relative committed/staged/unstaged diff、commit summaries 和安全的 untracked evidence；
 3. **自动化协议**：按 assistant message 边界解析 Reviewer/Decision Worker 输出，增加
    启动 preflight、可观测 heartbeat、permission gate 一致性和 signal 生命周期；
-4. **验证门禁**：已补齐真实 capability 矩阵并完成隔离 worktree 的真实
-   repair/reacceptance 演练；当前 exact-head 独立 Reviewer 通过前不进行任何合并或发布。
+4. **验证门禁**：已补齐真实 capability 矩阵、隔离 worktree 的真实
+   repair/reacceptance 演练、exact-head 独立 Reviewer 和受保护发布；本地候选仍不得绕过远程/main 独立边界。
 
-本轮不放宽以下边界：Reviewer 仍只读，验收仍使用 argv/`execFile`，不伪造 Claude
-`--resume`，不自动 merge/deploy/release，P0/P1、重复 finding、超时、API 错误和不完整
-证据继续 fail-closed。多 Worker 协作继续后置。
+本轮不放宽以下边界，同时不增加本地同步人工门：Reviewer 仍只读，验收仍使用 argv/`execFile`，不伪造 Claude
+`--resume`，Worker 不得远程 push 或 main/integration merge，P0/P1、重复 finding、超时、API 错误和不完整
+证据继续 fail-closed 并生成不可发布候选。多 Worker 协作继续后置。
