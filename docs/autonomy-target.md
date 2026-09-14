@@ -30,12 +30,16 @@ by default, requires a local commit before a candidate is deliverable.
 
 ## 2. Hard authority boundary
 
-The Worker and local automation do **not** receive authority or credentials for:
+Automatic Worker supervision uses the structured JSONL transport; the interactive tmux transport
+remains manual-only because it has no equivalent permission-response boundary. The Worker and local
+automation do **not** receive authority or credentials for:
 
 - pushing code to a remote repository;
 - merging into `main` or another protected integration branch;
 - starting automatic candidate work directly on a protected integration branch; repositories with a
-  branch use a non-protected local branch for unattended work.
+  branch use a non-protected local branch for unattended work;
+- inheriting Git/GitHub/package credential helpers or explicitly selected remote credentials in
+  automatic mode.
 
 A completed local task is a candidate until it passes the independent boundary. That boundary may
 be a later read-only review, CI policy, a maintainer action, or an explicit shutdown/rejection.
@@ -95,7 +99,9 @@ requires a local commit, and permits two bounded Decision Worker request retries
 Legacy `humanRequired`, takeover and approval fields remain for compatibility and explicit operator
 control. They are not entered by ordinary uncertainty, and a legacy approval object cannot override
 the deterministic remote push/main merge denial. The existing independent Review and protected
-CI/release paths remain the final external checks.
+CI/release paths remain the final external checks. Built-in automatic Claude workers request a fail-closed Claude Code Bash sandbox with no
+outbound domains; automatic command policy and credential filtering remain defense in depth.
+Full host-level sandboxing for custom Worker integrations is separate hardening work.
 
 ## 7. Explicit non-goals of this target
 

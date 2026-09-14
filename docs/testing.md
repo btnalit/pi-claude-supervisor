@@ -93,7 +93,7 @@ PI_CLAUDE_SUPERVISOR_REAL_CLAUDE=1 npm run spike:tmux-interactive
 The tmux spike is gated, authenticated, and excluded from normal CI. It uses
 plan mode with a fixed `opus` model, records only protocol metadata, and
 verifies three real Claude turns, exact screen-result markers, pause/resume,
-automation enabled with autonomous policy handling and optional takeover, direct PTY input, owned detach,
+manual takeover, direct PTY input, owned detach,
 and identity-bound restart re-adoption. The interactive spike uses a fresh temporary
 cwd to verify Claude's trust prompt, a real Bash permission prompt, an allow-once
 response, and an exact result marker; it also records metadata only.
@@ -128,8 +128,10 @@ callback. Approval callbacks are deliberately not accepted without a separately
 authenticated endpoint.
 
 The tmux transport is selected with `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`.
-Automatic mode rejects an explicit `process-pipe` transport; use JSONL or tmux for
-bounded decisions and repair. Before
+Automatic mode rejects explicit `process-pipe` and `tmux` transports; use JSONL for
+bounded decisions and repair. Built-in Claude workers also receive a fail-closed
+sandbox setting (`failIfUnavailable`, `allowUnsandboxedCommands=false`, no outbound
+network domains); verify that startup fails if the sandbox cannot be initialized. Before
 release, verify: private-socket attach, multi-line paste, prompt stability while
 Claude is busy, trust/permission policy handling, duplicate send prevention, pane
 replacement refusal, pause/resume, owned-session stop, adopted-session

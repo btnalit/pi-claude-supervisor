@@ -9,12 +9,13 @@
 用于 Pi 的 Claude Code Worker 监督扩展。MVP 中 Pi 负责生命周期、状态机、策略门和独立验收；Worker 只是被显式启动的子进程。
 
 > `v0.5.2` 已发布为单 Worker recovery 基线。默认手动 transport 是无额外依赖的
-> process pipe，不是 PTY；自动模式只使用 Claude JSONL 或 tmux。当前工作树已实现
+> process pipe，不是 PTY；自动模式只使用 Claude JSONL，tmux 保留为手动交互。当前工作树已实现
 > repairable/persistent 能力拆分、可取消验收/Reviewer、证据完整性门禁、启动前
 > preflight 和阶段进度通知；真实 Claude Code `2.1.270` 允许编辑的
 > repair/reacceptance 演练已在隔离临时 worktree 通过。确认的产品目标是本地开发
 > 完全无人值守；详见 [自动化目标](docs/autonomy-target.md)。代码进入远程仓库或
-> main/integration 分支必须经过独立边界，Worker 不拥有 push/merge 权限。
+> main/integration 分支必须经过独立边界，Worker 不拥有 push/merge 权限；自动模式仅使用
+> JSONL，tmux 保留为手动交互 transport。
 >
 > **无人值守状态：** 自动模式会自主完成本地修改、测试、有限修复、验收、独立 Review
 > 和本地提交检查；无法形成候选时自动挂起为不可发布候选。可选出站通知不授予权限，
@@ -24,10 +25,10 @@
 
 - 不会在扩展加载时自动启动 Worker。
 - 不经过 shell 启动子进程。
-- Worker 只继承最小环境；凭据必须由调用方显式传入。
+- Worker 只继承最小环境；自动模式会过滤远程凭据并禁用 Git/包管理器 credential helper，手动集成的凭据必须由调用方显式传入。
 - 本地命令和权限行为按任务/运行时授权策略处理；超出授权的动作自动拒绝或挂起，不要求同步人工响应。
 - Linux 上优先使用可写的 cgroup v2 清理后代进程，包括 `setsid()` 后代；不可用时回退到进程组清理。需要强制失败闭环时，embedding 集成可使用 `cgroupMode: "required"`，并会在 Claude 启动前执行 preflight。
-- 普通联网查询不因联网本身被拒绝；下载后直接交给 shell 等高风险模式按配置处理，无法安全处理时挂起候选。
+- 内置自动 Claude Worker 会请求 fail-closed 的 Claude Code Bash sandbox，禁止 Bash 子进程出站联网；命令策略仍是第二道门。手动/自定义集成必须自行提供等效网络边界。
 - Worker 声称完成只会进入 `verifying`，不能作为成功证据。
 - 默认独立验收命令为 `git diff --check`。
 - 目标是任务启动后本地开发无人值守：Worker 可以修改、测试、修复和本地提交；Worker 必须没有远程 push 或合并到 `main`/integration 分支的权限。
@@ -54,8 +55,8 @@ export PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_FORMAT=generic
 # export PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_SECRET='shared-secret'
 ```
 
-自动模式默认使用 `claude-jsonl`，通过 `result`、`control_request` 和进程
-`exit` 事件唤醒 Decision Worker；显式选择 tmux 时仍使用屏幕交互，不使用 JSONL 权限协议，也不会依赖 `/supervise poll` 轮询。本版本固定按已验证设备的
+自动模式默认并且只能使用 `claude-jsonl`，通过 `result`、`control_request` 和进程
+`exit` 事件唤醒 Decision Worker；tmux 仅用于手动屏幕交互，不使用 JSONL 权限协议，也不会依赖 `/supervise poll` 轮询。本版本固定按已验证设备的
 Claude CLI `2.1.270` 运行，跨版本兼容性不在本轮范围内。
 
 然后在 Pi 中使用：
@@ -120,12 +121,12 @@ Worker 应使用 `adopt-tmux`，而不是 takeover。
 `v0.5.0` 已完成并发布“多命令验收—独立只读 Reviewer—结构化修复轮次—再次验收”闭环。
 任务可通过 API 或 JSON spec 提供 `goal`、`scope`、`constraints`、`forbidden`、多个
 `acceptance` 命令和 `autonomy` 控制；旧的纯文本任务继续使用默认 `git diff --check`。
-Reviewer 只能使用 `read`、`grep`、`find`、`ls`，不会修改工作树或批准权限。自动模式记录
-任务开始时的 git baseline，要求完整的 baseline-relative tracked/commit/untracked evidence，
-并在默认情况下要求 Worker 本地 commit；无效输出、证据不完整、重复 finding、P0/P1 或预算耗尽
-会自动挂起候选。自动模式拒绝显式 process-pipe，并在模型执行前检查目录、可执行文件、依赖
-和 cgroup。详见 [自动化目标](docs/autonomy-target.md)。协同多 Worker 属于后续独立开发阶段，
-暂不把 sandbox、低权限和网络隔离作为本阶段门禁。
+Reviewer 只能使用 `read`、`grep`、`find`、`ls`，不会修改工作树或批准权限。自动模式在
+Worker 启动前捕获 git baseline，要求完整的 baseline-relative tracked/commit/untracked evidence，
+并在默认情况下要求 Worker 在非保护分支本地 commit；无效输出、证据不完整、重复 finding、P0/P1 或预算耗尽
+会自动挂起候选。自动模式拒绝 process-pipe 和 tmux，并在模型执行前检查目录、可执行文件、依赖
+和 cgroup；Worker 环境会过滤远程仓库凭据并禁用 Git 全局凭据 helper。详见 [自动化目标](docs/autonomy-target.md)。协同多 Worker 属于后续独立开发阶段，
+内置自动 Claude Worker 会请求 fail-closed 的 Claude Code Bash sandbox；自定义 Worker 的完整 host-level sandbox 仍是后续安全加固。
 
 ### tmux/PTY 交互模式
 
@@ -134,8 +135,7 @@ Reviewer 只能使用 `read`、`grep`、`find`、`ls`，不会修改工作树或
 ```bash
 export PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux
 export PI_CLAUDE_SUPERVISOR_WORKER='claude --permission-mode plan'
-# 可选自动 Decision Worker（当前显式启用；目标是无人值守本地开发）：
-# export PI_CLAUDE_SUPERVISOR_MODE=auto
+# tmux 仅为手动交互；无人值守 Decision Worker 必须使用 JSONL。
 # 接管非默认 tmux server 时可选：
 # export PI_CLAUDE_SUPERVISOR_TMUX_SOCKET=/path/to/tmux.sock
 ```
@@ -143,7 +143,8 @@ export PI_CLAUDE_SUPERVISOR_WORKER='claude --permission-mode plan'
 `/supervise start <task>` 会在私有 tmux server 中启动 Claude，并返回可复制的 attach 命令。
 可以在另一个终端 attach 到同一个 PTY，观察或人工输入。多行消息通过 tmux buffer 和 Enter
 发送，不会把消息拼接进 shell 命令；`pipe-pane` 记录原始输出，`capture-pane` 检测稳定的 Claude
-输入提示，并复用 watchdog、Decision Worker、审计和独立验收流程。
+输入提示，并复用 watchdog、审计和独立验收流程；由于 tmux 没有结构化权限边界，
+不会在 tmux 中启用自动 Decision Worker 或无人值守远程边界策略。
 
 如果 Claude 已由你在 tmux 中启动，可以显式接管且不会重放原始任务：
 

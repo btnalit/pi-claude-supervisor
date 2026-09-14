@@ -7,6 +7,7 @@ import { readFile, realpath } from "node:fs/promises";
 import { EventLog } from "./events.ts";
 import { redactSensitive } from "./redaction.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
+import { automaticWorkerEnvironment, isRemoteCredentialName } from "./worker/environment.ts";
 import { TmuxWorkerAdapter, attachCommand } from "./worker/tmux-adapter.ts";
 import { Supervisor, type DecisionSessionClosedInfo, type SupervisorProgress } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
@@ -41,8 +42,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   if (transport === "tmux" && cgroupMode === "required") {
     throw new Error("PI_CLAUDE_SUPERVISOR_CGROUP_MODE=required is unsupported with tmux; use process-pipe/jsonl or set cgroup mode to auto/off");
   }
-  if (automation && transport === "process-pipe") {
-    throw new Error("automatic supervision requires PI_CLAUDE_SUPERVISOR_TRANSPORT=jsonl or tmux; explicit process-pipe is manual-only");
+  if (automation && transport !== "jsonl") {
+    throw new Error("automatic supervision requires PI_CLAUDE_SUPERVISOR_TRANSPORT=jsonl; process-pipe and tmux are manual-only");
   }
   const adapter = transport === "tmux"
     ? new TmuxWorkerAdapter({ stateDir })
@@ -279,7 +280,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 cwd: cwdKey,
                 command,
                 args: workerArgs,
-                env: selectedWorkerEnvironment(),
+                env: selectedWorkerEnvironment(taskAutomation),
                 approval,
                 automation: taskAutomation,
                 tmuxSession,
@@ -497,7 +498,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 cwd: cwdKey,
                 command: record.command,
                 args: record.args,
-                env: selectedWorkerEnvironment(),
+                env: selectedWorkerEnvironment(record.spec?.autonomy.unattended !== false),
                 approval,
                 automation: record.spec?.autonomy.unattended !== false,
                 maxTurns: record.maxTurns,
@@ -758,16 +759,17 @@ function formatSessions(sessions: Map<string, Supervisor>, recoverable: Decision
   return [...active, ...pending].join("\n") || "No task sessions.";
 }
 
-function selectedWorkerEnvironment(): NodeJS.ProcessEnv {
+function selectedWorkerEnvironment(automatic = false): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = {};
   const names = (process.env.PI_CLAUDE_SUPERVISOR_WORKER_ENV ?? "")
     .split(",")
     .map((name) => name.trim())
     .filter(Boolean);
   for (const name of names) {
+    if (automatic && isRemoteCredentialName(name)) continue;
     if (process.env[name] !== undefined) result[name] = process.env[name];
   }
-  return result;
+  return automatic ? automaticWorkerEnvironment(result) : result;
 }
 
 async function readTaskSpecFile(path: string, cwd: string): Promise<TaskSpec> {

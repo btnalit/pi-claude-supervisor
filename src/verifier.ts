@@ -66,6 +66,23 @@ export async function repositoryHead(cwd: string, signal?: AbortSignal): Promise
   }
 }
 
+/** Determine whether cwd is a non-bare Git worktree without invoking a shell. */
+export async function repositoryWorkTree(cwd: string, signal?: AbortSignal): Promise<boolean | undefined> {
+  try {
+    const result = await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], {
+      cwd,
+      timeout: 30_000,
+      maxBuffer: 1024,
+      signal,
+      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
+    });
+    const value = String(result.stdout).trim();
+    return value === "true" ? true : value === "false" ? false : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Read the current symbolic branch without invoking a shell. */
 export async function repositoryBranch(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
   try {

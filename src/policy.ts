@@ -24,11 +24,18 @@ export function evaluatePermission(toolName: string, input: unknown): PolicyResu
 const deniedPatterns = [
   // The Worker may develop and commit locally, but it never receives the
   // authority to write to a remote repository or integrate into main.
-  /\bgit\b[\s\S]*\b(?:push|merge)\b/iu,
-  /\bgh\b[\s\S]*\bpr\s+(?:create|merge|close|reopen|edit)\b/iu,
+  /\bgit\b[\s\S]*\b(?:push|merge|send-pack|receive-pack|update-ref)\b/iu,
+  /\bgit-(?:send|receive|upload)-pack\b/iu,
+  /\bgh\b[\s\S]*\b(?:api|pr\s+(?:create|merge|close|reopen|edit)|release\b)/iu,
+  /\b(?:glab|hub)\b[\s\S]*\b(?:api|mr\s+(?:create|merge|close|reopen|edit)|pull-request|release)\b/iu,
   /\bgit\b[\s\S]*\b(?:checkout|switch)\b[\s-]+(?:main|master|trunk|integration|develop)\b/iu,
+  /\bgit\b[\s\S]*\b(?:checkout\s+-(?:B|b)|switch\s+(?:-c|--create))\s+(?:main|master|trunk|integration|develop)\b/iu,
+  /\bgit\b[\s\S]*\b(?:update-ref|symbolic-ref)\b[\s\S]*\brefs\/heads\/(?:main|master|trunk|integration|develop)\b/iu,
   /\b(?:npm|pnpm|yarn)\b[\s\S]*\bpublish\b/iu,
-  /--dangerously-skip-permissions\b/iu,
+  /\b(?:ssh|scp|sftp|rsync)\b/iu,
+  /\b(?:curl|wget)\b[\s\S]*(?:-X\s*(?:POST|PUT|PATCH|DELETE)|--method(?:=|\s+)(?:POST|PUT|PATCH|DELETE)|https?:\/\/(?:api\.)?(?:github|gitlab|bitbucket|registry\.npmjs)\.)/iu,
+  /(?:\$\{?[^\s`}]+\}?|`[^`]*`|\$\([^)]*\))[\s\S]*\b(?:push|merge|publish)\b|\b(?:push|merge|publish)\b[\s\S]*(?:\$\{?[^\s`}]+\}?|`[^`]*`|\$\([^)]*\))/iu,
+  /--(?:allow-)?dangerously-skip-permissions\b/iu,
   /--permission-mode\s+(?:bypasspermissions|dontask)\b/iu,
   /\brm\s+-rf\s+\//iu,
   /\bmkfs(?:\.|\s)/iu,
@@ -41,8 +48,8 @@ export function evaluateCommand(command: string, args: readonly string[] = []): 
   const normalized = [command, ...args].join(" ").trim();
   if (!normalized) return { decision: "deny", reason: "empty command" };
   if (deniedPatterns.some((pattern) => pattern.test(normalized))) {
-    if (/\bgit\b[\s\S]*\b(?:push|merge)\b|\bgh\b[\s\S]*\bpr\s+(?:create|merge|close|reopen|edit)\b/iu.test(normalized)) {
-      return { decision: "deny", reason: "Worker has no remote push or main/integration merge authority" };
+    if (/\bgit\b[\s\S]*\b(?:push|merge|send-pack|receive-pack|update-ref)\b|\bgit-(?:send|receive|upload)-pack\b|\b(?:gh|glab|hub)\b[\s\S]*\b(?:api|pr|mr|pull-request|release)\b|\b(?:curl|wget)\b[\s\S]*(?:github|gitlab|bitbucket|registry\.npmjs)\b/iu.test(normalized)) {
+      return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
     }
     if (/\bgit\b[\s\S]*\b(?:checkout|switch)\b[\s-]+(?:main|master|trunk|integration|develop)\b/iu.test(normalized)) {
       return { decision: "deny", reason: "Worker cannot switch to a protected integration branch" };

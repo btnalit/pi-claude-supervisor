@@ -61,7 +61,7 @@ try {
     cwd,
     command: claude,
     args: ["--model", model, "--permission-mode", "plan"],
-    automation: true,
+    automation: false,
     maxTurns: 4,
     decisionSessionDir: join(stateDir, "decision-sessions"),
   });
@@ -128,7 +128,7 @@ try {
     ownedTurns: 3,
     exactOutput: true,
     pauseResume: true,
-    automationEnabled: true,
+    automationEnabled: false,
     humanTakeover: true,
     automaticActionsAfterTakeover: 0,
     restartReadoption: true,

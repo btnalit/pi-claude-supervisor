@@ -14,6 +14,9 @@ test("policy hard-denies publication and remote/integration writes", () => {
   assert.equal(evaluateCommand("npm publish").decision, "deny");
   assert.equal(evaluateCommand("npm --prefix /tmp/pkg publish").decision, "deny");
   assert.equal(evaluateCommand("gh pr merge 25").decision, "deny");
+  assert.equal(evaluateCommand("gh api -X POST repos/acme/project/releases").decision, "deny");
+  assert.equal(evaluateCommand("git send-pack ssh://example.invalid/repo").decision, "deny");
+  assert.equal(evaluateCommand("git checkout -B main").decision, "deny");
 });
 
 test("policy does not create a synchronous human gate for local development", () => {
@@ -27,6 +30,7 @@ test("policy allows ordinary read-only commands", () => {
 
 test("policy denies unsafe worker permission flags even when passed as arguments", () => {
   assert.equal(evaluateCommand("claude", ["--dangerously-skip-permissions"]).decision, "deny");
+  assert.equal(evaluateCommand("claude", ["--allow-dangerously-skip-permissions"]).decision, "deny");
 });
 
 test("remote and destructive commands remain denied even with a legacy approval", () => {

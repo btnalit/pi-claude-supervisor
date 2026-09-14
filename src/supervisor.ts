@@ -4,9 +4,10 @@ import { EventLog, type SupervisorEvent } from "./events.ts";
 import { SupervisorStateMachine } from "./state.ts";
 import { evaluatePermission } from "./policy.ts";
 import { PiDecisionWorker, type DecisionAction, type DecisionWorkerFactory, type DecisionWorkerLike } from "./decision-worker.ts";
-import { collectRepositoryEvidence, repositoryBranch, repositoryHead, verifyAll, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
+import { collectRepositoryEvidence, repositoryBranch, repositoryHead, repositoryWorkTree, verifyAll, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { redactSensitive } from "./redaction.ts";
+import { automaticClaudeArgs, automaticWorkerEnvironment } from "./worker/environment.ts";
 import type { ReviewInput, TaskReviewer } from "./reviewer.ts";
 import type {
   AcceptanceReport,
@@ -89,7 +90,7 @@ export interface SupervisorStartOptions {
   tmuxExpectedIdentity?: WorkerStartInput["tmuxExpectedIdentity"];
   /** Do not replay the task when adopting an existing interactive session. */
   sendInitialInput?: boolean;
-  /** Enable the event-driven Pi Decision Worker. Requires claude-jsonl or tmux. */
+  /** Enable the event-driven Pi Decision Worker. Automatic mode requires claude-jsonl. */
   automation?: boolean;
   /** Persistent Pi session location for the Decision Worker. */
   decisionSessionFile?: string;
@@ -232,13 +233,25 @@ export class Supervisor {
     this.#startToken = randomUUID();
     this.#startStopReason = undefined;
     this.#startAbortError = undefined;
-    const baseCommitPromise = options.baseCommit
-      ? Promise.resolve(options.baseCommit)
-      : repositoryHead(options.cwd, startAbortController.signal);
     try {
-      if (this.#automation && spec.autonomy.requireLocalCommit) {
-        const branch = await repositoryBranch(options.cwd, startAbortController.signal);
+      if (this.#automation && !this.#reviewer) throw new Error("automatic supervision requires an independent Reviewer");
+      let discoveredBase = options.baseCommit;
+      if (discoveredBase && !/^[0-9a-f]{40,64}$/iu.test(discoveredBase)) {
+        throw new Error("automatic supervision requires a full hexadecimal git baseline");
+      }
+      if (this.#automation) {
+        discoveredBase ??= await repositoryHead(options.cwd, startAbortController.signal);
         this.#assertStartNotAborted(startAbortController.signal);
+        if (discoveredBase) this.#task.baseCommit = discoveredBase;
+        if (spec.autonomy.requireLocalCommit && options.sendInitialInput !== false && !discoveredBase) {
+          throw new Error("automatic local candidates require a git baseline before Worker startup");
+        }
+        const [workTree, branch] = await Promise.all([
+          repositoryWorkTree(options.cwd, startAbortController.signal),
+          repositoryBranch(options.cwd, startAbortController.signal),
+        ]);
+        this.#assertStartNotAborted(startAbortController.signal);
+        if (workTree === true && !branch) throw new Error("automatic local candidates cannot start from a detached or unreadable git HEAD");
         if (branch && isProtectedBranch(branch)) throw new Error("automatic local candidates cannot start on a protected integration branch");
         if (!this.#task.baseBranch && branch) this.#task.baseBranch = branch;
       }
@@ -253,14 +266,16 @@ export class Supervisor {
         },
       });
       this.#reportProgress("starting", "preflight and Worker startup");
-      if (this.#automation && !["jsonl", "tmux"].includes(this.#adapter.capabilities().transport)) {
-        throw new Error("automatic supervision requires claude-jsonl or tmux transport");
+      if (this.#automation && this.#adapter.capabilities().transport !== "jsonl") {
+        throw new Error("automatic supervision requires the claude-jsonl transport; tmux is manual-only");
       }
+      const workerEnvironment = this.#automation ? automaticWorkerEnvironment(options.env) : options.env;
+      const workerArgs = this.#automation ? automaticClaudeArgs(options.command, options.args) : options.args;
       await this.#adapter.preflight?.({
         cwd: options.cwd,
         command: options.command,
-        args: options.args,
-        env: options.env,
+        args: workerArgs,
+        env: workerEnvironment,
         approval: options.approval,
       });
       this.#assertStartNotAborted(startAbortController.signal);
@@ -272,8 +287,6 @@ export class Supervisor {
           sessionDir: options.decisionSessionDir ? join(options.decisionSessionDir, taskId) : undefined,
           ...(options.onDecisionSessionReady ? {
             onSessionReady: async (info: { sessionFile: string; sessionId: string; restored: boolean }) => {
-              const discoveredBase = await baseCommitPromise;
-              if (discoveredBase && this.#task) this.#task.baseCommit = discoveredBase;
               return options.onDecisionSessionReady?.({
                 taskId,
                 task: spec.goal,
@@ -303,20 +316,18 @@ export class Supervisor {
         task: options.initialInput ?? spec.goal,
         cwd: options.cwd,
         command: options.command,
-        args: options.args,
-        env: options.env,
+        args: workerArgs,
         approval: options.approval,
         tmuxSession: options.tmuxSession,
         tmuxSocket: options.tmuxSocket,
         tmuxExpectedIdentity: options.tmuxExpectedIdentity,
         sendInitialInput: options.sendInitialInput,
         eventListener: (event) => this.#receiveWorkerEvent(event),
+        env: workerEnvironment,
         abortSignal: startAbortController.signal,
         startupToken: this.#startToken,
       };
       this.#handle = await this.#adapter.start(input);
-      const discoveredBase = await baseCommitPromise;
-      if (discoveredBase) this.#task.baseCommit = discoveredBase;
       this.#assertStartNotAborted(startAbortController.signal);
       this.#machine.transition("running");
       await this.#appendEvent({ type: "worker_started", taskId, workerId: this.#handle.id, data: { pid: this.#handle.pid } });
@@ -902,7 +913,8 @@ export class Supervisor {
     }
 
     let repositoryEvidence: RepositoryEvidence | undefined;
-    if (this.#task.spec.autonomy.requireLocalCommit) {
+    const needsRepositoryEvidence = this.#task.spec.autonomy.requireLocalCommit || (this.#automation && Boolean(this.#task.baseCommit));
+    if (needsRepositoryEvidence) {
       try {
         repositoryEvidence = redactRepositoryEvidence(await collectRepositoryEvidence(this.#task.cwd, { signal: verificationAbortController.signal, baseRef: this.#task.baseCommit }));
       } catch (error) {
@@ -910,14 +922,21 @@ export class Supervisor {
         await this.#parkCandidate(`local repository evidence could not be collected: ${safeMessage(error)}`);
         return result;
       }
-      const commitOutcome = await this.#ensureLocalCommit(result, repositoryEvidence);
-      if (commitOutcome === "repair_requested") {
-        this.#verificationAbortController = undefined;
+      if (this.#automation && this.#task.baseCommit && (!repositoryEvidence.branch || isProtectedBranch(repositoryEvidence.branch))) {
+        this.#lastVerification = result;
+        await this.#parkCandidate(`local candidate branch is unavailable or protected: ${repositoryEvidence.branch ?? "(detached)"}`);
         return result;
       }
-      if (commitOutcome === "blocked") {
-        this.#lastVerification = result;
-        return this.#finalizeVerification(result, "blocked", "local changes were not committed on the task branch");
+      if (this.#task.spec.autonomy.requireLocalCommit) {
+        const commitOutcome = await this.#ensureLocalCommit(result, repositoryEvidence);
+        if (commitOutcome === "repair_requested") {
+          this.#verificationAbortController = undefined;
+          return result;
+        }
+        if (commitOutcome === "blocked") {
+          this.#lastVerification = result;
+          return this.#finalizeVerification(result, "blocked", "local changes were not committed on the task branch");
+        }
       }
     }
 

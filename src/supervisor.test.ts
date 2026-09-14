@@ -9,6 +9,7 @@ import type { SupervisorEvent } from "./events.ts";
 import type { WorkerAdapter, WorkerHandle, WorkerOutputChunk, WorkerStatus } from "./types.ts";
 import { Supervisor } from "./supervisor.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
+import { TmuxWorkerAdapter } from "./worker/tmux-adapter.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -58,6 +59,64 @@ test("supervisor rejects spawn failure before reporting a worker start", async (
   }), /spawn|ENOENT/u);
   assert.equal(supervisor.state, "failed");
   assert.equal(supervisor.handle, undefined);
+});
+
+test("automatic supervision requires an independent Reviewer", async () => {
+  const supervisor = new Supervisor(new ProcessWorkerAdapter());
+  await assert.rejects(() => supervisor.start({
+    task: "missing reviewer",
+    cwd: "/tmp",
+    command: process.execPath,
+    args: ["-e", "setInterval(() => {}, 1000)"],
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 } },
+  }), /independent Reviewer/u);
+});
+
+test("automatic supervision rejects tmux before Worker startup", async () => {
+  const adapter = new TmuxWorkerAdapter();
+  const supervisor = new Supervisor(adapter, undefined, {
+    reviewer: { review: async () => ({ verdict: "pass", summary: "unused", findings: [], round: 0, checkedAt: new Date().toISOString() }) },
+  });
+  await assert.rejects(() => supervisor.start({
+    task: "tmux is manual",
+    cwd: "/tmp",
+    command: process.execPath,
+    args: ["-e", "setInterval(() => {}, 1000)"],
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 } },
+  }), /tmux is manual-only/u);
+});
+
+test("protected branches are rejected even when local commits are optional", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-protected-start-"));
+  try {
+    await execFileAsync("git", ["init", "-q", "-b", "main"], { cwd });
+    await execFileAsync("git", ["config", "user.email", "test@example.invalid"], { cwd });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd });
+    await writeFile(join(cwd, "base.txt"), "base\n");
+    await execFileAsync("git", ["add", "base.txt"], { cwd });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd });
+    const supervisor = new Supervisor(new ProcessWorkerAdapter(), undefined, {
+      reviewer: { review: async () => ({ verdict: "pass", summary: "unused", findings: [], round: 0, checkedAt: new Date().toISOString() }) },
+    });
+    await assert.rejects(() => supervisor.start({
+      task: "protected branch",
+      cwd,
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 } },
+    }), /protected integration branch/u);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
 
 test("stop preempts a startup blocked before a worker handle exists", async () => {
@@ -566,6 +625,7 @@ test("non-persistent verification failure finalizes once and closes the decision
   };
   const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
     onHumanRequired: () => {},
+    reviewer: { review: async (input) => ({ verdict: "pass", summary: "not reached", findings: [], round: input.round, checkedAt: new Date().toISOString() }) },
   });
   await supervisor.start({
     task: "non-persistent repair failure",

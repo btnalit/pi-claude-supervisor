@@ -12,7 +12,8 @@ worker remains an explicitly started child process.
 
 > **Release status:** `v0.5.2` is the released single-Worker recovery baseline. The
 > default manual transport is dependency-free process pipes, not PTY. Automatic
-> supervision uses Claude JSONL or tmux, with repairable-vs-persistent capabilities,
+> supervision uses Claude JSONL only; tmux is manual-only because it has no structured
+> permission boundary. Repairable-vs-persistent capabilities,
 > cancellable verification, evidence completeness gates, startup preflight and phase
 > progress reporting. A real edit-capable Claude Code `2.1.270` repair/reacceptance
 > drill passed in an isolated temporary worktree. The confirmed product target is
@@ -29,9 +30,9 @@ worker remains an explicitly started child process.
 
 - The extension never starts a worker automatically.
 - Worker commands are launched without a shell.
-- Workers receive a minimal environment; credentials must be explicitly supplied by the caller.
+- Workers receive a minimal environment; automatic mode strips remote credentials and disables Git/package credential helpers. Credentials must be explicitly supplied by the caller in manual integrations.
 - Local command and permission behavior follows the configured task/runtime policy; actions outside that authority are rejected or parked without requiring a synchronous human response.
-- Ordinary network use is not denied merely because it is network use; download-to-shell patterns follow the configured policy or produce a parked candidate.
+- Built-in automatic Claude workers request a fail-closed Claude Code Bash sandbox with no outbound domains; command policy remains a second guard. Manual/custom integrations must provide their own equivalent network boundary.
 - A worker completion is only a transition to `verifying`; it is not evidence of success.
 - Verification is an independent host command (default: `git diff --check`).
 - Target local development runs unattended after a task starts: the Worker may edit, test, repair and commit locally. The Worker must have no authority or credentials to push remotely or merge into `main`/an integration branch.
@@ -123,7 +124,8 @@ scheduling, structured handoffs, aggregate acceptance and graph-aware recovery;
 it will not grant any Worker remote push or main/integration merge authority.
 Unattended local development is the target operating mode; a blocked or failed
 candidate is parked with its evidence rather than made dependent on a human being
-online. Host permissions and network access follow the configured task/runtime policy.
+online. Built-in automatic Claude workers use a fail-closed Bash sandbox with no outbound
+domains; custom integrations must provide an equivalent boundary.
 Set `PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=0` only for a task that intentionally
 produces no git candidate, or set `autonomy.requireLocalCommit` in its spec.
 `PI_CLAUDE_SUPERVISOR_UNATTENDED=0` opts a task out of automatic Decision Worker control;
@@ -143,8 +145,8 @@ evidence, duplicate findings, P0/P1 findings and exhausted repair budgets park t
 candidate without waiting for a human; see [the autonomy target](docs/autonomy-target.md).
 Coordinated multi-worker scheduling is a later milestone; CI uses deterministic fake
 Workers/replay fixtures, and real multi-worker Claude tests remain authenticated
-manual Spikes. CLI multi-version compatibility, sandboxing, low-privilege execution
-and network isolation are not part of this milestone.
+manual Spikes. Full host-level sandboxing and low-privilege execution for custom
+integrations remain separate hardening work.
 
 Automatic mode persists the Pi Decision Worker session under the configured state
 directory. After an unclean Pi restart, `/supervise sessions` lists recoverable
@@ -167,8 +169,7 @@ For an interactive Claude Code window, opt in to the tmux transport:
 export PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux
 export PI_CLAUDE_SUPERVISOR_WORKER='claude --permission-mode plan'
 # tmux does not support cgroup required mode; use cgroup mode auto/off.
-# Optional automatic Decision Worker (manual mode is the default):
-# export PI_CLAUDE_SUPERVISOR_MODE=auto
+# tmux is manual-only; automatic Decision Worker supervision requires JSONL.
 # Optional, only when adopting a non-default tmux server:
 # export PI_CLAUDE_SUPERVISOR_TMUX_SOCKET=/path/to/tmux.sock
 ```
@@ -178,9 +179,10 @@ literal attach command. Use that command in another terminal to watch or
 manually interact with the same PTY; attaching is optional for unattended local
 development. The adapter sends multi-line input through
 tmux buffers and Enter, never by interpolating the message into a shell command.
-It records the PTY stream with `pipe-pane`, uses `capture-pane` to detect a
-stable Claude input prompt, and feeds turn-completion events into the same
-watchdog, Decision Worker, audit and verification paths as JSONL.
+It records the PTY stream with `pipe-pane` and uses `capture-pane` to detect a
+stable Claude input prompt. Because tmux has no structured permission boundary,
+automatic Decision Worker supervision is disabled for this transport; use JSONL for
+unattended decisions, repair and protected command enforcement.
 
 A session that you started yourself can be explicitly adopted without replaying
 the task:

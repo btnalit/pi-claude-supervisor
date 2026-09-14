@@ -288,10 +288,9 @@ limit, so a normal large test report is not misclassified as a failed command.
 - bypassing the configured Claude Code/task permissions;
 - accepting model text as verification;
 - shell command interpolation;
-- automatic network denial or a fake domain allowlist. Network access follows
-  Claude's own permission model and the command policy; suspicious download-to-
-  shell patterns are handled by the configured policy or produce a parked candidate,
-  rather than requiring a human to be online;
+- a host-level network sandbox for arbitrary custom Worker integrations. Built-in automatic
+  Claude workers request a fail-closed Claude Code Bash sandbox with no outbound domains;
+  command policy and credential filtering remain defense in depth;
 - Claude CLI multi-version compatibility in the current stability milestone;
-- OS sandbox, low-privilege execution and network isolation in the current
+- full OS sandbox and low-privilege execution for custom Worker integrations in the current
   lifecycle milestone.
