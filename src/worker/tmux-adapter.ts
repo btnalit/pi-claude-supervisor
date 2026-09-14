@@ -285,8 +285,12 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
           record.cleanupError = undefined;
         } else if (isPaneIdentityError(error)) {
           record.paneDead = false;
+          record.cleanupComplete = false;
           record.cleanupError = asError(error);
-        } else record.cleanupError = asError(error);
+        } else {
+          record.cleanupComplete = false;
+          record.cleanupError = asError(error);
+        }
       }
       return this.#status(record, !record.paneDead);
     }
@@ -422,6 +426,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       try { await rm(record.runtimeDir, { recursive: true, force: true }); }
       catch (error) { record.cleanupError ??= asError(error); }
     }
+    record.cleanupComplete = !record.cleanupError;
     if (record.cleanupError) throw new Error(`tmux supervision release failed: ${record.cleanupError.message}`);
     // A released tmux worker is intentionally left running. It can be adopted
     // again explicitly after Pi restarts, and the user's attached window stays open.

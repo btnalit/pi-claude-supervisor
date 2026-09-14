@@ -142,20 +142,22 @@ response.
 
 The automated adapter matrix covers external `SIGTERM`, `SIGINT`, `SIGKILL`,
 `SIGSTOP`/`SIGCONT`, SIGTERM refusal/escalation, leader-early-exit descendant
-cleanup, required cgroup cleanup of a `setsid()` descendant, repeated stop,
-spawn failure, output truncation, blocked stdin write timeouts, and immediate
-JSONL results. The Supervisor matrix also covers
-retrying failed lifecycle events, preserving startup event order, stopping under
-persistent timeout-event failure, and restoring output after event-log failure. The Supervisor matrix covers startup rejection, externally terminated
-workers, lifecycle serialization and stop races.
+cleanup, required cgroup bootstrap containment of a pre-attachment detached
+and `setsid()` descendant, repeated stop, spawn failure, output truncation,
+blocked stdin write timeouts, and immediate JSONL results. The Supervisor
+matrix also covers retrying failed lifecycle events, preserving startup event
+order, stopping under persistent timeout-event failure, and restoring output
+after event-log failure. The Supervisor matrix covers startup rejection,
+externally terminated workers, lifecycle serialization and stop races.
 
 Before release, manually test at least: immediate crash, hung process, malformed
 output, duplicate send, send/exit race, Pi `SIGTERM`/`SIGINT` shutdown,
 verification failure, blocked stdin writes/stop preemption, corrupt event-log
 tails, and descendants that call `setsid()` when cgroup mode is unavailable (expected
-fallback limitation). The cgroup test proves cleanup after attachment but does
-not eliminate the post-spawn attachment window. `SIGSTOP` and `SIGKILL` of the Pi host cannot be handled;
-verify and document the resulting orphan behavior.
+fallback limitation). In cgroup mode, a small bootstrap joins the cgroup before
+launching Worker code, and cleanup also validates and reaps the detached process
+group; this closes the post-spawn attachment window. `SIGSTOP` and `SIGKILL` of
+the Pi host cannot be handled; verify and document the resulting orphan behavior.
 Default behavior must be fail-closed and leave no orphaned worker process within
 the managed process group.
 

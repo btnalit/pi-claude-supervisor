@@ -85,6 +85,9 @@ test("owned tmux identity can be re-adopted after restart", { skip: !tmuxAvailab
     });
     assert.equal(readopted.ownership, "adopted");
     await readoptedAdapter.stop(readopted, "detach after re-adopt");
+    const releasedStatus = await readoptedAdapter.getStatus(readopted);
+    assert.equal(releasedStatus.running, true);
+    assert.equal(releasedStatus.processGroupCleaned, true);
   } finally {
     if (handle) {
       await adapter.stop(handle, "owned re-adopt test complete").catch(() => {});
