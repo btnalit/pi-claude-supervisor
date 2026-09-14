@@ -124,6 +124,9 @@ function formatCheckResult(result: AcceptanceCheckResult): string {
 }
 
 function boundOutput(value: string): string {
-  if (Buffer.byteLength(value, "utf8") <= MAX_OUTPUT_BYTES) return value;
-  return `${Buffer.from(value, "utf8").subarray(-MAX_OUTPUT_BYTES).toString("utf8")}\n[TRUNCATED]`;
+  const encoded = Buffer.from(value, "utf8");
+  if (encoded.byteLength <= MAX_OUTPUT_BYTES) return value;
+  const marker = Buffer.from("\n[TRUNCATED]", "utf8");
+  const suffix = encoded.subarray(-Math.max(0, MAX_OUTPUT_BYTES - marker.byteLength));
+  return `${suffix.toString("utf8")}${marker.toString("utf8")}`;
 }

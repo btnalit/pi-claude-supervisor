@@ -67,8 +67,10 @@ guarantee.
 The extension persists each automatic Decision Worker session as Pi JSONL plus a
 0600 task mapping. Recovery is explicit and safe: after an unclean Pi restart,
 `/supervise sessions` shows the task as `recoverable`, and `/supervise recover
-<task-id>` restores the Decision Worker history before starting a new Claude
-Worker.
+[--takeover] <task-id>` restores the Decision Worker history before starting a new
+Claude Worker. `--takeover` is accepted only when the old Pi owner is dead, the
+Worker process group is gone, and its cgroup is a real readable empty boundary;
+persistent tmux sessions use `adopt-tmux`.
 Run the permission and signal probes explicitly when validating a CLI release:
 
 ```bash
@@ -94,7 +96,9 @@ response, and an exact result marker; it also records metadata only.
 
 For each release, pin and record the validated Claude Code version, resolved
 executable path, and model. The spikes reject an unpinned/mismatched executable
-version. For this release the validated version is `2.1.270` with model `opus`.
+version. For this release the validated version is `2.1.270` with model `opus`;
+the bounded matrix and its fail-closed outliers are recorded in
+[`docs/stability-matrix-2.1.270.md`](stability-matrix-2.1.270.md).
 Record:
 
 1. exact version and resolved executable path;
@@ -152,7 +156,8 @@ the managed process group.
 
 ## Near-term automation acceptance gate
 
-The next implementation milestone focuses on real stability for the pinned
+The `v0.5.0` implementation of the acceptance—independent Review—repair—reacceptance
+loop is shipped. The remaining gate focuses on real stability for the pinned
 Claude Code `2.1.270` CLI. It does not add a multi-version matrix or wait for
 OS sandbox, low-privilege or network-isolation work.
 
@@ -186,6 +191,30 @@ The adapter/replay matrix must cover:
 
 Real Claude tests remain authenticated manual Spikes and are pinned to
 `2.1.270`; they are not part of normal CI. Normal CI runs deterministic fake
-Worker and replay fixtures. Stability evidence should include ten consecutive
-ordinary automatic runs and at least five runs each for permission and question
-handling, with no duplicate action, false completion or unreaped Worker.
+Worker and replay fixtures. The short-term stability gate is still pending and
+must include ten consecutive ordinary automatic runs and at least five runs each
+for permission and question handling, with no duplicate action, false completion
+or unreaped Worker.
+
+## Future multi-worker test plan
+
+Multiple independent task sessions already run concurrently when their canonical
+cwd/worktrees do not overlap. This is not yet coordinated multi-worker
+collaboration. The future multi-worker milestone must be tested as a task graph,
+not as unrestricted shared-worker access.
+
+Required deterministic and integration coverage:
+
+- two independent Workers with separate worktrees and aggregated parent status;
+- dependency ordering and a blocked child that must not start early;
+- child failure, timeout, cancellation propagation and bounded global budgets;
+- schema-validated handoff artifacts with duplicate/oversized/stale handoffs;
+- conflicting diffs detected before integration, with no same-worktree writes;
+- independent child acceptance followed by root-task aggregate acceptance and Review;
+- single-child recovery, whole-graph recovery and Pi shutdown during scheduling;
+- no child can grant permissions, send control input to another child or bypass Policy Gate;
+- explicit human-controlled integration in a separate worktree; no automatic merge or publish.
+
+The multi-worker gate should be added only after the pinned single-worker stability
+and recovery gates pass. CI should use fake Workers and replay fixtures; authenticated
+Claude multi-worker Spikes remain manual and version-pinned.

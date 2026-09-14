@@ -27,6 +27,28 @@ directories/worktrees; same-cwd and parent/child cwd starts are rejected before
 spawn, including concurrent starts, to prevent uncoordinated edits. Pending starts
 are also awaited during Pi shutdown.
 
+### Multi-worker boundary and roadmap
+
+The current implementation supports multiple **independent** task sessions, not
+coordinated shared-worktree editing. Every active session must own a
+non-overlapping canonical cwd/worktree and has an isolated Supervisor,
+watchdog, Worker handle and acceptance/review loop. The shared EventLog is only
+an audit stream; it is not a collaboration or authorization channel.
+
+A future multi-worker scheduler must introduce an explicit parent/child task
+graph, roles, dependencies, bounded concurrency and structured handoff
+artifacts. Child Workers must communicate through validated evidence and event
+references rather than another Worker's control channel. Each child is accepted
+independently; the parent can complete only after aggregate acceptance and
+independent Review. Integration, conflict resolution, merge and publication
+remain explicit human-controlled operations in a separate integration worktree.
+
+Recovery and shutdown must be graph-aware: a parent with an unknown child state
+cannot complete, cancellation must propagate within a bounded budget, and Pi
+shutdown must leave every child either cleanup-verified or explicitly
+recoverable. This work is scheduled after single-worker stability and session
+recovery, not by relaxing the current cwd lease rule.
+
 ## MVP transport
 
 `ProcessWorkerAdapter` uses `node:child_process.spawn` with:
@@ -126,9 +148,12 @@ registry before spawning Claude. The default registry is
 may point all Pi processes at an alternate shared directory. Canonical paths
 conflict with both their parents and descendants, and the registry lock
 serializes acquisition across independent Pi processes. A lease is released
-only after the adapter confirms the worker and its descendant cleanup; an
-unconfirmed lease left by a crashed Pi is intentionally retained and requires
-operator verification/manual cleanup rather than unsafe automatic reclamation.
+only after the adapter confirms the worker and its descendant cleanup. An
+unconfirmed lease left by a crashed Pi is intentionally retained. Ordinary
+recovery refuses it; an operator may use `recover --takeover` only when the old
+owner is dead, the Worker process group is gone, and the lease independently
+reads a real empty cgroup boundary for the old Worker. Missing or unverifiable
+Worker evidence still requires manual cleanup rather than unsafe reclamation.
 An explicitly adopted tmux session may hand off an existing lease only after
 its owner identity is no longer live and its canonical cwd, tmux session/socket,
 pane id, pane PID/start time, and pane command all match; ordinary starts
@@ -170,7 +195,8 @@ duplicate turns. The adapter also exposes event subscriptions for `result`,
 `control_request`, permission requests and process exit. Automatic mode routes
 those events to a persistent, read-only Pi Decision Worker; its Pi session JSONL
 and task mapping are persisted under the supervisor state directory. After an
-unclean Pi restart, recovery is explicit: `/supervise recover <task-id>` restores
+unclean Pi restart, recovery is explicit: `/supervise recover [--takeover]
+<task-id>` restores
 the Decision Worker context and starts a new Claude Worker. It does not silently
 resume or duplicate a task. It does not poll to detect turn completion. A watchdog timer remains only as a deadlock safety
 fallback. Permission actions pass through `evaluatePermission` and can be

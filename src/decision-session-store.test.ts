@@ -32,6 +32,8 @@ test("Decision Worker session registry survives a fresh store instance", async (
   const restored = await new DecisionSessionStore(directory).load(taskId);
   assert.equal(restored?.taskId, taskId);
   assert.equal(restored?.state, "active");
+  assert.equal(restored?.recoveryState, "ready");
+  assert.equal(restored?.recoveryAttempt, 0);
   assert.equal(restored?.decisionSessionFile, sessionFile);
   assert.deepEqual(restored?.args, ["--print"]);
   assert.equal((await stat(join(directory, `${taskId}.json`))).mode & 0o777, 0o600);
@@ -56,7 +58,52 @@ test("Decision Worker recovery rejects a record whose task id differs from its f
   await assert.rejects(() => new DecisionSessionStore(directory).load(taskId), /task id mismatch/u);
 });
 
-test("Decision Worker session registry ignores corrupt records during discovery", async () => {
+test("Decision Worker recovery claims are durable and only one attempt can start", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-claude-decision-store-recovery-"));
+  const store = new DecisionSessionStore(directory);
+  const sessionDirectory = store.sessionDirectory(taskId);
+  await mkdir(sessionDirectory, { recursive: true });
+  const sessionFile = join(sessionDirectory, "session.jsonl");
+  await writeFile(sessionFile, "{}\n");
+  await store.save({
+    taskId,
+    task: "recover once",
+    cwd: "/tmp/fixture",
+    command: "claude",
+    args: [],
+    decisionSessionFile: sessionFile,
+    maxTurns: 10,
+    deadlineMs: 60_000,
+    noOutputTimeoutMs: 60_000,
+    startedAt: new Date().toISOString(),
+    turn: 2,
+    state: "active",
+  });
+
+  const [first, second] = await Promise.allSettled([store.beginRecovery(taskId), new DecisionSessionStore(directory).beginRecovery(taskId)]);
+  assert.equal([first, second].filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal([first, second].filter((result) => result.status === "rejected").length, 1);
+  const claimed = first.status === "fulfilled" ? first.value : second.status === "fulfilled" ? second.value : undefined;
+  assert.equal(claimed?.recoveryState, "starting");
+  assert.equal(claimed?.recoveryAttempt, 1);
+  await store.recordRecoveryWorker(taskId, { id: "worker-1", pid: 12345, startedAt: new Date().toISOString() });
+  assert.equal((await store.load(taskId))?.recoveryState, "registered");
+  await store.markRecoveryIdle(taskId);
+  assert.equal((await store.load(taskId))?.recoveryState, "recovered_idle");
+  await store.markRecoveryInterrupted(taskId);
+  assert.equal((await store.load(taskId))?.recoveryState, "interrupted");
+  const retry = await store.beginRecovery(taskId);
+  assert.equal(retry.recoveryAttempt, 2);
+  await store.resetRecovery(taskId);
+  assert.equal((await store.load(taskId))?.recoveryState, "ready");
+  const stale = await store.load(taskId);
+  assert.ok(stale);
+  await store.save({ ...stale, recoveryState: "starting", recoveryOwnerPid: 999999999, recoveryOwnerStartTime: "1" });
+  await store.reconcileStaleRecovery(taskId);
+  assert.equal((await store.load(taskId))?.recoveryState, "interrupted");
+});
+
+test("Decision Worker session registry ignores corrupt and misnamed records during discovery", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-claude-decision-store-corrupt-"));
   const store = new DecisionSessionStore(directory);
   await mkdir(store.sessionDirectory(taskId), { recursive: true });
@@ -76,6 +123,7 @@ test("Decision Worker session registry ignores corrupt records during discovery"
     state: "active",
   });
   await writeFile(join(directory, "corrupt.json"), "not-json\n");
+  await writeFile(join(directory, "not-a-task.json"), JSON.stringify({ taskId, state: "active" }));
   const records = await store.list({ activeOnly: true });
   assert.deepEqual(records.map((record) => record.taskId), [taskId]);
 });

@@ -45,6 +45,44 @@ test("cwd lease worker identity is persisted and release is token-bound", async 
   await rm(root, { recursive: true, force: true });
 });
 
+test("cwd lease takeover requires an explicit dead-owner and dead-worker proof", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-takeover-"));
+  const leaseDir = join(root, "leases");
+  const cwd = join(root, "repo");
+  await mkdir(cwd);
+  const store = new CwdLeaseStore(leaseDir);
+  const old = await store.acquire(cwd, "77777777-7777-4777-8777-777777777777", "process-pipe");
+  await old.updateWorker({ transport: "process-pipe", pid: 999999998, startTime: "1", ownership: "owned", cgroupPath: "/sys/fs/cgroup/pi-claude-supervisor-test-gone" });
+  const oldPath = join(leaseDir, `${old.record.leaseId}.json`);
+  const oldRecord = JSON.parse(await readFile(oldPath, "utf8")) as Record<string, unknown>;
+  oldRecord.ownerPid = 999999999;
+  oldRecord.ownerStartTime = "1";
+  await writeFile(oldPath, `${JSON.stringify(oldRecord)}\n`);
+  await assert.rejects(
+    () => store.acquire(cwd, "88888888-8888-4888-8888-888888888888", "process-pipe"),
+    /working-directory lease is held/u,
+  );
+  await assert.rejects(
+    () => store.acquire(cwd, "88888888-8888-4888-8888-888888888888", "process-pipe", { takeover: { taskId: old.record.taskId } }),
+    /working-directory lease is held/u,
+  );
+  await old.release();
+
+  const noCgroup = await store.acquire(cwd, "99999999-9999-4999-8999-999999999999", "process-pipe");
+  await noCgroup.updateWorker({ transport: "process-pipe", pid: 999999997, startTime: "1", ownership: "owned" });
+  const noCgroupPath = join(leaseDir, `${noCgroup.record.leaseId}.json`);
+  const noCgroupRecord = JSON.parse(await readFile(noCgroupPath, "utf8")) as Record<string, unknown>;
+  noCgroupRecord.ownerPid = 999999996;
+  noCgroupRecord.ownerStartTime = "1";
+  await writeFile(noCgroupPath, `${JSON.stringify(noCgroupRecord)}\n`);
+  await assert.rejects(
+    () => store.acquire(cwd, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "process-pipe", { takeover: { taskId: noCgroup.record.taskId } }),
+    /working-directory lease is held/u,
+  );
+  await noCgroup.release();
+  await rm(root, { recursive: true, force: true });
+});
+
 test("cwd leases canonicalize symlink aliases and support identity-bound tmux handoff", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-"));
   const leaseDir = join(root, "leases");
@@ -65,6 +103,7 @@ test("cwd leases canonicalize symlink aliases and support identity-bound tmux ha
   await assert.rejects(() => store.acquire(alias, "99999999-9999-4999-8999-999999999999", "process-pipe"), /working-directory lease is held/u);
   const adopted = await store.acquire(alias, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "tmux", handoff);
   assert.equal(adopted.record.taskId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+  assert.equal(adopted.replacedTaskId, old.record.taskId);
   assert.equal((await store.list()).length, 1);
   await adopted.release();
   await rm(root, { recursive: true, force: true });

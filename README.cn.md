@@ -54,7 +54,7 @@ Claude CLI `2.1.270` 运行，跨版本兼容性不在本轮范围内。
 /supervise start --spec ./task.json
 /supervise poll
 /supervise sessions
-/supervise recover <task-id>
+/supervise recover [--takeover] <task-id>
 /supervise stop human requested stop
 /supervise verify
 /supervise approve <task-id> allow|deny [request-id]
@@ -94,17 +94,20 @@ Claude CLI `2.1.270` 运行，跨版本兼容性不在本轮范围内。
 
 当前 webhook 是出站通知，不直接接受批准命令；批准或接管仍通过 Pi。
 自动模式会将 Decision Worker 会话持久化到状态目录。Pi 非正常重启后，`/supervise sessions`
-会显示 `recoverable` 任务；显式执行 `/supervise recover <task-id>` 会恢复 Decision Worker 上下文并
-重新启动 Claude Worker，不会静默恢复或重复执行任务。
+会显示 `recoverable` 任务；显式执行 `/supervise recover [--takeover] <task-id>` 会恢复 Decision Worker 上下文并
+重新启动 Claude Worker，不会静默恢复或重复执行任务。旧 Pi 进程已退出且租约确认旧 Worker
+进程组已消失且 cgroup 仍是真实、可读取的空边界时，才可显式添加 `--takeover`；缺失、仍存活或无法确认的 Worker 会被拒绝。持久 tmux
+Worker 应使用 `adopt-tmux`，而不是 takeover。
 自动模式下，Decision Worker 可以安全拒绝 `AskUserQuestion`，让 Claude 将问题转成普通文本，
 再根据任务和仓库证据自动回答；无法确定时才升级人工。如需微信内闭环，需要另建带签名验证、
 一次性 action token 和重放保护的入站 callback 服务。
 
-近期自动化目标是先稳定完成“多命令验收—独立只读 Reviewer—结构化修复轮次—再次验收”闭环。
+`v0.5.0` 已完成并发布“多命令验收—独立只读 Reviewer—结构化修复轮次—再次验收”闭环。
 任务可通过 API 或 JSON spec 提供 `goal`、`scope`、`constraints`、`forbidden` 和多个
 `acceptance` 命令；旧的纯文本任务继续使用默认 `git diff --check`。Reviewer 只能使用
-`read`、`grep`、`find`、`ls`，不会修改工作树或批准权限。当前稳定性验证固定针对 Claude Code
-`2.1.270`，暂不把多版本兼容、sandbox、低权限和网络隔离作为本阶段门禁。
+`read`、`grep`、`find`、`ls`，不会修改工作树或批准权限。短期剩余门禁是固定 Claude Code
+`2.1.270` 的重复稳定性统计和 recovery 测试；协同多 Worker 属于后续独立开发阶段，
+暂不把多版本兼容、sandbox、低权限和网络隔离作为本阶段门禁。
 
 ### tmux/PTY 交互模式
 
@@ -149,6 +152,11 @@ PTY 屏幕文字不是 Claude JSONL。权限/信任对话框和无法确定的 T
 /supervise poll <task-id>
 /supervise send <task-id> continue after checking the test failure
 ```
+
+当前支持的是**独立任务会话并行**，不是共享工作树的协同多 Worker。后续多 Worker
+开发任务会引入 parent/child 任务图、依赖、并发上限、结构化 handoff、汇总验收和
+跨进程恢复，但不会放宽“一个 worktree 一个写入者”的边界，也不会自动 merge 或 publish。
+该阶段应安排在固定 Claude `2.1.270` 稳定性统计和单 Worker recovery 语义完成之后。
 
 Pull Request 必须通过聚合的 `CI / Quality gate`。Release Please 根据 Conventional Commits 创建版本 PR；维护者合并后，Release workflow 会针对精确 tag commit 重新验证，并通过受保护的 `npm` environment 使用 npm provenance 发布。
 

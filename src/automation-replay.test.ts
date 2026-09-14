@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { EventLog, type SupervisorEvent } from "./events.ts";
 import { Supervisor } from "./supervisor.ts";
@@ -104,18 +107,69 @@ test("automation replay covers permission allow, result, acceptance and independ
     decisionWorkerFactory: replayDecisionWorkerFactory(),
   });
 
-  adapter.emit({ type: "permission_request", request: { requestId: "request-1", toolUseId: "tool-1", toolName: "Bash", input: { command: "printf OK" }, raw: {} } });
+  const permission = { requestId: "request-1", toolUseId: "tool-1", toolName: "Bash", input: { command: "printf OK" }, raw: {} };
+  adapter.emit({ type: "permission_request", request: permission });
+  adapter.emit({ type: "permission_request", request: permission });
   await waitFor(() => adapter.permissionResponses.length === 1);
   assert.equal(adapter.permissionResponses[0]?.decision.behavior, "allow");
 
-  adapter.emit({ type: "turn_completed", result: { type: "result", uuid: "result-1" }, sequence: 1 });
+  const result = { type: "turn_completed" as const, result: { type: "result", uuid: "result-1" }, sequence: 1 };
+  adapter.emit(result);
+  adapter.emit(result);
   await waitFor(() => supervisor.state === "completed");
   assert.equal(supervisor.state, "completed");
   assert.ok(events.records.some((event) => event.type === "acceptance_check_finished"));
-  assert.ok(events.records.some((event) => event.type === "acceptance_result"));
-  assert.ok(events.records.some((event) => event.type === "review_result"));
-  assert.ok(events.records.some((event) => event.type === "review_finished"));
+  assert.equal(events.records.filter((event) => event.type === "acceptance_result").length, 1);
+  assert.equal(events.records.filter((event) => event.type === "review_result").length, 1);
+  assert.equal(events.records.filter((event) => event.type === "review_finished").length, 1);
   assert.ok(events.records.some((event) => event.type === "verification_passed"));
+});
+
+test("automation replay repairs a required-check failure before reacceptance and review", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-automation-replay-"));
+  try {
+    const marker = join(cwd, "repair-fixture.marker");
+    const checkScript = [
+      "const fs = require('node:fs');",
+      `const marker = ${JSON.stringify(marker)};`,
+      "if (fs.existsSync(marker)) process.exit(0);",
+      "fs.writeFileSync(marker, 'repaired');",
+      "process.stderr.write('required check failed');",
+      "process.exit(7);",
+    ].join(" ");
+    const adapter = new ReplayAdapter();
+    const events = new ReplayEventLog();
+    const supervisor = new Supervisor(adapter, events, { reviewer });
+    await supervisor.start({
+      task: "replay a repairable required-check failure",
+      cwd,
+      command: "fixture",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: { acceptance: [{ id: "repairable", name: "repairable", command: process.execPath, args: ["-e", checkScript], required: true, timeoutMs: 1_000 }] },
+      decisionWorkerFactory: replayDecisionWorkerFactory(),
+    });
+
+    adapter.emit({ type: "turn_completed", result: { type: "result", uuid: "result-before-repair" }, sequence: 1 });
+    await waitFor(() => adapter.messages.length === 1);
+    assert.match(adapter.messages[0] ?? "", /Automatic repair round 1/u);
+    assert.equal(supervisor.state, "running");
+
+    adapter.emit({ type: "turn_completed", result: { type: "result", uuid: "result-after-repair" }, sequence: 2 });
+    await waitFor(() => supervisor.state === "completed");
+    assert.equal(supervisor.state, "completed");
+    assert.equal(adapter.messages.length, 1);
+    const acceptanceResults = events.records.filter((event) => event.type === "acceptance_result");
+    assert.equal(acceptanceResults.length, 2);
+    assert.equal((acceptanceResults[0]?.data?.checks as Array<{ status: string }>)[0]?.status, "failed");
+    assert.equal((acceptanceResults[1]?.data?.checks as Array<{ status: string }>)[0]?.status, "passed");
+    assert.equal(events.records.filter((event) => event.type === "repair_requested").length, 1);
+    assert.equal(events.records.filter((event) => event.type === "review_result").length, 1);
+    assert.ok(events.records.some((event) => event.type === "verification_passed"));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
 
 test("automation replay denies AskUserQuestion instead of inventing permission", async () => {

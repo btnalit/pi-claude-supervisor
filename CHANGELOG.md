@@ -17,6 +17,9 @@ All notable changes to this project will be documented here.
 - Independent read-only Reviewer results with bounded findings and automatic repair rounds.
 - JSONL malformed-record handling and duplicate result/permission suppression fixtures.
 - Active JSONL request shutdown coverage and deterministic acceptance/review tests.
+- Durable Decision Worker recovery claims with stale-owner reconciliation and explicit fail-closed takeover.
+- Identity-bound tmux handoff cleanup and recovery/lease lifecycle coverage.
+- Claude Code 2.1.270 bounded stability matrix evidence in `docs/stability-matrix-2.1.270.md`.
 
 ## [0.4.1](https://github.com/btnalit/pi-claude-supervisor/compare/v0.4.0...v0.4.1) (2026-09-14)
 
@@ -85,7 +88,7 @@ All notable changes to this project will be documented here.
 - Historical Claude CLI 2.1.268 permission allow/deny and SIGTERM/SIGINT transport spike evidence; current release validation uses Claude CLI 2.1.270.
 - Event-driven JSONL `control_request`/`result`/exit events, permission responses, persistent Pi Decision Worker automation, bounded duplicate/turn handling, and outbound human-intervention webhooks.
 - Long-task defaults are now 100 automatic turns, 4 hours wall time and 20 minutes without output; Decision Worker API failures alert human operators directly instead of attempting an LLM fallback.
-- Automatic Decision Worker sessions now persist as Pi JSONL with a 0600 task registry. Unclean Pi restarts expose explicit `/supervise recover <task-id>` recovery; Claude work is not silently duplicated.
+- Automatic Decision Worker sessions now persist as Pi JSONL with a 0600 task registry. Unclean Pi restarts expose explicit `/supervise recover [--takeover] <task-id>` recovery; Claude work is not silently duplicated.
 - Local tests and package-content checks.
 
 ### Limitations

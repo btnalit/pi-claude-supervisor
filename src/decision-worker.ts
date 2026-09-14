@@ -1,4 +1,7 @@
-import { access, readFile, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { lstat, open, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import type { TaskSpec, WorkerEvent } from "./types.ts";
 import { redactSensitive } from "./redaction.ts";
@@ -299,18 +302,52 @@ function sanitizeSessionHeader(manager: SessionManager): void {
 }
 
 async function sanitizeSessionFile(path: string): Promise<void> {
-  const contents = await readFile(path, "utf8");
+  const securePath = resolve(path);
+  const contents = await readSessionFileSecure(securePath);
   const sanitized = contents.split("\n").map((line) => {
     if (!line.trim()) return line;
     try { return JSON.stringify(redactSensitive(JSON.parse(line))); }
     catch { return String(redactSensitive(line)); }
   }).join("\n");
-  if (sanitized !== contents) await writeFile(path, sanitized, { mode: 0o600 });
+  if (sanitized === contents) return;
+
+  await assertSessionParentDirectory(securePath);
+  const temporary = `${securePath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+  try {
+    // Write beside the validated session and replace the name atomically. The
+    // temporary file is exclusive so a pre-created symlink cannot be followed.
+    await writeFile(temporary, sanitized, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    await assertSessionParentDirectory(securePath);
+    await rename(temporary, securePath);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => {});
+  }
+}
+
+async function readSessionFileSecure(path: string): Promise<string> {
+  const securePath = resolve(path);
+  await assertSessionParentDirectory(securePath);
+  if (typeof fsConstants.O_NOFOLLOW !== "number") throw new Error("secure Decision Worker session-file opening is unavailable");
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(securePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const info = await handle.stat();
+    if (!info.isFile() || info.size <= 0) throw new Error("Decision Worker session file is not a non-empty regular file");
+    return await handle.readFile("utf8");
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function assertSessionParentDirectory(path: string): Promise<void> {
+  const parent = dirname(path);
+  const info = await lstat(parent);
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Decision Worker session directory is not a real directory");
 }
 
 async function fileExists(path: string): Promise<boolean> {
   try {
-    await access(path);
+    await readSessionFileSecure(path);
     return true;
   } catch (error) {
     if (error instanceof Error && /ENOENT/u.test(error.message)) return false;

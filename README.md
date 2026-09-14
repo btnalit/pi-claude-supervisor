@@ -59,7 +59,7 @@ export PI_CLAUDE_SUPERVISOR_WORKER=claude
 /supervise start inspect the current repository and report what should be changed
 /supervise start --spec ./task.json
 /supervise sessions
-/supervise recover <task-id>
+/supervise recover [--takeover] <task-id>
 /supervise poll
 /supervise poll all
 /supervise send continue with read-only inspection
@@ -100,24 +100,36 @@ The supervisor allows only one active JSONL request per session: poll until its
 yet exposed by the adapter. Multiple independent task sessions can run
 concurrently when they use different canonical working directories or
 worktrees; same-directory starts are rejected even when concurrent, and
-`/supervise sessions` lists the sessions. Unattended use still requires the
-remaining lifecycle, signal and recovery checks. Host permissions and network
-access follow explicit caller authorization and host policy; there is no
-automatic merge, deploy, release or publish.
+`/supervise sessions` lists the sessions. This is independent-session
+parallelism, not coordinated multi-worker collaboration. A future multi-worker
+milestone will add explicit parent/child task graphs, dependencies, bounded
+scheduling, structured handoffs, aggregate acceptance and graph-aware recovery;
+it will not relax the one-writer-per-worktree rule or enable automatic
+merge/publish. Unattended use still requires the remaining lifecycle, signal and
+recovery checks. Host permissions and network access follow explicit caller
+authorization and host policy; there is no automatic merge, deploy, release or
+publish.
 
-The near-term automation milestone adds a structured acceptance pipeline:
+The `v0.5.0` automation milestone adds a structured acceptance pipeline:
 multiple argv-based checks, an independent read-only Reviewer, bounded structured
 findings and repair rounds. Legacy text tasks keep the default `git diff --check`.
 The Reviewer only has `read`, `grep`, `find` and `ls`; it cannot edit files or grant
-permissions. Stability evidence is pinned to Claude Code `2.1.270`; CLI
+permissions. The next gates are pinned Claude Code `2.1.270` stability statistics
+and explicit session recovery. Coordinated multi-worker scheduling is a later
+milestone; CI will use deterministic fake Workers/replay fixtures, and real
+multi-worker Claude tests will remain authenticated manual Spikes. CLI
 multi-version compatibility, sandboxing, low-privilege execution and network
 isolation are not part of this milestone.
 
 Automatic mode persists the Pi Decision Worker session under the configured state
 directory. After an unclean Pi restart, `/supervise sessions` lists recoverable
-tasks; `/supervise recover <task-id>` explicitly restores the Decision Worker
+tasks; `/supervise recover [--takeover] <task-id>` explicitly restores the Decision Worker
 context and starts a new Claude Worker. It never silently resumes or duplicates
-work. The adapter intentionally does not inherit arbitrary host environment variables.
+work. If the old Pi owner is dead, add `--takeover` only after the lease proves
+the old Worker's process group is gone and its cgroup is a real, readable empty
+boundary; missing or unverifiable Worker evidence is refused.
+For a persistent tmux Worker, use explicit `adopt-tmux` instead of takeover.
+The adapter intentionally does not inherit arbitrary host environment variables.
 Pass credentials through an explicit `WorkerStartInput.env` in an embedding
 integration. For the built-in command, opt in to named variables, for example
 `PI_CLAUDE_SUPERVISOR_WORKER_ENV=ANTHROPIC_API_KEY`.
