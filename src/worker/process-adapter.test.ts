@@ -221,6 +221,32 @@ test("leader exit automatically cleans descendants before status is terminal", a
   }
 });
 
+test("required cgroup bootstrap contains a descendant created before attachment", { skip: !requiredCgroupTestAvailable }, async () => {
+  const adapter = new ProcessWorkerAdapter({ cgroupMode: "required", terminationGraceMs: 25, killGraceMs: 200 });
+  const handle = await adapter.start({
+    task: "early detached descendant",
+    cwd: process.cwd(),
+    command: process.execPath,
+    args: ["-e", "const {spawn}=require('node:child_process'); const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'}); process.stdout.write(String(c.pid)); const until=Date.now()+200; while(Date.now()<until){}; setInterval(()=>{},1000)", "--"],
+  });
+  let childPid: number | undefined;
+  for (let attempt = 0; attempt < 30 && !childPid; attempt++) {
+    const text = (await adapter.readOutput(handle)).map((chunk) => chunk.text).join("");
+    childPid = Number(text.trim()) || undefined;
+    if (!childPid) await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(childPid);
+  await adapter.stop(handle, "early detached descendant cleanup");
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try { process.kill(childPid, 0); } catch (error) {
+      if (error instanceof Error && /ESRCH/u.test(error.message)) return;
+      throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`early detached descendant process ${childPid} survived cgroup cleanup`);
+});
+
 test("required cgroup cleanup kills a setsid descendant", { skip: !requiredCgroupTestAvailable }, async () => {
   const adapter = new ProcessWorkerAdapter({ cgroupMode: "required", terminationGraceMs: 25, killGraceMs: 200 });
   const handle = await adapter.start({

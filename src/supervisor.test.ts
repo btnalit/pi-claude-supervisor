@@ -447,6 +447,32 @@ test("verification stops an owned persistent worker before completion", async ()
   assert.equal(supervisor.state, "completed");
 });
 
+test("adopted verification treats intentional release as confirmed cleanup", async () => {
+  const handle: WorkerHandle = { id: "adopted-verification", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "adopted" };
+  let released = false;
+  let closure: { cleanupConfirmed: boolean; reason: string } | undefined;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true, repairableSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running: true, activeRequests: 0, processGroupCleaned: released }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { released = true; },
+    release: async () => { released = true; },
+    killProcessGroup: async () => { throw new Error("adopted session cannot be killed"); },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter);
+  await supervisor.start({ task: "adopted fixture", cwd: "/tmp", command: "fixture", deadlineMs: 0, noOutputTimeoutMs: 0, onDecisionSessionClosed: (_taskId, info) => { closure = info; } });
+  await supervisor.poll();
+  const result = await supervisor.verify({ command: process.execPath, args: ["-e", "process.exit(0)"] });
+  assert.equal(result.ok, true);
+  assert.equal(supervisor.state, "completed");
+  assert.deepEqual(closure, { cleanupConfirmed: true, reason: "completed" });
+});
+
 test("verification rejects cgroup cleanup errors instead of completing", async () => {
   const handle: WorkerHandle = { id: "persistent-cgroup-error", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
   let stopped = false;

@@ -95,6 +95,7 @@ interface ProcessRecord {
  */
 export class ProcessWorkerAdapter implements WorkerAdapter {
   readonly #records = new Map<string, ProcessRecord>();
+  readonly #pendingStartupAborts = new Map<string, string>();
   readonly #mode: "process-pipe" | "claude-jsonl";
   readonly #terminationGraceMs: number;
   readonly #killGraceMs: number;
@@ -146,12 +147,43 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       startedAt: new Date().toISOString(),
       cwd: input.cwd,
     };
-    const child = spawn(input.command, args, {
-      cwd: input.cwd,
-      env: workerEnvironment(process.env, input.env),
-      detached: true,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    const workerEnv = workerEnvironment(process.env, input.env);
+    await assertExecutable(input.command, workerEnv.PATH);
+    const pendingAbortReason = input.startupToken ? this.#pendingStartupAborts.get(input.startupToken) : undefined;
+    if (input.startupToken) this.#pendingStartupAborts.delete(input.startupToken);
+    if (pendingAbortReason !== undefined) throw new Error(`worker startup aborted: ${pendingAbortReason}`);
+    let cgroupPath: string | undefined;
+    let cgroupError: Error | undefined;
+    if (this.#cgroupMode !== "off" && process.platform === "linux") {
+      try {
+        cgroupPath = await this.#createCgroup(handle.id);
+        handle.cgroupPath = cgroupPath;
+      } catch (error) {
+        cgroupError = error instanceof Error ? error : new Error(String(error));
+        if (this.#cgroupMode === "required") throw new Error(`unable to create a worker cgroup: ${cgroupError.message}`, { cause: cgroupError });
+      }
+    }
+    const delayedAbortReason = input.startupToken ? this.#pendingStartupAborts.get(input.startupToken) : undefined;
+    if (input.startupToken) this.#pendingStartupAborts.delete(input.startupToken);
+    if (input.abortSignal?.aborted || delayedAbortReason !== undefined) {
+      if (cgroupPath) await rm(cgroupPath, { recursive: true, force: true }).catch(() => {});
+      throw new Error(`worker startup aborted${delayedAbortReason ? `: ${delayedAbortReason}` : " before spawn"}`);
+    }
+    const launch = cgroupPath
+      ? cgroupBootstrapLaunch(input.command, args, input.cwd, workerEnv, cgroupPath)
+      : { command: input.command, args, env: workerEnv };
+    let child: ChildProcess;
+    try {
+      child = spawn(launch.command, launch.args, {
+        cwd: input.cwd,
+        env: launch.env,
+        detached: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (error) {
+      if (cgroupPath) await rm(cgroupPath, { recursive: true, force: true }).catch(() => {});
+      throw error;
+    }
     handle.pid = child.pid;
     let resolveSpawn!: () => void;
     let rejectSpawn!: (error: Error) => void;
@@ -179,6 +211,8 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       resolveExit,
       sentKeys: new Set(),
       groupCleanupComplete: child.pid === undefined,
+      cgroupPath,
+      cgroupError,
       spawned,
       spawnedSuccessfully: false,
       inputTail: Promise.resolve(),
@@ -253,8 +287,6 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       try {
         await record.spawned;
         this.#assertNotAborted(record);
-        await this.#attachCgroup(record);
-        this.#assertNotAborted(record);
       } catch (error) {
         try {
           await this.#ensureGroupCleanup(record);
@@ -298,6 +330,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
 
   async abortStart(reason = "startup aborted", startupToken?: string): Promise<void> {
     const records = [...this.#records.values()].filter((record) => record.starting && (startupToken === undefined || record.startupToken === startupToken));
+    if (startupToken !== undefined && records.length === 0) this.#pendingStartupAborts.set(startupToken, reason);
     for (const record of records) {
       record.abortRequested = true;
       record.stopping = true;
@@ -621,35 +654,11 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     }
   }
 
-  async #attachCgroup(record: ProcessRecord): Promise<void> {
-    if (this.#cgroupMode === "off") return;
-    if (!record.handle.pid) {
-      const error = new Error("worker pid was unavailable for cgroup attachment");
-      record.cgroupError = error;
-      if (this.#cgroupMode === "required") throw new Error(`unable to attach worker to a cgroup: ${error.message}`, { cause: error });
-      throw error;
-    }
-    if (process.platform !== "linux") {
-      const error = new Error("cgroups are unavailable on this platform");
-      record.cgroupError = error;
-      if (this.#cgroupMode === "required") throw new Error(`unable to attach worker to a cgroup: ${error.message}`, { cause: error });
-      return;
-    }
-    let path: string | undefined;
-    try {
-      const parent = this.#cgroupParentPath ?? await currentCgroupPath();
-      path = `${parent}/pi-claude-supervisor-${record.handle.id}`;
-      await mkdir(path);
-      await writeFile(`${path}/cgroup.procs`, `${record.handle.pid}\n`);
-      record.cgroupPath = path;
-      record.handle.cgroupPath = path;
-    } catch (error) {
-      if (path) await rm(path, { recursive: true, force: true }).catch(() => {});
-      record.cgroupError = error instanceof Error ? error : new Error(String(error));
-      if (this.#cgroupMode === "required") {
-        throw new Error(`unable to attach worker to a cgroup: ${record.cgroupError.message}`, { cause: record.cgroupError });
-      }
-    }
+  async #createCgroup(id: string): Promise<string> {
+    const parent = this.#cgroupParentPath ?? await currentCgroupPath();
+    const path = `${parent}/pi-claude-supervisor-${id}`;
+    await mkdir(path);
+    return path;
   }
 
   #record(handle: WorkerHandle): ProcessRecord {
@@ -716,6 +725,74 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     if (record.exitCode !== undefined || !record.handle.pid) return;
     process.kill(-record.handle.pid, signal);
   }
+}
+
+const CGROUP_BOOTSTRAP_KEYS = {
+  command: "PI_CLAUDE_SUPERVISOR_BOOTSTRAP_COMMAND",
+  args: "PI_CLAUDE_SUPERVISOR_BOOTSTRAP_ARGS",
+  cwd: "PI_CLAUDE_SUPERVISOR_BOOTSTRAP_CWD",
+  cgroup: "PI_CLAUDE_SUPERVISOR_BOOTSTRAP_CGROUP",
+} as const;
+
+const CGROUP_BOOTSTRAP_SCRIPT = `
+const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const keys = ${JSON.stringify(Object.values(CGROUP_BOOTSTRAP_KEYS))};
+const decode = (key) => Buffer.from(process.env[key] || "", "base64").toString("utf8");
+let child;
+try {
+  const cgroup = decode(${JSON.stringify(CGROUP_BOOTSTRAP_KEYS.cgroup)});
+  writeFileSync(cgroup + "/cgroup.procs", String(process.pid) + "\\n");
+  const env = { ...process.env };
+  for (const key of keys) delete env[key];
+  child = spawn(
+    decode(${JSON.stringify(CGROUP_BOOTSTRAP_KEYS.command)}),
+    JSON.parse(decode(${JSON.stringify(CGROUP_BOOTSTRAP_KEYS.args)})),
+    { cwd: decode(${JSON.stringify(CGROUP_BOOTSTRAP_KEYS.cwd)}), env, stdio: "inherit" },
+  );
+} catch (error) {
+  console.error("worker cgroup bootstrap failed:", error instanceof Error ? error.message : String(error));
+  process.exit(125);
+}
+const forwardedSignals = ["SIGTERM", "SIGINT", "SIGQUIT"];
+for (const signal of forwardedSignals) {
+  process.on(signal, () => {
+    try { child.kill(signal); } catch {}
+  });
+}
+let finished = false;
+child.once("error", (error) => {
+  if (finished) return;
+  finished = true;
+  console.error("worker bootstrap child failed:", error.message);
+  process.exit(127);
+});
+child.once("exit", (code, signal) => {
+  if (finished) return;
+  finished = true;
+  if (signal) {
+    for (const forwarded of forwardedSignals) process.removeAllListeners(forwarded);
+    try { process.kill(process.pid, signal); } catch {}
+    setTimeout(() => process.exit(128), 50).unref();
+    return;
+  }
+  process.exit(code ?? 1);
+});
+`;
+
+function cgroupBootstrapLaunch(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv, cgroupPath: string): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
+  const encode = (value: string) => Buffer.from(value, "utf8").toString("base64");
+  return {
+    command: process.execPath,
+    args: ["-e", CGROUP_BOOTSTRAP_SCRIPT],
+    env: {
+      ...env,
+      [CGROUP_BOOTSTRAP_KEYS.command]: encode(command),
+      [CGROUP_BOOTSTRAP_KEYS.args]: encode(JSON.stringify(args)),
+      [CGROUP_BOOTSTRAP_KEYS.cwd]: encode(cwd),
+      [CGROUP_BOOTSTRAP_KEYS.cgroup]: encode(cgroupPath),
+    },
+  };
 }
 
 function claudeJsonlArgs(args: readonly string[] = []): string[] {

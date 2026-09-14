@@ -1032,8 +1032,10 @@ export class Supervisor {
     if (!handle) return true;
     try {
       const status = await this.#adapter.getStatus(handle);
-      return !status.running
-        && status.processGroupCleaned === true
+      const cleanupBoundaryConfirmed = handle.ownership === "adopted"
+        ? status.processGroupCleaned === true
+        : !status.running && status.processGroupCleaned === true;
+      return cleanupBoundaryConfirmed
         && !status.cleanupError
         && (!status.cgroupError || status.cgroupRequired === false);
     } catch {
