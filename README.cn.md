@@ -11,8 +11,9 @@
 > `v0.5.1` 已发布为单 Worker recovery 基线。默认手动 transport 是无额外依赖的
 > process pipe，不是 PTY；自动模式只使用 Claude JSONL 或 tmux。当前工作树已实现
 > repairable/persistent 能力拆分、可取消验收/Reviewer、证据完整性门禁、启动前
-> preflight 和阶段进度通知；允许编辑的真实 repair/reacceptance 演练仍是下一次
-> 发布前的门禁。低权限用户、OS sandbox 与网络隔离继续延期。
+> preflight 和阶段进度通知；真实 Claude Code `2.1.270` 允许编辑的
+> repair/reacceptance 演练已在隔离临时 worktree 通过，剩余发布门禁是 exact-head
+> 独立只读 Review。低权限用户、OS sandbox 与网络隔离继续延期。
 
 ## 关键安全边界
 
@@ -113,8 +114,9 @@ Worker 应使用 `adopt-tmux`，而不是 takeover。
 `read`、`grep`、`find`、`ls`，不会修改工作树或批准权限。当前加固要求 HEAD-relative
 tracked diff 和受限 untracked evidence 完整，P0/P1 或重复 finding 必须人工处理；自动模式
 拒绝显式 process-pipe，并在模型执行前检查目录、可执行文件、依赖和 cgroup。剩余门禁是
-固定 Claude Code `2.1.270` 隔离 worktree 的真实 repair/reacceptance 及 exact-head review；
-协同多 Worker 属于后续独立开发阶段，暂不把 sandbox、低权限和网络隔离作为本阶段门禁。
+固定 Claude Code `2.1.270` 隔离 worktree 的真实 repair/reacceptance 已通过，当前只剩
+exact-head 独立只读 Review；协同多 Worker 属于后续独立开发阶段，暂不把 sandbox、低权限
+和网络隔离作为本阶段门禁。
 
 ### tmux/PTY 交互模式
 

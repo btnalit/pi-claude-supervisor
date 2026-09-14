@@ -164,15 +164,14 @@ the managed process group.
 The `v0.5.0` implementation of the acceptance—independent Review—repair—reacceptance
 loop is shipped. The `v0.5.1` real read-only drill reached acceptance and independent
 Review, then correctly stopped at human intervention after two P1 and two P2 findings.
-The drill did not exercise real repair because the task forbade edits and set
-`maxRepairRounds=0`; replay coverage is not a substitute for a real repairable capability
-matrix. The current hardening plan is recorded in
-[`docs/automation-hardening-plan.md`](automation-hardening-plan.md). Deterministic
+A separate real edit-capable Claude Code `2.1.270` drill then exercised one bounded
+acceptance failure, repair turn, reacceptance and independent Reviewer `pass` in an
+isolated temporary worktree. The current hardening plan and evidence paths are recorded
+in [`docs/automation-hardening-plan.md`](automation-hardening-plan.md). Deterministic
 coverage now includes repairable-vs-persistent capability assertions, cancellation
 of acceptance commands, stop-from-verifying precedence, paused watchdog baselining,
-staged/untracked evidence and untracked symlink rejection. A real edit-capable
-repair/reacceptance drill remains a release gate and has not been claimed by the
-current source changes.
+staged/untracked evidence and untracked symlink rejection. The remaining release gate
+is the exact-head independent read-only review.
 
 ### Acceptance and Reviewer fixtures
 
@@ -210,10 +209,10 @@ The adapter/replay matrix must cover:
 
 Real Claude tests remain authenticated manual Spikes and are pinned to
 `2.1.270`; they are not part of normal CI. Normal CI runs deterministic fake
-Worker and replay fixtures. The short-term stability gate is still pending and
-must include ten consecutive ordinary automatic runs and at least five runs each
-for permission and question handling, with no duplicate action, false completion
-or unreaped Worker.
+Worker and replay fixtures. The pinned stability matrix is the compatibility evidence
+for this release line; any future CLI change must rerun ten consecutive ordinary
+automatic runs and at least five runs each for permission and question handling, with
+no duplicate action, false completion or unreaped Worker.
 
 ## Future multi-worker test plan
 
@@ -245,15 +244,15 @@ permission flags, task id, acceptance result, Reviewer result, cleanup status an
 status. A human-required result is a valid safety outcome and must not be converted into a
 pass by retrying the same task automatically.
 
-Before release of the hardening changes, run in this order:
+For the hardening release, the completed gate record is:
 
 1. `npm run check`, `npm run test:pi`, `npm run test:install`, `npm run build`;
 2. deterministic lifecycle/evidence/capability tests;
-3. a disposable temporary-worktree real Claude repair/reacceptance spike with explicit human
-   approval for any edit-capable Worker;
-4. a read-only review of the exact resulting commit;
-5. cleanup verification: no Worker, no Decision Worker, no unreconciled lease and clean Git
+3. a disposable temporary-worktree real Claude repair/reacceptance spike with an edit-capable
+   Worker;
+4. cleanup verification: no Worker, no Decision Worker, no unreconciled lease and clean Git
    worktree.
 
-The repair spike must not run against the release worktree, must not use Claude `--resume` as
-an invented recovery mechanism, and must not merge, publish or release automatically.
+The remaining gate is a read-only review of the exact resulting commit. The drill evidence is
+recorded in `docs/automation-hardening-plan.md`; it did not run against this release worktree,
+did not use Claude `--resume`, and did not merge, publish or release automatically.

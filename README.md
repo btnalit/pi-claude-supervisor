@@ -15,8 +15,9 @@ worker remains an explicitly started child process.
 > supervision uses Claude JSONL or tmux, and the current working-tree hardening
 > adds repairable-vs-persistent capabilities, cancellable verification, evidence
 > completeness gates, startup preflight and phase progress reporting. A real
-> edit-capable repair/reacceptance drill remains required before releasing that
-> hardening; OS sandbox, low-privilege execution and network isolation remain
+> edit-capable Claude Code `2.1.270` repair/reacceptance drill has passed in an
+> isolated temporary worktree; the exact-head independent review is the remaining
+> release gate. OS sandbox, low-privilege execution and network isolation remain
 > deferred.
 
 ## Safety boundary
@@ -121,8 +122,8 @@ The Reviewer only has `read`, `grep`, `find` and `ls`; it cannot edit files or g
 permissions. The current hardening also requires complete HEAD-relative tracked and
 bounded untracked evidence, rejects P0/P1 or repeated findings, and only repairs a
 live `repairableSession` Worker. Automatic mode rejects explicit `process-pipe` and
-preflights runtime prerequisites. The remaining gate is a pinned Claude Code
-`2.1.270` disposable repair/reacceptance run plus exact-head independent review.
+preflights runtime prerequisites. The real pinned Claude Code `2.1.270` disposable repair/reacceptance run has passed;
+the remaining gate is the exact-head independent review.
 Coordinated multi-worker scheduling is a later milestone; CI uses deterministic fake
 Workers/replay fixtures, and real multi-worker Claude tests remain authenticated
 manual Spikes. CLI multi-version compatibility, sandboxing, low-privilege execution

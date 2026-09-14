@@ -1,6 +1,6 @@
 # Pi Claude Supervisor 完整方案
 
-> 文档状态：`v0.5.1` 已发布；Phase A–C 加固已在当前工作树实现；Phase D 真实 repair/reacceptance 仍待门禁
+> 文档状态：`v0.5.1` 已发布；Phase A–D 加固和真实 repair/reacceptance 已在当前工作树实现；待 exact-head 独立只读 Review 门禁
 > 目标项目目录：`pi-claude-supervisor`  
 > 适用对象：W、项目负责人、实现人员、评审人员
 
@@ -36,7 +36,7 @@ Claude Code Worker
 4. Supervisor 因误判导致无限循环、危险操作或不可审计的修改。
 5. 人工无法随时接管或恢复任务。
 
-**当前状态：`v0.5.1` 已正式发布，已完成固定 Claude Code `2.1.270` 稳定性统计、单 Worker recovery 和真实只读 Review drill。当前工作树已落实 repairable/persistent 能力拆分、verifying stop、paused watchdog、完整 repository evidence、可取消验收/Reviewer、启动 preflight、权限门禁修复和阶段进度通知；下一项硬门禁是在隔离 worktree 中完成一次允许编辑的真实 repair/reacceptance，再做 exact-head 独立 Review。协同多 Worker 仍延期；低权限用户、OS sandbox 与网络隔离仍是后续安全加固。**
+**当前状态：`v0.5.1` 已正式发布，已完成固定 Claude Code `2.1.270` 稳定性统计、单 Worker recovery、真实只读 Review drill 和隔离临时 worktree 的允许编辑 repair/reacceptance drill。当前工作树已落实 repairable/persistent 能力拆分、verifying stop、paused watchdog、完整 repository evidence、可取消验收/Reviewer、启动 preflight、权限门禁修复和阶段进度通知；下一项也是发布前最后硬门禁的是当前 exact head 的独立只读 Review。协同多 Worker 仍延期；低权限用户、OS sandbox 与网络隔离仍是后续安全加固。**
 
 ---
 
@@ -1046,8 +1046,8 @@ Worker → 验收 → 独立 Reviewer → fail-closed 人工介入链路。验�
    diff 和安全的 untracked evidence；
 3. **自动化协议**：按 assistant message 边界解析 Reviewer/Decision Worker 输出，增加
    启动 preflight、可观测 heartbeat、permission gate 一致性和 signal 生命周期；
-4. **验证门禁**：补齐真实 capability 矩阵、隔离 worktree 的真实 repair/reacceptance
-   演练，并在独立 Reviewer 通过前不进行任何合并或发布。
+4. **验证门禁**：已补齐真实 capability 矩阵并完成隔离 worktree 的真实
+   repair/reacceptance 演练；当前 exact-head 独立 Reviewer 通过前不进行任何合并或发布。
 
 本轮不放宽以下边界：Reviewer 仍只读，验收仍使用 argv/`execFile`，不伪造 Claude
 `--resume`，不自动 merge/deploy/release，P0/P1、重复 finding、超时、API 错误和不完整
