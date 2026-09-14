@@ -1,6 +1,6 @@
 # Pi Claude Supervisor 完整方案
 
-> 文档状态：方案设计稿 / MVP 实施基线  
+> 文档状态：`v0.5.0` 已发布 / 后续开发路线图
 > 目标项目目录：`pi-claude-supervisor`  
 > 适用对象：W、项目负责人、实现人员、评审人员
 
@@ -36,7 +36,7 @@ Claude Code Worker
 4. Supervisor 因误判导致无限循环、危险操作或不可审计的修改。
 5. 人工无法随时接管或恢复任务。
 
-**总体判断：架构方向可以 GO。先完成兼容性 Spike、生命周期和故障恢复验证；低权限用户、OS sandbox 与网络隔离不作为当前主线或硬性阻塞，按调用者明确授权和宿主机策略运行，后续再做安全加固。**
+**当前状态：`v0.5.0` 已完成“验收—独立 Review—自动修复—再验收”闭环并正式发布。下一阶段先完成固定 Claude Code `2.1.270` 的稳定性统计和恢复语义，再推进有边界的多 Worker 协作；低权限用户、OS sandbox 与网络隔离仍是后续安全加固，不作为当前主线硬性阻塞。**
 
 ---
 
@@ -74,7 +74,9 @@ Claude Code 适合作为实际开发 Worker，但在长时间任务中可能出�
 - 不自动 merge、deploy 或 release。
 
 当前扩展已支持多个独立任务会话并行推进，但不允许活动会话共享同一
-工作目录。事件日志由跨进程锁协调，状态和 watchdog 按会话隔离。
+工作目录。事件日志由跨进程锁协调，状态和 watchdog 按会话隔离。这里要区分两种
+“多 Worker”：**独立会话并行**已经属于当前能力；**有依赖、交接和汇总验收的协同多
+Worker**属于后续开发任务，不能通过简单地放宽 cwd 限制来实现。
 
 暂不支持：
 
@@ -979,3 +981,52 @@ Reviewer 必须使用独立 Pi session，只允许 `read`、`grep`、`find`、`l
 - OS sandbox、低权限执行和网络隔离；
 - 自动 merge、deploy、release、publish；
 - 多 Worker 在同一工作树协作。
+
+## 21. 后续开发路线图
+
+`v0.5.0` 的发布不代表所有自动化目标都已完成。后续任务按“稳定性 → 恢复 → 协同
+调度 → 安全加固”推进；多 Worker 可以纳入开发任务，但应作为独立阶段，不能与当前
+单 Worker 稳定性门禁混在一起。
+
+### 21.1 短期：稳定性收尾
+
+- 完成真实 Claude Code `2.1.270` 重复 Spike：普通任务连续 10 次，权限和问题回退各至少 5 次；
+- 补齐 replay：多轮修复、验收失败修复、repair budget 耗尽、takeover、recover 和 Pi shutdown；
+- 补齐边界测试：Reviewer 流式输出上限、`DecisionSessionStore.list()` 任务 ID 校验、跨进程恢复和超时/输出截断；
+- 继续观察 npm `0.5.0`、GitHub Release 资产、provenance 和回滚路径；
+- 验收标准：无重复动作、错误 complete、未清理 Worker 或未审计的自动放行。
+
+### 21.2 中期：恢复能力
+
+- 设计安全的 Claude session resume；明确 `--resume` 与实时 PTY attach 的边界；
+- 完善 takeover、recover、Pi shutdown、Worker 崩溃和部分完成的状态语义；
+- 增加跨进程恢复端到端测试，包括 cwd lease、Decision Worker session、Worker 身份和事件日志一致性；
+- 恢复失败必须进入 `HUMAN_REQUIRED`，不能静默重放原始任务或重复发送输入。
+
+### 21.3 后续：多 Worker 协作与调度
+
+第一阶段只做**独立 worktree 的多 Worker 编排**，不允许共享工作树写入。建议拆成以下
+开发任务：
+
+1. **任务图与角色模型**：增加 `parentTaskId`、Worker role、`dependsOn`、worktree、handoff
+   artifact 和子任务状态；明确 root task 与 child task 的审计关联。
+2. **受限调度器**：实现并发上限、依赖就绪、全局时间/修复预算、取消传播和失败隔离；
+   不让任意 Worker 自行启动、停止或批准另一个 Worker。
+3. **结构化交接**：Worker 之间只通过受限 artifact、事件引用和验收报告交接，不直接共享
+   控制通道；交接内容必须经过 schema 校验和大小限制。
+4. **汇总验收**：每个 child 先独立验收，root task 再汇总目标、diff、测试和 Reviewer 结果；
+   冲突、缺失证据或任一 P0/P1 自动升级人工。
+5. **恢复与关闭**：支持单个 child、整棵任务图和 Pi shutdown 的一致性恢复；父任务不能在
+   子任务状态未知时报告 `completed`。
+6. **冲突检测和人工整合**：只允许在独立 integration worktree 中进行显式整合；不自动
+   merge/publish，冲突和整合动作必须保留人工控制权。
+
+多 Worker 阶段的最小验收矩阵：两个独立 Worker 并行、依赖顺序、一个 Worker 失败、取消
+传播、重复交接、工作树冲突、单 child 恢复、整棵任务图恢复和 shutdown 中断。通过这些
+门禁后，才评估是否需要更复杂的 lead-worker 或动态任务分解。
+
+### 21.4 后置：安全加固
+
+- CLI 多版本兼容矩阵；
+- OS sandbox、低权限执行、网络隔离/allowlist；
+- 更深的供应链、SBOM、密钥隔离和生产监控。

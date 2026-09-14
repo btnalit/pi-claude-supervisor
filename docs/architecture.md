@@ -27,6 +27,28 @@ directories/worktrees; same-cwd and parent/child cwd starts are rejected before
 spawn, including concurrent starts, to prevent uncoordinated edits. Pending starts
 are also awaited during Pi shutdown.
 
+### Multi-worker boundary and roadmap
+
+The current implementation supports multiple **independent** task sessions, not
+coordinated shared-worktree editing. Every active session must own a
+non-overlapping canonical cwd/worktree and has an isolated Supervisor,
+watchdog, Worker handle and acceptance/review loop. The shared EventLog is only
+an audit stream; it is not a collaboration or authorization channel.
+
+A future multi-worker scheduler must introduce an explicit parent/child task
+graph, roles, dependencies, bounded concurrency and structured handoff
+artifacts. Child Workers must communicate through validated evidence and event
+references rather than another Worker's control channel. Each child is accepted
+independently; the parent can complete only after aggregate acceptance and
+independent Review. Integration, conflict resolution, merge and publication
+remain explicit human-controlled operations in a separate integration worktree.
+
+Recovery and shutdown must be graph-aware: a parent with an unknown child state
+cannot complete, cancellation must propagate within a bounded budget, and Pi
+shutdown must leave every child either cleanup-verified or explicitly
+recoverable. This work is scheduled after single-worker stability and session
+recovery, not by relaxing the current cwd lease rule.
+
 ## MVP transport
 
 `ProcessWorkerAdapter` uses `node:child_process.spawn` with:
