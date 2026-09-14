@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.4.1...v0.5.0) (2026-09-14)
+
+
+### Features
+
+* add acceptance review repair loop ([fe29c78](https://github.com/btnalit/pi-claude-supervisor/commit/fe29c78a228494768aa52b03ee1bf1545b079119))
+
 ## [Unreleased]
 
 ### Added
