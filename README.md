@@ -127,11 +127,16 @@ the task:
 ```
 
 Adoption checks the session's working directory and pane command, and refuses a
-pane that already has another output pipe. It does not claim ownership: `/supervise stop` and Pi shutdown detach supervision rather
-than killing the user's tmux session. Use `tmux kill-session` yourself when the
-adopted window should be closed. `/supervise takeover <task-id>` disables
-automatic Decision Worker messages; resume them only with
-`/supervise resume-auto <task-id>`.
+pane that already has another output pipe. Owned sessions use a generated
+private tmux socket, so preserve the complete `attach=...` command printed by
+`start`. When re-adopting after a Pi restart, set
+`PI_CLAUDE_SUPERVISOR_TMUX_SOCKET` to the socket path from that command before
+running `adopt-tmux`; the session name alone is sufficient only for the default
+server. Adoption does not claim ownership: `/supervise stop` and Pi shutdown
+detach supervision rather than killing the user's tmux session. Use `tmux
+kill-session` yourself when the adopted window should be closed.
+`/supervise takeover <task-id>` disables automatic Decision Worker messages;
+resume them only with `/supervise resume-auto <task-id>`.
 
 PTY screen text is not Claude JSONL. Permission dialogs, trust prompts and
 ambiguous TUI states are escalated to a human; tmux mode must not be treated as

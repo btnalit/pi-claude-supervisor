@@ -63,6 +63,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   let activeTaskId: string | undefined;
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;
+  let detachedLeaseSweepTimer: NodeJS.Timeout | undefined;
 
   const notify = (ctx: ExtensionContext, message: string, type: "info" | "warning" = "info") => {
     if (ctx.hasUI) ctx.ui.notify(redactText(message), type);
@@ -81,29 +82,41 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
       return false;
     }
   };
+  const forgetSession = (taskId: string): void => {
+    sessions.delete(taskId);
+    reservedCwds.delete(taskId);
+    cleanupRequiredTasks.delete(taskId);
+    if (activeTaskId === taskId) activeTaskId = undefined;
+  };
   const releaseSettledReservations = async (): Promise<void> => {
     for (const [taskId, session] of sessions) {
-      if (!["completed", "stopped", "failed"].includes(session.state)) continue;
+      const terminal = ["completed", "stopped", "failed"].includes(session.state);
+      const detached = session.released;
+      if (!terminal && !detached) continue;
       if (!session.handle) {
-        if (await releaseLease(taskId)) {
-          reservedCwds.delete(taskId);
-          cleanupRequiredTasks.delete(taskId);
-        }
+        if (await releaseLease(taskId)) forgetSession(taskId);
         continue;
       }
       try {
         const status = await adapter.getStatus(session.handle);
-        if (!status.running && status.processGroupCleaned === true && !status.cleanupError && (!status.cgroupError || status.cgroupRequired === false)) {
-          if (await releaseLease(taskId)) {
-            reservedCwds.delete(taskId);
-            cleanupRequiredTasks.delete(taskId);
-          }
+        const adoptedDetachConfirmed = detached
+          && session.handle.ownership === "adopted"
+          && !status.running;
+        const cleanupConfirmed = status.processGroupCleaned === true || adoptedDetachConfirmed;
+        if (!status.running && cleanupConfirmed && !status.cleanupError && (!status.cgroupError || status.cgroupRequired === false)) {
+          if (await releaseLease(taskId)) forgetSession(taskId);
         }
       } catch {
         // Keep the reservation when cleanup status cannot be confirmed.
       }
     }
   };
+  detachedLeaseSweepTimer = setInterval(() => {
+    void releaseSettledReservations().catch((error) => {
+      console.error(`pi-claude-supervisor detached lease sweep failed: ${redactText(error instanceof Error ? error.message : String(error))}`);
+    });
+  }, 1_000);
+  detachedLeaseSweepTimer.unref();
   const stopSession = async (session: Supervisor, reason: string, releasePersistent = false): Promise<void> => {
     const handle = session.handle;
     const persistent = adapter.capabilities().persistentSession && Boolean(handle);
@@ -572,6 +585,10 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     if (shutdownPromise) return shutdownPromise;
     shuttingDown = true;
     shutdownPromise = (async () => {
+      if (detachedLeaseSweepTimer) {
+        clearInterval(detachedLeaseSweepTimer);
+        detachedLeaseSweepTimer = undefined;
+      }
       const pending = [...pendingStarts];
       let startupFailures: PromiseRejectedResult[] = [];
       await Promise.race([Promise.allSettled(pending), delay(5_000)]);

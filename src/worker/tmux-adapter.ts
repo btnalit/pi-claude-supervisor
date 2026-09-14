@@ -264,10 +264,16 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         const pane = await this.#paneStatus(record);
         record.paneDead = pane.dead;
         record.panePid = pane.pid;
-        if (!pane.dead) await this.#rememberPaneIdentity(record, pane.pid);
+        if (pane.dead) record.cleanupError = undefined;
+        else await this.#rememberPaneIdentity(record, pane.pid);
       } catch (error) {
-        if (isMissingSession(error) || isPaneIdentityError(error)) record.paneDead = true;
-        else record.cleanupError = asError(error);
+        if (isMissingSession(error)) {
+          record.paneDead = true;
+          record.cleanupError = undefined;
+        } else if (isPaneIdentityError(error)) {
+          record.paneDead = false;
+          record.cleanupError = asError(error);
+        } else record.cleanupError = asError(error);
       }
       return this.#status(record, !record.paneDead);
     }
@@ -284,10 +290,11 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     } catch (error) {
       if (isMissingSession(error)) {
         record.paneDead = true;
+        record.cleanupError = undefined;
         if (!record.cleanupComplete && record.owned) await this.#cleanup(record, false);
       } else {
         record.cleanupError = asError(error);
-        if (isPaneIdentityError(error)) record.paneDead = true;
+        if (isPaneIdentityError(error)) record.paneDead = false;
       }
     }
     return this.#status(record, !record.paneDead && !record.released);
@@ -485,7 +492,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   #startMonitor(record: TmuxRecord): void {
     record.monitor = setInterval(() => {
       void this.#monitor(record).catch((error) => {
-        if (isPaneIdentityError(error)) record.paneDead = true;
+        if (isPaneIdentityError(error)) record.paneDead = false;
         if (!record.cleanupComplete && !isMissingSession(error)) record.cleanupError = asError(error);
       });
     }, this.#pollIntervalMs);
