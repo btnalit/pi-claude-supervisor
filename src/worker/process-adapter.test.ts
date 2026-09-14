@@ -316,6 +316,34 @@ test("claude-jsonl ignores unsolicited results when no request is active", async
   }
 });
 
+test("claude-jsonl does not let an unsolicited result poison a later matching result", async () => {
+  const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
+  const events: import("../types.ts").WorkerEvent[] = [];
+  const handle = await adapter.start({
+    task: "",
+    cwd: process.cwd(),
+    command: process.execPath,
+    eventListener: (event) => { events.push(event); },
+    args: ["-e", "const result = JSON.stringify({type:'result', uuid:'collision-result'}); process.stdout.write(result + '\\n'); process.stdin.on('data', () => setTimeout(() => process.stdout.write(result + '\\n'), 10)); setInterval(() => {}, 1000)", "--"],
+  });
+  try {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      await adapter.readOutput(handle);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(events.filter((event) => event.type === "turn_completed").length, 0);
+    await adapter.send(handle, "second", "turn-2");
+    for (let attempt = 0; attempt < 40 && events.filter((event) => event.type === "turn_completed").length < 1; attempt += 1) {
+      await adapter.readOutput(handle);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(events.filter((event) => event.type === "turn_completed").length, 1);
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+  } finally {
+    await adapter.stop(handle, "result collision test complete");
+  }
+});
+
 test("claude-jsonl ignores malformed lines and duplicate result records", async () => {
   const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
   const events: import("../types.ts").WorkerEvent[] = [];
