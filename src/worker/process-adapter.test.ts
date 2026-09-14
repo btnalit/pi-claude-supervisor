@@ -294,6 +294,29 @@ test("claude-jsonl result sequence distinguishes repeated session ids", async ()
   await adapter.stop(handle, "test complete");
 });
 
+test("claude-jsonl bounds an overlong protocol record before accepting later lines", async () => {
+  const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl", maxProtocolBufferBytes: 128 });
+  const events: import("../types.ts").WorkerEvent[] = [];
+  const handle = await adapter.start({
+    task: "first",
+    cwd: process.cwd(),
+    command: process.execPath,
+    eventListener: (event) => { events.push(event); },
+    args: ["-e", "process.stdin.on('data', () => { process.stdout.write('x'.repeat(100000)); setTimeout(() => process.stdout.write('\\n' + JSON.stringify({type:'result', uuid:'after-overflow'}) + '\\n'), 10); }); setInterval(() => {}, 1000)", "--"],
+  });
+  try {
+    for (let attempt = 0; attempt < 40 && events.filter((event) => event.type === "turn_completed").length < 1; attempt += 1) {
+      await adapter.readOutput(handle);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(events.filter((event) => event.type === "turn_completed").length, 1);
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+    assert.equal((await adapter.getStatus(handle)).outputTruncated, true);
+  } finally {
+    await adapter.stop(handle, "protocol buffer bound test complete");
+  }
+});
+
 test("claude-jsonl ignores unsolicited results when no request is active", async () => {
   const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
   const events: import("../types.ts").WorkerEvent[] = [];

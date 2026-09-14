@@ -25,6 +25,8 @@ export interface ProcessWorkerAdapterOptions {
   maxOutputChunks?: number;
   /** Maximum UTF-8 bytes of captured output retained per worker. */
   maxOutputBytes?: number;
+  /** Maximum UTF-8 bytes retained for an incomplete Claude JSONL record. */
+  maxProtocolBufferBytes?: number;
   /** Maximum time a blocked stdin write may hold lifecycle operations. */
   inputWriteTimeoutMs?: number;
   /** Linux descendant cleanup mode; auto uses cgroup v2 when available. */
@@ -87,6 +89,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   readonly #killGraceMs: number;
   readonly #maxOutputChunks: number;
   readonly #maxOutputBytes: number;
+  readonly #maxProtocolBufferBytes: number;
   readonly #inputWriteTimeoutMs: number;
   readonly #cgroupMode: "off" | "auto" | "required";
   readonly #cgroupParentPath?: string;
@@ -97,6 +100,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     this.#killGraceMs = boundedDelay(options.killGraceMs ?? 500);
     this.#maxOutputChunks = boundedPositiveInteger(options.maxOutputChunks ?? 10_000, "maxOutputChunks");
     this.#maxOutputBytes = boundedPositiveInteger(options.maxOutputBytes ?? 8 * 1024 * 1024, "maxOutputBytes");
+    this.#maxProtocolBufferBytes = boundedPositiveInteger(options.maxProtocolBufferBytes ?? 256 * 1024, "maxProtocolBufferBytes");
     this.#inputWriteTimeoutMs = boundedDelay(options.inputWriteTimeoutMs ?? 10_000);
     this.#cgroupMode = options.cgroupMode ?? "auto";
     this.#cgroupParentPath = options.cgroupParentPath;
@@ -465,50 +469,67 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   }
 
   #observeJsonl(record: ProcessRecord, chunk: string): void {
-    record.protocolBuffer += chunk;
-    let newline = record.protocolBuffer.indexOf("\n");
-    while (newline >= 0) {
-      const line = record.protocolBuffer.slice(0, newline).trim();
-      record.protocolBuffer = record.protocolBuffer.slice(newline + 1);
-      if (line) {
-        try {
-          const event = JSON.parse(line) as Record<string, unknown>;
-          this.#emit(record, { type: "jsonl", handle: record.handle, record: event });
-          if (event.type === "control_request") {
-            const request = event.request;
-            if (isPermissionRequest(event, request)) {
-              const requestId = String(event.request_id);
-              if (!record.seenPermissionRequestIds.has(requestId)) {
-                rememberBounded(record.seenPermissionRequestIds, requestId);
-                this.#emit(record, {
-                  type: "permission_request",
-                  handle: record.handle,
-                  request: {
-                    requestId,
-                    toolUseId: request.tool_use_id,
-                    toolName: request.tool_name,
-                    input: request.input,
-                    raw: event,
-                  },
-                });
-              }
-            }
+    let offset = 0;
+    while (offset < chunk.length) {
+      const newline = chunk.indexOf("\n", offset);
+      if (newline < 0) {
+        const tail = chunk.slice(offset);
+        if (Buffer.byteLength(record.protocolBuffer, "utf8") + Buffer.byteLength(tail, "utf8") > this.#maxProtocolBufferBytes) {
+          record.protocolBuffer = "";
+          record.outputTruncated = true;
+        } else {
+          record.protocolBuffer += tail;
+        }
+        return;
+      }
+      const linePart = chunk.slice(offset, newline);
+      if (Buffer.byteLength(record.protocolBuffer, "utf8") + Buffer.byteLength(linePart, "utf8") > this.#maxProtocolBufferBytes) {
+        record.outputTruncated = true;
+      } else {
+        this.#processJsonlLine(record, `${record.protocolBuffer}${linePart}`.trim());
+      }
+      record.protocolBuffer = "";
+      offset = newline + 1;
+    }
+  }
+
+  #processJsonlLine(record: ProcessRecord, line: string): void {
+    if (!line) return;
+    try {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      this.#emit(record, { type: "jsonl", handle: record.handle, record: event });
+      if (event.type === "control_request") {
+        const request = event.request;
+        if (isPermissionRequest(event, request)) {
+          const requestId = String(event.request_id);
+          if (!record.seenPermissionRequestIds.has(requestId)) {
+            rememberBounded(record.seenPermissionRequestIds, requestId);
+            this.#emit(record, {
+              type: "permission_request",
+              handle: record.handle,
+              request: {
+                requestId,
+                toolUseId: request.tool_use_id,
+                toolName: request.tool_name,
+                input: request.input,
+                raw: event,
+              },
+            });
           }
-          if (event.type === "result" && record.activeRequests > 0) {
-            const resultId = jsonlRecordId(event, record.activeRequestSequence);
-            if (!record.seenResultIds.has(resultId)) {
-              rememberBounded(record.seenResultIds, resultId);
-              record.activeRequests = Math.max(0, record.activeRequests - 1);
-              record.activeRequestSequence = undefined;
-              record.turnSequence += 1;
-              this.#emit(record, { type: "turn_completed", handle: record.handle, result: event, sequence: record.turnSequence });
-            }
-          }
-        } catch {
-          // Keep raw output for diagnostics; malformed output is not a completion signal.
         }
       }
-      newline = record.protocolBuffer.indexOf("\n");
+      if (event.type === "result" && record.activeRequests > 0) {
+        const resultId = jsonlRecordId(event, record.activeRequestSequence);
+        if (!record.seenResultIds.has(resultId)) {
+          rememberBounded(record.seenResultIds, resultId);
+          record.activeRequests = Math.max(0, record.activeRequests - 1);
+          record.activeRequestSequence = undefined;
+          record.turnSequence += 1;
+          this.#emit(record, { type: "turn_completed", handle: record.handle, result: event, sequence: record.turnSequence });
+        }
+      }
+    } catch {
+      // Keep raw output for diagnostics; malformed output is not a completion signal.
     }
   }
 
