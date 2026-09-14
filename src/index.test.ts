@@ -105,6 +105,11 @@ test("adopted tmux detach retains a live lease and reaps it after the session di
     assert.equal((await seedStore.list()).length, 1);
     assert.equal(spawnSync("tmux", ["-S", seeded.tmuxSocket!, "has-session", "-t", seeded.sessionName!], { stdio: "ignore" }).status, 0);
 
+    const replacement = spawnSync("tmux", ["-S", seeded.tmuxSocket!, "respawn-pane", "-k", "-t", seeded.tmuxPaneId!, "--", fakeClaude, "-e", fixture], { encoding: "utf8" });
+    assert.equal(replacement.status, 0, replacement.stderr);
+    await command.handler("poll", context);
+    assert.equal((await seedStore.list()).length, 1);
+
     spawnSync("tmux", ["-S", seeded.tmuxSocket!, "kill-session", "-t", seeded.sessionName!], { stdio: "ignore" });
     for (let attempt = 0; attempt < 30 && (await seedStore.list()).length > 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 100));
     assert.deepEqual(await seedStore.list(), []);
