@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { CwdLeaseStore, type CwdLeaseHandle, workerIdentity } from "./cwd-lease.ts";
+import { DecisionSessionStore } from "./decision-session-store.ts";
 import { TmuxWorkerAdapter } from "./worker/tmux-adapter.ts";
 import extension from "./index.ts";
 
@@ -31,6 +33,90 @@ test("index rejects required cgroup mode with tmux instead of ignoring it", () =
     else process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = previousTransport;
     if (previousCgroupMode === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE;
     else process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = previousCgroupMode;
+  }
+});
+
+test("index recovers an idle Decision Worker without replaying the original task", { concurrency: false }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-index-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-state-"));
+  const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-leases-"));
+  const taskId = "22222222-2222-4222-8222-222222222222";
+  const marker = join(stateDir, "received-input.jsonl");
+  const decisionStore = new DecisionSessionStore(join(stateDir, "decision-sessions"));
+  const decisionSessionDirectory = decisionStore.sessionDirectory(taskId);
+  await mkdir(decisionSessionDirectory, { recursive: true });
+  const decisionSessionFile = join(decisionSessionDirectory, "session.jsonl");
+  await writeFile(decisionSessionFile, `${JSON.stringify({ type: "session", version: 3, id: randomUUID(), timestamp: new Date().toISOString(), cwd })}\n`);
+  const fakeWorker = "const fs=require('node:fs'); process.stdin.on('data', data => fs.appendFileSync(process.argv[1], data)); setInterval(() => {}, 10000);";
+  await decisionStore.save({
+    taskId,
+    task: "original task must not be replayed",
+    cwd,
+    command: process.execPath,
+    args: ["-e", fakeWorker, marker],
+    decisionSessionFile,
+    maxTurns: 2,
+    deadlineMs: 60_000,
+    noOutputTimeoutMs: 60_000,
+    startedAt: new Date().toISOString(),
+    turn: 0,
+    state: "active",
+  });
+  const keys = ["PI_CLAUDE_SUPERVISOR_STATE_DIR", "PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR", "PI_CLAUDE_SUPERVISOR_TRANSPORT", "PI_CLAUDE_SUPERVISOR_CGROUP_MODE", "PI_CLAUDE_SUPERVISOR_MODE", "PI_CLAUDE_SUPERVISOR_AUTOMATION"] as const;
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]])) as Record<typeof keys[number], string | undefined>;
+  for (const key of keys) delete process.env[key];
+  process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
+  process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
+  process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "jsonl";
+  process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "off";
+  process.env.PI_CLAUDE_SUPERVISOR_MODE = "auto";
+  process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "1";
+  const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
+  const messages: string[] = [];
+  const context: TestContext = { cwd, hasUI: true, ui: { confirm: async () => false, notify: (message) => messages.push(message) } };
+  let shutdownHandler: (() => Promise<void>) | undefined;
+  try {
+    const fakePi = {
+      registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) { registrations.commands.push({ name, definition }); },
+      on(name: string, handler: () => Promise<void>) { registrations.events.push({ name, handler }); },
+    };
+    extension(fakePi as never);
+    const command = registrations.commands.find(({ name }) => name === "supervise")?.definition;
+    shutdownHandler = registrations.events.find(({ name }) => name === "session_shutdown")?.handler;
+    assert.ok(command);
+    assert.ok(shutdownHandler);
+
+    await command.handler(`recover ${taskId}`, context);
+    assert.match(messages.at(-1) ?? "", new RegExp(`Worker recovered idle: task=${taskId} worker=[^;]+; original task was not replayed`, "u"));
+    const recovered = await decisionStore.load(taskId);
+    assert.equal(recovered?.state, "active");
+    assert.equal(recovered?.recoveryState, "recovered_idle");
+    assert.ok(recovered?.recoveryWorker?.id);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await assert.rejects(() => readFile(marker, "utf8"), /ENOENT/u);
+
+    await command.handler(`send ${taskId} explicit continuation`, context);
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        const received = await readFile(marker, "utf8");
+        assert.match(received, /explicit continuation/u);
+        break;
+      } catch (error) {
+        if (attempt === 19) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+    await command.handler(`stop ${taskId}`, context);
+    assert.equal((await decisionStore.load(taskId))?.state, "closed");
+  } finally {
+    if (shutdownHandler) await shutdownHandler().catch(() => {});
+    for (const key of keys) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+    await rm(cwd, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(leaseDir, { recursive: true, force: true });
   }
 });
 

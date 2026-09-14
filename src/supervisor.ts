@@ -39,6 +39,13 @@ export interface DecisionSessionReadyInfo {
   lastFindingSignature?: string;
 }
 
+export type DecisionSessionCloseReason = "completed" | "human_stop" | "recoverable_failure";
+
+export interface DecisionSessionClosedInfo {
+  cleanupConfirmed: boolean;
+  reason: DecisionSessionCloseReason;
+}
+
 export interface SupervisorStartOptions {
   /** Reuse an existing task id when explicitly recovering after a Pi restart. */
   taskId?: string;
@@ -78,7 +85,7 @@ export interface SupervisorStartOptions {
   initialFindingSignature?: string;
   onDecisionSessionReady?: (info: DecisionSessionReadyInfo) => Promise<void> | void;
   onDecisionSessionProgress?: (info: { taskId: string; turn: number; repairRound: number; lastFindingSignature?: string }) => Promise<void> | void;
-  onDecisionSessionClosed?: (taskId: string) => Promise<void> | void;
+  onDecisionSessionClosed?: (taskId: string, info: DecisionSessionClosedInfo) => Promise<void> | void;
   onHumanRequired?: (notice: HumanInterventionNotice) => Promise<void> | void;
   reviewer?: TaskReviewer;
   decisionWorkerFactory?: DecisionWorkerFactory;
@@ -120,7 +127,7 @@ export class Supervisor {
   #pendingPermissions = new Map<string, WorkerPermissionRequest>();
   #humanRequired = false;
   #onDecisionSessionProgress?: (info: { taskId: string; turn: number; repairRound: number; lastFindingSignature?: string }) => Promise<void> | void;
-  #onDecisionSessionClosed?: (taskId: string) => Promise<void> | void;
+  #onDecisionSessionClosed?: (taskId: string, info: DecisionSessionClosedInfo) => Promise<void> | void;
   #startAbortController?: AbortController;
   #startToken?: string;
   #startStopReason?: string;
@@ -269,6 +276,7 @@ export class Supervisor {
           catch (cleanupError) { startupCleanupError ??= cleanupError; }
         }
       }
+      const startupCleanupConfirmed = !handle || (!startupCleanupError && await this.#isCleanupConfirmed(handle));
       if (startupCleanupError && !startFailure.workerCleanupRequired) {
         Object.defineProperty(startupError, "workerCleanupRequired", { value: true, enumerable: false });
       }
@@ -278,7 +286,7 @@ export class Supervisor {
       } catch { /* logging failure must not hide the startup failure */ }
       await this.#decision?.close().catch(() => {});
       this.#decision = undefined;
-      await Promise.resolve(this.#onDecisionSessionClosed?.(taskId)).catch(() => {});
+      await Promise.resolve(this.#onDecisionSessionClosed?.(taskId, { cleanupConfirmed: startupCleanupConfirmed, reason: "recoverable_failure" })).catch(() => {});
       this.#startAbortController = undefined;
       this.#startToken = undefined;
       this.#startStopReason = undefined;
@@ -319,14 +327,16 @@ export class Supervisor {
     }
     if (!status.running && ["running", "waiting", "paused"].includes(this.#machine.state)) {
       this.#clearWatchdog();
-      const cleanupSafe = !status.cleanupError && status.processGroupCleaned === true;
+      const cleanupSafe = !status.cleanupError
+        && status.processGroupCleaned === true
+        && (!status.cgroupError || status.cgroupRequired === false);
       if ((status.exitReason === "completed" || intentionalVerification) && cleanupSafe) this.#machine.transition("verifying");
       else this.#machine.transition("failed");
       await this.#appendEvent({ type: "worker_exited", taskId, workerId: handle.id, data: { exitCode: status.exitCode, signal: status.signal, reason: status.exitReason, cleanupSafe, cleanupError: status.cleanupError } });
       if (this.#machine.state === "failed") {
         await this.#decision?.close().catch(() => {});
         this.#decision = undefined;
-        await Promise.resolve(this.#onDecisionSessionClosed?.(taskId)).catch(() => {});
+        await Promise.resolve(this.#onDecisionSessionClosed?.(taskId, { cleanupConfirmed: cleanupSafe, reason: "recoverable_failure" })).catch(() => {});
       }
     }
     return { status, output };
@@ -626,7 +636,7 @@ export class Supervisor {
     }), 15_000, "persistent worker release");
   }
 
-  async stop(reason = "human requested stop"): Promise<void> {
+  async stop(reason = "human requested stop", options: { preserveDecisionSession?: boolean } = {}): Promise<void> {
     // A stop must be able to preempt startup rather than waiting behind a
     // startup operation that is blocked in a provider or adapter call.
     if (this.#machine.state === "starting") {
@@ -643,10 +653,10 @@ export class Supervisor {
       this.#preemptiveStop = this.#adapter.stop(this.#handle, reason);
       void this.#preemptiveStop.catch(() => { /* consumed by serialized stop */ });
     }
-    return this.#exclusive(() => this.#stopInternal(reason));
+    return this.#exclusive(() => this.#stopInternal(reason, true, options.preserveDecisionSession ? "recoverable_failure" : "human_stop"));
   }
 
-  async #stopInternal(reason: string, flushPendingEvents = true): Promise<void> {
+  async #stopInternal(reason: string, flushPendingEvents = true, closeReason: DecisionSessionCloseReason = "recoverable_failure"): Promise<void> {
     if (flushPendingEvents) await this.#flushPendingEvents();
     if (!this.#handle) throw new Error("no active task");
     if (this.#machine.state === "stopped") {
@@ -663,9 +673,10 @@ export class Supervisor {
       this.#preemptiveStop = undefined;
       if (preemptiveStop) await preemptiveStop;
       else if (this.#handle) await this.#adapter.stop(this.#handle, reason);
+      const cleanupConfirmed = await this.#isCleanupConfirmed(this.#handle);
       await this.#decision?.close().catch(() => {});
       this.#decision = undefined;
-      await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "")).catch(() => {});
+      await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", { cleanupConfirmed, reason: closeReason })).catch(() => {});
       return;
     }
     if (this.#machine.state === "completed") {
@@ -689,10 +700,11 @@ export class Supervisor {
     }
     this.#machine.transition("stopped");
     await this.#appendEvent({ type: "worker_stopped", taskId: this.#task?.taskId, workerId: this.#handle.id, data: { reason } });
-    if (outputError) throw outputError;
+    const cleanupConfirmed = await this.#isCleanupConfirmed(this.#handle);
     await this.#decision?.close().catch(() => {});
     this.#decision = undefined;
-    await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "")).catch(() => {});
+    await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", { cleanupConfirmed, reason: closeReason })).catch(() => {});
+    if (outputError) throw outputError;
   }
 
   async #drainOutputAfterStop(handle: WorkerHandle): Promise<void> {
@@ -841,9 +853,13 @@ export class Supervisor {
     const verificationSucceeded = result.ok && !cleanupError;
     this.#machine.transition(verificationSucceeded ? "completed" : "failed");
     await this.#appendEvent({ type: verificationSucceeded ? "verification_passed" : "verification_failed", taskId: this.#task?.taskId, workerId: this.#handle?.id, data: { ...result, ...(cleanupError ? { cleanupError: safeMessage(cleanupError) } : {}) } });
+    const cleanupConfirmed = !cleanupError && await this.#isCleanupConfirmed(this.#handle);
     await this.#decision?.close().catch(() => {});
     this.#decision = undefined;
-    await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "")).catch(() => {});
+    await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", {
+      cleanupConfirmed,
+      reason: verificationSucceeded ? "completed" : "recoverable_failure",
+    })).catch(() => {});
     if (cleanupError) throw cleanupError;
     return result;
   }
@@ -871,9 +887,23 @@ export class Supervisor {
       } catch {
         // Preserve the verifier error; the event remains a pending lifecycle record.
       }
+      const cleanupConfirmed = !cleanupError && await this.#isCleanupConfirmed(this.#handle);
       await this.#decision?.close().catch(() => {});
       this.#decision = undefined;
-      await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task.taskId)).catch(() => {});
+      await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task.taskId, { cleanupConfirmed, reason: "recoverable_failure" })).catch(() => {});
+    }
+  }
+
+  async #isCleanupConfirmed(handle?: WorkerHandle): Promise<boolean> {
+    if (!handle) return true;
+    try {
+      const status = await this.#adapter.getStatus(handle);
+      return !status.running
+        && status.processGroupCleaned === true
+        && !status.cleanupError
+        && (!status.cgroupError || status.cgroupRequired === false);
+    } catch {
+      return false;
     }
   }
 

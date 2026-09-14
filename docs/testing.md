@@ -67,8 +67,10 @@ guarantee.
 The extension persists each automatic Decision Worker session as Pi JSONL plus a
 0600 task mapping. Recovery is explicit and safe: after an unclean Pi restart,
 `/supervise sessions` shows the task as `recoverable`, and `/supervise recover
-<task-id>` restores the Decision Worker history before starting a new Claude
-Worker.
+[--takeover] <task-id>` restores the Decision Worker history before starting a new
+Claude Worker. `--takeover` is accepted only when the old Pi owner is dead and
+its Worker cgroup/process boundary is independently confirmed gone; persistent
+tmux sessions use `adopt-tmux`.
 Run the permission and signal probes explicitly when validating a CLI release:
 
 ```bash
@@ -94,7 +96,9 @@ response, and an exact result marker; it also records metadata only.
 
 For each release, pin and record the validated Claude Code version, resolved
 executable path, and model. The spikes reject an unpinned/mismatched executable
-version. For this release the validated version is `2.1.270` with model `opus`.
+version. For this release the validated version is `2.1.270` with model `opus`;
+the bounded matrix and its fail-closed outliers are recorded in
+[`docs/stability-matrix-2.1.270.md`](stability-matrix-2.1.270.md).
 Record:
 
 1. exact version and resolved executable path;

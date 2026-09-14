@@ -7,7 +7,7 @@ import { EventLog } from "./events.ts";
 import { redactSensitive } from "./redaction.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
 import { TmuxWorkerAdapter, attachCommand } from "./worker/tmux-adapter.ts";
-import { Supervisor } from "./supervisor.ts";
+import { Supervisor, type DecisionSessionClosedInfo } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
 import { loadSupervisorEnvironment } from "./config.ts";
@@ -15,7 +15,7 @@ import { DecisionSessionStore, type DecisionSessionRecord } from "./decision-ses
 import { CwdLeaseStore, type CwdLeaseHandle, pathsOverlap, workerIdentity } from "./cwd-lease.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { PiReadOnlyReviewer } from "./reviewer.ts";
-import type { TaskSpec } from "./types.ts";
+import type { TaskSpec, WorkerHandle } from "./types.ts";
 
 /**
  * Pi Claude Supervisor.
@@ -69,6 +69,17 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   let shutdownPromise: Promise<void> | undefined;
   let detachedLeaseSweepTimer: NodeJS.Timeout | undefined;
 
+  const handleDecisionSessionClosed = async (taskId: string, info: DecisionSessionClosedInfo): Promise<void> => {
+    const record = await decisionStore.load(taskId);
+    if (!record || record.state !== "active") return;
+    const terminal = info.reason === "completed" || info.reason === "human_stop";
+    if (terminal && info.cleanupConfirmed) {
+      await decisionStore.close(taskId);
+      return;
+    }
+    await decisionStore.markRecoveryInterrupted(taskId);
+  };
+
   const notify = (ctx: ExtensionContext, message: string, type: "info" | "warning" = "info") => {
     if (ctx.hasUI) ctx.ui.notify(redactText(message), type);
   };
@@ -121,7 +132,18 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     });
   }, 1_000);
   detachedLeaseSweepTimer.unref();
-  const stopSession = async (session: Supervisor, reason: string, releasePersistent = false): Promise<void> => {
+  const workerCleanupConfirmed = async (handle: NonNullable<Supervisor["handle"]>): Promise<boolean> => {
+    try {
+      const status = await adapter.getStatus(handle);
+      return !status.running
+        && status.processGroupCleaned === true
+        && !status.cleanupError
+        && (!status.cgroupError || status.cgroupRequired === false);
+    } catch {
+      return false;
+    }
+  };
+  const stopSession = async (session: Supervisor, reason: string, releasePersistent = false, preserveDecisionSession = false): Promise<void> => {
     const handle = session.handle;
     const persistent = adapter.capabilities().persistentSession && Boolean(handle);
     const taskId = session.task?.taskId;
@@ -136,7 +158,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     if (!handle && ["failed", "completed", "stopped"].includes(session.state)) return;
     let lifecycleError: unknown;
     try {
-      await session.stop(reason);
+      await session.stop(reason, { preserveDecisionSession });
     } catch (error) {
       lifecycleError = error;
     }
@@ -273,26 +295,34 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 } : undefined,
                 sendInitialInput: !tmuxSession,
                 decisionSessionDir: decisionStore.directory,
-                onDecisionSessionReady: (info) => decisionStore.save({
-                  taskId: info.taskId,
-                  task: info.task,
-                  spec: info.spec,
-                  cwd: info.cwd,
-                  command,
-                  args: workerArgs,
-                  approval,
-                  decisionSessionFile: info.sessionFile,
-                  maxTurns: info.maxTurns,
-                  deadlineMs: info.deadlineMs,
-                  noOutputTimeoutMs: info.noOutputTimeoutMs,
-                  startedAt: info.startedAt,
-                  turn: info.turn,
-                  repairRound: info.repairRound,
-                  ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}),
-                  state: "active",
-                }),
+                onDecisionSessionReady: async (info) => {
+                  const current = await decisionStore.load(info.taskId);
+                  await decisionStore.save({
+                    taskId: info.taskId,
+                    task: info.task,
+                    spec: info.spec,
+                    cwd: info.cwd,
+                    command,
+                    args: workerArgs,
+                    approval,
+                    decisionSessionFile: info.sessionFile,
+                    maxTurns: info.maxTurns,
+                    deadlineMs: info.deadlineMs,
+                    noOutputTimeoutMs: info.noOutputTimeoutMs,
+                    startedAt: info.startedAt,
+                    turn: info.turn,
+                    repairRound: info.repairRound,
+                    ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}),
+                    state: "active",
+                    recoveryState: current?.recoveryState ?? "ready",
+                    recoveryAttempt: current?.recoveryAttempt ?? 0,
+                    ...(current?.recoveryOwnerPid !== undefined ? { recoveryOwnerPid: current.recoveryOwnerPid } : {}),
+                    ...(current?.recoveryOwnerStartTime ? { recoveryOwnerStartTime: current.recoveryOwnerStartTime } : {}),
+                    ...(current?.recoveryWorker ? { recoveryWorker: current.recoveryWorker } : {}),
+                  });
+                },
                 onDecisionSessionProgress: (info) => decisionStore.update(info.taskId, { turn: info.turn, repairRound: info.repairRound, ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}) }),
-                onDecisionSessionClosed: (taskId) => decisionStore.close(taskId),
+                onDecisionSessionClosed: handleDecisionSessionClosed,
               });
               const startedTaskId = session.task?.taskId;
               if (!startedTaskId) throw new Error("worker started without a task id");
@@ -318,6 +348,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 }
                 throw registrationError;
               }
+              if (lease.replacedTaskId) await decisionStore.close(lease.replacedTaskId);
               // Register immediately after spawn so shutdown can retry cleanup if
               // the first stop attempt fails.
               sessions.set(startedTaskId, session);
@@ -325,7 +356,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
               activeTaskId = startedTaskId;
               if (shuttingDown) {
                 try {
-                  await stopSession(session, "Pi session shutdown during worker start", true);
+                  await stopSession(session, "Pi session shutdown during worker start", true, true);
                   sessions.delete(startedTaskId);
                   reservedCwds.delete(startedTaskId);
                 } finally {
@@ -392,12 +423,15 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             pendingCwds.delete(cwdKey);
           }
         } else if (operation === "recover") {
-          const taskId = rest[0];
-          if (!taskId) throw new Error("Usage: /supervise recover <task-id>");
+          const takeover = rest.includes("--takeover");
+          const taskId = rest.find((value) => value !== "--takeover");
+          if (!taskId || rest.some((value) => value !== "--takeover" && value !== taskId)) throw new Error("Usage: /supervise recover [--takeover] <task-id>");
           if (shuttingDown) throw new Error("Pi session is shutting down");
           if (sessions.has(taskId)) throw new Error(`Task session is already loaded: ${taskId}`);
           const record = await decisionStore.load(taskId);
           if (!record || record.state !== "active") throw new Error(`No recoverable Decision Worker session: ${taskId}`);
+          const staleRecovery = !["ready", "interrupted"].includes(record.recoveryState);
+          if (staleRecovery && !takeover) throw new Error(`Decision Worker recovery is stale (${record.recoveryState}); retry with --takeover only after verifying the old Worker is gone: ${taskId}`);
           if (!await decisionStore.sessionFileExists(taskId)) throw new Error(`Decision Worker session file is missing or unsafe: ${taskId}`);
           if (record.maxTurns > 0 && record.turn >= record.maxTurns) throw new Error(`Cannot recover task after its turn budget was exhausted: ${taskId}`);
           if (record.deadlineMs > 0 && Date.now() - Date.parse(record.startedAt) >= record.deadlineMs) throw new Error(`Cannot recover task after its wall-clock deadline: ${taskId}`);
@@ -420,11 +454,28 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             if (!approved) throw new Error("Worker command not approved");
             approval = { actor: "human", reason: policy.reason };
           }
-          const lease = await cwdLeaseStore.acquire(cwdKey, record.taskId, adapter.capabilities().transport);
+          const lease = await cwdLeaseStore.acquire(cwdKey, record.taskId, adapter.capabilities().transport, takeover
+            ? {
+              takeover: {
+                taskId: record.taskId,
+                ...(staleRecovery ? { beforeReplace: () => decisionStore.reconcileStaleRecovery(record.taskId) } : {}),
+              },
+            }
+            : {});
+          if (staleRecovery && lease.replacedTaskId !== record.taskId) {
+            await lease.release();
+            throw new Error(`Stale Decision Worker recovery has no verified old lease to take over: ${record.taskId}`);
+          }
           cwdLeases.set(record.taskId, lease);
-          if (shuttingDown) {
+          let recoveryClaimed = false;
+          try {
+            await decisionStore.beginRecovery(record.taskId);
+            recoveryClaimed = true;
+            if (shuttingDown) throw new Error("Pi session is shutting down");
+          } catch (error) {
+            if (recoveryClaimed) await decisionStore.markRecoveryInterrupted(record.taskId).catch(() => {});
             await releaseLease(record.taskId);
-            throw new Error("Pi session is shutting down");
+            throw error;
           }
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
@@ -440,8 +491,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             },
           });
           pendingStartSessions.add(session);
-          let recoveryCleanupCompleted = false;
           const recoveryOperation = (async () => {
+            let startedHandle: WorkerHandle | undefined;
             try {
               const handle = await session.start({
                 taskId: record.taskId,
@@ -467,72 +518,100 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 initialFindingSignature: record.lastFindingSignature,
                 decisionSessionFile: record.decisionSessionFile,
                 decisionSessionDir: decisionStore.directory,
-                onDecisionSessionReady: (info) => decisionStore.save({
-                  taskId: info.taskId,
-                  task: info.task,
-                  spec: info.spec,
-                  cwd: info.cwd,
-                  command: record.command,
-                  args: record.args,
-                  approval,
-                  decisionSessionFile: info.sessionFile,
-                  maxTurns: info.maxTurns,
-                  deadlineMs: info.deadlineMs,
-                  noOutputTimeoutMs: info.noOutputTimeoutMs,
-                  startedAt: info.startedAt,
-                  turn: info.turn,
-                  repairRound: info.repairRound,
-                  ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}),
-                  state: "active",
-                }),
+                onDecisionSessionReady: async (info) => {
+                  const current = await decisionStore.load(info.taskId);
+                  if (!current || current.state !== "active") throw new Error("Decision Worker recovery record disappeared before session registration");
+                  await decisionStore.save({
+                    taskId: info.taskId,
+                    task: info.task,
+                    spec: info.spec,
+                    cwd: info.cwd,
+                    command: record.command,
+                    args: record.args,
+                    approval,
+                    decisionSessionFile: info.sessionFile,
+                    maxTurns: info.maxTurns,
+                    deadlineMs: info.deadlineMs,
+                    noOutputTimeoutMs: info.noOutputTimeoutMs,
+                    startedAt: info.startedAt,
+                    turn: info.turn,
+                    repairRound: info.repairRound,
+                    ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}),
+                    state: "active",
+                    recoveryState: current.recoveryState,
+                    recoveryAttempt: current.recoveryAttempt,
+                    ...(current.recoveryOwnerPid !== undefined ? { recoveryOwnerPid: current.recoveryOwnerPid } : {}),
+                    ...(current.recoveryOwnerStartTime ? { recoveryOwnerStartTime: current.recoveryOwnerStartTime } : {}),
+                    ...(current.recoveryWorker ? { recoveryWorker: current.recoveryWorker } : {}),
+                  });
+                },
                 onDecisionSessionProgress: (info) => decisionStore.update(info.taskId, { turn: info.turn, repairRound: info.repairRound, ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}) }),
-                onDecisionSessionClosed: (closedTaskId) => decisionStore.close(closedTaskId),
+                onDecisionSessionClosed: handleDecisionSessionClosed,
               });
-              try {
-                await lease.updateWorker({
-                  transport: adapter.capabilities().transport,
-                  ...(await workerIdentity(handle)),
-                  sessionName: handle.sessionName,
-                  tmuxSocket: handle.tmuxSocket,
-                  ownership: handle.ownership,
-                });
-              } catch (error) {
-                const registrationError = error instanceof Error ? error : new Error(String(error));
-                try {
-                  await stopSession(session, "cwd lease metadata registration failed");
-                  recoveryCleanupCompleted = await releaseLease(record.taskId);
-                } catch (cleanupError) {
-                  const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-                  registrationError.message = `${registrationError.message}; worker cleanup failed: ${message}`;
-                  Object.defineProperty(registrationError, "workerCleanupRequired", { value: true, enumerable: false });
-                }
-                throw registrationError;
+              startedHandle = handle;
+              await lease.updateWorker({
+                transport: adapter.capabilities().transport,
+                ...(await workerIdentity(handle)),
+                sessionName: handle.sessionName,
+                tmuxSocket: handle.tmuxSocket,
+                ownership: handle.ownership,
+              });
+              await decisionStore.recordRecoveryWorker(record.taskId, {
+                id: handle.id,
+                pid: handle.pid,
+                startedAt: handle.startedAt,
+              });
+              const registered = await decisionStore.load(record.taskId);
+              if (!registered || registered.state !== "active" || registered.recoveryState !== "registered" || registered.recoveryWorker?.id !== handle.id) {
+                throw new Error("Recovered Worker registration was not durably confirmed");
               }
               sessions.set(record.taskId, session);
               reservedCwds.set(record.taskId, cwdKey);
               activeTaskId = record.taskId;
               await session.takeover();
+              await decisionStore.markRecoveryIdle(record.taskId);
+              const idle = await decisionStore.load(record.taskId);
+              if (!idle || idle.state !== "active" || idle.recoveryState !== "recovered_idle" || idle.recoveryWorker?.id !== handle.id) {
+                throw new Error("Recovered idle state was not durably confirmed");
+              }
               if (shuttingDown) {
-                await stopSession(session, "Pi session shutdown during recovery", true);
+                await stopSession(session, "Pi session shutdown during recovery", true, true);
                 throw new Error("Pi session shut down during recovery");
               }
               message = `Worker recovered idle: task=${record.taskId} worker=${handle.id}; original task was not replayed; send an explicit continuation, then use resume-auto`;
             } catch (error) {
-              const cleanupRequired = requiresWorkerCleanup(error);
-              if (cleanupRequired) cleanupRequiredTasks.add(record.taskId);
-              const retainHandle = !recoveryCleanupCompleted && session.handle
-                && (cleanupRequired || session.handle.ownership === "adopted");
-              if (retainHandle) {
-                sessions.set(record.taskId, session);
-                reservedCwds.set(record.taskId, cwdKey);
-                activeTaskId = record.taskId;
-              } else if (!cleanupRequired && !recoveryCleanupCompleted) {
+              const handle = session.handle ?? startedHandle;
+              let cleanupConfirmed = !handle;
+              const retainedWorker = handle?.ownership === "adopted";
+              if (handle && !retainedWorker) {
+                try {
+                  await stopSession(session, "Decision Worker recovery cleanup", false, true);
+                  cleanupConfirmed = await workerCleanupConfirmed(handle);
+                } catch {
+                  cleanupConfirmed = false;
+                }
+              }
+              if (!cleanupConfirmed) cleanupRequiredTasks.add(record.taskId);
+              try {
+                await decisionStore.markRecoveryInterrupted(record.taskId);
+              } catch (stateError) {
+                cleanupConfirmed = false;
+                console.error(`pi-claude-supervisor recovery state update failed: ${redactText(stateError instanceof Error ? stateError.message : String(stateError))}`);
+              }
+              if (cleanupConfirmed && !retainedWorker) {
                 const released = await releaseLease(record.taskId);
-                if (!released) {
+                if (released) {
+                  forgetSession(record.taskId);
+                } else {
+                  cleanupRequiredTasks.add(record.taskId);
                   sessions.set(record.taskId, session);
                   reservedCwds.set(record.taskId, cwdKey);
                   activeTaskId = record.taskId;
                 }
+              } else {
+                sessions.set(record.taskId, session);
+                reservedCwds.set(record.taskId, cwdKey);
+                activeTaskId = record.taskId;
               }
               throw error;
             }
@@ -595,7 +674,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           } else if (operation === "resume-auto") {
             await session.resumeAutomation(); message = `Automatic decisions resumed: ${sessionId}.`;
           } else {
-            throw new Error("Usage: /supervise start|adopt-tmux|recover|sessions|status|poll [all|taskId]|send [taskId]|pause [taskId]|resume [taskId]|stop [taskId]|verify [taskId]|approve [taskId] <allow|deny>|takeover [taskId]|resume-auto [taskId]|capabilities");
+            throw new Error("Usage: /supervise start|adopt-tmux|recover [--takeover]|sessions|status|poll [all|taskId]|send [taskId]|pause [taskId]|resume [taskId]|stop [taskId]|verify [taskId]|approve [taskId] <allow|deny>|takeover [taskId]|resume-auto [taskId]|capabilities");
           }
         }
         notify(ctx, message);
@@ -629,7 +708,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           startupFailures.push(...results.filter((result): result is PromiseRejectedResult => result.status === "rejected"));
         }
       }
-      const results = await Promise.allSettled([...sessions.values()].map((session) => stopSession(session, "Pi session shutdown", true)));
+      const results = await Promise.allSettled([...sessions.values()].map((session) => stopSession(session, "Pi session shutdown", true, true)));
       await releaseSettledReservations();
       const failures = [...startupFailures, ...results.filter((result): result is PromiseRejectedResult => result.status === "rejected")];
       if (failures.length > 0) {
@@ -682,7 +761,7 @@ function formatSessions(sessions: Map<string, Supervisor>, recoverable: Decision
     .map(([taskId, session]) => `${taskId} state=${session.state} cwd=${session.task?.cwd ?? "-"} worker=${session.handle?.id ?? "-"}`);
   const pending = recoverable
     .filter((record) => !sessions.has(record.taskId))
-    .map((record) => `${record.taskId} state=recoverable cwd=${record.cwd} worker=-`);
+    .map((record) => `${record.taskId} state=recoverable recovery=${record.recoveryState} cwd=${record.cwd} worker=${record.recoveryWorker?.id ?? "-"}`);
   return [...active, ...pending].join("\n") || "No task sessions.";
 }
 

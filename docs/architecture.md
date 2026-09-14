@@ -148,9 +148,12 @@ registry before spawning Claude. The default registry is
 may point all Pi processes at an alternate shared directory. Canonical paths
 conflict with both their parents and descendants, and the registry lock
 serializes acquisition across independent Pi processes. A lease is released
-only after the adapter confirms the worker and its descendant cleanup; an
-unconfirmed lease left by a crashed Pi is intentionally retained and requires
-operator verification/manual cleanup rather than unsafe automatic reclamation.
+only after the adapter confirms the worker and its descendant cleanup. An
+unconfirmed lease left by a crashed Pi is intentionally retained. Ordinary
+recovery refuses it; an operator may use `recover --takeover` only when the old
+owner is dead and the lease independently proves the old Worker cgroup/process
+boundary is gone. Live or unverifiable Workers still require manual cleanup
+rather than unsafe reclamation.
 An explicitly adopted tmux session may hand off an existing lease only after
 its owner identity is no longer live and its canonical cwd, tmux session/socket,
 pane id, pane PID/start time, and pane command all match; ordinary starts
@@ -192,7 +195,8 @@ duplicate turns. The adapter also exposes event subscriptions for `result`,
 `control_request`, permission requests and process exit. Automatic mode routes
 those events to a persistent, read-only Pi Decision Worker; its Pi session JSONL
 and task mapping are persisted under the supervisor state directory. After an
-unclean Pi restart, recovery is explicit: `/supervise recover <task-id>` restores
+unclean Pi restart, recovery is explicit: `/supervise recover [--takeover]
+<task-id>` restores
 the Decision Worker context and starts a new Claude Worker. It does not silently
 resume or duplicate a task. It does not poll to detect turn completion. A watchdog timer remains only as a deadlock safety
 fallback. Permission actions pass through `evaluatePermission` and can be

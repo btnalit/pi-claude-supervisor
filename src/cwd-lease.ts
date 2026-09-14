@@ -36,8 +36,25 @@ export interface CwdLeaseHandoff {
   tmuxSocket?: string;
 }
 
+/**
+ * Explicit recovery takeover. This is intentionally separate from ordinary
+ * acquisition: an old Pi owner may have died while its Worker survived.
+ */
+export interface CwdLeaseTakeover {
+  taskId: string;
+  /** Run before the old lease is removed; failure leaves the old lease intact. */
+  beforeReplace?: (lease: CwdLeaseRecord) => Promise<void>;
+}
+
+export interface CwdLeaseAcquireOptions {
+  handoff?: CwdLeaseHandoff;
+  takeover?: CwdLeaseTakeover;
+}
+
 export interface CwdLeaseHandle {
   readonly record: CwdLeaseRecord;
+  /** Task id whose lease was explicitly handed off/taken over, if any. */
+  readonly replacedTaskId?: string;
   updateWorker(worker: CwdLeaseWorker): Promise<void>;
   release(): Promise<void>;
 }
@@ -63,7 +80,9 @@ export class CwdLeaseStore {
     return this.#directory;
   }
 
-  async acquire(cwd: string, taskId: string, transport: CwdLeaseTransport, options: { handoff?: CwdLeaseHandoff } = {}): Promise<CwdLeaseHandle> {
+  async acquire(cwd: string, taskId: string, transport: CwdLeaseTransport, options: CwdLeaseAcquireOptions = {}): Promise<CwdLeaseHandle> {
+    assertTaskId(taskId);
+    if (options.takeover) assertTaskId(options.takeover.taskId);
     const canonicalCwd = await realpath(resolve(cwd));
     const now = new Date().toISOString();
     const lease: CwdLeaseRecord = {
@@ -77,6 +96,7 @@ export class CwdLeaseStore {
       updatedAt: now,
       worker: { transport },
     };
+    let replacedTaskId: string | undefined;
     await this.#withLock(async () => {
       const leases = await this.#readAll();
       let handoffLease: CwdLeaseRecord | undefined;
@@ -88,23 +108,35 @@ export class CwdLeaseStore {
           continue;
         }
         if (!pathsOverlap(existing.cwd, canonicalCwd)) continue;
+        if (options.takeover?.taskId === existing.taskId
+          && existing.cwd === canonicalCwd
+          && await canTakeoverLease(existing)) {
+          await options.takeover.beforeReplace?.(existing);
+          replacedTaskId = existing.taskId;
+          await rm(this.#path(existing.leaseId), { force: true });
+          continue;
+        }
         throw new Error(`working-directory lease is held by task ${existing.taskId}: ${redactText(existing.cwd)}`);
       }
       await this.#write(lease);
-      if (handoffLease) await rm(this.#path(handoffLease.leaseId), { force: true });
+      if (handoffLease) {
+        replacedTaskId = handoffLease.taskId;
+        await rm(this.#path(handoffLease.leaseId), { force: true });
+      }
     });
-    return this.#handle(lease);
+    return this.#handle(lease, replacedTaskId);
   }
 
   async list(): Promise<CwdLeaseRecord[]> {
     return this.#withLock(() => this.#readAll());
   }
 
-  #handle(initial: CwdLeaseRecord): CwdLeaseHandle {
+  #handle(initial: CwdLeaseRecord, replacedTaskId?: string): CwdLeaseHandle {
     let current = { ...initial, worker: initial.worker ? { ...initial.worker } : undefined };
     let released = false;
     return {
       get record() { return current; },
+      get replacedTaskId() { return replacedTaskId; },
       updateWorker: async (worker) => {
         if (released) throw new Error("cwd lease has already been released");
         assertWorker(worker);
@@ -157,8 +189,8 @@ export class CwdLeaseStore {
   async #write(lease: CwdLeaseRecord): Promise<void> {
     await this.#ensureDirectory();
     const target = this.#path(lease.leaseId);
-    const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(lease, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    const temporary = `${target}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(lease, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
     await rename(temporary, target);
     await chmod(target, 0o600);
   }
@@ -252,12 +284,57 @@ async function processIdentityLive(pid: number, expectedStartTime?: string): Pro
   const currentStartTime = await processStartTime(pid);
   if (currentStartTime && expectedStartTime) return currentStartTime === expectedStartTime;
   if (currentStartTime) return true;
+  return processExists(pid);
+}
+
+async function processExists(pid: number): Promise<boolean> {
   try {
     process.kill(pid, 0);
     return true;
   } catch (error) {
     return error instanceof Error && /EPERM/u.test(error.message);
   }
+}
+
+async function processGroupExists(pid: number): Promise<boolean> {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return error instanceof Error && /EPERM/u.test(error.message);
+  }
+}
+
+async function cgroupHasProcesses(path: string): Promise<boolean> {
+  // Lease files are untrusted state. Never read an arbitrary path during
+  // takeover; only the kernel cgroup hierarchy is eligible for this check.
+  const cgroupRoot = resolve("/sys/fs/cgroup");
+  const cgroupPath = resolve(path);
+  if (!cgroupPath.startsWith(`${cgroupRoot}/`)) return true;
+  try {
+    const contents = await readFile(join(cgroupPath, "cgroup.procs"), "utf8");
+    return contents.split(/\s+/u).some((pid) => /^\d+$/u.test(pid));
+  } catch (error) {
+    if (error instanceof Error && /ENOENT/u.test(error.message)) return false;
+    return true;
+  }
+}
+
+async function canTakeoverLease(lease: CwdLeaseRecord): Promise<boolean> {
+  // The old supervisor owner must be gone. A dead owner is not enough when
+  // the detached Worker itself is still alive.
+  if (await processExists(lease.ownerPid)) return false;
+  const worker = lease.worker;
+  if (!worker) return false;
+  if (worker.transport === "tmux") return false;
+  if (!worker.pid) return false;
+  if (await processExists(worker.pid)) return false;
+  if (await processGroupExists(worker.pid)) return false;
+  // A process-group check cannot see a setsid descendant. Explicit takeover
+  // therefore requires the verified cgroup boundary used by the adapter.
+  if (!worker.cgroupPath || !resolve(worker.cgroupPath).startsWith(`${resolve("/sys/fs/cgroup")}/`)) return false;
+  if (await cgroupHasProcesses(worker.cgroupPath)) return false;
+  return true;
 }
 
 async function processStartTime(pid: number): Promise<string | undefined> {
@@ -286,6 +363,10 @@ async function matchesHandoff(lease: CwdLeaseRecord, handoff: CwdLeaseHandoff): 
   // A live owner is still an active supervisor. Do not let another Pi consume
   // its lease merely because the tmux session name is known.
   return !(await processIdentityLive(lease.ownerPid, lease.ownerStartTime));
+}
+
+function assertTaskId(taskId: string): void {
+  if (!/^[0-9a-f-]{36}$/iu.test(taskId)) throw new Error("invalid cwd lease task id");
 }
 
 function assertWorker(worker: CwdLeaseWorker): void {

@@ -59,7 +59,7 @@ export PI_CLAUDE_SUPERVISOR_WORKER=claude
 /supervise start inspect the current repository and report what should be changed
 /supervise start --spec ./task.json
 /supervise sessions
-/supervise recover <task-id>
+/supervise recover [--takeover] <task-id>
 /supervise poll
 /supervise poll all
 /supervise send continue with read-only inspection
@@ -123,9 +123,12 @@ isolation are not part of this milestone.
 
 Automatic mode persists the Pi Decision Worker session under the configured state
 directory. After an unclean Pi restart, `/supervise sessions` lists recoverable
-tasks; `/supervise recover <task-id>` explicitly restores the Decision Worker
+tasks; `/supervise recover [--takeover] <task-id>` explicitly restores the Decision Worker
 context and starts a new Claude Worker. It never silently resumes or duplicates
-work. The adapter intentionally does not inherit arbitrary host environment variables.
+work. If the old Pi owner is dead, add `--takeover` only after the lease proves
+the old Worker's cgroup/process boundary is gone; a live or unverifiable Worker is refused.
+For a persistent tmux Worker, use explicit `adopt-tmux` instead of takeover.
+The adapter intentionally does not inherit arbitrary host environment variables.
 Pass credentials through an explicit `WorkerStartInput.env` in an embedding
 integration. For the built-in command, opt in to named variables, for example
 `PI_CLAUDE_SUPERVISOR_WORKER_ENV=ANTHROPIC_API_KEY`.

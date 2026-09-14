@@ -1,8 +1,17 @@
-import { chmod, lstat, mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { chmod, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { redactSensitive } from "./redaction.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import type { TaskSpec } from "./types.ts";
+
+export type DecisionRecoveryState = "ready" | "starting" | "registered" | "recovered_idle" | "interrupted";
+
+export interface DecisionRecoveryWorker {
+  id: string;
+  pid?: number;
+  startedAt: string;
+}
 
 export interface DecisionSessionRecord {
   version: 1;
@@ -22,13 +31,26 @@ export interface DecisionSessionRecord {
   repairRound?: number;
   lastFindingSignature?: string;
   state: "active" | "closed";
+  recoveryState: DecisionRecoveryState;
+  recoveryAttempt: number;
+  recoveryOwnerPid?: number;
+  recoveryOwnerStartTime?: string;
+  recoveryWorker?: DecisionRecoveryWorker;
   updatedAt: string;
 }
+
+export type DecisionSessionRecordInput = Omit<DecisionSessionRecord, "version" | "updatedAt" | "recoveryState" | "recoveryAttempt" | "recoveryOwnerPid" | "recoveryOwnerStartTime"> & Partial<Pick<DecisionSessionRecord, "updatedAt" | "recoveryState" | "recoveryAttempt" | "recoveryOwnerPid" | "recoveryOwnerStartTime">>;
+
+const LOCK_TIMEOUT_MS = 10_000;
+const STALE_LOCK_MS = 5_000;
 
 /**
  * Small crash-tolerant registry for Decision Worker sessions.
  * The Pi session JSONL remains the source of conversation history; this file
  * only maps a supervisor task to that history and the restart parameters.
+ *
+ * Registry mutations use a process-bound lock and atomic record replacement so
+ * recovery state cannot be silently lost when two Pi processes race.
  */
 export class DecisionSessionStore {
   readonly #directory: string;
@@ -46,40 +68,143 @@ export class DecisionSessionStore {
     return join(this.#directory, taskId);
   }
 
-  async save(record: Omit<DecisionSessionRecord, "version" | "updatedAt"> & Partial<Pick<DecisionSessionRecord, "updatedAt">>): Promise<void> {
+  async save(record: DecisionSessionRecordInput): Promise<void> {
     assertTaskId(record.taskId);
     const decisionSessionFile = resolve(record.decisionSessionFile);
     await assertTaskDirectorySafe(this.#directory, record.taskId);
     assertSessionPath(decisionSessionFile, this.#directory, record.taskId);
     assertNoCredentialPath(decisionSessionFile);
     assertNoCredentialPath(record.cwd);
-    const safeRecord = redactRecord(record);
-    const normalized: DecisionSessionRecord = {
-      ...safeRecord,
-      version: 1,
-      updatedAt: safeRecord.updatedAt ?? new Date().toISOString(),
-      args: [...safeRecord.args],
-      decisionSessionFile,
-    };
-    await mkdir(this.#directory, { recursive: true, mode: 0o700 });
-    await chmod(this.#directory, 0o700);
-    const target = this.#recordPath(record.taskId);
-    const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
-    await writeJson(temporary, normalized);
-    await rename(temporary, target);
-    await chmod(target, 0o600);
+    await this.#withLock(() => this.#saveUnlocked({ ...record, decisionSessionFile }));
   }
 
   async close(taskId: string): Promise<void> {
-    const record = await this.load(taskId);
-    if (!record) return;
-    await this.save({ ...record, state: "closed", updatedAt: new Date().toISOString() });
+    assertTaskId(taskId);
+    await this.#withLock(async () => {
+      const record = await this.#loadUnlocked(taskId);
+      if (!record) return;
+      await this.#saveUnlocked({ ...record, state: "closed", updatedAt: new Date().toISOString() });
+    });
   }
 
   async update(taskId: string, patch: Partial<Pick<DecisionSessionRecord, "turn" | "repairRound" | "lastFindingSignature" | "updatedAt">>): Promise<void> {
-    const record = await this.load(taskId);
-    if (!record || record.state !== "active") return;
-    await this.save({ ...record, ...patch, updatedAt: patch.updatedAt ?? new Date().toISOString() });
+    assertTaskId(taskId);
+    await this.#withLock(async () => {
+      const record = await this.#loadUnlocked(taskId);
+      if (!record || record.state !== "active") return;
+      await this.#saveUnlocked({ ...record, ...patch, updatedAt: patch.updatedAt ?? new Date().toISOString() });
+    });
+  }
+
+  /** Claim an active record for one explicit recovery attempt. */
+  async beginRecovery(taskId: string): Promise<DecisionSessionRecord> {
+    assertTaskId(taskId);
+    return this.#withLock(async () => {
+      const record = await this.#loadUnlocked(taskId);
+      if (!record || record.state !== "active") throw new Error(`No active Decision Worker session: ${taskId}`);
+      if (record.recoveryState !== "ready" && record.recoveryState !== "interrupted") {
+        throw new Error(`Decision Worker recovery is already in progress or attached: ${taskId}`);
+      }
+      const next: DecisionSessionRecord = {
+        ...record,
+        recoveryState: "starting",
+        recoveryAttempt: record.recoveryAttempt + 1,
+        recoveryOwnerPid: process.pid,
+        recoveryOwnerStartTime: await processStartTime(process.pid),
+        recoveryWorker: undefined,
+        updatedAt: new Date().toISOString(),
+      };
+      await this.#saveUnlocked(next);
+      return next;
+    });
+  }
+
+  /** Persist the new Worker identity before exposing the recovered session. */
+  async recordRecoveryWorker(taskId: string, worker: DecisionRecoveryWorker): Promise<void> {
+    assertTaskId(taskId);
+    assertRecoveryWorker(worker);
+    await this.#withLock(async () => {
+      const record = await this.#loadUnlocked(taskId);
+      if (!record) throw new Error(`Decision Worker recovery record is missing: ${taskId}`);
+      if (record.state !== "active") throw new Error(`Decision Worker recovery record is closed: ${taskId}`);
+      if (record.recoveryState !== "starting") throw new Error(`Decision Worker recovery is not in startup state: ${taskId}`);
+      await this.#saveUnlocked({
+        ...record,
+        recoveryState: "registered",
+        recoveryWorker: { ...worker },
+        updatedAt: new Date().toISOString(),
+      });
+    });
+  }
+
+  /** Mark a registered recovery as an idle, human-controlled session. */
+  async markRecoveryIdle(taskId: string): Promise<void> {
+    assertTaskId(taskId);
+    await this.#withLock(async () => {
+      const record = await this.#loadUnlocked(taskId);
+      if (!record) throw new Error(`Decision Worker recovery record is missing: ${taskId}`);
+      if (record.state !== "active") throw new Error(`Decision Worker recovery record is closed: ${taskId}`);
+      if (record.recoveryState === "recovered_idle") return;
+      if (record.recoveryState !== "registered" && record.recoveryState !== "starting") {
+        throw new Error(`Decision Worker recovery cannot become idle from ${record.recoveryState}: ${taskId}`);
+      }
+      await this.#saveUnlocked({ ...record, recoveryState: "recovered_idle", updatedAt: new Date().toISOString() });
+    });
+  }
+
+  /**
+   * Reconcile a stale attempt only after the cwd-lease takeover has proved the
+   * old supervisor/Worker boundary is gone. The owner identity check remains
+   * here as a second independent guard.
+   */
+  async reconcileStaleRecovery(taskId: string): Promise<void> {
+    assertTaskId(taskId);
+    await this.#withLock(async () => {
+      const record = await this.#loadUnlocked(taskId);
+      if (!record || record.state !== "active") throw new Error(`Decision Worker recovery record is unavailable: ${taskId}`);
+      if (record.recoveryState === "ready" || record.recoveryState === "interrupted") return;
+      if (!record.recoveryOwnerPid || await processExists(record.recoveryOwnerPid)) {
+        throw new Error(`Decision Worker recovery owner is still live: ${taskId}`);
+      }
+      await this.#saveUnlocked({
+        ...record,
+        recoveryState: "interrupted",
+        recoveryWorker: undefined,
+        updatedAt: new Date().toISOString(),
+      });
+    });
+  }
+
+  /** Leave an active record visibly recoverable after an interrupted attempt. */
+  async markRecoveryInterrupted(taskId: string): Promise<void> {
+    assertTaskId(taskId);
+    await this.#withLock(async () => {
+      const record = await this.#loadUnlocked(taskId);
+      if (!record || record.state !== "active") return;
+      if (record.recoveryState === "interrupted") return;
+      await this.#saveUnlocked({
+        ...record,
+        recoveryState: "interrupted",
+        recoveryWorker: undefined,
+        updatedAt: new Date().toISOString(),
+      });
+    });
+  }
+
+  /** Reset a claimed record only when no Worker was spawned. */
+  async resetRecovery(taskId: string): Promise<void> {
+    assertTaskId(taskId);
+    await this.#withLock(async () => {
+      const record = await this.#loadUnlocked(taskId);
+      if (!record || record.state !== "active") return;
+      if (record.recoveryState === "ready") return;
+      await this.#saveUnlocked({
+        ...record,
+        recoveryState: "ready",
+        recoveryWorker: undefined,
+        updatedAt: new Date().toISOString(),
+      });
+    });
   }
 
   async sessionFileExists(taskId: string): Promise<boolean> {
@@ -96,29 +221,25 @@ export class DecisionSessionStore {
 
   async load(taskId: string): Promise<DecisionSessionRecord | undefined> {
     assertTaskId(taskId);
-    try {
-      const value = JSON.parse(await readFile(this.#recordPath(taskId), "utf8")) as Partial<DecisionSessionRecord>;
-      assertNoCredentialPath(typeof value.decisionSessionFile === "string" ? resolve(value.decisionSessionFile) : "");
-      return normalizeRecord(redactRecord(value), this.#directory, taskId);
-    } catch (error) {
-      if (error instanceof Error && /ENOENT/u.test(error.message)) return undefined;
-      throw error;
-    }
+    return this.#loadUnlocked(taskId);
   }
 
   async list(options: { activeOnly?: boolean } = {}): Promise<DecisionSessionRecord[]> {
     try {
+      const directoryInfo = await lstat(this.#directory);
+      if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) throw new Error("Decision Worker session registry is not a real directory");
       const names = await readdir(this.#directory);
       const records: DecisionSessionRecord[] = [];
       for (const name of names.filter((item) => item.endsWith(".json"))) {
         try {
-          const value = JSON.parse(await readFile(join(this.#directory, name), "utf8")) as Partial<DecisionSessionRecord>;
-          assertNoCredentialPath(typeof value.decisionSessionFile === "string" ? resolve(value.decisionSessionFile) : "");
           const expectedTaskId = name.slice(0, -".json".length);
+          assertTaskId(expectedTaskId);
+          const value = JSON.parse(await readRecordFile(join(this.#directory, name))) as Partial<DecisionSessionRecord>;
+          assertNoCredentialPath(typeof value.decisionSessionFile === "string" ? resolve(value.decisionSessionFile) : "");
           const record = normalizeRecord(redactRecord(value), this.#directory, expectedTaskId);
           if (!options.activeOnly || record.state === "active") records.push(record);
         } catch {
-          // A torn or manually edited registry record is not recoverable.
+          // A torn, misnamed, or manually edited registry record is not recoverable.
         }
       }
       return records.sort((first, second) => second.updatedAt.localeCompare(first.updatedAt));
@@ -128,6 +249,82 @@ export class DecisionSessionStore {
     }
   }
 
+  async #loadUnlocked(taskId: string): Promise<DecisionSessionRecord | undefined> {
+    try {
+      const value = JSON.parse(await readRecordFile(this.#recordPath(taskId))) as Partial<DecisionSessionRecord>;
+      assertNoCredentialPath(typeof value.decisionSessionFile === "string" ? resolve(value.decisionSessionFile) : "");
+      return normalizeRecord(redactRecord(value), this.#directory, taskId);
+    } catch (error) {
+      if (error instanceof Error && /ENOENT/u.test(error.message)) return undefined;
+      throw error;
+    }
+  }
+
+  async #saveUnlocked(record: DecisionSessionRecordInput | DecisionSessionRecord): Promise<void> {
+    assertTaskId(record.taskId);
+    const decisionSessionFile = resolve(record.decisionSessionFile);
+    await assertTaskDirectorySafe(this.#directory, record.taskId);
+    assertSessionPath(decisionSessionFile, this.#directory, record.taskId);
+    assertNoCredentialPath(decisionSessionFile);
+    assertNoCredentialPath(record.cwd);
+    assertRecoveryState(record.recoveryState);
+    assertRecoveryAttempt(record.recoveryAttempt);
+    assertRecoveryOwner(record.recoveryOwnerPid, record.recoveryOwnerStartTime);
+    if (record.recoveryWorker) assertRecoveryWorker(record.recoveryWorker);
+    const safeRecord = redactRecord(record);
+    const normalized: DecisionSessionRecord = {
+      ...safeRecord,
+      version: 1,
+      recoveryState: safeRecord.recoveryState ?? "ready",
+      recoveryAttempt: safeRecord.recoveryAttempt ?? 0,
+      ...(safeRecord.recoveryOwnerPid !== undefined ? { recoveryOwnerPid: safeRecord.recoveryOwnerPid } : {}),
+      ...(safeRecord.recoveryOwnerStartTime !== undefined ? { recoveryOwnerStartTime: safeRecord.recoveryOwnerStartTime } : {}),
+      updatedAt: safeRecord.updatedAt ?? new Date().toISOString(),
+      args: [...safeRecord.args],
+      decisionSessionFile,
+      ...(safeRecord.recoveryWorker ? { recoveryWorker: { ...safeRecord.recoveryWorker } } : {}),
+    } as DecisionSessionRecord;
+    await this.#ensureDirectory();
+    const target = this.#recordPath(record.taskId);
+    const temporary = `${target}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+    await writeJson(temporary, normalized);
+    await rename(temporary, target);
+    await chmod(target, 0o600);
+  }
+
+  async #withLock<T>(operation: () => Promise<T>): Promise<T> {
+    await this.#ensureDirectory();
+    const lockPath = join(this.#directory, ".lock");
+    const deadline = Date.now() + LOCK_TIMEOUT_MS;
+    while (true) {
+      try {
+        await mkdir(lockPath, { mode: 0o700 });
+        await writeFile(join(lockPath, "owner.json"), JSON.stringify({
+          pid: process.pid,
+          at: new Date().toISOString(),
+        }), { encoding: "utf8", mode: 0o600 });
+        break;
+      } catch (error) {
+        if (!(error instanceof Error) || !/EEXIST/u.test(error.message)) throw error;
+        if (await removeStaleLock(lockPath)) continue;
+        if (Date.now() >= deadline) throw new Error(`Decision Worker session registry lock timeout: ${lockPath}`);
+        await delay(25);
+      }
+    }
+    try {
+      return await operation();
+    } finally {
+      await rm(lockPath, { recursive: true, force: true });
+    }
+  }
+
+  async #ensureDirectory(): Promise<void> {
+    await mkdir(this.#directory, { recursive: true, mode: 0o700 });
+    const info = await lstat(this.#directory);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Decision Worker session registry is not a real directory");
+    await chmod(this.#directory, 0o700);
+  }
+
   #recordPath(taskId: string): string {
     assertTaskId(taskId);
     return join(this.#directory, `${taskId}.json`);
@@ -135,7 +332,13 @@ export class DecisionSessionStore {
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
-  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+}
+
+async function readRecordFile(path: string): Promise<string> {
+  const info = await lstat(path);
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error("Decision Worker session registry record is not a regular file");
+  return readFile(path, "utf8");
 }
 
 function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: string, expectedTaskId?: string): DecisionSessionRecord {
@@ -146,15 +349,24 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     || typeof value.decisionSessionFile !== "string" || (value.state !== "active" && value.state !== "closed")
     || typeof value.updatedAt !== "string" || !Number.isFinite(Date.parse(value.updatedAt))
     || !validLimit(value.maxTurns, 0) || !validLimit(value.deadlineMs, 0) || !validLimit(value.noOutputTimeoutMs, 0)
-    || !validLimit(value.turn, 0) || !validLimit(value.repairRound, 0)
+    || !validLimit(value.turn, 0) || !validLimit(value.repairRound, 0) || !validLimit(value.recoveryAttempt, 0)
+    || (value.recoveryOwnerPid !== undefined && (!Number.isSafeInteger(value.recoveryOwnerPid) || value.recoveryOwnerPid < 1))
+    || (value.recoveryOwnerStartTime !== undefined && (typeof value.recoveryOwnerStartTime !== "string" || !/^\d+$/u.test(value.recoveryOwnerStartTime)))
+    || (value.recoveryState !== undefined && !isRecoveryState(value.recoveryState))
     || (value.lastFindingSignature !== undefined && (typeof value.lastFindingSignature !== "string" || value.lastFindingSignature.length > 128))
-    || (value.startedAt !== undefined && (typeof value.startedAt !== "string" || !Number.isFinite(Date.parse(value.startedAt))))) {
+    || (value.startedAt !== undefined && (typeof value.startedAt !== "string" || !Number.isFinite(Date.parse(value.startedAt))))
+    || (value.recoveryWorker !== undefined && !isRecoveryWorker(value.recoveryWorker))) {
     throw new Error("invalid Decision Worker session record");
   }
   const decisionSessionFile = resolve(value.decisionSessionFile);
   assertSessionPath(decisionSessionFile, directory, value.taskId);
   assertNoCredentialPath(decisionSessionFile);
   assertNoCredentialPath(value.cwd);
+  const recoveryWorker = value.recoveryWorker && {
+    id: value.recoveryWorker.id,
+    ...(value.recoveryWorker.pid !== undefined ? { pid: value.recoveryWorker.pid } : {}),
+    startedAt: value.recoveryWorker.startedAt,
+  };
   return {
     version: 1,
     taskId: value.taskId,
@@ -173,6 +385,11 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     repairRound: value.repairRound ?? 0,
     ...(typeof value.lastFindingSignature === "string" ? { lastFindingSignature: value.lastFindingSignature } : {}),
     state: value.state,
+    recoveryState: value.recoveryState ?? "ready",
+    recoveryAttempt: value.recoveryAttempt ?? 0,
+    ...(value.recoveryOwnerPid !== undefined ? { recoveryOwnerPid: value.recoveryOwnerPid } : {}),
+    ...(typeof value.recoveryOwnerStartTime === "string" ? { recoveryOwnerStartTime: value.recoveryOwnerStartTime } : {}),
+    ...(recoveryWorker ? { recoveryWorker } : {}),
     updatedAt: value.updatedAt,
   };
 }
@@ -207,6 +424,95 @@ function assertSessionPath(sessionFile: string, directory: string, taskId: strin
   if (dirname(sessionFile) !== taskDirectory) throw new Error("Decision Worker session file must be a direct child of its task session directory");
 }
 
+function isRecoveryState(value: unknown): value is DecisionRecoveryState {
+  return value === "ready" || value === "starting" || value === "registered" || value === "recovered_idle" || value === "interrupted";
+}
+
+function assertRecoveryState(value: unknown): asserts value is DecisionRecoveryState | undefined {
+  if (value !== undefined && !isRecoveryState(value)) throw new Error("invalid Decision Worker recovery state");
+}
+
+function isRecoveryWorker(value: unknown): value is DecisionRecoveryWorker {
+  if (!value || typeof value !== "object") return false;
+  const worker = value as Partial<DecisionRecoveryWorker>;
+  return typeof worker.id === "string" && worker.id.length > 0 && worker.id.length <= 256
+    && (worker.pid === undefined || (Number.isSafeInteger(worker.pid) && worker.pid > 0))
+    && typeof worker.startedAt === "string" && Number.isFinite(Date.parse(worker.startedAt));
+}
+
+function assertRecoveryWorker(value: DecisionRecoveryWorker): void {
+  if (!isRecoveryWorker(value)) throw new Error("invalid Decision Worker recovery worker identity");
+}
+
+function assertRecoveryAttempt(value: unknown): asserts value is number | undefined {
+  if (value !== undefined && (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)) throw new Error("invalid Decision Worker recovery attempt");
+}
+
+function assertRecoveryOwner(pid: unknown, startTime: unknown): void {
+  if (pid !== undefined && (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid < 1)) throw new Error("invalid Decision Worker recovery owner pid");
+  if (startTime !== undefined && (typeof startTime !== "string" || !/^\d+$/u.test(startTime))) throw new Error("invalid Decision Worker recovery owner start time");
+}
+
 function validLimit(value: unknown, minimum: number): boolean {
   return value === undefined || (typeof value === "number" && Number.isSafeInteger(value) && value >= minimum);
+}
+
+async function removeStaleLock(lockPath: string): Promise<boolean> {
+  try {
+    const info = await lstat(lockPath);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Decision Worker session registry lock is not a real directory");
+    if (Date.now() - info.mtimeMs < STALE_LOCK_MS) return false;
+    const ownerPath = join(lockPath, "owner.json");
+    try {
+      const ownerInfo = await lstat(ownerPath);
+      if (!ownerInfo.isFile() || ownerInfo.isSymbolicLink()) throw new Error("Decision Worker session registry lock owner is not a regular file");
+    } catch (error) {
+      if (error instanceof Error && /ENOENT/u.test(error.message)) {
+        // An old/incomplete lock is reclaimable after the grace period.
+      } else {
+        throw error;
+      }
+    }
+    let owner: { pid?: unknown } = {};
+    try { owner = JSON.parse(await readFile(ownerPath, "utf8")) as { pid?: unknown }; }
+    catch { /* an old/incomplete lock is reclaimable after the grace period */ }
+    if (typeof owner.pid === "number" && Number.isSafeInteger(owner.pid) && owner.pid > 0) {
+      try {
+        process.kill(owner.pid, 0);
+        return false;
+      } catch (error) {
+        if (error instanceof Error && /EPERM/u.test(error.message)) return false;
+      }
+    }
+    await rm(lockPath, { recursive: true, force: true });
+    return true;
+  } catch (error) {
+    if (error instanceof Error && /ENOENT/u.test(error.message)) return true;
+    return false;
+  }
+}
+
+async function processExists(pid: number): Promise<boolean> {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error instanceof Error && /EPERM/u.test(error.message);
+  }
+}
+
+async function processStartTime(pid: number): Promise<string | undefined> {
+  try {
+    const statText = await readFile(`/proc/${pid}/stat`, "utf8");
+    const closeParen = statText.lastIndexOf(")");
+    const fields = closeParen >= 0 ? statText.slice(closeParen + 2).trim().split(/\s+/u) : [];
+    const startTime = fields[19];
+    return startTime && /^\d+$/u.test(startTime) ? startTime : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
