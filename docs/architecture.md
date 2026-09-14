@@ -136,7 +136,10 @@ cannot consume another task's lease. If post-start worker identity registration
 fails, owned workers are stopped before the lease is released; cleanup failure
 retains both the worker and lease fail-closed. Explicit `stop` cleans owned tmux
 sessions, while Pi shutdown detaches persistent sessions so they remain explicitly
-re-adoptable.
+re-adoptable. A detached adopted session retains its lease while the verified pane
+is alive; the extension periodically rechecks released sessions and removes the
+lease only after the pane is confirmed gone. If that check fails, the lease is
+retained rather than allowing a cwd overlap.
 
 Startup owns an `AbortController` and passes its signal to the adapter. A stop
 or shutdown request aborts the controller and calls the adapter's out-of-band

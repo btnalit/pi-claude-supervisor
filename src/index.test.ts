@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { CwdLeaseStore, type CwdLeaseHandle } from "./cwd-lease.ts";
+import { CwdLeaseStore, type CwdLeaseHandle, workerIdentity } from "./cwd-lease.ts";
+import { TmuxWorkerAdapter } from "./worker/tmux-adapter.ts";
 import extension from "./index.ts";
 
 test("index rejects an unknown worker transport instead of falling back", () => {
@@ -29,6 +31,104 @@ test("index rejects required cgroup mode with tmux instead of ignoring it", () =
     else process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = previousTransport;
     if (previousCgroupMode === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE;
     else process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = previousCgroupMode;
+  }
+});
+
+test("adopted tmux detach retains a live lease and reaps it after the session dies", { skip: spawnSync("tmux", ["-V"], { stdio: "ignore" }).status !== 0, concurrency: false }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-adopted-index-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-adopted-state-"));
+  const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-adopted-leases-"));
+  const fakeClaude = join(stateDir, "claude");
+  await copyFile(process.execPath, fakeClaude);
+  const fixture = "process.stdout.write('>\\n--------------------\\n'); process.stdin.resume(); setInterval(() => {}, 10000);";
+  const seededAdapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000 });
+  const seeded = await seededAdapter.start({ task: "seeded session", cwd, command: fakeClaude, args: ["-e", fixture], sendInitialInput: false });
+  const seedStore = new CwdLeaseStore(leaseDir);
+  const seedLease = await seedStore.acquire(cwd, "11111111-1111-4111-8111-111111111111", "tmux");
+  await seedLease.updateWorker({
+    transport: "tmux",
+    ...(await workerIdentity(seeded)),
+    sessionName: seeded.sessionName,
+    tmuxSocket: seeded.tmuxSocket,
+    tmuxTarget: seeded.tmuxTarget,
+    tmuxPaneId: seeded.tmuxPaneId,
+    paneStartTime: seeded.paneStartTime,
+    paneCommand: seeded.paneCommand,
+    ownership: "owned",
+  });
+  const leasePath = join(leaseDir, `${seedLease.record.leaseId}.json`);
+  const seededRecord = JSON.parse(await readFile(leasePath, "utf8")) as Record<string, unknown>;
+  seededRecord.ownerPid = 999999999;
+  seededRecord.ownerStartTime = "1";
+  await writeFile(leasePath, `${JSON.stringify(seededRecord)}\n`);
+  await seededAdapter.release(seeded, "seed handoff");
+
+  const previous = {
+    worker: process.env.PI_CLAUDE_SUPERVISOR_WORKER,
+    stateDir: process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR,
+    leaseDir: process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR,
+    transport: process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT,
+    cgroupMode: process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE,
+    mode: process.env.PI_CLAUDE_SUPERVISOR_MODE,
+    automation: process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION,
+    tmuxSocket: process.env.PI_CLAUDE_SUPERVISOR_TMUX_SOCKET,
+  };
+  process.env.PI_CLAUDE_SUPERVISOR_WORKER = `${fakeClaude} -e ${JSON.stringify(fixture)}`;
+  process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
+  process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
+  process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "tmux";
+  process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "auto";
+  process.env.PI_CLAUDE_SUPERVISOR_MODE = "manual";
+  process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "0";
+  process.env.PI_CLAUDE_SUPERVISOR_TMUX_SOCKET = seeded.tmuxSocket!;
+  const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
+  const messages: string[] = [];
+  const context: TestContext = { cwd, hasUI: true, ui: { confirm: async () => false, notify: (message) => messages.push(message) } };
+  let shutdownHandler: (() => Promise<void>) | undefined;
+  try {
+    const fakePi = {
+      registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) { registrations.commands.push({ name, definition }); },
+      on(name: string, handler: () => Promise<void>) { registrations.events.push({ name, handler }); },
+    };
+    extension(fakePi as never);
+    const command = registrations.commands.find(({ name }) => name === "supervise")?.definition;
+    shutdownHandler = registrations.events.find(({ name }) => name === "session_shutdown")?.handler;
+    assert.ok(command);
+    assert.ok(shutdownHandler);
+
+    await command.handler(`adopt-tmux ${seeded.sessionName} observe existing session`, context);
+    assert.match(messages.at(-1) ?? "", /^Tmux worker adopted:/u);
+    const taskId = messages.at(-1)?.match(/task=([0-9a-f-]{36})/u)?.[1];
+    assert.ok(taskId);
+    await command.handler(`stop ${taskId}`, context);
+    assert.match(messages.at(-1) ?? "", /Worker stopped/u);
+    assert.equal((await seedStore.list()).length, 1);
+    assert.equal(spawnSync("tmux", ["-S", seeded.tmuxSocket!, "has-session", "-t", seeded.sessionName!], { stdio: "ignore" }).status, 0);
+
+    spawnSync("tmux", ["-S", seeded.tmuxSocket!, "kill-session", "-t", seeded.sessionName!], { stdio: "ignore" });
+    for (let attempt = 0; attempt < 30 && (await seedStore.list()).length > 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(await seedStore.list(), []);
+  } finally {
+    if (shutdownHandler) await shutdownHandler().catch(() => {});
+    spawnSync("tmux", ["-S", seeded.tmuxSocket!, "kill-session", "-t", seeded.sessionName!], { stdio: "ignore" });
+    const envKeys = {
+      worker: "PI_CLAUDE_SUPERVISOR_WORKER",
+      stateDir: "PI_CLAUDE_SUPERVISOR_STATE_DIR",
+      leaseDir: "PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR",
+      transport: "PI_CLAUDE_SUPERVISOR_TRANSPORT",
+      cgroupMode: "PI_CLAUDE_SUPERVISOR_CGROUP_MODE",
+      mode: "PI_CLAUDE_SUPERVISOR_MODE",
+      automation: "PI_CLAUDE_SUPERVISOR_AUTOMATION",
+      tmuxSocket: "PI_CLAUDE_SUPERVISOR_TMUX_SOCKET",
+    } as const;
+    for (const [key, value] of Object.entries(previous) as Array<[keyof typeof envKeys, string | undefined]>) {
+      const envKey = envKeys[key];
+      if (value === undefined) delete process.env[envKey];
+      else process.env[envKey] = value;
+    }
+    await rm(cwd, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(leaseDir, { recursive: true, force: true });
   }
 });
 

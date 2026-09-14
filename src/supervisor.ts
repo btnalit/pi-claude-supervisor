@@ -108,6 +108,7 @@ export class Supervisor {
   #startStopReason?: string;
   #startAbortError?: unknown;
   #startAbortCompletion?: Promise<void>;
+  #released = false;
 
   constructor(adapter: WorkerAdapter, events = new EventLog(), hooks: { onHumanRequired?: (notice: HumanInterventionNotice) => Promise<void> | void } = {}) {
     this.#adapter = adapter;
@@ -120,6 +121,8 @@ export class Supervisor {
   get handle() { return this.#handle; }
   get lastVerification() { return this.#lastVerification; }
   get humanRequired() { return this.#humanRequired; }
+  /** True after the persistent worker was detached from this Supervisor. */
+  get released() { return this.#released; }
 
   async start(options: SupervisorStartOptions): Promise<WorkerHandle> {
     return this.#exclusive(() => this.#startInternal(options));
@@ -139,6 +142,7 @@ export class Supervisor {
     this.#handledEvents.clear();
     this.#pendingPermissions.clear();
     this.#humanRequired = false;
+    this.#released = false;
     this.#task = { taskId, task: options.task, cwd: options.cwd, maxTurns: options.maxTurns ?? 100, startedAt: options.startedAt ?? new Date().toISOString() };
     this.#turn = options.initialTurn ?? 0;
     this.#deadlineMs = options.deadlineMs ?? 4 * 60 * 60_000;
@@ -584,6 +588,7 @@ export class Supervisor {
     await withTimeout(this.#exclusive(async () => {
       this.#clearWatchdog();
       await preemptiveRelease;
+      this.#released = true;
       if (handle) await this.#appendEvent({ type: "worker_released", taskId: this.#task?.taskId, workerId: handle.id, data: { reason } });
     }), 15_000, "persistent worker release");
   }
