@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.4.1](https://github.com/btnalit/pi-claude-supervisor/compare/v0.4.0...v0.4.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* reconcile detached tmux leases and validate prompts ([d20262c](https://github.com/btnalit/pi-claude-supervisor/commit/d20262c8481ca761a48f7dc2b877951173d4681e))
+
 ## [0.4.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.3.0...v0.4.0) (2026-09-13)
 
 
