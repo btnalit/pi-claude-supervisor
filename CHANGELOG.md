@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.2](https://github.com/btnalit/pi-claude-supervisor/compare/v0.5.1...v0.5.2) (2026-09-14)
+
+
+### Bug Fixes
+
+* harden automatic review lifecycle ([fefa5c5](https://github.com/btnalit/pi-claude-supervisor/commit/fefa5c5b39fd2411b5e82df384074983252263ca))
+
 ## [0.5.1](https://github.com/btnalit/pi-claude-supervisor/compare/v0.5.0...v0.5.1) (2026-09-14)
 
 
