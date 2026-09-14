@@ -57,6 +57,7 @@ export PI_CLAUDE_SUPERVISOR_WORKER=claude
 ```text
 /supervise capabilities
 /supervise start inspect the current repository and report what should be changed
+/supervise start --spec ./task.json
 /supervise sessions
 /supervise recover <task-id>
 /supervise poll
@@ -66,6 +67,22 @@ export PI_CLAUDE_SUPERVISOR_WORKER=claude
 /supervise resume
 /supervise stop human requested stop
 /supervise verify
+```
+
+`--spec` accepts a JSON file; checks are always executed with argv (never through
+a shell), for example:
+
+```json
+{
+  "goal": "Implement the requested change",
+  "scope": ["src/"],
+  "constraints": ["Keep the public API compatible"],
+  "forbidden": ["Do not publish artifacts"],
+  "acceptance": [
+    { "id": "tests", "name": "tests", "command": "npm", "args": ["test"], "required": true }
+  ],
+  "maxRepairRounds": 3
+}
 ```
 
 The default MVP writes the task to the worker's stdin as plain process-pipe
@@ -87,6 +104,14 @@ worktrees; same-directory starts are rejected even when concurrent, and
 remaining lifecycle, signal and recovery checks. Host permissions and network
 access follow explicit caller authorization and host policy; there is no
 automatic merge, deploy, release or publish.
+
+The near-term automation milestone adds a structured acceptance pipeline:
+multiple argv-based checks, an independent read-only Reviewer, bounded structured
+findings and repair rounds. Legacy text tasks keep the default `git diff --check`.
+The Reviewer only has `read`, `grep`, `find` and `ls`; it cannot edit files or grant
+permissions. Stability evidence is pinned to Claude Code `2.1.270`; CLI
+multi-version compatibility, sandboxing, low-privilege execution and network
+isolation are not part of this milestone.
 
 Automatic mode persists the Pi Decision Worker session under the configured state
 directory. After an unclean Pi restart, `/supervise sessions` lists recoverable

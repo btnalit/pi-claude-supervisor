@@ -141,12 +141,67 @@ export interface WorkerCapabilities {
   persistentSession?: boolean;
 }
 
+export interface AcceptanceCheck {
+  id: string;
+  name: string;
+  command: string;
+  args: string[];
+  required: boolean;
+  timeoutMs: number;
+}
+
+export type AcceptanceCheckStatus = "passed" | "failed" | "timed_out" | "blocked";
+
+export interface AcceptanceCheckResult {
+  check: AcceptanceCheck;
+  status: AcceptanceCheckStatus;
+  ok: boolean;
+  exitCode: number;
+  output: string;
+  startedAt: string;
+  finishedAt: string;
+}
+
+export interface TaskSpec {
+  goal: string;
+  scope: string[];
+  constraints: string[];
+  forbidden: string[];
+  acceptance: AcceptanceCheck[];
+  maxRepairRounds: number;
+}
+
+export type ReviewVerdict = "pass" | "revise" | "human";
+export type ReviewSeverity = "P0" | "P1" | "P2" | "P3";
+
+export interface ReviewFinding {
+  id: string;
+  severity: ReviewSeverity;
+  message: string;
+  evidence?: string;
+  requiredFix?: string;
+  file?: string;
+  line?: number;
+  acceptanceRef?: string;
+}
+
+export interface ReviewReport {
+  verdict: ReviewVerdict;
+  summary: string;
+  findings: ReviewFinding[];
+  round: number;
+  checkedAt: string;
+}
+
 export interface TaskContext {
   taskId: string;
   task: string;
   cwd: string;
   maxTurns: number;
   startedAt: string;
+  spec: TaskSpec;
+  repairRound: number;
+  lastFindingSignature?: string;
 }
 
 export interface VerificationResult {
@@ -155,4 +210,9 @@ export interface VerificationResult {
   exitCode: number;
   output: string;
   checkedAt: string;
+}
+
+export interface AcceptanceReport extends VerificationResult {
+  checks: AcceptanceCheckResult[];
+  review?: ReviewReport;
 }

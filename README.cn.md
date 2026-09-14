@@ -51,6 +51,7 @@ Claude CLI `2.1.270` 运行，跨版本兼容性不在本轮范围内。
 ```text
 /supervise capabilities
 /supervise start inspect the current repository
+/supervise start --spec ./task.json
 /supervise poll
 /supervise sessions
 /supervise recover <task-id>
@@ -59,6 +60,21 @@ Claude CLI `2.1.270` 运行，跨版本兼容性不在本轮范围内。
 /supervise approve <task-id> allow|deny [request-id]
 /supervise takeover <task-id>
 /supervise resume-auto <task-id>
+```
+
+`--spec` 接受 JSON 文件；验收命令始终使用 argv 执行，不经过 shell。例如：
+
+```json
+{
+  "goal": "实现请求的修改",
+  "scope": ["src/"],
+  "constraints": ["保持公共 API 兼容"],
+  "forbidden": ["不要发布构建产物"],
+  "acceptance": [
+    { "id": "tests", "name": "tests", "command": "npm", "args": ["test"], "required": true }
+  ],
+  "maxRepairRounds": 3
+}
 ```
 
 人工升级通知的 generic JSON 格式为：
@@ -83,6 +99,12 @@ Claude CLI `2.1.270` 运行，跨版本兼容性不在本轮范围内。
 自动模式下，Decision Worker 可以安全拒绝 `AskUserQuestion`，让 Claude 将问题转成普通文本，
 再根据任务和仓库证据自动回答；无法确定时才升级人工。如需微信内闭环，需要另建带签名验证、
 一次性 action token 和重放保护的入站 callback 服务。
+
+近期自动化目标是先稳定完成“多命令验收—独立只读 Reviewer—结构化修复轮次—再次验收”闭环。
+任务可通过 API 或 JSON spec 提供 `goal`、`scope`、`constraints`、`forbidden` 和多个
+`acceptance` 命令；旧的纯文本任务继续使用默认 `git diff --check`。Reviewer 只能使用
+`read`、`grep`、`find`、`ls`，不会修改工作树或批准权限。当前稳定性验证固定针对 Claude Code
+`2.1.270`，暂不把多版本兼容、sandbox、低权限和网络隔离作为本阶段门禁。
 
 ### tmux/PTY 交互模式
 

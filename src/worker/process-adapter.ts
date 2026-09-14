@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import type {
@@ -43,6 +43,10 @@ interface ProcessRecord {
   lastInputAt?: string;
   activeRequests: number;
   turnSequence: number;
+  requestSequence: number;
+  activeRequestSequence?: number;
+  seenResultIds: Set<string>;
+  seenPermissionRequestIds: Set<string>;
   protocolBuffer: string;
   exitCode?: number | null;
   signal?: NodeJS.Signals;
@@ -140,6 +144,10 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       outputTruncated: false,
       activeRequests: input.task ? 1 : 0,
       turnSequence: 0,
+      requestSequence: input.task ? 1 : 0,
+      activeRequestSequence: input.task ? 1 : undefined,
+      seenResultIds: new Set(),
+      seenPermissionRequestIds: new Set(),
       protocolBuffer: "",
       exited,
       resolveExit,
@@ -366,7 +374,10 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       if (record.stopping) throw new Error("worker is stopping");
       if (record.sentKeys.has(idempotencyKey)) return;
       if (record.exitCode !== undefined) throw new Error("worker is not running");
-      if (this.#mode === "claude-jsonl") record.activeRequests += 1;
+      if (this.#mode === "claude-jsonl") {
+        record.activeRequests += 1;
+        record.activeRequestSequence = ++record.requestSequence;
+      }
       try {
         await this.#writeInput(record, this.#encodeMessage(message));
       } catch (error) {
@@ -466,23 +477,32 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
           if (event.type === "control_request") {
             const request = event.request;
             if (isPermissionRequest(event, request)) {
-              this.#emit(record, {
-                type: "permission_request",
-                handle: record.handle,
-                request: {
-                  requestId: String(event.request_id),
-                  toolUseId: request.tool_use_id,
-                  toolName: request.tool_name,
-                  input: request.input,
-                  raw: event,
-                },
-              });
+              const requestId = String(event.request_id);
+              if (!record.seenPermissionRequestIds.has(requestId)) {
+                rememberBounded(record.seenPermissionRequestIds, requestId);
+                this.#emit(record, {
+                  type: "permission_request",
+                  handle: record.handle,
+                  request: {
+                    requestId,
+                    toolUseId: request.tool_use_id,
+                    toolName: request.tool_name,
+                    input: request.input,
+                    raw: event,
+                  },
+                });
+              }
             }
           }
           if (event.type === "result") {
-            record.activeRequests = Math.max(0, record.activeRequests - 1);
-            record.turnSequence += 1;
-            this.#emit(record, { type: "turn_completed", handle: record.handle, result: event, sequence: record.turnSequence });
+            const resultId = jsonlRecordId(event, record.activeRequestSequence);
+            if (!record.seenResultIds.has(resultId)) {
+              rememberBounded(record.seenResultIds, resultId);
+              record.activeRequests = Math.max(0, record.activeRequests - 1);
+              record.activeRequestSequence = undefined;
+              record.turnSequence += 1;
+              this.#emit(record, { type: "turn_completed", handle: record.handle, result: event, sequence: record.turnSequence });
+            }
           }
         } catch {
           // Keep raw output for diagnostics; malformed output is not a completion signal.
@@ -663,6 +683,23 @@ async function cleanupCgroup(path: string, graceMs: number): Promise<void> {
     await delay(Math.min(10, Math.max(1, deadline - Date.now())));
   }
   throw new Error(`worker cgroup ${path} did not empty before cleanup deadline`);
+}
+
+function rememberBounded(values: Set<string>, value: string, limit = 2_000): void {
+  values.add(value);
+  while (values.size > limit) {
+    const first = values.values().next().value;
+    if (first === undefined) break;
+    values.delete(first);
+  }
+}
+
+function jsonlRecordId(record: Record<string, unknown>, requestSequence?: number): string {
+  for (const key of ["uuid", "request_id"]) {
+    if (typeof record[key] === "string" && record[key]) return `${key}:${record[key]}`;
+  }
+  const digest = createHash("sha256").update(JSON.stringify(record)).digest("hex").slice(0, 32);
+  return `request:${requestSequence ?? "unknown"}:${digest}`;
 }
 
 function isPermissionRequest(event: Record<string, unknown>, request: unknown): request is { subtype: "can_use_tool"; tool_use_id: string; tool_name: string; input: unknown } {

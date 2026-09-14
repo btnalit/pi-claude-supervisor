@@ -1,6 +1,6 @@
 import { access, readFile, writeFile } from "node:fs/promises";
 import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
-import type { WorkerEvent } from "./types.ts";
+import type { TaskSpec, WorkerEvent } from "./types.ts";
 import { redactSensitive } from "./redaction.ts";
 
 export type DecisionAction =
@@ -15,13 +15,26 @@ export interface DecisionContext {
   state: string;
   turn: number;
   maxTurns: number;
+  repairRound?: number;
+  spec?: TaskSpec;
 }
+
+export interface DecisionWorkerLike {
+  start(): Promise<void>;
+  updateContext(patch: Partial<DecisionContext>): void;
+  notify(event: WorkerEvent): void;
+  close(): Promise<void>;
+}
+
+export type DecisionWorkerFactory = (options: DecisionWorkerOptions) => DecisionWorkerLike;
 
 export interface DecisionWorkerOptions {
   context: DecisionContext;
   onAction: (action: DecisionAction, event: WorkerEvent) => Promise<void> | void;
   onFailure?: (event: WorkerEvent, error: unknown) => Promise<void> | void;
   onStartupFailure?: (error: unknown) => Promise<void> | void;
+  /** Bound each Decision Worker model request so failure handling cannot wait forever. */
+  timeoutMs?: number;
   /** Existing Pi session JSONL to restore after a Supervisor/Pi restart. */
   sessionFile?: string;
   /** Directory for newly created Pi session JSONL files. */
@@ -34,7 +47,7 @@ export interface DecisionWorkerOptions {
  * It has read-only repository tools and can request typed actions, but it
  * cannot directly spawn processes, modify files, or answer Claude's stdin.
  */
-export class PiDecisionWorker {
+export class PiDecisionWorker implements DecisionWorkerLike {
   readonly #options: DecisionWorkerOptions;
   readonly #seenEvents = new Set<string>();
   #session?: AgentSession;
@@ -43,10 +56,12 @@ export class PiDecisionWorker {
   #initialized = false;
   #sessionFile?: string;
   #context: DecisionContext;
+  readonly #timeoutMs: number;
 
   constructor(options: DecisionWorkerOptions) {
     this.#options = options;
     this.#context = { ...options.context };
+    this.#timeoutMs = options.timeoutMs ?? 120_000;
   }
 
   async start(): Promise<void> {
@@ -76,6 +91,7 @@ export class PiDecisionWorker {
       cwd: this.#options.context.cwd,
       resourceLoader,
       sessionManager,
+      thinkingLevel: "low",
       tools: ["read", "grep", "find", "ls"],
     });
     this.#session = session;
@@ -86,8 +102,9 @@ export class PiDecisionWorker {
     }
     if (!restored) {
       try {
-        await session.prompt(decisionInstructions(this.#context));
+        await withTimeout(session.prompt(decisionInstructions(this.#context)), this.#timeoutMs, "Decision Worker startup");
       } catch (error) {
+        await session.abort().catch(() => {});
         try { await this.#options.onStartupFailure?.(error); } catch { /* preserve the original startup failure */ }
         throw error;
       }
@@ -109,7 +126,7 @@ export class PiDecisionWorker {
     }
     this.#tail = this.#tail.then(async () => {
       if (!this.#session || this.#closed) return;
-      const text = await askDecision(this.#session, event, this.#context);
+      const text = await askDecision(this.#session, event, this.#context, this.#timeoutMs);
       const action = parseDecision(text, event);
       await this.#options.onAction(action, event);
     }).catch(async (error) => {
@@ -139,6 +156,7 @@ export class PiDecisionWorker {
     this.#closed = true;
     const session = this.#session;
     this.#session = undefined;
+    if (session) await session.abort().catch(() => {});
     session?.dispose();
   }
 }
@@ -153,6 +171,8 @@ Task: ${redactText(context.task)}
 Task id: ${redactText(context.taskId)}
 Working directory: ${redactText(context.cwd)}
 Maximum automatic turns: ${context.maxTurns}
+Current repair round: ${context.repairRound ?? 0}
+Task specification: ${boundedJson(context.spec ?? { goal: context.task })}
 
 Return exactly one JSON object and no markdown:
 {"action":"continue|redirect|answer|allow_permission|deny_permission|verify|retry|stop|ask_human|noop",...}
@@ -165,14 +185,19 @@ Use ask_human for product ambiguity, architecture tradeoffs with material risk, 
 secrets, deployment, or any uncertainty. Never invent missing information.`;
 }
 
-async function askDecision(session: AgentSession, event: WorkerEvent, context: DecisionContext): Promise<string> {
+async function askDecision(session: AgentSession, event: WorkerEvent, context: DecisionContext, timeoutMs: number): Promise<string> {
   let text = "";
   const unsubscribe = session.subscribe((value) => {
     const record = value as unknown as { type?: string; assistantMessageEvent?: { type?: string; delta?: string } };
     if (record.type === "message_update" && record.assistantMessageEvent?.type === "text_delta") text += record.assistantMessageEvent.delta ?? "";
   });
   try {
-    await session.prompt(`UNTRUSTED SUPERVISOR EVENT:\n${boundedJson(event)}\n\nCURRENT CONTEXT:\n${boundedJson(context)}\n\nChoose one action now.`);
+    try {
+      await withTimeout(session.prompt(`UNTRUSTED SUPERVISOR EVENT:\n${boundedJson(event)}\n\nCURRENT CONTEXT:\n${boundedJson(context)}\n\nChoose one action now.`), timeoutMs, "Decision Worker request");
+    } catch (error) {
+      await session.abort().catch(() => {});
+      throw error;
+    }
   } finally {
     unsubscribe();
   }
@@ -213,6 +238,19 @@ function eventKey(event: WorkerEvent): string {
   if (event.type === "exited") return `${event.handle.id}:exit`;
   if (event.type === "jsonl") return `${event.handle.id}:jsonl:${String(event.record.uuid ?? event.record.request_id ?? JSON.stringify(event.record))}`;
   return `${event.handle.id}:output:${event.chunk.at}:${event.chunk.text.slice(0, 80)}`;
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function boundedJson(value: unknown): string {

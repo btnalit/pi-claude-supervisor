@@ -25,6 +25,7 @@ test("Decision Worker session registry survives a fresh store instance", async (
     noOutputTimeoutMs: 20 * 60_000,
     startedAt: new Date().toISOString(),
     turn: 0,
+    repairRound: 0,
     state: "active",
   });
 
@@ -38,8 +39,10 @@ test("Decision Worker session registry survives a fresh store instance", async (
   await mkdir(store.sessionDirectory(taskId), { recursive: true });
   await writeFile(sessionFile, "{\"session\":true}\n");
   assert.equal(await store.sessionFileExists(taskId), true);
-  await store.update(taskId, { turn: 3 });
+  await store.update(taskId, { turn: 3, repairRound: 1, lastFindingSignature: "abc123" });
   assert.equal((await store.load(taskId))?.turn, 3);
+  assert.equal((await store.load(taskId))?.repairRound, 1);
+  assert.equal((await store.load(taskId))?.lastFindingSignature, "abc123");
 
   await store.close(taskId);
   assert.equal((await store.load(taskId))?.state, "closed");
@@ -62,6 +65,7 @@ test("Decision Worker session registry ignores corrupt records during discovery"
     noOutputTimeoutMs: 20 * 60_000,
     startedAt: new Date().toISOString(),
     turn: 0,
+    repairRound: 0,
     state: "active",
   });
   await writeFile(join(directory, "corrupt.json"), "not-json\n");

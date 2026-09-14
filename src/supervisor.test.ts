@@ -462,6 +462,154 @@ test("verification accepts confirmed process-group fallback in auto cgroup mode"
   await rm(cgroupParentDir, { recursive: true, force: true });
 });
 
+test("automatic acceptance review requests a bounded repair before completing", async () => {
+  const handle: WorkerHandle = { id: "review-repair-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
+  let running = true;
+  let sends: string[] = [];
+  let reviews = 0;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async (_handle, message) => { sends.push(message); },
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, undefined, {
+    reviewer: {
+      review: async () => {
+        reviews += 1;
+        return reviews === 1
+          ? { verdict: "revise", summary: "add the missing case", findings: [{ id: "F001", severity: "P2", message: "missing case", requiredFix: "add the case" }], round: reviews - 1, checkedAt: new Date().toISOString() }
+          : { verdict: "pass", summary: "verified", findings: [], round: reviews - 1, checkedAt: new Date().toISOString() };
+      },
+    },
+  });
+  await supervisor.start({
+    task: "reviewed fixture",
+    cwd: "/tmp",
+    command: "fixture",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+  });
+  await supervisor.poll();
+  const first = await supervisor.verify();
+  assert.equal(first.ok, false);
+  assert.equal(supervisor.state, "running");
+  assert.equal(reviews, 1);
+  assert.match(sends[0] ?? "", /Automatic repair round 1/u);
+
+  await supervisor.poll();
+  const second = await supervisor.verify();
+  assert.equal(second.ok, true);
+  assert.equal(second.review?.verdict, "pass");
+  assert.equal(reviews, 2);
+  assert.equal(supervisor.state, "completed");
+});
+
+test("repeated Reviewer findings escalate instead of looping forever", async () => {
+  const handle: WorkerHandle = { id: "duplicate-finding-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
+  let running = true;
+  let sends = 0;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => { sends += 1; },
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  let reviews = 0;
+  const supervisor = new Supervisor(adapter, undefined, {
+    reviewer: { review: async () => ({ verdict: "revise", summary: "still missing", findings: [{ id: "F001", severity: "P2", message: "same issue", requiredFix: "fix it" }], round: reviews++, checkedAt: new Date().toISOString() }) },
+  });
+  await supervisor.start({
+    task: "duplicate finding fixture",
+    cwd: "/tmp",
+    command: "fixture",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+  });
+  await supervisor.poll();
+  const first = await supervisor.verify();
+  assert.equal(first.review?.verdict, "revise");
+  assert.equal(supervisor.state, "running");
+  assert.equal(sends, 1);
+  await supervisor.poll();
+  const second = await supervisor.verify();
+  assert.equal(second.review?.verdict, "human");
+  assert.equal(supervisor.humanRequired, true);
+  assert.equal(sends, 1);
+});
+
+test("P0 and P1 Reviewer findings never enter automatic repair", async () => {
+  const handle: WorkerHandle = { id: "blocking-finding-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
+  let running = true;
+  let sends = 0;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => { sends += 1; },
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, undefined, {
+    reviewer: { review: async () => ({ verdict: "revise", summary: "unsafe", findings: [{ id: "F001", severity: "P1", message: "unsafe behavior", requiredFix: "human decision" }], round: 0, checkedAt: new Date().toISOString() }) },
+  });
+  await supervisor.start({
+    task: "blocking finding fixture",
+    cwd: "/tmp",
+    command: "fixture",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+  });
+  await supervisor.poll();
+  const result = await supervisor.verify();
+  assert.equal(result.review?.verdict, "human");
+  assert.equal(supervisor.humanRequired, true);
+  assert.equal(sends, 0);
+});
+
+test("Reviewer API failure is fail-closed and recorded as human review", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-reviewer-error-"));
+  const supervisor = new Supervisor(new ProcessWorkerAdapter({ cgroupMode: "off" }), undefined, {
+    onHumanRequired: () => {},
+    reviewer: { review: async () => { throw new Error("review service unavailable"); } },
+  });
+  await supervisor.start({ task: "reviewer failure fixture", cwd, command: process.execPath, args: ["-e", "console.log('worker complete')"] });
+  let polled = await supervisor.poll();
+  for (let attempt = 0; polled.status.running && attempt < 40; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    polled = await supervisor.poll();
+  }
+  const result = await supervisor.verify({ command: process.execPath, args: ["-e", "process.exit(0)"] });
+  assert.equal(result.review?.verdict, "human");
+  assert.equal(supervisor.humanRequired, true);
+  assert.equal(supervisor.state, "failed");
+});
+
 test("supervisor requires independent verification after worker exit", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-"));
   const supervisor = new Supervisor(new ProcessWorkerAdapter({ cgroupMode: "off" }));
