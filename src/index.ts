@@ -2,12 +2,13 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { accessSync, chmodSync, constants as fsConstants, lstatSync, mkdirSync } from "node:fs";
 import { readFile, realpath } from "node:fs/promises";
 import { EventLog } from "./events.ts";
 import { redactSensitive } from "./redaction.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
 import { TmuxWorkerAdapter, attachCommand } from "./worker/tmux-adapter.ts";
-import { Supervisor, type DecisionSessionClosedInfo } from "./supervisor.ts";
+import { Supervisor, type DecisionSessionClosedInfo, type SupervisorProgress } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
 import { loadSupervisorEnvironment } from "./config.ts";
@@ -40,6 +41,9 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   if (transport === "tmux" && cgroupMode === "required") {
     throw new Error("PI_CLAUDE_SUPERVISOR_CGROUP_MODE=required is unsupported with tmux; use process-pipe/jsonl or set cgroup mode to auto/off");
   }
+  if (automation && transport === "process-pipe") {
+    throw new Error("automatic supervision requires PI_CLAUDE_SUPERVISOR_TRANSPORT=jsonl or tmux; explicit process-pipe is manual-only");
+  }
   const adapter = transport === "tmux"
     ? new TmuxWorkerAdapter({ stateDir })
     : new ProcessWorkerAdapter({
@@ -53,9 +57,12 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     format: process.env.PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_FORMAT === "wecom" ? "wecom" : "generic",
     secret: process.env.PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_SECRET,
   });
+  const leaseDir = process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR ?? join(homedir(), ".pi", "agent", "claude-supervisor", "cwd-leases");
+  assertRuntimeDirectory(stateDir, "state");
+  assertRuntimeDirectory(leaseDir, "lease");
   const events = new EventLog(join(stateDir, "events.jsonl"));
   const decisionStore = new DecisionSessionStore(join(stateDir, "decision-sessions"));
-  const cwdLeaseStore = new CwdLeaseStore(process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR ?? join(homedir(), ".pi", "agent", "claude-supervisor", "cwd-leases"));
+  const cwdLeaseStore = new CwdLeaseStore(leaseDir);
   const reviewer = automation ? new PiReadOnlyReviewer() : undefined;
   const sessions = new Map<string, Supervisor>();
   const cwdLeases = new Map<string, CwdLeaseHandle>();
@@ -82,6 +89,9 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
 
   const notify = (ctx: ExtensionContext, message: string, type: "info" | "warning" = "info") => {
     if (ctx.hasUI) ctx.ui.notify(redactText(message), type);
+  };
+  const progress = (ctx: ExtensionContext) => (info: SupervisorProgress) => {
+    notify(ctx, `Worker progress: task=${info.taskId} phase=${info.phase} ${info.message}`, info.phase === "human" || info.phase === "failed" ? "warning" : "info");
   };
   const activeSessions = () => [...sessions.entries()].filter(([, session]) =>
     ["starting", "running", "waiting", "paused"].includes(session.state));
@@ -275,6 +285,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             try {
               const handle = await session.start({
                 taskId,
+                onProgress: progress(ctx),
                 task: goal,
                 spec,
                 cwd: cwdKey,
@@ -496,6 +507,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             try {
               const handle = await session.start({
                 taskId: record.taskId,
+                onProgress: progress(ctx),
                 // Claude session resume is not supported by this adapter. Start
                 // idle so recovery never replays the original task; the operator
                 // must explicitly send the next instruction.
@@ -719,11 +731,9 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     })();
     return shutdownPromise;
   };
-  const onSignal = (signal: NodeJS.Signals) => {
-    void shutdown().finally(() => process.exit(signal === "SIGTERM" ? 143 : 130));
-  };
-  process.once("SIGTERM", onSignal);
-  process.once("SIGINT", onSignal);
+  // Pi owns process signal handling and invokes session_shutdown. Installing a
+  // second extension-level process.exit() handler races Pi's terminal restore and
+  // other extension shutdown hooks.
   pi.on("session_shutdown", async () => {
     await shutdown();
   });
@@ -794,6 +804,18 @@ function formatStatus(status: Awaited<ReturnType<ProcessWorkerAdapter["getStatus
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function assertRuntimeDirectory(path: string, label: string): void {
+  try {
+    mkdirSync(path, { recursive: true, mode: 0o700 });
+    const info = lstatSync(path);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`${label} directory is not a real directory`);
+    chmodSync(path, 0o700);
+    accessSync(path, fsConstants.R_OK | fsConstants.W_OK | fsConstants.X_OK);
+  } catch (error) {
+    throw new Error(`${label} directory preflight failed for ${path}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  }
 }
 
 function redactText(value: string): string {

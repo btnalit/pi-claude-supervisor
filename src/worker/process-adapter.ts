@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { access, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { delimiter, isAbsolute, join } from "node:path";
 import type {
   WorkerAdapter,
   WorkerCapabilities,
@@ -114,13 +116,23 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       pause: true,
       resumeSession: false,
       processGroupControl: true,
+      repairableSession: this.#mode === "claude-jsonl",
     };
+  }
+
+  async preflight(input: Pick<WorkerStartInput, "cwd" | "command" | "args" | "env" | "approval">): Promise<void> {
+    const args = this.#mode === "claude-jsonl" ? claudeJsonlArgs(input.args) : (input.args ?? []);
+    assertSafeWorkerCommand(input.command, args, input.approval);
+    await assertWorkerCwd(input.cwd);
+    await assertExecutable(input.command, input.env?.PATH ?? process.env.PATH);
+    if (this.#cgroupMode === "required") await this.#preflightRequiredCgroup();
   }
 
   async start(input: WorkerStartInput): Promise<WorkerHandle> {
     if (input.abortSignal?.aborted) throw new Error("worker startup aborted before spawn");
     const args = this.#mode === "claude-jsonl" ? claudeJsonlArgs(input.args) : (input.args ?? []);
     assertSafeWorkerCommand(input.command, args, input.approval);
+    if (this.#cgroupMode === "required") await this.preflight(input);
     const handle: WorkerHandle = {
       id: randomUUID(),
       startedAt: new Date().toISOString(),
@@ -306,7 +318,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       lastOutputAt: record.lastOutputAt,
       lastInputAt: record.lastInputAt,
       activeRequests: this.#mode === "claude-jsonl" ? record.activeRequests : undefined,
-      exitReason: running ? undefined : record.signal ? "crashed" : record.exitCode === 0 ? "completed" : "failed",
+      exitReason: running ? undefined : record.stopping ? "stopped" : record.signal ? "crashed" : record.exitCode === 0 ? "completed" : "failed",
       processGroupCleaned: record.groupCleanupComplete,
       cgroupCleaned: record.cgroupPath ? record.groupCleanupComplete : undefined,
       cgroupRequired: this.#cgroupMode === "required",
@@ -574,6 +586,26 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     }
   }
 
+  async #preflightRequiredCgroup(): Promise<void> {
+    if (process.platform !== "linux") throw new Error("required cgroup cleanup is unavailable on this platform");
+    let probePath: string | undefined;
+    try {
+      const parent = this.#cgroupParentPath ?? await currentCgroupPath();
+      await access(parent, fsConstants.W_OK);
+      probePath = `${parent}/pi-claude-supervisor-preflight-${process.pid}-${randomUUID()}`;
+      await mkdir(probePath);
+      await stat(`${probePath}/cgroup.kill`);
+      await stat(`${probePath}/cgroup.events`);
+      await writeFile(`${probePath}/cgroup.kill`, "1\n");
+      const events = await readFile(`${probePath}/cgroup.events`, "utf8");
+      if (!/^populated 0$/mu.test(events)) throw new Error("preflight cgroup did not report populated 0");
+    } catch (error) {
+      throw new Error(`required cgroup preflight failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+    } finally {
+      if (probePath) await rm(probePath, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
   async #attachCgroup(record: ProcessRecord): Promise<void> {
     if (this.#cgroupMode === "off") return;
     if (!record.handle.pid) {
@@ -684,6 +716,27 @@ function ensureOption(args: string[], option: string, expected: string): void {
   if (args[index + 1] !== expected) throw new Error(`${option} must be ${expected} in claude-jsonl mode`);
 }
 
+async function assertWorkerCwd(cwd: string): Promise<void> {
+  const info = await stat(cwd);
+  if (!info.isDirectory()) throw new Error(`Worker cwd is not a directory: ${cwd}`);
+  await access(cwd, fsConstants.R_OK | fsConstants.W_OK | fsConstants.X_OK);
+}
+
+async function assertExecutable(command: string, pathValue: string | undefined): Promise<void> {
+  const candidates = isAbsolute(command) || command.includes("/") || command.includes("\\")
+    ? [command]
+    : (pathValue ?? "").split(delimiter).filter(Boolean).map((directory) => join(directory, command));
+  for (const candidate of candidates) {
+    try {
+      await access(candidate, fsConstants.X_OK);
+      return;
+    } catch {
+      // Try the next PATH entry.
+    }
+  }
+  throw new Error(`worker executable preflight failed (ENOENT): ${command}`);
+}
+
 async function currentCgroupPath(): Promise<string> {
   const contents = await readFile("/proc/self/cgroup", "utf8");
   const match = contents.match(/^0::([^\n]*)$/mu);
@@ -695,9 +748,23 @@ async function currentCgroupPath(): Promise<string> {
 
 async function cleanupCgroup(path: string, graceMs: number): Promise<void> {
   try {
-    await writeFile(`${path}/cgroup.kill`, "1\n");
+    await stat(path);
   } catch (error) {
     if (error instanceof Error && /ENOENT/u.test(error.message)) return;
+    throw error;
+  }
+  try {
+    await writeFile(`${path}/cgroup.kill`, "1\n");
+  } catch (error) {
+    if (error instanceof Error && /ENOENT/u.test(error.message)) {
+      // ENOENT is success only when the cgroup directory itself disappeared.
+      try { await stat(path); }
+      catch (directoryError) {
+        if (directoryError instanceof Error && /ENOENT/u.test(directoryError.message)) return;
+        throw directoryError;
+      }
+      throw new Error(`cgroup.kill is missing from live cgroup ${path}`);
+    }
     throw error;
   }
   const deadline = Date.now() + graceMs;

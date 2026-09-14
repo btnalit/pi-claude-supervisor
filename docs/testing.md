@@ -65,7 +65,10 @@ cause a later run to fail closed as human-required after the bounded Decision
 Worker or Reviewer timeout; this is evidence for the manual spike only, not a CI
 guarantee.
 The extension persists each automatic Decision Worker session as Pi JSONL plus a
-0600 task mapping. Recovery is explicit and safe: after an unclean Pi restart,
+0600 task mapping. Automatic startup preflights the state/lease directories, cwd,
+worker executable, transport dependency and required cgroup boundary before model
+execution. Progress callbacks expose the current phase and periodic Worker
+heartbeat. Recovery is explicit and safe: after an unclean Pi restart,
 `/supervise sessions` shows the task as `recoverable`, and `/supervise recover
 [--takeover] <task-id>` restores the Decision Worker history before starting a new
 Claude Worker. `--takeover` is accepted only when the old Pi owner is dead, the
@@ -120,7 +123,9 @@ escalation is outbound-only through `PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL`;
 approval callbacks are deliberately not accepted without a separately
 authenticated endpoint.
 
-The tmux transport is selected with `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`. Before
+The tmux transport is selected with `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`.
+Automatic mode rejects an explicit `process-pipe` transport; use JSONL or tmux for
+bounded decisions and repair. Before
 release, verify: private-socket attach, multi-line paste, prompt stability while
 Claude is busy, trust/permission dialog takeover, duplicate send prevention, pane
 replacement refusal, pause/resume, owned-session stop, adopted-session
@@ -157,9 +162,17 @@ the managed process group.
 ## Near-term automation acceptance gate
 
 The `v0.5.0` implementation of the acceptance—independent Review—repair—reacceptance
-loop is shipped. The remaining gate focuses on real stability for the pinned
-Claude Code `2.1.270` CLI. It does not add a multi-version matrix or wait for
-OS sandbox, low-privilege or network-isolation work.
+loop is shipped. The `v0.5.1` real read-only drill reached acceptance and independent
+Review, then correctly stopped at human intervention after two P1 and two P2 findings.
+The drill did not exercise real repair because the task forbade edits and set
+`maxRepairRounds=0`; replay coverage is not a substitute for a real repairable capability
+matrix. The current hardening plan is recorded in
+[`docs/automation-hardening-plan.md`](automation-hardening-plan.md). Deterministic
+coverage now includes repairable-vs-persistent capability assertions, cancellation
+of acceptance commands, stop-from-verifying precedence, paused watchdog baselining,
+staged/untracked evidence and untracked symlink rejection. A real edit-capable
+repair/reacceptance drill remains a release gate and has not been claimed by the
+current source changes.
 
 ### Acceptance and Reviewer fixtures
 
@@ -170,6 +183,9 @@ Deterministic tests must cover:
 - independent read-only Reviewer pass/revise/human results;
 - invalid Reviewer JSON and Reviewer API failure escalating to human;
 - repair rounds, repeated finding detection, P0/P1 escalation and repair-budget exhaustion;
+- non-persistent JSONL verification failure without duplicate terminal transitions;
+- repairable-but-not-persistent JSONL multi-turn repair;
+- stop and Pi shutdown from `verifying`, including Decision Worker closure and cwd lease release;
 - completion being impossible without passing all required checks and review.
 
 Reviewer sessions use only `read`, `grep`, `find` and `ls`; they must not modify
@@ -187,7 +203,10 @@ The adapter/replay matrix must cover:
 - duplicate Supervisor idempotency keys without duplicate input;
 - stop, SIGTERM, SIGINT and Pi shutdown while a JSONL request is active;
 - ordinary completion, low-risk permission allow, AskUserQuestion deny-to-text,
-  multi-turn, verifier failure/repair, takeover and explicit recovery.
+  multi-turn, verifier failure/repair, takeover and explicit recovery;
+- staged and untracked repository evidence, symlink rejection and truncation fail-closed;
+- paused watchdog behavior and resume-time no-output rebasing;
+- assistant-message-bounded Reviewer and Decision Worker output parsing.
 
 Real Claude tests remain authenticated manual Spikes and are pinned to
 `2.1.270`; they are not part of normal CI. Normal CI runs deterministic fake
@@ -218,3 +237,23 @@ Required deterministic and integration coverage:
 The multi-worker gate should be added only after the pinned single-worker stability
 and recovery gates pass. CI should use fake Workers and replay fixtures; authenticated
 Claude multi-worker Spikes remain manual and version-pinned.
+
+## Live drill and hardening gate
+
+A live review must record the exact Claude executable/version, transport, cgroup mode,
+permission flags, task id, acceptance result, Reviewer result, cleanup status and cwd lease
+status. A human-required result is a valid safety outcome and must not be converted into a
+pass by retrying the same task automatically.
+
+Before release of the hardening changes, run in this order:
+
+1. `npm run check`, `npm run test:pi`, `npm run test:install`, `npm run build`;
+2. deterministic lifecycle/evidence/capability tests;
+3. a disposable temporary-worktree real Claude repair/reacceptance spike with explicit human
+   approval for any edit-capable Worker;
+4. a read-only review of the exact resulting commit;
+5. cleanup verification: no Worker, no Decision Worker, no unreconciled lease and clean Git
+   worktree.
+
+The repair spike must not run against the release worktree, must not use Claude `--resume` as
+an invented recovery mechanism, and must not merge, publish or release automatically.

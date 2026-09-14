@@ -8,7 +8,11 @@
 
 用于 Pi 的 Claude Code Worker 监督扩展。MVP 中 Pi 负责生命周期、状态机、策略门和独立验收；Worker 只是被显式启动的子进程。
 
-> 当前默认 transport 是无额外依赖的 process pipe，不是 PTY。已新增可选 Claude JSONL framing，并通过基础 prompt、多轮和 resume Spike。当前优先保证生命周期、进程组清理、恢复和独立验收；低权限用户、OS sandbox 与网络隔离不作为当前主线，按明确授权和宿主机策略运行，后续再做安全加固。
+> `v0.5.1` 已发布为单 Worker recovery 基线。默认手动 transport 是无额外依赖的
+> process pipe，不是 PTY；自动模式只使用 Claude JSONL 或 tmux。当前工作树已实现
+> repairable/persistent 能力拆分、可取消验收/Reviewer、证据完整性门禁、启动前
+> preflight 和阶段进度通知；允许编辑的真实 repair/reacceptance 演练仍是下一次
+> 发布前的门禁。低权限用户、OS sandbox 与网络隔离继续延期。
 
 ## 关键安全边界
 
@@ -16,12 +20,13 @@
 - 不经过 shell 启动子进程。
 - Worker 只继承最小环境；凭据必须由调用方显式传入。
 - 破坏性命令和绕过权限的 Worker 参数默认拒绝；需要复核的启动命令会请求用户批准，不会一律拒绝。
-- Linux 上优先使用可写的 cgroup v2 清理后代进程，包括 `setsid()` 后代；不可用时回退到进程组清理。需要强制失败闭环时，embedding 集成可使用 `cgroupMode: "required"`。
+- Linux 上优先使用可写的 cgroup v2 清理后代进程，包括 `setsid()` 后代；不可用时回退到进程组清理。需要强制失败闭环时，embedding 集成可使用 `cgroupMode: "required"`，并会在 Claude 启动前执行 preflight。
 - 普通联网查询不因联网本身被拒绝；下载后直接交给 shell 等高风险模式仍需人工复核。
 - Worker 声称完成只会进入 `verifying`，不能作为成功证据。
 - 默认独立验收命令为 `git diff --check`。
 - 扩展运行时不执行 merge、deploy、release 或 publish；仓库 Release 只会在维护者合并 Release Please PR 且 CI 门禁全部通过后自动发布。
-- 默认 4 小时总时限、20 分钟无输出 watchdog 超时即停止 Worker，适合长程开发任务；嵌入调用方可将对应选项设为 `0` 关闭。
+- 默认 4 小时总时限、20 分钟无输出 watchdog 超时即停止 Worker；paused 期间不消耗无输出预算，resume 会重建基准但不会重置总时限。嵌入调用方可将对应选项设为 `0` 关闭。
+- 验收命令、仓库证据收集和独立 Reviewer 共用 abort signal，人工 stop/shutdown 不必等待完整超时。
 
 ## 安装和使用
 
@@ -105,9 +110,11 @@ Worker 应使用 `adopt-tmux`，而不是 takeover。
 `v0.5.0` 已完成并发布“多命令验收—独立只读 Reviewer—结构化修复轮次—再次验收”闭环。
 任务可通过 API 或 JSON spec 提供 `goal`、`scope`、`constraints`、`forbidden` 和多个
 `acceptance` 命令；旧的纯文本任务继续使用默认 `git diff --check`。Reviewer 只能使用
-`read`、`grep`、`find`、`ls`，不会修改工作树或批准权限。短期剩余门禁是固定 Claude Code
-`2.1.270` 的重复稳定性统计和 recovery 测试；协同多 Worker 属于后续独立开发阶段，
-暂不把多版本兼容、sandbox、低权限和网络隔离作为本阶段门禁。
+`read`、`grep`、`find`、`ls`，不会修改工作树或批准权限。当前加固要求 HEAD-relative
+tracked diff 和受限 untracked evidence 完整，P0/P1 或重复 finding 必须人工处理；自动模式
+拒绝显式 process-pipe，并在模型执行前检查目录、可执行文件、依赖和 cgroup。剩余门禁是
+固定 Claude Code `2.1.270` 隔离 worktree 的真实 repair/reacceptance 及 exact-head review；
+协同多 Worker 属于后续独立开发阶段，暂不把 sandbox、低权限和网络隔离作为本阶段门禁。
 
 ### tmux/PTY 交互模式
 

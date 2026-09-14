@@ -6,6 +6,9 @@ import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager,
 import type { TaskSpec, WorkerEvent } from "./types.ts";
 import { redactSensitive } from "./redaction.ts";
 
+const MAX_DECISION_RESPONSE_BYTES = 32 * 1024;
+const MAX_DECISION_FIELD_BYTES = 8 * 1024;
+
 export type DecisionAction =
   | { action: "continue" | "redirect" | "answer"; message: string; reason: string; confidence?: number }
   | { action: "allow_permission" | "deny_permission"; requestId: string; toolUseId: string; reason: string; confidence?: number }
@@ -189,10 +192,37 @@ secrets, deployment, or any uncertainty. Never invent missing information.`;
 }
 
 async function askDecision(session: AgentSession, event: WorkerEvent, context: DecisionContext, timeoutMs: number): Promise<string> {
-  let text = "";
+  let current = "";
+  let finalMessage = "";
+  let capturingAssistant = false;
+  let currentTooLarge = false;
+  let finalTooLarge = false;
   const unsubscribe = session.subscribe((value) => {
-    const record = value as unknown as { type?: string; assistantMessageEvent?: { type?: string; delta?: string } };
-    if (record.type === "message_update" && record.assistantMessageEvent?.type === "text_delta") text += record.assistantMessageEvent.delta ?? "";
+    const record = value as unknown as { type?: string; message?: { role?: string; content?: unknown }; assistantMessageEvent?: { type?: string; delta?: string } };
+    const role = record.message?.role;
+    if (record.type === "message_start" && role === "assistant") {
+      current = "";
+      currentTooLarge = false;
+      capturingAssistant = true;
+      return;
+    }
+    if (record.type === "message_update" && record.assistantMessageEvent?.type === "text_delta" && (capturingAssistant || role === "assistant" || role === undefined)) {
+      capturingAssistant = true;
+      const delta = record.assistantMessageEvent.delta ?? "";
+      if (Buffer.byteLength(current, "utf8") + Buffer.byteLength(delta, "utf8") > MAX_DECISION_RESPONSE_BYTES) {
+        currentTooLarge = true;
+        return;
+      }
+      current += delta;
+      return;
+    }
+    if (record.type === "message_end" && role === "assistant") {
+      finalMessage = current || textFromMessage(record.message?.content);
+      finalTooLarge = currentTooLarge;
+      current = "";
+      currentTooLarge = false;
+      capturingAssistant = false;
+    }
   });
   try {
     try {
@@ -204,11 +234,21 @@ async function askDecision(session: AgentSession, event: WorkerEvent, context: D
   } finally {
     unsubscribe();
   }
-  return text;
+  if (finalTooLarge) return "";
+  return finalMessage || current;
+}
+
+function textFromMessage(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((block): block is { type?: unknown; text?: unknown } => Boolean(block && typeof block === "object"))
+    .filter((block) => block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text as string)
+    .join("");
 }
 
 function parseDecision(text: string, event: WorkerEvent): DecisionAction {
-  const candidate = text.match(/\{[\s\S]*\}/u)?.[0];
+  const candidate = text.trim();
   if (!candidate) return { action: "ask_human", reason: "Decision Worker returned no JSON action" };
   try {
     const value = JSON.parse(candidate) as Record<string, unknown>;
@@ -216,11 +256,13 @@ function parseDecision(text: string, event: WorkerEvent): DecisionAction {
     if (typeof action !== "string") throw new Error("missing action");
     const allowed = new Set(["continue", "redirect", "answer", "allow_permission", "deny_permission", "verify", "retry", "stop", "ask_human", "noop"]);
     if (!allowed.has(action)) throw new Error(`unsupported action: ${action}`);
-    const reason = typeof value.reason === "string" && value.reason.trim() ? value.reason : "no reason provided";
-    const confidence = typeof value.confidence === "number" ? value.confidence : undefined;
+    const reason = typeof value.reason === "string" && value.reason.trim() ? boundedDecisionText(value.reason, "reason") : "no reason provided";
+    const confidence = value.confidence === undefined ? undefined : typeof value.confidence === "number" && Number.isFinite(value.confidence) && value.confidence >= 0 && value.confidence <= 1
+      ? value.confidence
+      : (() => { throw new Error("confidence must be a finite number between 0 and 1"); })();
     if (["continue", "redirect", "answer"].includes(action)) {
       if (typeof value.message !== "string" || !value.message.trim()) throw new Error("message required");
-      return { action: action as "continue" | "redirect" | "answer", message: value.message, reason, confidence };
+      return { action: action as "continue" | "redirect" | "answer", message: boundedDecisionText(value.message, "message"), reason, confidence };
     }
     if (["allow_permission", "deny_permission"].includes(action)) {
       const permission = event.type === "permission_request" ? event.request : undefined;
@@ -229,10 +271,15 @@ function parseDecision(text: string, event: WorkerEvent): DecisionAction {
       if (!requestId || !toolUseId) throw new Error("permission requestId/toolUseId required");
       return { action: action as "allow_permission" | "deny_permission", requestId, toolUseId, reason, confidence };
     }
-    return { action: action as "verify" | "retry" | "stop" | "ask_human" | "noop", reason, question: typeof value.question === "string" ? value.question : undefined, confidence };
+    return { action: action as "verify" | "retry" | "stop" | "ask_human" | "noop", reason, question: typeof value.question === "string" ? boundedDecisionText(value.question, "question") : undefined, confidence };
   } catch (error) {
     return { action: "ask_human", reason: `invalid Decision Worker action: ${error instanceof Error ? error.message : String(error)}` };
   }
+}
+
+function boundedDecisionText(value: string, field: string): string {
+  if (Buffer.byteLength(value, "utf8") > MAX_DECISION_FIELD_BYTES) throw new Error(`${field} exceeds ${MAX_DECISION_FIELD_BYTES} bytes`);
+  return value;
 }
 
 function eventKey(event: WorkerEvent): string {

@@ -104,6 +104,8 @@ export interface PermissionDecision {
 
 export interface WorkerAdapter {
   capabilities(): WorkerCapabilities;
+  /** Validate host/transport prerequisites before starting a Worker. */
+  preflight?(input: Pick<WorkerStartInput, "cwd" | "command" | "args" | "env" | "approval">): Promise<void>;
   start(input: WorkerStartInput): Promise<WorkerHandle>;
   /** Cancel adapter-owned startup work before a WorkerHandle is returned. */
   abortStart?(reason: string, startupToken?: string): Promise<void>;
@@ -137,8 +139,10 @@ export interface WorkerCapabilities {
   pause: boolean;
   resumeSession: boolean;
   processGroupControl: boolean;
-  /** The worker can remain alive while Pi disconnects from it. */
+  /** The worker can remain alive while Pi disconnects from it and be explicitly re-adopted. */
   persistentSession?: boolean;
+  /** The current Supervisor can send another bounded turn after a result. */
+  repairableSession?: boolean;
 }
 
 export interface AcceptanceCheck {
@@ -150,7 +154,7 @@ export interface AcceptanceCheck {
   timeoutMs: number;
 }
 
-export type AcceptanceCheckStatus = "passed" | "failed" | "timed_out" | "blocked";
+export type AcceptanceCheckStatus = "passed" | "failed" | "timed_out" | "blocked" | "cancelled";
 
 export interface AcceptanceCheckResult {
   check: AcceptanceCheck;

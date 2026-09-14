@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdir, open, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { access, chmod, lstat, mkdir, open, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, isAbsolute, join } from "node:path";
 import type {
   WorkerAdapter,
   WorkerCapabilities,
@@ -108,6 +109,17 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     this.#terminationGraceMs = boundedDelay(options.terminationGraceMs ?? 2_000);
   }
 
+  async preflight(input: Pick<WorkerStartInput, "cwd" | "command" | "args" | "env" | "approval">): Promise<void> {
+    assertSafeWorkerCommand(input.command, input.args ?? [], input.approval);
+    await assertDirectory(input.cwd);
+    await assertExecutableAvailable(input.command, input.env?.PATH ?? process.env.PATH);
+    await assertExecutableAvailable(this.#tmuxBinary, process.env.PATH);
+    await mkdir(this.#stateDir, { recursive: true, mode: 0o700 });
+    const stateInfo = await lstat(this.#stateDir);
+    if (!stateInfo.isDirectory() || stateInfo.isSymbolicLink()) throw new Error(`tmux state directory is not a real directory: ${this.#stateDir}`);
+    await chmod(this.#stateDir, 0o700);
+  }
+
   capabilities(): WorkerCapabilities {
     return {
       transport: "tmux",
@@ -116,6 +128,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       resumeSession: false,
       processGroupControl: false,
       persistentSession: true,
+      repairableSession: true,
     };
   }
 
@@ -1032,6 +1045,27 @@ function isPidAlive(pid: number): boolean {
   } catch (error) {
     return error instanceof Error && /EPERM/u.test(error.message);
   }
+}
+
+async function assertDirectory(path: string): Promise<void> {
+  const info = await stat(path);
+  if (!info.isDirectory()) throw new Error(`Worker cwd is not a directory: ${path}`);
+  await access(path, fsConstants.R_OK | fsConstants.W_OK | fsConstants.X_OK);
+}
+
+async function assertExecutableAvailable(command: string, pathValue: string | undefined): Promise<void> {
+  const candidates = isAbsolute(command) || command.includes("/") || command.includes("\\")
+    ? [command]
+    : (pathValue ?? "").split(delimiter).filter(Boolean).map((directory) => join(directory, command));
+  for (const candidate of candidates) {
+    try {
+      await access(candidate, fsConstants.X_OK);
+      return;
+    } catch {
+      // Try the next PATH entry.
+    }
+  }
+  throw new Error(`executable preflight failed (ENOENT): ${command}`);
 }
 
 function boundedDelay(value: number): number {

@@ -98,8 +98,12 @@ test("pause and resume control the entire worker process group", async () => {
     await new Promise((resolve) => setTimeout(resolve, 60));
     await adapter.readOutput(handle);
     await adapter.pause(handle);
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    assert.equal((await adapter.readOutput(handle)).length, 0);
+    let pausedEmptyReads = 0;
+    for (let attempt = 0; attempt < 20 && pausedEmptyReads < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      pausedEmptyReads = (await adapter.readOutput(handle)).length === 0 ? pausedEmptyReads + 1 : 0;
+    }
+    assert.equal(pausedEmptyReads, 2);
     await adapter.resume(handle);
     let resumedOutput = [];
     for (let attempt = 0; attempt < 20 && resumedOutput.length === 0; attempt += 1) {
@@ -437,6 +441,7 @@ test("claude-jsonl stop preempts an active request and confirms cleanup", async 
   await adapter.stop(handle, "active request shutdown");
   const status = await adapter.getStatus(handle);
   assert.equal(status.running, false);
+  assert.equal(status.exitReason, "stopped");
   assert.equal(status.processGroupCleaned, true);
 });
 
@@ -508,6 +513,14 @@ test("claude-jsonl emits permission events and accepts the exact allow response"
   assert.equal(status.exitReason, "completed");
   assert.ok(events.some((event) => event.type === "turn_completed"));
   await adapter.stop(handle, "permission test complete");
+});
+
+test("JSONL exposes attached repairability without claiming persistent recovery", () => {
+  const jsonl = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
+  const pipe = new ProcessWorkerAdapter({ mode: "process-pipe" });
+  assert.equal(jsonl.capabilities().repairableSession, true);
+  assert.equal(jsonl.capabilities().persistentSession, undefined);
+  assert.equal(pipe.capabilities().repairableSession, false);
 });
 
 test("claude-jsonl mode frames initial and subsequent messages", async () => {

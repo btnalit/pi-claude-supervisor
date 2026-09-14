@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { normalizeTaskSpec } from "./acceptance.ts";
-import { verifyAll } from "./verifier.ts";
+import { collectRepositoryEvidence, verifyAll } from "./verifier.ts";
+
+const execFileAsync = promisify(execFile);
 
 test("legacy tasks receive a default acceptance check", () => {
   const spec = normalizeTaskSpec(undefined, "inspect the repository");
@@ -53,6 +57,60 @@ test("verifyAll records multiple required and optional check outcomes", async ()
   }
 });
 
+test("verifyAll cancels an in-flight acceptance command", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-acceptance-cancel-"));
+  const controller = new AbortController();
+  try {
+    const pending = verifyAll(cwd, [{ id: "cancel", name: "cancel", command: process.execPath, args: ["-e", "setTimeout(() => {}, 10000)"], required: true, timeoutMs: 30_000 }], { signal: controller.signal });
+    setTimeout(() => controller.abort(), 30).unref();
+    const report = await pending;
+    assert.equal(report.ok, false);
+    assert.equal(report.checks[0]?.status, "cancelled");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("repository evidence includes staged and untracked changes", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-evidence-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd });
+    await execFileAsync("git", ["config", "user.email", "test@example.invalid"], { cwd });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd });
+    await writeFile(join(cwd, "tracked.txt"), "base\\n");
+    await execFileAsync("git", ["add", "tracked.txt"], { cwd });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd });
+    await writeFile(join(cwd, "tracked.txt"), "staged change\\n");
+    await execFileAsync("git", ["add", "tracked.txt"], { cwd });
+    await writeFile(join(cwd, "new.txt"), "new file content\\n");
+
+    const evidence = await collectRepositoryEvidence(cwd);
+    assert.equal(evidence.complete, true);
+    assert.match(evidence.diff, /staged change/u);
+    assert.match(evidence.untracked ?? "", /new\.txt/u);
+    assert.match(evidence.untracked ?? "", /new file content/u);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("repository evidence rejects untracked symlinks", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-evidence-symlink-"));
+  const outside = await mkdtemp(join(tmpdir(), "pi-claude-evidence-outside-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd });
+    await writeFile(join(outside, "secret.txt"), "outside content\\n");
+    await symlink(join(outside, "secret.txt"), join(cwd, "link.txt"));
+    const evidence = await collectRepositoryEvidence(cwd);
+    assert.equal(evidence.complete, false);
+    assert.match(evidence.untracked ?? "", /non-regular file|symlink|read failed/u);
+    assert.doesNotMatch(evidence.untracked ?? "", /outside content/u);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
 test("verifyAll records timeout evidence and bounds check output", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-acceptance-"));
   try {
@@ -63,8 +121,7 @@ test("verifyAll records timeout evidence and bounds check output", async () => {
     assert.equal(report.ok, false);
     assert.equal(report.checks[0]?.status, "timed_out");
     assert.notEqual(report.checks[0]?.output, "");
-    assert.equal(report.checks[1]?.status, "failed");
-    assert.match(report.checks[1]?.output ?? "", /TRUNCATED/u);
+    assert.equal(report.checks[1]?.status, "passed");
     assert.ok(Buffer.byteLength(report.checks[1]?.output ?? "", "utf8") <= 256 * 1024);
     assert.ok(Buffer.byteLength(report.output, "utf8") <= 256 * 1024);
   } finally {

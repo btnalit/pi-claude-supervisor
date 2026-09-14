@@ -10,11 +10,14 @@ A policy-gated [Pi](https://pi.dev) extension for supervising a Claude Code work
 The MVP keeps Pi in control of lifecycle, state, policy and verification while the
 worker remains an explicitly started child process.
 
-> **MVP status:** the default transport is dependency-free process pipes, not PTY.
-> An opt-in Claude JSONL framing mode has passed basic prompt, multi-turn and
-> resume fixtures. The current priority is signal, shutdown, process-group and
-> recovery validation; OS sandbox, low-privilege execution and network isolation
-> are deferred hardening items and are not required by the current MVP plan.
+> **Release status:** `v0.5.1` is the released single-Worker recovery baseline. The
+> default manual transport is dependency-free process pipes, not PTY. Automatic
+> supervision uses Claude JSONL or tmux, and the current working-tree hardening
+> adds repairable-vs-persistent capabilities, cancellable verification, evidence
+> completeness gates, startup preflight and phase progress reporting. A real
+> edit-capable repair/reacceptance drill remains required before releasing that
+> hardening; OS sandbox, low-privilege execution and network isolation remain
+> deferred.
 
 ## Safety boundary
 
@@ -27,7 +30,8 @@ worker remains an explicitly started child process.
 - Verification is an independent host command (default: `git diff --check`).
 - The extension never performs merge, deploy, release, or publish at runtime. Repository releases are automated only after a maintainer merges a Release Please PR and the full CI gate passes.
 - A 4-hour wall-clock and 20-minute no-output watchdog stop a worker by default for long development tasks; embedding callers can set either to `0` to disable.
-- On Linux, the adapter automatically uses a writable cgroup v2 for descendant cleanup, including `setsid()` descendants; it falls back to process-group cleanup when unavailable. Use the adapter's `cgroupMode: "required"` for a fail-closed integration.
+- On Linux, the adapter automatically uses a writable cgroup v2 for descendant cleanup, including `setsid()` descendants; it falls back to process-group cleanup when unavailable. Use `cgroupMode: "required"` for a fail-closed integration; required mode is preflighted before Claude starts.
+- Acceptance commands, repository evidence collection and independent Review share an abort signal, so operator stop/shutdown does not wait for a full command or model timeout.
 - Events are append-only JSONL records in `~/.pi/agent/claude-supervisor/events.jsonl`.
 
 ## Install
@@ -114,12 +118,15 @@ The `v0.5.0` automation milestone adds a structured acceptance pipeline:
 multiple argv-based checks, an independent read-only Reviewer, bounded structured
 findings and repair rounds. Legacy text tasks keep the default `git diff --check`.
 The Reviewer only has `read`, `grep`, `find` and `ls`; it cannot edit files or grant
-permissions. The next gates are pinned Claude Code `2.1.270` stability statistics
-and explicit session recovery. Coordinated multi-worker scheduling is a later
-milestone; CI will use deterministic fake Workers/replay fixtures, and real
-multi-worker Claude tests will remain authenticated manual Spikes. CLI
-multi-version compatibility, sandboxing, low-privilege execution and network
-isolation are not part of this milestone.
+permissions. The current hardening also requires complete HEAD-relative tracked and
+bounded untracked evidence, rejects P0/P1 or repeated findings, and only repairs a
+live `repairableSession` Worker. Automatic mode rejects explicit `process-pipe` and
+preflights runtime prerequisites. The remaining gate is a pinned Claude Code
+`2.1.270` disposable repair/reacceptance run plus exact-head independent review.
+Coordinated multi-worker scheduling is a later milestone; CI uses deterministic fake
+Workers/replay fixtures, and real multi-worker Claude tests remain authenticated
+manual Spikes. CLI multi-version compatibility, sandboxing, low-privilege execution
+and network isolation are not part of this milestone.
 
 Automatic mode persists the Pi Decision Worker session under the configured state
 directory. After an unclean Pi restart, `/supervise sessions` lists recoverable

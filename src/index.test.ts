@@ -21,6 +21,21 @@ test("index rejects an unknown worker transport instead of falling back", () => 
   }
 });
 
+test("index rejects explicit process-pipe in automatic mode", () => {
+  const previousTransport = process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
+  const previousMode = process.env.PI_CLAUDE_SUPERVISOR_MODE;
+  process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "process-pipe";
+  process.env.PI_CLAUDE_SUPERVISOR_MODE = "auto";
+  try {
+    assert.throws(() => extension({} as never), /automatic supervision requires/u);
+  } finally {
+    if (previousTransport === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
+    else process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = previousTransport;
+    if (previousMode === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_MODE;
+    else process.env.PI_CLAUDE_SUPERVISOR_MODE = previousMode;
+  }
+});
+
 test("index rejects required cgroup mode with tmux instead of ignoring it", () => {
   const previousTransport = process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
   const previousCgroupMode = process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE;

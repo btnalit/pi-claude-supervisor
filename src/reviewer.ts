@@ -15,6 +15,8 @@ export interface ReviewInput {
   workerOutput?: string;
   workerResult?: Record<string, unknown>;
   round: number;
+  /** Abort a review when the operator stops or shuts down the Supervisor. */
+  signal?: AbortSignal;
 }
 
 export interface TaskReviewer {
@@ -38,6 +40,9 @@ export class PiReadOnlyReviewer implements TaskReviewer {
   }
 
   async review(input: ReviewInput): Promise<ReviewReport> {
+    if (input.evidence.complete === false || input.evidence.truncated === true) {
+      return invalidReview("repository evidence is incomplete or truncated", input.round, new Date().toISOString());
+    }
     const resourceLoader = new DefaultResourceLoader({
       cwd: input.cwd,
       agentDir: getAgentDir(),
@@ -55,20 +60,40 @@ export class PiReadOnlyReviewer implements TaskReviewer {
       thinkingLevel: "low",
       tools: ["read", "grep", "find", "ls"],
     });
-    let text = "";
-    let responseTooLarge = false;
+    let current = "";
+    let finalMessage = "";
+    let capturingAssistant = false;
+    let currentTooLarge = false;
+    let finalTooLarge = false;
     const unsubscribe = session.subscribe((value) => {
-      const record = value as unknown as { type?: string; assistantMessageEvent?: { type?: string; delta?: string } };
-      if (record.type !== "message_update" || record.assistantMessageEvent?.type !== "text_delta" || responseTooLarge) return;
-      const delta = record.assistantMessageEvent.delta ?? "";
-      if (Buffer.byteLength(text, "utf8") + Buffer.byteLength(delta, "utf8") > MAX_REVIEW_RESPONSE_BYTES) {
-        responseTooLarge = true;
+      const record = value as unknown as { type?: string; message?: { role?: string; content?: unknown }; assistantMessageEvent?: { type?: string; delta?: string } };
+      const role = record.message?.role;
+      if (record.type === "message_start" && role === "assistant") {
+        current = "";
+        currentTooLarge = false;
+        capturingAssistant = true;
         return;
       }
-      text += delta;
+      if (record.type === "message_update" && record.assistantMessageEvent?.type === "text_delta" && (capturingAssistant || role === "assistant" || role === undefined)) {
+        capturingAssistant = true;
+        const delta = record.assistantMessageEvent.delta ?? "";
+        if (Buffer.byteLength(current, "utf8") + Buffer.byteLength(delta, "utf8") > MAX_REVIEW_RESPONSE_BYTES) {
+          currentTooLarge = true;
+          return;
+        }
+        current += delta;
+        return;
+      }
+      if (record.type === "message_end" && role === "assistant") {
+        finalMessage = current || textFromMessage(record.message?.content);
+        finalTooLarge = currentTooLarge;
+        current = "";
+        currentTooLarge = false;
+        capturingAssistant = false;
+      }
     });
     try {
-      await withTimeout(session.prompt(reviewPrompt(input)), this.#timeoutMs, "independent Reviewer");
+      await withTimeout(session.prompt(reviewPrompt(input)), this.#timeoutMs, "independent Reviewer", input.signal);
     } catch (error) {
       await session.abort().catch(() => {});
       throw error;
@@ -76,9 +101,9 @@ export class PiReadOnlyReviewer implements TaskReviewer {
       unsubscribe();
       session.dispose();
     }
-    return responseTooLarge
+    return finalTooLarge
       ? invalidReview(`Reviewer response exceeded ${MAX_REVIEW_RESPONSE_BYTES} bytes`, input.round, new Date().toISOString())
-      : parseReview(text, input.round);
+      : parseReview(finalMessage || current, input.round);
   }
 }
 
@@ -105,8 +130,15 @@ ${boundedJson(input.acceptance)}
 REPOSITORY STATUS:
 ${boundText(input.evidence.status, 8_000)}
 
-REPOSITORY DIFF (UNTRUSTED):
+REPOSITORY DIFF (HEAD-RELATIVE, UNTRUSTED):
 ${boundText(input.evidence.diff, 16_000)}
+
+UNTRACKED FILE EVIDENCE (UNTRUSTED):
+${boundText(input.evidence.untracked ?? "(none)", 16_000)}
+
+EVIDENCE COMPLETE:
+${String(input.evidence.complete !== false && input.evidence.truncated !== true)}
+If repository evidence is incomplete or truncated, do not return pass; return human and explain which evidence is unavailable.
 
 WORKER OUTPUT (UNTRUSTED):
 ${boundTailText(redactSensitive(input.workerOutput ?? "(none)"), 8_000)}
@@ -116,6 +148,15 @@ ${boundedJson(input.workerResult ?? null, 8_000)}
 
 REVIEW ROUND:
 ${input.round}`;
+}
+
+function textFromMessage(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((block): block is { type?: unknown; text?: unknown } => Boolean(block && typeof block === "object"))
+    .filter((block) => block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text as string)
+    .join("");
 }
 
 export function parseReview(text: string, round: number): ReviewReport {
@@ -179,16 +220,28 @@ function redactText(value: string): string {
   return String(redactSensitive(value));
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string, signal?: AbortSignal): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
+  let onAbort: (() => void) | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
     timer.unref();
   });
+  const aborted = new Promise<never>((_, reject) => {
+    if (!signal) return;
+    onAbort = () => {
+      const error = new Error(`${label} aborted`);
+      error.name = "AbortError";
+      reject(error);
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
   try {
-    return await Promise.race([promise, timeout]);
+    return await Promise.race([promise, timeout, aborted]);
   } finally {
     if (timer) clearTimeout(timer);
+    if (signal && onAbort) signal.removeEventListener("abort", onAbort);
   }
 }
 

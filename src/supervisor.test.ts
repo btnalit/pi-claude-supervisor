@@ -207,6 +207,31 @@ test("watchdog starts the no-output clock at the worker start", async () => {
   await supervisor.stop("test complete");
 });
 
+test("paused workers do not consume the no-output watchdog budget", async () => {
+  const handle: WorkerHandle = { id: "paused-watchdog-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
+  let running = true;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "process-pipe", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter);
+  await supervisor.start({ task: "pause watchdog", cwd: "/tmp", command: "fixture", deadlineMs: 0, noOutputTimeoutMs: 25 });
+  await supervisor.pause();
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  assert.equal(supervisor.state, "paused");
+  await supervisor.resume();
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  assert.equal(supervisor.state, "stopped");
+});
+
 test("watchdog stops the worker even when timeout events cannot be persisted", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-watchdog-log-failure-"));
   const adapter = new ProcessWorkerAdapter({ terminationGraceMs: 25, killGraceMs: 25 });
@@ -373,16 +398,17 @@ test("supervisor restores output when output event persistence fails", async () 
 
 test("supervisor retries a failed stop event on a later idempotent stop", async () => {
   const handle: WorkerHandle = { id: "stop-event-retry-worker", startedAt: new Date().toISOString(), cwd: "/tmp" };
+  let running = true;
   const adapter: WorkerAdapter = {
     capabilities: () => ({ transport: "process-pipe", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true }),
     start: async () => handle,
-    getStatus: async () => ({ handle, running: true, processGroupCleaned: true }),
+    getStatus: async () => ({ handle, running, processGroupCleaned: !running }),
     readOutput: async () => [],
     send: async () => {},
     pause: async () => {},
     resume: async () => {},
-    stop: async () => {},
-    killProcessGroup: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
     resumeSession: async () => handle,
   };
   const log = new FlakyEventLog("worker_stopped");
@@ -489,6 +515,96 @@ test("verification accepts confirmed process-group fallback in auto cgroup mode"
   assert.equal(result.ok, true);
   assert.equal(supervisor.state, "completed");
   await rm(cgroupParentDir, { recursive: true, force: true });
+});
+
+test("non-persistent verification failure finalizes once and closes the decision session", async () => {
+  const handle: WorkerHandle = { id: "non-persistent-repair-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
+  let running = true;
+  let decisionClosed = 0;
+  const events = new FlakyEventLog("never-fail");
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running, exitReason: running ? undefined : "completed", processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+    onHumanRequired: () => {},
+  });
+  await supervisor.start({
+    task: "non-persistent repair failure",
+    cwd: "/tmp",
+    command: "fixture",
+    automation: true,
+    spec: { acceptance: [{ id: "fail", name: "fail", command: process.execPath, args: ["-e", "process.exit(7)"], required: true, timeoutMs: 1_000 }] },
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => { decisionClosed += 1; } }),
+  });
+  running = false;
+  await supervisor.poll();
+  assert.equal(supervisor.state, "verifying");
+  const result = await supervisor.verify();
+  assert.equal(result.ok, false);
+  assert.equal(supervisor.state, "failed");
+  assert.equal(decisionClosed, 1);
+  assert.ok(events.events.some((event) => event.type === "verification_failed"));
+});
+
+test("stop from verifying performs cleanup and reaches stopped", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-stop-verifying-"));
+  try {
+    const supervisor = new Supervisor(new ProcessWorkerAdapter({ cgroupMode: "off" }));
+    await supervisor.start({ task: "stop verifying", cwd, command: process.execPath, args: ["-e", "console.log('done')"], deadlineMs: 0, noOutputTimeoutMs: 0 });
+    let report = await supervisor.poll();
+    for (let attempt = 0; report.status.running && attempt < 40; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      report = await supervisor.poll();
+    }
+    assert.equal(supervisor.state, "verifying");
+    await supervisor.stop("operator stop while verifying");
+    assert.equal(supervisor.state, "stopped");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("stop aborts an in-flight acceptance command and wins verification", async () => {
+  const handle: WorkerHandle = { id: "cancel-verification-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
+  let running = true;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, repairableSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter);
+  await supervisor.start({
+    task: "cancel verification",
+    cwd: "/tmp",
+    command: "fixture",
+    spec: { acceptance: [{ id: "slow", name: "slow", command: process.execPath, args: ["-e", "setTimeout(() => {}, 10000)"], required: true, timeoutMs: 30_000 }] },
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+  });
+  await supervisor.poll();
+  const verification = supervisor.verify();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const stopping = supervisor.stop("operator cancelled verification");
+  const result = await verification;
+  await stopping;
+  assert.equal(result.checks[0]?.status, "cancelled");
+  assert.equal(supervisor.state, "stopped");
 });
 
 test("automatic acceptance review requests a bounded repair before completing", async () => {
