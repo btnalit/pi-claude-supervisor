@@ -294,7 +294,7 @@ test("claude-jsonl result sequence distinguishes repeated session ids", async ()
   await adapter.stop(handle, "test complete");
 });
 
-test("claude-jsonl bounds an overlong protocol record before accepting later lines", async () => {
+test("claude-jsonl discards split continuations after an overlong protocol record", async () => {
   const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl", maxProtocolBufferBytes: 128 });
   const events: import("../types.ts").WorkerEvent[] = [];
   const handle = await adapter.start({
@@ -302,14 +302,16 @@ test("claude-jsonl bounds an overlong protocol record before accepting later lin
     cwd: process.cwd(),
     command: process.execPath,
     eventListener: (event) => { events.push(event); },
-    args: ["-e", "process.stdin.on('data', () => { process.stdout.write('x'.repeat(100000)); setTimeout(() => process.stdout.write('\\n' + JSON.stringify({type:'result', uuid:'after-overflow'}) + '\\n'), 10); }); setInterval(() => {}, 1000)", "--"],
+    args: ["-e", "process.stdin.on('data', () => { const write = () => process.stdout.write(JSON.stringify({type:'result', uuid:'continuation'}) + '\\n', () => setTimeout(() => process.stdout.write(JSON.stringify({type:'result', uuid:'legitimate'}) + '\\n'), 10)); process.stdout.write('x'.repeat(100000), write); }); setInterval(() => {}, 1000)", "--"],
   });
   try {
-    for (let attempt = 0; attempt < 40 && events.filter((event) => event.type === "turn_completed").length < 1; attempt += 1) {
+    for (let attempt = 0; attempt < 50 && events.filter((event) => event.type === "turn_completed").length < 1; attempt += 1) {
       await adapter.readOutput(handle);
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    assert.equal(events.filter((event) => event.type === "turn_completed").length, 1);
+    const completed = events.filter((event): event is Extract<import("../types.ts").WorkerEvent, { type: "turn_completed" }> => event.type === "turn_completed");
+    assert.equal(completed.length, 1);
+    assert.equal((completed[0].result as { uuid?: string }).uuid, "legitimate");
     assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
     assert.equal((await adapter.getStatus(handle)).outputTruncated, true);
   } finally {

@@ -50,6 +50,7 @@ interface ProcessRecord {
   seenResultIds: Set<string>;
   seenPermissionRequestIds: Set<string>;
   protocolBuffer: string;
+  discardProtocolLine: boolean;
   exitCode?: number | null;
   signal?: NodeJS.Signals;
   spawnError?: Error;
@@ -153,6 +154,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       seenResultIds: new Set(),
       seenPermissionRequestIds: new Set(),
       protocolBuffer: "",
+      discardProtocolLine: false,
       exited,
       resolveExit,
       sentKeys: new Set(),
@@ -471,11 +473,20 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   #observeJsonl(record: ProcessRecord, chunk: string): void {
     let offset = 0;
     while (offset < chunk.length) {
+      if (record.discardProtocolLine) {
+        const newline = chunk.indexOf("\n", offset);
+        if (newline < 0) return;
+        record.discardProtocolLine = false;
+        record.protocolBuffer = "";
+        offset = newline + 1;
+        continue;
+      }
       const newline = chunk.indexOf("\n", offset);
       if (newline < 0) {
         const tail = chunk.slice(offset);
         if (Buffer.byteLength(record.protocolBuffer, "utf8") + Buffer.byteLength(tail, "utf8") > this.#maxProtocolBufferBytes) {
           record.protocolBuffer = "";
+          record.discardProtocolLine = true;
           record.outputTruncated = true;
         } else {
           record.protocolBuffer += tail;
