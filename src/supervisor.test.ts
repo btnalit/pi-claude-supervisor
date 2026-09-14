@@ -556,6 +556,64 @@ test("repeated Reviewer findings escalate instead of looping forever", async () 
   assert.equal(sends, 1);
 });
 
+test("repair-round exhaustion fails closed after the final automatic repair", async () => {
+  const handle: WorkerHandle = { id: "exhausted-repair-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
+  let running = true;
+  let sends = 0;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => { sends += 1; },
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const events = new FlakyEventLog("never-fail");
+  let reviews = 0;
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+    reviewer: {
+      review: async () => {
+        const round = reviews++;
+        return {
+          verdict: "revise" as const,
+          summary: "still missing",
+          findings: [{ id: "F001", severity: "P2" as const, message: `issue in round ${round}`, requiredFix: "fix it" }],
+          round,
+          checkedAt: new Date().toISOString(),
+        };
+      },
+    },
+  });
+  await supervisor.start({
+    task: "exhaust automatic repairs",
+    cwd: "/tmp",
+    command: "fixture",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: { maxRepairRounds: 1, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+  });
+  await supervisor.poll();
+  const first = await supervisor.verify();
+  assert.equal(first.review?.verdict, "revise");
+  assert.equal(supervisor.state, "running");
+  assert.equal(sends, 1);
+
+  await supervisor.poll();
+  const second = await supervisor.verify();
+  assert.equal(second.ok, false);
+  assert.equal(second.review?.verdict, "revise");
+  assert.equal(supervisor.state, "failed");
+  assert.equal(sends, 1);
+  assert.ok(events.events.some((event) => event.type === "repair_round_exhausted"));
+  assert.ok(events.events.some((event) => event.type === "verification_failed"));
+});
+
 test("P0 and P1 Reviewer findings never enter automatic repair", async () => {
   const handle: WorkerHandle = { id: "blocking-finding-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
   let running = true;
