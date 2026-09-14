@@ -17,6 +17,8 @@ test("policy hard-denies publication and remote/integration writes", () => {
   assert.equal(evaluateCommand("gh api -X POST repos/acme/project/releases").decision, "deny");
   assert.equal(evaluateCommand("git send-pack ssh://example.invalid/repo").decision, "deny");
   assert.equal(evaluateCommand("git checkout -B main").decision, "deny");
+  assert.equal(evaluateCommand("git branch -f main").decision, "deny");
+  assert.equal(evaluateCommand("git \"$ACTION\" \"$BRANCH\"").decision, "deny");
 });
 
 test("policy does not create a synchronous human gate for local development", () => {

@@ -28,8 +28,9 @@ const deniedPatterns = [
   /\bgit-(?:send|receive|upload)-pack\b/iu,
   /\bgh\b[\s\S]*\b(?:api|pr\s+(?:create|merge|close|reopen|edit)|release\b)/iu,
   /\b(?:glab|hub)\b[\s\S]*\b(?:api|mr\s+(?:create|merge|close|reopen|edit)|pull-request|release)\b/iu,
-  /\bgit\b[\s\S]*\b(?:checkout|switch)\b[\s-]+(?:main|master|trunk|integration|develop)\b/iu,
-  /\bgit\b[\s\S]*\b(?:checkout\s+-(?:B|b)|switch\s+(?:-c|--create))\s+(?:main|master|trunk|integration|develop)\b/iu,
+  /\bgit\b[\s\S]*\b(?:checkout|switch|branch|reset|restore|worktree|update-ref|symbolic-ref)\b[\s\S]*\b(?:main|master|trunk|integration|develop)\b/iu,
+  /\bgit\b[\s\S]*(?:\$\{?|\$\(|`)[\s\S]*\b(?:checkout|switch|branch|reset|restore|worktree|update-ref|symbolic-ref)\b/iu,
+  /\bgit\b[\s\S]*(?:\$\{?|\$\(|`)/iu,
   /\bgit\b[\s\S]*\b(?:update-ref|symbolic-ref)\b[\s\S]*\brefs\/heads\/(?:main|master|trunk|integration|develop)\b/iu,
   /\b(?:npm|pnpm|yarn)\b[\s\S]*\bpublish\b/iu,
   /\b(?:ssh|scp|sftp|rsync)\b/iu,
@@ -51,8 +52,8 @@ export function evaluateCommand(command: string, args: readonly string[] = []): 
     if (/\bgit\b[\s\S]*\b(?:push|merge|send-pack|receive-pack|update-ref)\b|\bgit-(?:send|receive|upload)-pack\b|\b(?:gh|glab|hub)\b[\s\S]*\b(?:api|pr|mr|pull-request|release)\b|\b(?:curl|wget)\b[\s\S]*(?:github|gitlab|bitbucket|registry\.npmjs)\b/iu.test(normalized)) {
       return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
     }
-    if (/\bgit\b[\s\S]*\b(?:checkout|switch)\b[\s-]+(?:main|master|trunk|integration|develop)\b/iu.test(normalized)) {
-      return { decision: "deny", reason: "Worker cannot switch to a protected integration branch" };
+    if (/\bgit\b[\s\S]*\b(?:checkout|switch|branch|reset|restore|worktree|update-ref|symbolic-ref)\b[\s\S]*\b(?:main|master|trunk|integration|develop)\b/iu.test(normalized)) {
+      return { decision: "deny", reason: "Worker cannot switch to or mutate a protected integration branch" };
     }
     if (/\b(?:npm|pnpm|yarn)\b[\s\S]*\bpublish\b/iu.test(normalized)) {
       return { decision: "deny", reason: "package publication belongs to the protected release workflow" };
