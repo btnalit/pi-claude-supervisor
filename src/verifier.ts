@@ -66,6 +66,23 @@ export async function repositoryHead(cwd: string, signal?: AbortSignal): Promise
   }
 }
 
+/** Verify that a full commit object is still present without invoking a shell. */
+export async function repositoryCommitExists(cwd: string, commit: string, signal?: AbortSignal): Promise<boolean> {
+  if (!/^[0-9a-f]{40,64}$/iu.test(commit)) return false;
+  try {
+    const result = await execFileAsync("git", ["cat-file", "-e", `${commit}^{commit}`], {
+      cwd,
+      timeout: 30_000,
+      maxBuffer: 1024,
+      signal,
+      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
+    });
+    return result.stderr.length === 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Determine whether cwd is a non-bare Git worktree without invoking a shell. */
 export async function repositoryWorkTree(cwd: string, signal?: AbortSignal): Promise<boolean | undefined> {
   try {

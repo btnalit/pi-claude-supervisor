@@ -4,11 +4,11 @@ import { EventLog, type SupervisorEvent } from "./events.ts";
 import { SupervisorStateMachine } from "./state.ts";
 import { evaluatePermission } from "./policy.ts";
 import { PiDecisionWorker, type DecisionAction, type DecisionWorkerFactory, type DecisionWorkerLike } from "./decision-worker.ts";
-import { collectRepositoryEvidence, repositoryBranch, repositoryHead, repositoryWorkTree, verifyAll, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
+import { collectRepositoryEvidence, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryWorkTree, verifyAll, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { redactSensitive } from "./redaction.ts";
 import { automaticClaudeArgs, automaticWorkerEnvironment } from "./worker/environment.ts";
-import type { ReviewInput, TaskReviewer } from "./reviewer.ts";
+import { normalizeReviewReport, type ReviewInput, type TaskReviewer } from "./reviewer.ts";
 import type {
   AcceptanceReport,
   ReviewReport,
@@ -235,25 +235,16 @@ export class Supervisor {
     this.#startAbortError = undefined;
     try {
       if (this.#automation && !this.#reviewer) throw new Error("automatic supervision requires an independent Reviewer");
-      let discoveredBase = options.baseCommit;
-      if (discoveredBase && !/^[0-9a-f]{40,64}$/iu.test(discoveredBase)) {
+      const recovering = Boolean(options.taskId && options.startedAt);
+      if (options.baseCommit && !/^[0-9a-f]{40,64}$/iu.test(options.baseCommit)) {
         throw new Error("automatic supervision requires a full hexadecimal git baseline");
       }
       if (this.#automation) {
-        discoveredBase ??= await repositoryHead(options.cwd, startAbortController.signal);
+        if (recovering && !options.baseCommit) throw new Error("automatic recovery requires a persisted git baseline");
+        const boundary = await automaticRepositoryBoundary(options.cwd, options.baseCommit, options.baseBranch, startAbortController.signal);
         this.#assertStartNotAborted(startAbortController.signal);
-        if (discoveredBase) this.#task.baseCommit = discoveredBase;
-        if (spec.autonomy.requireLocalCommit && options.sendInitialInput !== false && !discoveredBase) {
-          throw new Error("automatic local candidates require a git baseline before Worker startup");
-        }
-        const [workTree, branch] = await Promise.all([
-          repositoryWorkTree(options.cwd, startAbortController.signal),
-          repositoryBranch(options.cwd, startAbortController.signal),
-        ]);
-        this.#assertStartNotAborted(startAbortController.signal);
-        if (workTree === true && !branch) throw new Error("automatic local candidates cannot start from a detached or unreadable git HEAD");
-        if (branch && isProtectedBranch(branch)) throw new Error("automatic local candidates cannot start on a protected integration branch");
-        if (!this.#task.baseBranch && branch) this.#task.baseBranch = branch;
+        this.#task.baseCommit = boundary.baseCommit;
+        this.#task.baseBranch = boundary.branch;
       }
       await this.#appendEvent({
         type: "task_started",
@@ -311,7 +302,10 @@ export class Supervisor {
         });
         await this.#decision.start();
       }
-      this.#assertStartNotAborted(startAbortController.signal);
+      if (this.#automation) {
+        await automaticRepositoryBoundary(options.cwd, this.#task.baseCommit, this.#task.baseBranch, startAbortController.signal);
+        this.#assertStartNotAborted(startAbortController.signal);
+      }
       const input: WorkerStartInput = {
         task: options.initialInput ?? spec.goal,
         cwd: options.cwd,
@@ -922,6 +916,12 @@ export class Supervisor {
         await this.#parkCandidate(`local repository evidence could not be collected: ${safeMessage(error)}`);
         return result;
       }
+      if (this.#automation && (this.#task.baseCommit || this.#task.spec.autonomy.requireLocalCommit)
+        && (repositoryEvidence.complete === false || repositoryEvidence.truncated === true)) {
+        this.#lastVerification = result;
+        await this.#parkCandidate("repository evidence is incomplete or truncated; candidate cannot be published");
+        return result;
+      }
       if (this.#automation && this.#task.baseCommit && (!repositoryEvidence.branch || isProtectedBranch(repositoryEvidence.branch))) {
         this.#lastVerification = result;
         await this.#parkCandidate(`local candidate branch is unavailable or protected: ${repositoryEvidence.branch ?? "(detached)"}`);
@@ -943,10 +943,10 @@ export class Supervisor {
     if (this.#reviewer) {
       await this.#appendEvent({ type: "review_started", taskId: this.#task.taskId, workerId: this.#handle?.id, data: { round: this.#repairRound } });
       this.#reportProgress("review", "collecting repository evidence and running independent Reviewer", true);
-      let review;
+      let review: ReviewReport;
       try {
         const evidence = repositoryEvidence ?? redactRepositoryEvidence(await collectRepositoryEvidence(this.#task.cwd, { signal: verificationAbortController.signal, baseRef: this.#task.baseCommit }));
-        review = await withTimeout(this.#reviewer.review({
+        const rawReview = await withTimeout(this.#reviewer.review({
           taskId: this.#task.taskId,
           cwd: this.#task.cwd,
           spec: this.#task.spec,
@@ -957,6 +957,7 @@ export class Supervisor {
           round: this.#repairRound,
           signal: verificationAbortController.signal,
         } satisfies ReviewInput), REVIEW_TIMEOUT_MS, "independent Reviewer", verificationAbortController.signal);
+        review = normalizeReviewReport(rawReview, this.#repairRound);
       } catch (error) {
         if (error instanceof Error && error.name === "TimeoutError") verificationAbortController.abort(error.message);
         review = { verdict: "human" as const, summary: `independent Reviewer failed: ${safeMessage(error)}`, findings: [], round: this.#repairRound, checkedAt: new Date().toISOString() };
@@ -1275,6 +1276,36 @@ export class Supervisor {
       }
     });
   }
+}
+
+async function automaticRepositoryBoundary(
+  cwd: string,
+  expectedBaseCommit: string | undefined,
+  expectedBranch: string | undefined,
+  signal?: AbortSignal,
+): Promise<{ baseCommit: string; branch: string }> {
+  if (signal?.aborted) throw new Error("automatic repository boundary check aborted");
+  const baseCommit = expectedBaseCommit ?? await repositoryHead(cwd, signal);
+  if (signal?.aborted) throw new Error("automatic repository boundary check aborted");
+  if (!baseCommit || !/^[0-9a-f]{40,64}$/iu.test(baseCommit)) {
+    throw new Error("automatic supervision requires a verified git baseline before Worker startup");
+  }
+  if (!await repositoryCommitExists(cwd, baseCommit, signal)) {
+    if (signal?.aborted) throw new Error("automatic repository boundary check aborted");
+    throw new Error("automatic supervision baseline is not an existing git commit");
+  }
+  const [workTree, branch] = await Promise.all([
+    repositoryWorkTree(cwd, signal),
+    repositoryBranch(cwd, signal),
+  ]);
+  if (signal?.aborted) throw new Error("automatic repository boundary check aborted");
+  if (workTree !== true) throw new Error("automatic supervision requires a verified non-bare git worktree");
+  if (!branch) throw new Error("automatic supervision cannot start from a detached, unreadable, or missing git branch");
+  if (isProtectedBranch(branch)) throw new Error("automatic local candidates cannot start on a protected integration branch");
+  if (expectedBranch && branch !== expectedBranch) {
+    throw new Error(`automatic recovery branch changed from ${expectedBranch} to ${branch}`);
+  }
+  return { baseCommit, branch };
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string, signal?: AbortSignal): Promise<T> {

@@ -1,10 +1,18 @@
 # Implementation Review
 
 An independent read-only reviewer examined the implementation before the final
-hardening pass. The review found no blocker in the TypeScript/Pi registration
-surface. The MVP intentionally does not provide OS sandboxing, low-privilege
-execution, or network isolation; those are deferred security-hardening items,
-not blockers for the lifecycle and recovery track.
+hardening pass. The review found release blockers in automatic startup validation,
+shell-policy lexical handling, malformed custom Reviewer results, credential
+filtering, and stale security documentation. Those findings are addressed by the
+current implementation and regression tests.
+
+Automatic mode is fail-closed at its supported Worker boundary: it requires a
+validated non-bare Git worktree, an existing full baseline commit, a non-protected
+branch, the Claude JSONL transport, and a direct `claude`/`claude.exe` executable.
+The built-in Claude path requests Claude Code's fail-closed Bash sandbox with no
+outbound domains. Arbitrary custom executables are not admitted to automatic mode;
+manual/custom integrations remain responsible for their own host sandbox and
+network boundary.
 
 ## Findings addressed in this pass
 
@@ -24,12 +32,12 @@ not blockers for the lifecycle and recovery track.
 
 ## Residual risks and follow-up hardening
 
-These are verified limitations and follow-up work, not reasons to stop the
-lifecycle track:
+These are verified limitations and follow-up work after the automatic boundary
+hardening:
 
-- OS sandbox, lower-privilege execution, and network allowlisting are not
-  provided by the adapter. The caller may run with explicitly authorized host
-  permissions; the deployment owner accepts responsibility for that boundary.
+- The Claude Code sandbox is a requested runtime boundary and is fail-closed when
+  unavailable; it is not a substitute for a host-level sandbox, lower-privilege
+  account, or container policy for manual integrations.
 - Event contents can contain worker output or user messages; common credential
   patterns are now redacted and sequence recovery is persisted, but broader
   structured-secret coverage remains follow-up work.
@@ -40,9 +48,9 @@ lifecycle track:
 - Fault injection coverage now includes lifecycle-log failure, SIGTERM refusal,
   blocked stdin and managed orphan descendants; shutdown cleanup under injected
   adapter failure remains a follow-up failure-injection case.
-- The default transport is process-pipe. Claude JSONL framing is opt-in; the
-  next priority is signal, shutdown and descendant-cleanup evidence rather than
-  network or low-privilege isolation.
+- The default manual transport is process-pipe. Claude JSONL is mandatory for
+  automatic mode; the remaining transport work concerns signal, shutdown and
+  descendant-cleanup evidence rather than weakening the automatic boundary.
 
 ## Evidence
 

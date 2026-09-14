@@ -191,10 +191,12 @@ is alive; the extension periodically rechecks released sessions and removes the
 lease only after the pane is confirmed gone. If that check fails, the lease is
 retained rather than allowing a cwd overlap.
 
-Before model or Worker execution, automatic starts preflight the validated cwd,
-worker executable, transport dependencies, runtime state/lease directories and,
-when requested, the real writable cgroup-v2 boundary. A failed preflight is
-fail-closed and does not start Claude. Long acceptance commands and Reviewer
+Before model or Worker execution, automatic starts validate a full existing Git
+baseline, a non-bare worktree, a readable non-protected branch, the direct
+`claude`/`claude.exe` executable, JSONL transport, runtime state/lease directories
+and, when requested, the real writable cgroup-v2 boundary. The repository boundary
+is checked again immediately before the Worker adapter starts. A failed preflight
+is fail-closed and does not start Claude. Long acceptance commands and Reviewer
 sessions share an abort signal with the Supervisor, so operator stop/shutdown
 wins without waiting for a full check timeout. Progress hooks expose starting,
 Worker heartbeat, acceptance, review, repair and candidate/decision phases in the Pi UI.
@@ -288,9 +290,10 @@ limit, so a normal large test report is not misclassified as a failed command.
 - bypassing the configured Claude Code/task permissions;
 - accepting model text as verification;
 - shell command interpolation;
-- a host-level network sandbox for arbitrary custom Worker integrations. Built-in automatic
-  Claude workers request a fail-closed Claude Code Bash sandbox with no outbound domains;
-  command policy and credential filtering remain defense in depth;
+- a host-level network sandbox for manual integrations. Automatic mode does not admit
+  arbitrary custom executables: its supported Worker is direct Claude, which requests a
+  fail-closed Claude Code Bash sandbox with no outbound domains; command policy and
+  credential filtering remain defense in depth;
 - Claude CLI multi-version compatibility in the current stability milestone;
 - full OS sandbox and low-privilege execution for custom Worker integrations in the current
   lifecycle milestone.

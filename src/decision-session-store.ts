@@ -356,6 +356,8 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     || (value.recoveryOwnerStartTime !== undefined && (typeof value.recoveryOwnerStartTime !== "string" || !/^\d+$/u.test(value.recoveryOwnerStartTime)))
     || (value.recoveryState !== undefined && !isRecoveryState(value.recoveryState))
     || (value.lastFindingSignature !== undefined && (typeof value.lastFindingSignature !== "string" || value.lastFindingSignature.length > 128))
+    || (value.baseCommit !== undefined && (typeof value.baseCommit !== "string" || !/^[0-9a-f]{40,64}$/iu.test(value.baseCommit)))
+    || (value.baseBranch !== undefined && (typeof value.baseBranch !== "string" || !/^[A-Za-z0-9._/-]+$/u.test(value.baseBranch)))
     || (value.startedAt !== undefined && (typeof value.startedAt !== "string" || !Number.isFinite(Date.parse(value.startedAt))))
     || (value.recoveryWorker !== undefined && !isRecoveryWorker(value.recoveryWorker))) {
     throw new Error("invalid Decision Worker session record");
@@ -383,6 +385,8 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     deadlineMs: value.deadlineMs ?? 4 * 60 * 60_000,
     noOutputTimeoutMs: value.noOutputTimeoutMs ?? 20 * 60_000,
     startedAt: value.startedAt ?? value.updatedAt,
+    ...(typeof value.baseCommit === "string" ? { baseCommit: value.baseCommit } : {}),
+    ...(typeof value.baseBranch === "string" ? { baseBranch: value.baseBranch } : {}),
     turn: value.turn ?? 0,
     repairRound: value.repairRound ?? 0,
     ...(typeof value.lastFindingSignature === "string" ? { lastFindingSignature: value.lastFindingSignature } : {}),

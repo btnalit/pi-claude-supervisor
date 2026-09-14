@@ -56,6 +56,16 @@ test("index recovers an idle Decision Worker without replaying the original task
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-state-"));
   const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-leases-"));
   const taskId = "22222222-2222-4222-8222-222222222222";
+  const fakeClaude = join(cwd, "claude");
+  await copyFile(process.execPath, fakeClaude);
+  assert.equal(spawnSync("git", ["init", "-q"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["config", "user.email", "test@example.invalid"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["config", "user.name", "Test"], { cwd, stdio: "ignore" }).status, 0);
+  await writeFile(join(cwd, "base.txt"), "base\n");
+  assert.equal(spawnSync("git", ["add", "base.txt"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["commit", "-qm", "base"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["switch", "-c", "worker/recovery"], { cwd, stdio: "ignore" }).status, 0);
+  const baseCommit = spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).stdout.trim();
   const marker = join(stateDir, "received-input.jsonl");
   const decisionStore = new DecisionSessionStore(join(stateDir, "decision-sessions"));
   const decisionSessionDirectory = decisionStore.sessionDirectory(taskId);
@@ -67,13 +77,15 @@ test("index recovers an idle Decision Worker without replaying the original task
     taskId,
     task: "original task must not be replayed",
     cwd,
-    command: process.execPath,
+    command: fakeClaude,
     args: ["-e", fakeWorker, marker],
     decisionSessionFile,
     maxTurns: 2,
     deadlineMs: 60_000,
     noOutputTimeoutMs: 60_000,
     startedAt: new Date().toISOString(),
+    baseCommit,
+    baseBranch: "worker/recovery",
     turn: 0,
     state: "active",
   });
@@ -106,6 +118,8 @@ test("index recovers an idle Decision Worker without replaying the original task
     const recovered = await decisionStore.load(taskId);
     assert.equal(recovered?.state, "active");
     assert.equal(recovered?.recoveryState, "recovered_idle");
+    assert.equal(recovered?.baseCommit, baseCommit);
+    assert.equal(recovered?.baseBranch, "worker/recovery");
     assert.ok(recovered?.recoveryWorker?.id);
     await new Promise((resolve) => setTimeout(resolve, 100));
     await assert.rejects(() => readFile(marker, "utf8"), /ENOENT/u);

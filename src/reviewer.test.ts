@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseReview } from "./reviewer.ts";
+import { normalizeReviewReport, parseReview } from "./reviewer.ts";
 
 test("Reviewer parser accepts bounded structured findings", () => {
   const report = parseReview(JSON.stringify({
@@ -11,6 +11,17 @@ test("Reviewer parser accepts bounded structured findings", () => {
   assert.equal(report.verdict, "revise");
   assert.equal(report.round, 1);
   assert.equal(report.findings[0]?.severity, "P2");
+});
+
+test("malformed custom Reviewer values are normalized to a blocking report", () => {
+  const circular: Record<string, unknown> = {};
+  circular.self = circular;
+  for (const value of [undefined, null, "not an object", circular]) {
+    const report = normalizeReviewReport(value, 3);
+    assert.equal(report.verdict, "human");
+    assert.equal(report.round, 3);
+    assert.equal(report.findings[0]?.severity, "P1");
+  }
 });
 
 test("invalid Reviewer output escalates to human", () => {

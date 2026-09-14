@@ -20,7 +20,7 @@
 - `pi-interactive-shell` 如果通过版本、API、许可证和故障测试，应优先复用其 PTY 和人工接管实现。
 - `pi-claude-code`、`pi-harness-delegate` 在完成供应链、API 和故障语义审计前，不作为核心依赖。
 
-**结论：架构方向 GO；先完成固定版本 Spike、生命周期和故障恢复主线。低权限用户、sandbox 与网络隔离属于后续安全加固，不作为当前主线硬阻塞。另经产品确认，本地开发必须完全无人值守；远程 push 和 main/integration merge 是 Worker 不具备权限的独立边界。详见 [autonomy-target.md](autonomy-target.md)。**
+**结论：架构方向 GO；先完成固定版本 Spike、生命周期和故障恢复主线。当前自动模式已把直接 Claude 的 fail-closed sandbox、无出站域名、JSONL transport、Git baseline 和分支校验作为启动边界，并拒绝任意自定义可执行文件；手动集成的 host-level 低权限和网络隔离仍是后续加固。另经产品确认，本地开发必须完全无人值守；远程 push 和 main/integration merge 是 Worker 不具备权限的独立边界。详见 [autonomy-target.md](autonomy-target.md)。**
 
 ## 2. 外部参考源审查结果
 
@@ -237,17 +237,18 @@ MVP 必须满足：
 
 - 依赖 lockfile 和 SBOM；
 - 包来源校验；
-- 可选最小权限和 sandbox；
-- 可选网络白名单；
-- 密钥隔离；
+- 手动/自定义集成的最小权限和 host-level sandbox；
+- 手动/自定义集成的网络白名单；自动 Claude 路径已请求无出站域名并在不可用时失败；
+- 更广泛的密钥隔离；
 - 日志脱敏；
 - 成本和时间告警；
 - 灰度 feature flag；
 - 可随时关闭自动化；
 - 故障回滚、候选挂起和可选通知。
 
-其中低权限用户、sandbox 和网络白名单不阻塞当前生命周期验证；本地运行权限由
-任务和调用方授权策略控制，远程 push/main merge 仍由独立边界控制。
+其中手动/自定义集成的 host-level 低权限、sandbox 和网络白名单不阻塞当前生命周期验证；
+自动模式不接受没有 Claude sandbox 边界的自定义 Worker。本地运行权限由任务和调用方授权策略
+控制，远程 push/main merge 仍由独立边界控制。
 
 ### 5.4 建议 Go / No-Go 门槛
 

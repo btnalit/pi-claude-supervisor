@@ -25,10 +25,10 @@
 
 - 不会在扩展加载时自动启动 Worker。
 - 不经过 shell 启动子进程。
-- Worker 只继承最小环境；自动模式会过滤远程凭据并禁用 Git/包管理器 credential helper，手动集成的凭据必须由调用方显式传入。
+- Worker 只继承最小环境；自动模式采用默认拒绝的环境变量 allowlist，过滤远程凭据并禁用 Git/包管理器 credential helper。自动模式只能选择文档列出的 Claude provider 变量；任意自定义变量仅限手动集成。
 - 本地命令和权限行为按任务/运行时授权策略处理；超出授权的动作自动拒绝或挂起，不要求同步人工响应。
 - Linux 上优先使用可写的 cgroup v2 清理后代进程，包括 `setsid()` 后代；不可用时回退到进程组清理。需要强制失败闭环时，embedding 集成可使用 `cgroupMode: "required"`，并会在 Claude 启动前执行 preflight。
-- 内置自动 Claude Worker 会请求 fail-closed 的 Claude Code Bash sandbox，禁止 Bash 子进程出站联网；命令策略仍是第二道门。手动/自定义集成必须自行提供等效网络边界。
+- 自动模式只接受直接的 `claude`/`claude.exe` Worker，并请求 fail-closed 的 Claude Code Bash sandbox，禁止 Bash 子进程出站联网；命令策略仍是第二道门。手动/自定义集成必须自行提供等效 host/network 边界。
 - Worker 声称完成只会进入 `verifying`，不能作为成功证据。
 - 默认独立验收命令为 `git diff --check`。
 - 目标是任务启动后本地开发无人值守：Worker 可以修改、测试、修复和本地提交；Worker 必须没有远程 push 或合并到 `main`/integration 分支的权限。
@@ -116,7 +116,7 @@ Claude CLI `2.1.270` 运行，跨版本兼容性不在本轮范围内。
 重新启动 Claude Worker，不会静默恢复或重复执行任务。旧 Pi 进程已退出且租约确认旧 Worker
 进程组已消失且 cgroup 仍是真实、可读取的空边界时，才可显式添加 `--takeover`；缺失、仍存活或无法确认的 Worker 会被拒绝。持久 tmux
 Worker 应使用 `adopt-tmux`，而不是 takeover。
-自动模式下，Decision Worker 在任务授权范围内自动处理普通问题、测试失败和修复轮次，记录假设和证据；无法形成可交付候选时自动挂起并保留证据，而不是要求人工必须在线。可通过 `PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=0` 或 task `autonomy.requireLocalCommit` 关闭本地 commit 要求；远程 push 和 main/integration merge 仍由独立边界控制。
+自动模式下，Decision Worker 在任务授权范围内自动处理普通问题、测试失败和修复轮次，记录假设和证据；无法形成可交付候选时自动挂起并保留证据，而不是要求人工必须在线。可通过 `PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=0` 或 task `autonomy.requireLocalCommit` 关闭本地 commit 要求，但自动模式仍要求有效 Git baseline 和非保护 worktree；远程 push 和 main/integration merge 仍由独立边界控制。
 
 `v0.5.0` 已完成并发布“多命令验收—独立只读 Reviewer—结构化修复轮次—再次验收”闭环。
 任务可通过 API 或 JSON spec 提供 `goal`、`scope`、`constraints`、`forbidden`、多个
@@ -126,7 +126,7 @@ Worker 启动前捕获 git baseline，要求完整的 baseline-relative tracked/
 并在默认情况下要求 Worker 在非保护分支本地 commit；无效输出、证据不完整、重复 finding、P0/P1 或预算耗尽
 会自动挂起候选。自动模式拒绝 process-pipe 和 tmux，并在模型执行前检查目录、可执行文件、依赖
 和 cgroup；Worker 环境会过滤远程仓库凭据并禁用 Git 全局凭据 helper。详见 [自动化目标](docs/autonomy-target.md)。协同多 Worker 属于后续独立开发阶段，
-内置自动 Claude Worker 会请求 fail-closed 的 Claude Code Bash sandbox；自定义 Worker 的完整 host-level sandbox 仍是后续安全加固。
+自动模式只接受直接 Claude 可执行文件，并请求 fail-closed 的 Claude Code Bash sandbox；任意自定义可执行文件会在自动模式拒绝。手动/自定义 Worker 的完整 host-level sandbox 仍需由集成方提供。
 
 ### tmux/PTY 交互模式
 

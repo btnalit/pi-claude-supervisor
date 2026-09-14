@@ -7,7 +7,7 @@ import { readFile, realpath } from "node:fs/promises";
 import { EventLog } from "./events.ts";
 import { redactSensitive } from "./redaction.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
-import { automaticWorkerEnvironment, isRemoteCredentialName } from "./worker/environment.ts";
+import { automaticWorkerEnvironment } from "./worker/environment.ts";
 import { TmuxWorkerAdapter, attachCommand } from "./worker/tmux-adapter.ts";
 import { Supervisor, type DecisionSessionClosedInfo, type SupervisorProgress } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
@@ -766,7 +766,6 @@ function selectedWorkerEnvironment(automatic = false): NodeJS.ProcessEnv {
     .map((name) => name.trim())
     .filter(Boolean);
   for (const name of names) {
-    if (automatic && isRemoteCredentialName(name)) continue;
     if (process.env[name] !== undefined) result[name] = process.env[name];
   }
   return automatic ? automaticWorkerEnvironment(result) : result;

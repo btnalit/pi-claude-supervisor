@@ -121,7 +121,8 @@ JSONL and routes `result`, permission, and process-exit events to the persistent
 Pi Decision Worker. Task autonomy defaults to unattended local work, a required
 local commit on a non-protected task branch and two bounded Decision Worker retries. Configure
 `PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=0` or task `autonomy.requireLocalCommit`
-only for an intentional non-git candidate. An explicit `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux` selection
+only to disable the local-commit deliverability check; automatic mode still requires a Git
+baseline and non-protected worktree. An explicit `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux` selection
 remains screen-based and does not use the JSONL permission protocol. `process-pipe` remains the manual compatibility mode. Candidate/failure notification is optional and outbound-only through
 `PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL`; it is not a synchronous approval
 callback. Approval callbacks are deliberately not accepted without a separately
@@ -131,8 +132,11 @@ The tmux transport is selected with `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`.
 Automatic mode rejects explicit `process-pipe` and `tmux` transports; use JSONL for
 bounded decisions and repair. Built-in Claude workers also receive a fail-closed
 sandbox setting (`failIfUnavailable`, `allowUnsandboxedCommands=false`, no outbound
-network domains); verify that startup fails if the sandbox cannot be initialized. Before
-release, verify: private-socket attach, multi-line paste, prompt stability while
+network domains); verify that startup fails if the sandbox cannot be initialized.
+Automatic startup also requires a full existing Git baseline, non-bare non-protected
+worktree and a direct `claude`/`claude.exe` executable; arbitrary custom executables
+are rejected in automatic mode. Before release, verify: private-socket attach,
+multi-line paste, prompt stability while
 Claude is busy, trust/permission policy handling, duplicate send prevention, pane
 replacement refusal, pause/resume, owned-session stop, adopted-session
 detach/re-adoption, bounded shutdown, and Pi shutdown without closing an

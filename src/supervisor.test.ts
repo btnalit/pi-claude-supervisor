@@ -47,6 +47,26 @@ class SelectiveFailingEventLog {
   }
 }
 
+async function initializeGitRepository(cwd: string, branch = "worker/test"): Promise<string> {
+  await execFileAsync("git", ["init", "-q"], { cwd });
+  await execFileAsync("git", ["config", "user.email", "test@example.invalid"], { cwd });
+  await execFileAsync("git", ["config", "user.name", "Test"], { cwd });
+  await writeFile(join(cwd, "base.txt"), "base\n");
+  await execFileAsync("git", ["add", "base.txt"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "base"], { cwd });
+  await execFileAsync("git", ["switch", "-c", branch], { cwd });
+  const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  return stdout.trim();
+}
+
+function automaticSpec() {
+  return { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1 } };
+}
+
+function automaticReviewer() {
+  return { review: async () => ({ verdict: "pass" as const, summary: "unused", findings: [], round: 0, checkedAt: new Date().toISOString() }) };
+}
+
 test("supervisor rejects spawn failure before reporting a worker start", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-spawn-error-"));
   const supervisor = new Supervisor(new ProcessWorkerAdapter());
@@ -82,14 +102,95 @@ test("automatic supervision rejects tmux before Worker startup", async () => {
   });
   await assert.rejects(() => supervisor.start({
     task: "tmux is manual",
-    cwd: "/tmp",
-    command: process.execPath,
+    cwd: process.cwd(),
+    command: "claude",
     args: ["-e", "setInterval(() => {}, 1000)"],
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
     spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 } },
   }), /tmux is manual-only/u);
+});
+
+test("automatic supervision rejects a non-Git cwd before Worker startup", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-non-git-start-"));
+  try {
+    const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
+    const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
+    await assert.rejects(() => supervisor.start({
+      task: "non-Git cwd",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: automaticSpec(),
+    }), /verified git baseline/u);
+    assert.equal(supervisor.handle, undefined);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("automatic supervision rejects a detached or bare repository", async () => {
+  const detachedCwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-detached-start-"));
+  const bareCwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-bare-start-"));
+  try {
+    const detachedBase = await initializeGitRepository(detachedCwd, "worker/detached");
+    await execFileAsync("git", ["checkout", "--detach", detachedBase], { cwd: detachedCwd });
+    const detached = new Supervisor(new ProcessWorkerAdapter({ mode: "claude-jsonl" }), undefined, { reviewer: automaticReviewer() });
+    await assert.rejects(() => detached.start({ task: "detached", cwd: detachedCwd, command: "claude", automation: true, deadlineMs: 0, noOutputTimeoutMs: 0, spec: automaticSpec() }), /detached, unreadable, or missing git branch/u);
+
+    const bareBase = await initializeGitRepository(bareCwd, "worker/bare");
+    await execFileAsync("git", ["config", "core.bare", "true"], { cwd: bareCwd });
+    const bare = new Supervisor(new ProcessWorkerAdapter({ mode: "claude-jsonl" }), undefined, { reviewer: automaticReviewer() });
+    await assert.rejects(() => bare.start({ task: "bare", cwd: bareCwd, command: "claude", automation: true, baseCommit: bareBase, baseBranch: "worker/bare", deadlineMs: 0, noOutputTimeoutMs: 0, spec: automaticSpec() }), /non-bare git worktree/u);
+  } finally {
+    await rm(detachedCwd, { recursive: true, force: true });
+    await rm(bareCwd, { recursive: true, force: true });
+  }
+});
+
+test("automatic supervision rejects a non-Claude executable after repository validation", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-custom-worker-start-"));
+  try {
+    await initializeGitRepository(cwd, "worker/custom-worker");
+    const supervisor = new Supervisor(new ProcessWorkerAdapter({ mode: "claude-jsonl" }), undefined, { reviewer: automaticReviewer() });
+    await assert.rejects(() => supervisor.start({
+      task: "custom automatic worker",
+      cwd,
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: automaticSpec(),
+    }), /direct Claude executable/u);
+    assert.equal(supervisor.handle, undefined);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("automatic supervision rejects a supplied baseline that is not an existing commit", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-missing-baseline-"));
+  try {
+    await initializeGitRepository(cwd, "worker/missing-baseline");
+    const supervisor = new Supervisor(new ProcessWorkerAdapter({ mode: "claude-jsonl" }), undefined, { reviewer: automaticReviewer() });
+    await assert.rejects(() => supervisor.start({
+      task: "missing baseline",
+      cwd,
+      command: "claude",
+      baseCommit: "0".repeat(40),
+      baseBranch: "worker/missing-baseline",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: automaticSpec(),
+    }), /not an existing git commit/u);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
 
 test("protected branches are rejected even when local commits are optional", async () => {
@@ -629,8 +730,8 @@ test("non-persistent verification failure finalizes once and closes the decision
   });
   await supervisor.start({
     task: "non-persistent repair failure",
-    cwd: "/tmp",
-    command: "fixture",
+    cwd: process.cwd(),
+    command: "claude",
     automation: true,
     spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "fail", name: "fail", command: process.execPath, args: ["-e", "process.exit(7)"], required: true, timeoutMs: 1_000 }] },
     decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => { decisionClosed += 1; } }),
@@ -759,8 +860,8 @@ test("automatic acceptance review requests a bounded repair before completing", 
   });
   await supervisor.start({
     task: "reviewed fixture",
-    cwd: "/tmp",
-    command: "fixture",
+    cwd: process.cwd(),
+    command: "claude",
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
@@ -819,7 +920,7 @@ test("automatic candidates require and review a local commit", async () => {
     await supervisor.start({
       task: "commit the candidate locally",
       cwd,
-      command: "fixture",
+      command: "claude",
       automation: true,
       deadlineMs: 0,
       noOutputTimeoutMs: 0,
@@ -865,8 +966,8 @@ test("repeated Reviewer findings escalate instead of looping forever", async () 
   });
   await supervisor.start({
     task: "duplicate finding fixture",
-    cwd: "/tmp",
-    command: "fixture",
+    cwd: process.cwd(),
+    command: "claude",
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
@@ -921,8 +1022,8 @@ test("repair-round exhaustion parks the candidate after the final automatic repa
   });
   await supervisor.start({
     task: "exhaust automatic repairs",
-    cwd: "/tmp",
-    command: "fixture",
+    cwd: process.cwd(),
+    command: "claude",
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
@@ -967,8 +1068,8 @@ test("P0 and P1 Reviewer findings never enter automatic repair", async () => {
   });
   await supervisor.start({
     task: "blocking finding fixture",
-    cwd: "/tmp",
-    command: "fixture",
+    cwd: process.cwd(),
+    command: "claude",
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
@@ -1001,6 +1102,28 @@ test("Reviewer API failure parks a candidate without human review", async () => 
   assert.equal(supervisor.humanRequired, false);
   assert.equal(supervisor.candidateParked, true);
   assert.equal(supervisor.state, "blocked");
+});
+
+test("malformed custom Reviewer output parks and cleans up the Worker", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-reviewer-malformed-"));
+  const supervisor = new Supervisor(new ProcessWorkerAdapter({ cgroupMode: "off" }), undefined, {
+    reviewer: { review: async () => ({ verdict: "pass" } as never) },
+  });
+  try {
+    await supervisor.start({ task: "malformed reviewer fixture", cwd, command: process.execPath, args: ["-e", "console.log('worker complete')"] });
+    let polled = await supervisor.poll();
+    for (let attempt = 0; polled.status.running && attempt < 40; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      polled = await supervisor.poll();
+    }
+    const result = await supervisor.verify({ command: process.execPath, args: ["-e", "process.exit(0)"] });
+    assert.equal(result.review?.verdict, "human");
+    assert.equal(supervisor.candidateParked, true);
+    assert.equal(supervisor.state, "blocked");
+    assert.equal((await supervisor.poll()).status.running, false);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
 
 test("supervisor requires independent verification after worker exit", async () => {

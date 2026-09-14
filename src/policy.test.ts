@@ -19,6 +19,13 @@ test("policy hard-denies publication and remote/integration writes", () => {
   assert.equal(evaluateCommand("git checkout -B main").decision, "deny");
   assert.equal(evaluateCommand("git branch -f main").decision, "deny");
   assert.equal(evaluateCommand("git \"$ACTION\" \"$BRANCH\"").decision, "deny");
+  assert.equal(evaluateCommand("g''it switch main").decision, "deny");
+  assert.equal(evaluateCommand("git \\\npush origin main").decision, "deny");
+  assert.equal(evaluateCommand("echo ref > .git/refs/heads/main").decision, "deny");
+  assert.equal(evaluateCommand("echo ref > refs/heads/main").decision, "deny");
+  assert.equal(evaluateCommand("echo ref > .git/refs/heads/$BRANCH").decision, "deny");
+  assert.equal(evaluateCommand("bash --noprofile -c 'git push'").decision, "deny");
+  assert.equal(evaluateCommand("python -c \"subprocess.run(['git','push'])\"").decision, "deny");
 });
 
 test("policy does not create a synchronous human gate for local development", () => {
@@ -33,6 +40,8 @@ test("policy allows ordinary read-only commands", () => {
 test("policy denies unsafe worker permission flags even when passed as arguments", () => {
   assert.equal(evaluateCommand("claude", ["--dangerously-skip-permissions"]).decision, "deny");
   assert.equal(evaluateCommand("claude", ["--allow-dangerously-skip-permissions"]).decision, "deny");
+  assert.equal(evaluateCommand("claude", ["--permission-mode=bypassPermissions"]).decision, "deny");
+  assert.equal(evaluateCommand("claude", ["--permission-mode=bypass-permissions"]).decision, "deny");
 });
 
 test("remote and destructive commands remain denied even with a legacy approval", () => {

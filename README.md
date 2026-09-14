@@ -30,9 +30,9 @@ worker remains an explicitly started child process.
 
 - The extension never starts a worker automatically.
 - Worker commands are launched without a shell.
-- Workers receive a minimal environment; automatic mode strips remote credentials and disables Git/package credential helpers. Credentials must be explicitly supplied by the caller in manual integrations.
+- Workers receive a minimal environment; automatic mode uses a deny-by-default variable allowlist, strips remote credentials and disables Git/package credential helpers. Only documented Claude provider variables may be selected for automatic mode; arbitrary custom variables remain manual-only.
 - Local command and permission behavior follows the configured task/runtime policy; actions outside that authority are rejected or parked without requiring a synchronous human response.
-- Built-in automatic Claude workers request a fail-closed Claude Code Bash sandbox with no outbound domains; command policy remains a second guard. Manual/custom integrations must provide their own equivalent network boundary.
+- Automatic mode admits only a direct `claude`/`claude.exe` Worker and requests a fail-closed Claude Code Bash sandbox with no outbound domains; command policy remains a second guard. Manual/custom integrations must provide their own equivalent host/network boundary.
 - A worker completion is only a transition to `verifying`; it is not evidence of success.
 - Verification is an independent host command (default: `git diff --check`).
 - Target local development runs unattended after a task starts: the Worker may edit, test, repair and commit locally. The Worker must have no authority or credentials to push remotely or merge into `main`/an integration branch.
@@ -124,10 +124,12 @@ scheduling, structured handoffs, aggregate acceptance and graph-aware recovery;
 it will not grant any Worker remote push or main/integration merge authority.
 Unattended local development is the target operating mode; a blocked or failed
 candidate is parked with its evidence rather than made dependent on a human being
-online. Built-in automatic Claude workers use a fail-closed Bash sandbox with no outbound
-domains; custom integrations must provide an equivalent boundary.
+online. Automatic mode admits only direct Claude executables and uses a fail-closed Bash
+sandbox with no outbound domains; arbitrary custom executables are rejected in automatic
+mode. Manual/custom integrations must provide an equivalent host/network boundary.
 Set `PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=0` only for a task that intentionally
-produces no git candidate, or set `autonomy.requireLocalCommit` in its spec.
+produces no local commit candidate, or set `autonomy.requireLocalCommit` in its spec;
+automatic mode still requires a valid Git baseline and non-protected worktree.
 `PI_CLAUDE_SUPERVISOR_UNATTENDED=0` opts a task out of automatic Decision Worker control;
 a required local commit is checked on a non-protected task branch;
 `PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES` bounds transient Decision Worker retries.
@@ -157,9 +159,10 @@ the old Worker's process group is gone and its cgroup is a real, readable empty
 boundary; missing or unverifiable Worker evidence is refused.
 For a persistent tmux Worker, use explicit `adopt-tmux` instead of takeover.
 The adapter intentionally does not inherit arbitrary host environment variables.
-Pass credentials through an explicit `WorkerStartInput.env` in an embedding
-integration. For the built-in command, opt in to named variables, for example
-`PI_CLAUDE_SUPERVISOR_WORKER_ENV=ANTHROPIC_API_KEY`.
+Manual embedding integrations may pass credentials through an explicit
+`WorkerStartInput.env`; automatic mode accepts only documented Claude provider
+variables, for example `PI_CLAUDE_SUPERVISOR_WORKER_ENV=ANTHROPIC_API_KEY`, and
+filters remote credentials and configuration-injection variables.
 
 ### tmux/PTY transport
 

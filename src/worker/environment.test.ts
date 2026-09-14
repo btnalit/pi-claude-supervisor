@@ -16,14 +16,28 @@ test("worker environment keeps essentials and excludes unrelated credentials", (
 test("automatic Worker environment strips remote credentials and credential helpers", () => {
   const result = automaticWorkerEnvironment({
     ANTHROPIC_API_KEY: "provider-key",
+    CLAUDE_CODE_OAUTH_TOKEN: "oauth-token",
     GITHUB_TOKEN: "remote-token",
     SSH_AUTH_SOCK: "/tmp/agent.sock",
     AWS_ACCESS_KEY_ID: "cloud-key",
+    GH_ENTERPRISE_TOKEN: "enterprise-token",
+    GITHUB_ENTERPRISE_TOKEN: "github-enterprise-token",
+    CODEARTIFACT_AUTH_TOKEN: "registry-token",
+    HUGGINGFACE_TOKEN: "hub-token",
+    GIT_CONFIG_PARAMETERS: "credential.helper=store",
+    RANDOM_LOCAL_SETTING: "not-allowlisted",
   });
   assert.equal(result.ANTHROPIC_API_KEY, "provider-key");
+  assert.equal(result.CLAUDE_CODE_OAUTH_TOKEN, "oauth-token");
   assert.equal(result.GITHUB_TOKEN, undefined);
   assert.equal(result.SSH_AUTH_SOCK, undefined);
   assert.equal(result.AWS_ACCESS_KEY_ID, undefined);
+  assert.equal(result.GH_ENTERPRISE_TOKEN, undefined);
+  assert.equal(result.GITHUB_ENTERPRISE_TOKEN, undefined);
+  assert.equal(result.CODEARTIFACT_AUTH_TOKEN, undefined);
+  assert.equal(result.HUGGINGFACE_TOKEN, undefined);
+  assert.equal(result.GIT_CONFIG_PARAMETERS, undefined);
+  assert.equal(result.RANDOM_LOCAL_SETTING, undefined);
   assert.equal(result.GIT_CONFIG_NOSYSTEM, "1");
   assert.equal(result.GIT_CONFIG_COUNT, "3");
   assert.equal(result.GIT_SSH_COMMAND, "false");
@@ -41,5 +55,5 @@ test("automatic Claude args require a fail-closed sandbox", () => {
     network: { allowedDomains: [] },
   });
   assert.throws(() => automaticClaudeArgs("claude", ["--settings", "{}"]), /controls --settings/u);
-  assert.deepEqual(automaticClaudeArgs("fixture", ["--settings", "{}"]), ["--settings", "{}"]);
+  assert.throws(() => automaticClaudeArgs("fixture", ["--settings", "{}"]), /direct Claude executable/u);
 });

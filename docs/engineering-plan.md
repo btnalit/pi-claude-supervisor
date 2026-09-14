@@ -36,7 +36,7 @@ Claude Code Worker
 4. Supervisor 因误判导致无限循环、危险操作或不可审计的修改。
 5. 人工无法随时接管或恢复任务。
 
-**当前状态：`v0.5.2` 已正式发布，已完成固定 Claude Code `2.1.270` 稳定性验证、单 Worker recovery、真实只读 Review drill、隔离临时 worktree 的允许编辑 repair/reacceptance drill、exact-head 独立 Review 和受保护发布。当前工作树已落实 repairable/persistent 能力拆分、verifying stop、paused watchdog、baseline-relative repository evidence、可取消验收/Reviewer、启动 preflight、无人值守权限决策、local-commit enforcement、候选挂起和阶段进度通知。Legacy human/takeover APIs 仅保留显式兼容控制；普通不确定性不再阻塞本地循环。协同多 Worker、低权限用户、OS sandbox 与网络隔离仍是独立后续里程碑。**
+**当前状态：`v0.5.2` 已正式发布，已完成固定 Claude Code `2.1.270` 稳定性验证、单 Worker recovery、真实只读 Review drill、隔离临时 worktree 的允许编辑 repair/reacceptance drill、exact-head 独立 Review 和受保护发布。当前工作树已落实 repairable/persistent 能力拆分、verifying stop、paused watchdog、baseline-relative repository evidence、可取消验收/Reviewer、启动 preflight、无人值守权限决策、local-commit enforcement、候选挂起和阶段进度通知。自动模式现在要求 direct Claude JSONL、完整 Git baseline、非保护分支，并请求不可用即失败的 Claude Code sandbox 和无出站域名；任意自定义可执行文件不会进入自动模式。Legacy human/takeover APIs 仅保留显式兼容控制；普通不确定性不再阻塞本地循环。协同多 Worker、手动/自定义集成的 host-level 低权限和网络隔离仍是独立后续里程碑。**
 
 ---
 
@@ -917,7 +917,7 @@ PTY 和 headless JSONL 只能选择一个作为 MVP 的主 transport，禁止两
 
 ## 20. 近期落地与剩余门禁：稳定的自动验收闭环
 
-本轮已落地 TaskSpec 多命令验收和 autonomy 字段、独立只读 Reviewer、结构化 repair round、重复 finding/P0/P1 候选挂起、JSONL 去重、baseline-relative commit evidence 和确定性 replay fixture。剩余门禁是固定 CLI 的重复运行统计，而不是继续扩大本地同步安全边界。当前只验证固定的 Claude Code `2.1.270`，不把多版本兼容作为本阶段任务。OS sandbox、低权限用户、network allowlist、SBOM 和更深的供应链加固后置，不作为本阶段门禁；远程 push/main merge、保护 CI 和发布仍保持独立边界。
+本轮已落地 TaskSpec 多命令验收和 autonomy 字段、独立只读 Reviewer、结构化 repair round、重复 finding/P0/P1 候选挂起、JSONL 去重、baseline-relative commit evidence 和确定性 replay fixture。剩余门禁是固定 CLI 的重复运行统计，而不是继续扩大本地同步安全边界。当前只验证固定的 Claude Code `2.1.270`，不把多版本兼容作为本阶段任务。自动 Claude 路径已请求 fail-closed sandbox 和无出站域名；OS 级低权限、host-level sandbox、手动/自定义集成的 network allowlist、SBOM 和更深的供应链加固后置，不作为本阶段门禁；远程 push/main merge、保护 CI 和发布仍保持独立边界。
 
 ### 20.1 Goal / Evidence / Sign-off 模型
 

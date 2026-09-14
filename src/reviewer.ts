@@ -168,6 +168,22 @@ function textFromMessage(content: unknown): string {
     .join("");
 }
 
+export function normalizeReviewReport(value: unknown, round: number): ReviewReport {
+  try {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return invalidReview("invalid Reviewer output: result must be an object", round, new Date().toISOString());
+    }
+    const report = value as { verdict?: unknown; summary?: unknown; findings?: unknown };
+    if (typeof report.verdict !== "string" || typeof report.summary !== "string" || !report.summary.trim() || !Array.isArray(report.findings)) {
+      return invalidReview("invalid Reviewer output: result must include verdict, summary and findings", round, new Date().toISOString());
+    }
+    const encoded = JSON.stringify(value);
+    return parseReview(encoded ?? "", round);
+  } catch (error) {
+    return invalidReview(`invalid Reviewer output: ${error instanceof Error ? error.message : String(error)}`, round, new Date().toISOString());
+  }
+}
+
 export function parseReview(text: string, round: number): ReviewReport {
   const checkedAt = new Date().toISOString();
   if (Buffer.byteLength(text, "utf8") > MAX_REVIEW_RESPONSE_BYTES) return invalidReview(`Reviewer response exceeded ${MAX_REVIEW_RESPONSE_BYTES} bytes`, round, checkedAt);
