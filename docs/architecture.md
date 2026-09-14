@@ -59,6 +59,13 @@ recovery, not by relaxing the current cwd lease rule.
 - idempotency keys for messages;
 - no session-resume claim.
 
+Worker capabilities distinguish two different properties. `persistentSession` means that a
+Worker can remain usable across a Pi disconnect/restart and can be explicitly re-adopted;
+`repairableSession` means that the current Supervisor can send another bounded turn after a
+verification/review result. Claude JSONL is repairable while attached but does not claim
+cross-restart resume. Tmux is both repairable and persistent. The Supervisor must never infer
+one capability from the other.
+
 This is a control-boundary fixture and headless transport. It does not emulate a
 terminal. Manual compatibility mode remains `process-pipe`; automatic mode
 (`PI_CLAUDE_SUPERVISOR_MODE=auto`) defaults to Claude JSONL and uses the CLI
@@ -68,7 +75,8 @@ screen-based.
 A worker exit automatically triggers cleanup, and terminal status waits for
 that cleanup to be confirmed (or reports a cleanup error). On Linux the adapter
 uses cgroup v2 automatically when the current user cgroup is writable; the
-`required` mode fails startup if cgroup attachment is unavailable. Cgroup
+`required` mode performs a preflight and fails before Claude starts if cgroup
+attachment or cleanup is unavailable. Cgroup
 cleanup kills descendants even when they call `setsid()` or create another
 process group. Attachment occurs immediately after spawn, so a worker that
 forks before attachment remains a documented startup-window limitation.
@@ -78,9 +86,11 @@ process-group cleanup. That fallback is not recursive: `setsid()` descendants
 can escape, and PID reuse between leader exit and cleanup is a host-level
 limitation. Production deployments that require an atomic boundary should use a
 service-manager scope, Job Object, pidfd-aware reaper, or equivalent supervisor.
-The Pi host installs graceful `SIGTERM`/`SIGINT` handlers, but `SIGSTOP` and
-`SIGKILL` cannot be handled; no orphan guarantee is claimed for those host-fatal
-signals.
+Pi owns graceful `SIGTERM`/`SIGINT` handling and invokes the extension's
+`session_shutdown` hook. The extension does not install a second `process.exit()`
+handler, avoiding races with Pi terminal restoration and other extensions. `SIGSTOP`
+and `SIGKILL` cannot be handled; no orphan guarantee is claimed for those
+host-fatal signals.
 
 ## tmux/PTY transport
 
@@ -130,10 +140,12 @@ idle -> starting -> running -> waiting -> running -> verifying -> completed
                   |       |       |             |
                   v       v       v             v
                 paused  failed  stopped        idle
+                              verifying -> stopped
 ```
 
-`stop` is available from `starting`, `running`, `waiting` and `paused`. Invalid
-transitions fail closed. Supervisor lifecycle operations and their state/event
+`stop` is available from `starting`, `running`, `waiting`, `paused` and `verifying`.
+A stop request from `verifying` is cleanup-authoritative and takes precedence over a
+verification result that has not yet been finalized. Invalid transitions fail closed. Supervisor lifecycle operations and their state/event
 updates run through one serial queue, so concurrent `poll`, `send`, `stop`,
 watchdog and shutdown work cannot produce duplicate terminal transitions. If a
 lifecycle event append fails after the state transition, it remains pending and
@@ -166,6 +178,14 @@ is alive; the extension periodically rechecks released sessions and removes the
 lease only after the pane is confirmed gone. If that check fails, the lease is
 retained rather than allowing a cwd overlap.
 
+Before model or Worker execution, automatic starts preflight the validated cwd,
+worker executable, transport dependencies, runtime state/lease directories and,
+when requested, the real writable cgroup-v2 boundary. A failed preflight is
+fail-closed and does not start Claude. Long acceptance commands and Reviewer
+sessions share an abort signal with the Supervisor, so operator stop/shutdown
+wins without waiting for a full check timeout. Progress hooks expose starting,
+Worker heartbeat, acceptance, review, repair and human-gate phases in the Pi UI.
+
 Startup owns an `AbortController` and passes its signal to the adapter. A stop
 or shutdown request aborts the controller and calls the adapter's out-of-band
 startup cleanup without waiting behind the serialized start operation. Each
@@ -186,7 +206,9 @@ must be treated as sensitive because worker output may contain repository data.
 For Claude JSONL, the adapter tracks `activeRequests`, `lastInputAt` and
 `lastOutputAt`. A `result` record closes an active request; malformed output does
 not. JSONL sends are rejected while a request is active, and a valid terminal
-result moves the session to `waiting`; only then may the next turn be sent.
+result moves the session to `waiting`; only then may the next turn be sent. A paused
+Worker does not consume its no-output budget; resume establishes a fresh no-output
+baseline while the cumulative wall-clock deadline remains active.
 Input writes are serialized with stop and are acknowledged through the stream
 write callback before their idempotency key is consumed. Writes have a bounded
 timeout, and `stop()` preempts a queued lifecycle operation by initiating adapter
@@ -224,11 +246,19 @@ conversation or control channel. It can inspect only `read`, `grep`, `find` and 
 output or a Reviewer API failure is a human-required condition.
 
 A `revise` result produces an audited repair round and sends a bounded corrective
-instruction to a still-live JSONL/tmux Worker. Checks and review then run again.
+instruction to a still-live `repairableSession` Worker. Checks and review then run again.
 The repair budget defaults to three rounds; repeated findings and P0/P1 findings
-stop automation and escalate. A non-persistent Worker that has already exited
-cannot be silently recreated for repair; it remains failed/recoverable rather
-than replaying the original task.
+stop automation and escalate. A Worker that has already exited cannot be silently recreated
+for repair; it remains failed/recoverable rather than replaying the original task. If a repair
+or human-review branch cannot continue, a single idempotent terminalizer records
+`verification_failed`, closes the Decision Worker and reports cleanup evidence; it never performs
+a second `failed -> failed` transition.
+
+Repository evidence is HEAD-relative: tracked staged and unstaged changes are collected together,
+and untracked regular files are included through bounded, component-safe, no-symlink reads. Incomplete or
+truncated evidence is not sufficient for an independent `pass` verdict. Acceptance
+process output uses a bounded execution buffer before the smaller persisted evidence
+limit, so a normal large test report is not misclassified as a failed command.
 
 ## Deliberate non-goals
 

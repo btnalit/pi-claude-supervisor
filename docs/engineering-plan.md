@@ -1,6 +1,6 @@
 # Pi Claude Supervisor 完整方案
 
-> 文档状态：`v0.5.0` 已发布 / 后续开发路线图
+> 文档状态：`v0.5.1` 已发布；Phase A–D 加固和真实 repair/reacceptance 已在当前工作树实现；待 exact-head 独立只读 Review 门禁
 > 目标项目目录：`pi-claude-supervisor`  
 > 适用对象：W、项目负责人、实现人员、评审人员
 
@@ -36,7 +36,7 @@ Claude Code Worker
 4. Supervisor 因误判导致无限循环、危险操作或不可审计的修改。
 5. 人工无法随时接管或恢复任务。
 
-**当前状态：`v0.5.0` 已完成“验收—独立 Review—自动修复—再验收”闭环并正式发布。下一阶段先完成固定 Claude Code `2.1.270` 的稳定性统计和恢复语义，再推进有边界的多 Worker 协作；低权限用户、OS sandbox 与网络隔离仍是后续安全加固，不作为当前主线硬性阻塞。**
+**当前状态：`v0.5.1` 已正式发布，已完成固定 Claude Code `2.1.270` 稳定性统计、单 Worker recovery、真实只读 Review drill 和隔离临时 worktree 的允许编辑 repair/reacceptance drill。当前工作树已落实 repairable/persistent 能力拆分、verifying stop、paused watchdog、完整 repository evidence、可取消验收/Reviewer、启动 preflight、权限门禁修复和阶段进度通知；下一项也是发布前最后硬门禁的是当前 exact head 的独立只读 Review。协同多 Worker 仍延期；低权限用户、OS sandbox 与网络隔离仍是后续安全加固。**
 
 ---
 
@@ -1030,3 +1030,25 @@ Reviewer 必须使用独立 Pi session，只允许 `read`、`grep`、`find`、`l
 - CLI 多版本兼容矩阵；
 - OS sandbox、低权限执行、网络隔离/allowlist；
 - 更深的供应链、SBOM、密钥隔离和生产监控。
+
+## 22. v0.5.1 真实演练后的自动化加固计划
+
+`v0.5.1` 发布后的真实 Claude Code `2.1.270` 演练完成了
+Worker → 验收 → 独立 Reviewer → fail-closed 人工介入链路。验收六项全部通过，
+但发现两个 P1 和两个 P2 生命周期/证据问题。正式记录、复现结果、实施阶段和门禁
+见 [`docs/automation-hardening-plan.md`](automation-hardening-plan.md)。
+
+本轮实现顺序固定为：
+
+1. **生命周期与能力模型**：拆分 `persistentSession` 与 `repairableSession`，修复非持久
+   JSONL repair 的非法终态转换，并支持 `verifying` 状态的 stop/shutdown；
+2. **watchdog 与证据完整性**：暂停 no-output 时钟，补齐 HEAD-relative staged/unstaged
+   diff 和安全的 untracked evidence；
+3. **自动化协议**：按 assistant message 边界解析 Reviewer/Decision Worker 输出，增加
+   启动 preflight、可观测 heartbeat、permission gate 一致性和 signal 生命周期；
+4. **验证门禁**：已补齐真实 capability 矩阵并完成隔离 worktree 的真实
+   repair/reacceptance 演练；当前 exact-head 独立 Reviewer 通过前不进行任何合并或发布。
+
+本轮不放宽以下边界：Reviewer 仍只读，验收仍使用 argv/`execFile`，不伪造 Claude
+`--resume`，不自动 merge/deploy/release，P0/P1、重复 finding、超时、API 错误和不完整
+证据继续 fail-closed。多 Worker 协作继续后置。

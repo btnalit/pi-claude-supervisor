@@ -98,8 +98,12 @@ test("pause and resume control the entire worker process group", async () => {
     await new Promise((resolve) => setTimeout(resolve, 60));
     await adapter.readOutput(handle);
     await adapter.pause(handle);
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    assert.equal((await adapter.readOutput(handle)).length, 0);
+    let pausedEmptyReads = 0;
+    for (let attempt = 0; attempt < 20 && pausedEmptyReads < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      pausedEmptyReads = (await adapter.readOutput(handle)).length === 0 ? pausedEmptyReads + 1 : 0;
+    }
+    assert.equal(pausedEmptyReads, 2);
     await adapter.resume(handle);
     let resumedOutput = [];
     for (let attempt = 0; attempt < 20 && resumedOutput.length === 0; attempt += 1) {
@@ -215,6 +219,32 @@ test("leader exit automatically cleans descendants before status is terminal", a
   } catch (error) {
     assert.ok(error instanceof Error && /ESRCH/u.test(error.message));
   }
+});
+
+test("required cgroup bootstrap contains a descendant created before attachment", { skip: !requiredCgroupTestAvailable }, async () => {
+  const adapter = new ProcessWorkerAdapter({ cgroupMode: "required", terminationGraceMs: 25, killGraceMs: 200 });
+  const handle = await adapter.start({
+    task: "early detached descendant",
+    cwd: process.cwd(),
+    command: process.execPath,
+    args: ["-e", "const {spawn}=require('node:child_process'); const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'}); process.stdout.write(String(c.pid)); const until=Date.now()+200; while(Date.now()<until){}; setInterval(()=>{},1000)", "--"],
+  });
+  let childPid: number | undefined;
+  for (let attempt = 0; attempt < 30 && !childPid; attempt++) {
+    const text = (await adapter.readOutput(handle)).map((chunk) => chunk.text).join("");
+    childPid = Number(text.trim()) || undefined;
+    if (!childPid) await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(childPid);
+  await adapter.stop(handle, "early detached descendant cleanup");
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try { process.kill(childPid, 0); } catch (error) {
+      if (error instanceof Error && /ESRCH/u.test(error.message)) return;
+      throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`early detached descendant process ${childPid} survived cgroup cleanup`);
 });
 
 test("required cgroup cleanup kills a setsid descendant", { skip: !requiredCgroupTestAvailable }, async () => {
@@ -437,6 +467,7 @@ test("claude-jsonl stop preempts an active request and confirms cleanup", async 
   await adapter.stop(handle, "active request shutdown");
   const status = await adapter.getStatus(handle);
   assert.equal(status.running, false);
+  assert.equal(status.exitReason, "stopped");
   assert.equal(status.processGroupCleaned, true);
 });
 
@@ -508,6 +539,14 @@ test("claude-jsonl emits permission events and accepts the exact allow response"
   assert.equal(status.exitReason, "completed");
   assert.ok(events.some((event) => event.type === "turn_completed"));
   await adapter.stop(handle, "permission test complete");
+});
+
+test("JSONL exposes attached repairability without claiming persistent recovery", () => {
+  const jsonl = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
+  const pipe = new ProcessWorkerAdapter({ mode: "process-pipe" });
+  assert.equal(jsonl.capabilities().repairableSession, true);
+  assert.equal(jsonl.capabilities().persistentSession, undefined);
+  assert.equal(pipe.capabilities().repairableSession, false);
 });
 
 test("claude-jsonl mode frames initial and subsequent messages", async () => {

@@ -1,4 +1,7 @@
 import { execFile } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
+import { lstat, open, realpath } from "node:fs/promises";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { AcceptanceCheck, AcceptanceCheckResult, AcceptanceReport, VerificationResult } from "./types.ts";
 import { assertSafeWorkerCommand } from "./policy.ts";
@@ -6,15 +9,37 @@ import { workerEnvironment } from "./worker/environment.ts";
 
 const execFileAsync = promisify(execFile);
 const MAX_OUTPUT_BYTES = 256 * 1024;
+const MAX_EXEC_BUFFER_BYTES = 8 * 1024 * 1024;
+const MAX_UNTRACKED_FILE_BYTES = 64 * 1024;
+const MAX_UNTRACKED_FILES = 128;
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const error = new Error("verification aborted");
+  error.name = "AbortError";
+  throw error;
+}
 
 export interface VerificationCommand {
   command: string;
   args?: string[];
 }
 
+export interface VerificationOptions {
+  signal?: AbortSignal;
+  onCheck?: (info: { check: AcceptanceCheck; result: AcceptanceCheckResult; index: number; total: number }) => void | Promise<void>;
+}
+
 export interface RepositoryEvidence {
   status: string;
+  /** HEAD-relative diff for tracked staged and unstaged changes. */
   diff: string;
+  /** Bounded content for untracked regular files. */
+  untracked?: string;
+  /** False when a command/file could not be safely or completely collected. */
+  complete?: boolean;
+  /** True when any evidence field was bounded or omitted. */
+  truncated?: boolean;
   collectedAt: string;
 }
 
@@ -22,6 +47,7 @@ export async function verify(
   cwd: string,
   command: VerificationCommand = { command: "git", args: ["diff", "--check"] },
   timeoutMs = 120_000,
+  options: VerificationOptions = {},
 ): Promise<VerificationResult> {
   assertSafeWorkerCommand(command.command, command.args);
   const check: AcceptanceCheck = {
@@ -32,9 +58,9 @@ export async function verify(
     required: true,
     timeoutMs,
   };
-  const result = await runCheck(cwd, check);
+  const result = await runCheck(cwd, check, options.signal);
   return {
-    ok: result.ok,
+    ok: result.ok && !options.signal?.aborted,
     command: [check.command, ...check.args].join(" "),
     exitCode: result.exitCode,
     output: result.output,
@@ -42,39 +68,58 @@ export async function verify(
   };
 }
 
-export async function verifyAll(cwd: string, checks: readonly AcceptanceCheck[]): Promise<AcceptanceReport> {
+export async function verifyAll(cwd: string, checks: readonly AcceptanceCheck[], options: VerificationOptions = {}): Promise<AcceptanceReport> {
   if (checks.length === 0) throw new Error("at least one acceptance check is required");
   const results: AcceptanceCheckResult[] = [];
-  for (const check of checks) results.push(await runCheck(cwd, check));
-  const ok = results.every((result) => !result.check.required || result.ok);
+  for (const [index, check] of checks.entries()) {
+    const result = await runCheck(cwd, check, options.signal);
+    results.push(result);
+    await options.onCheck?.({ check, result, index, total: checks.length });
+    if (options.signal?.aborted) break;
+  }
+  const cancelled = options.signal?.aborted === true;
+  const ok = !cancelled && results.every((result) => !result.check.required || result.ok);
   const firstFailure = results.find((result) => result.check.required && !result.ok);
   return {
     ok,
     command: "acceptance checks",
-    exitCode: firstFailure?.exitCode ?? 0,
-    output: boundOutput(results.map(formatCheckResult).join("\n\n")),
+    exitCode: firstFailure?.exitCode ?? (cancelled ? 1 : 0),
+    output: boundOutput(`${results.map(formatCheckResult).join("\n\n")}${cancelled ? "\n\n[verification cancelled]" : ""}`),
     checkedAt: new Date().toISOString(),
     checks: results,
   };
 }
 
 /** Collect bounded repository evidence for the independent read-only Reviewer. */
-export async function collectRepositoryEvidence(cwd: string): Promise<RepositoryEvidence> {
-  const [status, diff] = await Promise.all([
-    readGitEvidence(cwd, ["status", "--short", "--untracked-files=all"]),
-    readGitEvidence(cwd, ["diff", "--no-ext-diff", "--unified=3"]),
+export async function collectRepositoryEvidence(cwd: string, options: Pick<VerificationOptions, "signal"> = {}): Promise<RepositoryEvidence> {
+  throwIfAborted(options.signal);
+  const [statusResult, diffResult, untrackedResult] = await Promise.all([
+    readGitEvidence(cwd, ["status", "--short", "--untracked-files=all"], options.signal),
+    // HEAD-relative diff includes both staged and unstaged changes for tracked files.
+    readGitEvidence(cwd, ["diff", "--no-ext-diff", "--unified=3", "HEAD", "--"], options.signal),
+    collectUntrackedEvidence(cwd, options.signal),
   ]);
-  return { status, diff, collectedAt: new Date().toISOString() };
+  throwIfAborted(options.signal);
+  return {
+    status: statusResult.text,
+    diff: diffResult.text,
+    untracked: untrackedResult.text,
+    complete: statusResult.complete && diffResult.complete && untrackedResult.complete,
+    truncated: statusResult.truncated || diffResult.truncated || untrackedResult.truncated,
+    collectedAt: new Date().toISOString(),
+  };
 }
 
-async function runCheck(cwd: string, check: AcceptanceCheck): Promise<AcceptanceCheckResult> {
+async function runCheck(cwd: string, check: AcceptanceCheck, signal?: AbortSignal): Promise<AcceptanceCheckResult> {
+  throwIfAborted(signal);
   assertSafeWorkerCommand(check.command, check.args);
   const startedAt = new Date().toISOString();
   try {
     const result = await execFileAsync(check.command, check.args, {
       cwd,
       timeout: check.timeoutMs,
-      maxBuffer: MAX_OUTPUT_BYTES,
+      maxBuffer: MAX_EXEC_BUFFER_BYTES,
+      signal,
       env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
     });
     const finishedAt = new Date().toISOString();
@@ -88,13 +133,14 @@ async function runCheck(cwd: string, check: AcceptanceCheck): Promise<Acceptance
       finishedAt,
     };
   } catch (error) {
-    const failure = error as { code?: number | string; signal?: string; stdout?: string; stderr?: string; message?: string; killed?: boolean };
+    const failure = error as { code?: number | string; signal?: string; stdout?: string; stderr?: string; message?: string; killed?: boolean; name?: string };
     const finishedAt = new Date().toISOString();
-    const timedOut = failure.killed === true || failure.signal === "SIGTERM" || failure.code === "ETIMEDOUT";
+    const cancelled = signal?.aborted === true || failure.name === "AbortError" || failure.code === "ABORT_ERR";
+    const timedOut = !cancelled && (failure.killed === true || failure.signal === "SIGTERM" || failure.code === "ETIMEDOUT");
     const exitCode = typeof failure.code === "number" ? failure.code : 1;
     return {
       check,
-      status: timedOut ? "timed_out" : "failed",
+      status: cancelled ? "cancelled" : timedOut ? "timed_out" : "failed",
       ok: false,
       exitCode,
       output: boundOutput(`${failure.stdout ?? ""}${failure.stderr ?? ""}${failure.message ?? ""}`),
@@ -104,23 +150,132 @@ async function runCheck(cwd: string, check: AcceptanceCheck): Promise<Acceptance
   }
 }
 
-async function readGitEvidence(cwd: string, args: string[]): Promise<string> {
+interface EvidencePart {
+  text: string;
+  complete: boolean;
+  truncated: boolean;
+}
+
+async function readGitEvidence(cwd: string, args: string[], signal?: AbortSignal): Promise<EvidencePart> {
+  throwIfAborted(signal);
   try {
     const result = await execFileAsync("git", args, {
       cwd,
       timeout: 30_000,
       maxBuffer: MAX_OUTPUT_BYTES,
+      signal,
       env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
     });
-    return boundOutput(`${result.stdout}${result.stderr}`) || "(none)";
+    const bounded = boundEvidence(`${result.stdout}${result.stderr}`);
+    return { ...bounded, text: bounded.text || "(none)" };
   } catch (error) {
     const failure = error as { stdout?: string; stderr?: string; message?: string };
-    return boundOutput(`${failure.stdout ?? ""}${failure.stderr ?? ""}${failure.message ?? "git evidence unavailable"}`);
+    const bounded = boundEvidence(`${failure.stdout ?? ""}${failure.stderr ?? ""}${failure.message ?? "git evidence unavailable"}`);
+    return { ...bounded, complete: false };
+  }
+}
+
+async function collectUntrackedEvidence(cwd: string, signal?: AbortSignal): Promise<EvidencePart> {
+  throwIfAborted(signal);
+  let output: string;
+  let root: string;
+  try {
+    root = await realpath(cwd);
+  } catch (error) {
+    return { text: `[UNTRACKED EVIDENCE UNAVAILABLE] ${error instanceof Error ? error.message : String(error)}`, complete: false, truncated: false };
+  }
+  try {
+    const result = await execFileAsync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+      cwd,
+      timeout: 30_000,
+      maxBuffer: MAX_OUTPUT_BYTES,
+      signal,
+      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
+    });
+    output = result.stdout;
+    throwIfAborted(signal);
+  } catch (error) {
+    const failure = error as { stdout?: string; stderr?: string; message?: string };
+    return { text: `[UNTRACKED EVIDENCE UNAVAILABLE] ${failure.stderr ?? failure.message ?? "git ls-files failed"}`, complete: false, truncated: false };
+  }
+  const paths = output.split("\0").filter(Boolean);
+  if (paths.length === 0) return { text: "(none)", complete: true, truncated: false };
+  let complete = paths.length <= MAX_UNTRACKED_FILES;
+  let truncated = false;
+  const sections: string[] = [];
+  for (const path of paths.slice(0, MAX_UNTRACKED_FILES)) {
+    const fullPath = resolve(root, path);
+    const relativePath = relative(root, fullPath);
+    if (isAbsolute(relativePath) || relativePath === ".." || relativePath.startsWith(`..${"/"}`) || relativePath.startsWith(`..${"\\"}`)) {
+      complete = false;
+      sections.push(`--- ${JSON.stringify(path)} [unsafe path omitted]`);
+      continue;
+    }
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      await assertNoSymlinkComponents(root, relativePath);
+      const info = await lstat(fullPath);
+      if (info.isSymbolicLink() || !info.isFile()) {
+        complete = false;
+        sections.push(`--- ${JSON.stringify(path)} [non-regular file omitted]`);
+        continue;
+      }
+      const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+      handle = await open(fullPath, fsConstants.O_RDONLY | noFollow);
+      const opened = await handle.stat();
+      if (!opened.isFile()) {
+        complete = false;
+        sections.push(`--- ${JSON.stringify(path)} [non-regular file omitted]`);
+        continue;
+      }
+      const buffer = Buffer.alloc(MAX_UNTRACKED_FILE_BYTES + 1);
+      const read = await handle.read(buffer, 0, buffer.length, 0);
+      const bytes = buffer.subarray(0, read.bytesRead);
+      if (read.bytesRead > MAX_UNTRACKED_FILE_BYTES) {
+        complete = false;
+        truncated = true;
+      }
+      if (bytes.includes(0)) {
+        complete = false;
+        sections.push(`--- ${JSON.stringify(path)} [binary file omitted]`);
+      } else {
+        sections.push(`--- ${JSON.stringify(path)}${read.bytesRead > MAX_UNTRACKED_FILE_BYTES ? " [TRUNCATED]" : ""}\n${bytes.toString("utf8")}`);
+      }
+    } catch (error) {
+      complete = false;
+      sections.push(`--- ${JSON.stringify(path)} [read failed: ${error instanceof Error ? error.message : String(error)}]`);
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  }
+  if (paths.length > MAX_UNTRACKED_FILES) {
+    truncated = true;
+    sections.push(`[TRUNCATED: ${paths.length - MAX_UNTRACKED_FILES} untracked paths omitted]`);
+  }
+  const bounded = boundEvidence(sections.join("\n"));
+  return { ...bounded, complete: complete && bounded.complete, truncated: truncated || bounded.truncated };
+}
+
+async function assertNoSymlinkComponents(root: string, relativePath: string): Promise<void> {
+  const parts = relativePath.split(sep).filter(Boolean);
+  let current = root;
+  for (const part of parts) {
+    current = resolve(current, part);
+    const info = await lstat(current);
+    if (info.isSymbolicLink()) throw new Error("symlink path component is not allowed in repository evidence");
   }
 }
 
 function formatCheckResult(result: AcceptanceCheckResult): string {
   return `[${result.status}] ${result.check.id}: ${result.check.command} ${result.check.args.join(" ")}\n${result.output || "(no output)"}`;
+}
+
+function boundEvidence(value: string): EvidencePart {
+  const encoded = Buffer.from(value, "utf8");
+  if (encoded.byteLength <= MAX_OUTPUT_BYTES) return { text: value, complete: true, truncated: false };
+  const marker = Buffer.from("\n[TRUNCATED]", "utf8");
+  const suffix = encoded.subarray(-Math.max(0, MAX_OUTPUT_BYTES - marker.byteLength));
+  return { text: `${suffix.toString("utf8")}${marker.toString("utf8")}`, complete: false, truncated: true };
 }
 
 function boundOutput(value: string): string {

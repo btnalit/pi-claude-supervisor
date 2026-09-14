@@ -65,7 +65,10 @@ cause a later run to fail closed as human-required after the bounded Decision
 Worker or Reviewer timeout; this is evidence for the manual spike only, not a CI
 guarantee.
 The extension persists each automatic Decision Worker session as Pi JSONL plus a
-0600 task mapping. Recovery is explicit and safe: after an unclean Pi restart,
+0600 task mapping. Automatic startup preflights the state/lease directories, cwd,
+worker executable, transport dependency and required cgroup boundary before model
+execution. Progress callbacks expose the current phase and periodic Worker
+heartbeat. Recovery is explicit and safe: after an unclean Pi restart,
 `/supervise sessions` shows the task as `recoverable`, and `/supervise recover
 [--takeover] <task-id>` restores the Decision Worker history before starting a new
 Claude Worker. `--takeover` is accepted only when the old Pi owner is dead, the
@@ -120,7 +123,9 @@ escalation is outbound-only through `PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL`;
 approval callbacks are deliberately not accepted without a separately
 authenticated endpoint.
 
-The tmux transport is selected with `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`. Before
+The tmux transport is selected with `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`.
+Automatic mode rejects an explicit `process-pipe` transport; use JSONL or tmux for
+bounded decisions and repair. Before
 release, verify: private-socket attach, multi-line paste, prompt stability while
 Claude is busy, trust/permission dialog takeover, duplicate send prevention, pane
 replacement refusal, pause/resume, owned-session stop, adopted-session
@@ -137,29 +142,38 @@ response.
 
 The automated adapter matrix covers external `SIGTERM`, `SIGINT`, `SIGKILL`,
 `SIGSTOP`/`SIGCONT`, SIGTERM refusal/escalation, leader-early-exit descendant
-cleanup, required cgroup cleanup of a `setsid()` descendant, repeated stop,
-spawn failure, output truncation, blocked stdin write timeouts, and immediate
-JSONL results. The Supervisor matrix also covers
-retrying failed lifecycle events, preserving startup event order, stopping under
-persistent timeout-event failure, and restoring output after event-log failure. The Supervisor matrix covers startup rejection, externally terminated
-workers, lifecycle serialization and stop races.
+cleanup, required cgroup bootstrap containment of a pre-attachment detached
+and `setsid()` descendant, repeated stop, spawn failure, output truncation,
+blocked stdin write timeouts, and immediate JSONL results. The Supervisor
+matrix also covers retrying failed lifecycle events, preserving startup event
+order, stopping under persistent timeout-event failure, and restoring output
+after event-log failure. The Supervisor matrix covers startup rejection,
+externally terminated workers, lifecycle serialization and stop races.
 
 Before release, manually test at least: immediate crash, hung process, malformed
 output, duplicate send, send/exit race, Pi `SIGTERM`/`SIGINT` shutdown,
 verification failure, blocked stdin writes/stop preemption, corrupt event-log
 tails, and descendants that call `setsid()` when cgroup mode is unavailable (expected
-fallback limitation). The cgroup test proves cleanup after attachment but does
-not eliminate the post-spawn attachment window. `SIGSTOP` and `SIGKILL` of the Pi host cannot be handled;
-verify and document the resulting orphan behavior.
+fallback limitation). In cgroup mode, a small bootstrap joins the cgroup before
+launching Worker code, and cleanup also validates and reaps the detached process
+group; this closes the post-spawn attachment window. `SIGSTOP` and `SIGKILL` of
+the Pi host cannot be handled; verify and document the resulting orphan behavior.
 Default behavior must be fail-closed and leave no orphaned worker process within
 the managed process group.
 
 ## Near-term automation acceptance gate
 
 The `v0.5.0` implementation of the acceptance—independent Review—repair—reacceptance
-loop is shipped. The remaining gate focuses on real stability for the pinned
-Claude Code `2.1.270` CLI. It does not add a multi-version matrix or wait for
-OS sandbox, low-privilege or network-isolation work.
+loop is shipped. The `v0.5.1` real read-only drill reached acceptance and independent
+Review, then correctly stopped at human intervention after two P1 and two P2 findings.
+A separate real edit-capable Claude Code `2.1.270` drill then exercised one bounded
+acceptance failure, repair turn, reacceptance and independent Reviewer `pass` in an
+isolated temporary worktree. The current hardening plan and evidence paths are recorded
+in [`docs/automation-hardening-plan.md`](automation-hardening-plan.md). Deterministic
+coverage now includes repairable-vs-persistent capability assertions, cancellation
+of acceptance commands, stop-from-verifying precedence, paused watchdog baselining,
+staged/untracked evidence and untracked symlink rejection. The remaining release gate
+is the exact-head independent read-only review.
 
 ### Acceptance and Reviewer fixtures
 
@@ -170,6 +184,9 @@ Deterministic tests must cover:
 - independent read-only Reviewer pass/revise/human results;
 - invalid Reviewer JSON and Reviewer API failure escalating to human;
 - repair rounds, repeated finding detection, P0/P1 escalation and repair-budget exhaustion;
+- non-persistent JSONL verification failure without duplicate terminal transitions;
+- repairable-but-not-persistent JSONL multi-turn repair;
+- stop and Pi shutdown from `verifying`, including Decision Worker closure and cwd lease release;
 - completion being impossible without passing all required checks and review.
 
 Reviewer sessions use only `read`, `grep`, `find` and `ls`; they must not modify
@@ -187,14 +204,17 @@ The adapter/replay matrix must cover:
 - duplicate Supervisor idempotency keys without duplicate input;
 - stop, SIGTERM, SIGINT and Pi shutdown while a JSONL request is active;
 - ordinary completion, low-risk permission allow, AskUserQuestion deny-to-text,
-  multi-turn, verifier failure/repair, takeover and explicit recovery.
+  multi-turn, verifier failure/repair, takeover and explicit recovery;
+- staged and untracked repository evidence, symlink rejection and truncation fail-closed;
+- paused watchdog behavior and resume-time no-output rebasing;
+- assistant-message-bounded Reviewer and Decision Worker output parsing.
 
 Real Claude tests remain authenticated manual Spikes and are pinned to
 `2.1.270`; they are not part of normal CI. Normal CI runs deterministic fake
-Worker and replay fixtures. The short-term stability gate is still pending and
-must include ten consecutive ordinary automatic runs and at least five runs each
-for permission and question handling, with no duplicate action, false completion
-or unreaped Worker.
+Worker and replay fixtures. The pinned stability matrix is the compatibility evidence
+for this release line; any future CLI change must rerun ten consecutive ordinary
+automatic runs and at least five runs each for permission and question handling, with
+no duplicate action, false completion or unreaped Worker.
 
 ## Future multi-worker test plan
 
@@ -218,3 +238,23 @@ Required deterministic and integration coverage:
 The multi-worker gate should be added only after the pinned single-worker stability
 and recovery gates pass. CI should use fake Workers and replay fixtures; authenticated
 Claude multi-worker Spikes remain manual and version-pinned.
+
+## Live drill and hardening gate
+
+A live review must record the exact Claude executable/version, transport, cgroup mode,
+permission flags, task id, acceptance result, Reviewer result, cleanup status and cwd lease
+status. A human-required result is a valid safety outcome and must not be converted into a
+pass by retrying the same task automatically.
+
+For the hardening release, the completed gate record is:
+
+1. `npm run check`, `npm run test:pi`, `npm run test:install`, `npm run build`;
+2. deterministic lifecycle/evidence/capability tests;
+3. a disposable temporary-worktree real Claude repair/reacceptance spike with an edit-capable
+   Worker;
+4. cleanup verification: no Worker, no Decision Worker, no unreconciled lease and clean Git
+   worktree.
+
+The remaining gate is a read-only review of the exact resulting commit. The drill evidence is
+recorded in `docs/automation-hardening-plan.md`; it did not run against this release worktree,
+did not use Claude `--resume`, and did not merge, publish or release automatically.

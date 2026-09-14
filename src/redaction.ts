@@ -10,8 +10,9 @@ export function redactSensitive(value: unknown, key?: string): unknown {
       .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/gu, "[REDACTED]")
       .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/gu, "[REDACTED]")
       .replace(/\b(Bearer\s+)[^\s]+/giu, "$1[REDACTED]")
+      .replace(/\b((?:authorization)\s*:\s*(?:[A-Za-z]+\s+)?)[^\s,;)}\]]+/giu, "$1[REDACTED]")
+      .replace(/\b((?:x-api-key|api[-_]?key|token|secret|password|credential)\s*[:=]\s*)[^\s,;)}\]]+/giu, "$1[REDACTED]")
       .replace(/\b((?:AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)))=([^\s]+)/gu, "$1=[REDACTED]")
-      .replace(/\b((?:authorization|x-api-key|api-key)\s*:\s*)[^\s]+/giu, "$1[REDACTED]")
       .replace(/(--?(?:token|api[-_]?key|secret|password|authorization)(?:=|\s+))[^\s]+/giu, "$1[REDACTED]");
   }
   if (Array.isArray(value)) return value.map((item) => redactSensitive(item, key));

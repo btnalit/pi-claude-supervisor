@@ -18,6 +18,18 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+### Hardening implemented in working tree (not yet released)
+
+- Split JSONL in-process `repairableSession` from cross-restart `persistentSession` and eliminate duplicate terminal transitions.
+- Make `verifying` stop/shutdown cleanup authoritative, with abortable acceptance and Reviewer operations.
+- Pause and rebase the no-output watchdog clock across pause/resume while retaining the cumulative deadline.
+- Include staged, unstaged and bounded untracked evidence in independent Review, with symlink/path safety and fail-closed completeness.
+- Harden assistant-message output framing, startup/runtime preflight, permission gates, bounded acceptance buffers and lifecycle progress reporting.
+
+### Remaining hardening gate
+
+- Complete the exact-head independent read-only Review; the real editable Claude `2.1.270` repair/reacceptance drill and cleanup/lease evidence are recorded in `docs/automation-hardening-plan.md`.
+
 ### Added
 
 - Structured task specifications with Goal, scope, constraints, forbidden actions and multiple argv-based acceptance checks.
