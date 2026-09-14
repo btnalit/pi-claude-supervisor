@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.1](https://github.com/btnalit/pi-claude-supervisor/compare/v0.5.0...v0.5.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* harden single-worker recovery lifecycle ([14c01ec](https://github.com/btnalit/pi-claude-supervisor/commit/14c01ec610b1210eda1ea2d60269fad25b8b3575))
+
 ## [0.5.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.4.1...v0.5.0) (2026-09-14)
 
 
