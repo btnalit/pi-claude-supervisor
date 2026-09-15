@@ -1547,7 +1547,11 @@ function isReadyScreen(screen: string): boolean {
 
 function hasBridgePromptInput(screen: string): boolean {
   const lines = stripAnsi(screen).replaceAll("\u00a0", " ").split(/\r?\n/u).map((line) => line.trim());
-  return lines.some((line) => /^>\s+.+$/u.test(line));
+  // Supervisor input is echoed by the PTY after the bridge prompt. A long
+  // base64 frame can wrap, and the bridge's one-line erase then leaves the
+  // first `> @pi:user ...` line visible after the result. It is stale control
+  // input, not a human turn; counting it would leave activeRequests stuck at 1.
+  return lines.some((line) => /^>\s+.+$/u.test(line) && !/^>\s+@pi:(?:user|json)\s+/u.test(line));
 }
 
 function hasPromptInput(screen: string): boolean {

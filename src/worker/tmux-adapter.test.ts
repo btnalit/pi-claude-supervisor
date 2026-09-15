@@ -182,6 +182,42 @@ process.stdin.on("data", data => {
   }
 });
 
+test("automatic tmux ignores wrapped Supervisor input after a result", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-wrapped-input-test-"));
+  const fixture = join(stateDir, "fixture.mjs");
+  const fakeClaude = join(stateDir, "claude");
+  await writeFile(fixture, `
+process.stdout.write(JSON.stringify({ type: "system", subtype: "ready" }) + "\\n");
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", data => {
+  for (const line of data.split("\\n").filter(Boolean)) {
+    const request = JSON.parse(line);
+    process.stdout.write(JSON.stringify({ type: "result", subtype: "success", uuid: request.message.content }) + "\\n");
+  }
+});
+process.stdin.resume();
+setInterval(() => {}, 10000);
+`);
+  await writeFile(fakeClaude, `#!/usr/bin/env node\nawait import(${JSON.stringify(fixture)});\n`);
+  await chmod(fakeClaude, 0o700);
+  const events: Array<{ type: string; sequence?: number }> = [];
+  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 100 });
+  const task = "long Supervisor input that must not look like a human prompt ".repeat(20);
+  let handle;
+  try {
+    handle = await adapter.start({ task, cwd: process.cwd(), command: fakeClaude, args: [], automatic: true,
+      eventListener: (event) => { if (event.type === "turn_completed") events.push({ type: event.type, sequence: event.sequence }); } });
+    await waitFor(() => events.some((event) => event.sequence === 1));
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+    await adapter.send(handle, "second turn", "wrapped-input-second");
+    await waitFor(() => events.some((event) => event.sequence === 2));
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+  } finally {
+    if (handle) await adapter.stop(handle, "wrapped input cleanup").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("automatic tmux pane exit is clean teardown, not a nested-process failure", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-pane-exit-test-"));
   const fixture = join(stateDir, "fixture.mjs");
