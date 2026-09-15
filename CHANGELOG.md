@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.5](https://github.com/btnalit/pi-claude-supervisor/compare/v0.5.4...v0.5.5) (2026-09-15)
+
+
+### Bug Fixes
+
+* ignore expected tmux teardown races ([ac7ad57](https://github.com/btnalit/pi-claude-supervisor/commit/ac7ad57efa835764ea02fa138f8837947a5d9c39))
+
 ## [0.5.4](https://github.com/btnalit/pi-claude-supervisor/compare/v0.5.3...v0.5.4) (2026-09-15)
 
 
