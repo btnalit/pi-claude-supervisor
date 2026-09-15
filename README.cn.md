@@ -28,7 +28,7 @@
 - Worker 只继承最小环境；自动模式采用默认拒绝的环境变量 allowlist，过滤远程凭据并禁用 Git/包管理器 credential helper。自动模式只能选择文档列出的 Claude provider 变量；任意自定义变量仅限手动集成。
 - 本地命令和权限行为按任务/运行时授权策略处理；超出授权的动作自动拒绝或挂起，不要求同步人工响应。
 - Linux 上优先使用可写的 cgroup v2 清理后代进程，包括 `setsid()` 后代；不可用时回退到进程组清理。需要强制失败闭环时，embedding 集成可使用 `cgroupMode: "required"`，并会在 Claude 启动前执行 preflight。
-- 自动模式只接受直接的 `claude`/`claude.exe` Worker，并请求 fail-closed 的 Claude Code Bash sandbox，禁止 Bash 子进程出站联网；命令策略仍是第二道门。手动/自定义集成必须自行提供等效 host/network 边界。
+- 自动模式只接受裸的 `claude`/`claude.exe` 命令名，并从 Supervisor 的 PATH 解析、固定由操作者拥有的可执行文件（或使用 `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` 固定路径）；显式路径和可写/不可信位置会被拒绝。它请求 fail-closed 的 Claude Code Bash sandbox，禁止 Bash 子进程出站联网；命令策略仍是第二道门。手动/自定义集成必须自行提供等效 host/network 边界。
 - Worker 声称完成只会进入 `verifying`，不能作为成功证据。
 - 默认独立验收命令为 `git diff --check`。
 - 目标是任务启动后本地开发无人值守：Worker 可以修改、测试、修复和本地提交；Worker 必须没有远程 push 或合并到 `main`/integration 分支的权限。
@@ -126,7 +126,7 @@ Worker 启动前捕获 git baseline，要求完整的 baseline-relative tracked/
 并在默认情况下要求 Worker 在非保护分支本地 commit；无效输出、证据不完整、重复 finding、P0/P1 或预算耗尽
 会自动挂起候选。自动模式拒绝 process-pipe 和 tmux，并在模型执行前检查目录、可执行文件、依赖
 和 cgroup；Worker 环境会过滤远程仓库凭据并禁用 Git 全局凭据 helper。详见 [自动化目标](docs/autonomy-target.md)。协同多 Worker 属于后续独立开发阶段，
-自动模式只接受直接 Claude 可执行文件，并请求 fail-closed 的 Claude Code Bash sandbox；任意自定义可执行文件会在自动模式拒绝。手动/自定义 Worker 的完整 host-level sandbox 仍需由集成方提供。
+自动模式只接受裸的直接 Claude 命令名，会固定解析后的操作者拥有的可执行文件，并请求 fail-closed 的 Claude Code Bash sandbox；任意自定义可执行文件和显式可执行路径会在自动模式拒绝。需要固定路径时设置 `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE`。手动/自定义 Worker 的完整 host-level sandbox 仍需由集成方提供。
 
 ### tmux/PTY 交互模式
 

@@ -134,8 +134,11 @@ bounded decisions and repair. Built-in Claude workers also receive a fail-closed
 sandbox setting (`failIfUnavailable`, `allowUnsandboxedCommands=false`, no outbound
 network domains); verify that startup fails if the sandbox cannot be initialized.
 Automatic startup also requires a full existing Git baseline, non-bare non-protected
-worktree and a direct `claude`/`claude.exe` executable; arbitrary custom executables
-are rejected in automatic mode. Before release, verify: private-socket attach,
+worktree and the bare `claude`/`claude.exe` command name. It resolves and pins an
+operator-owned, non-writable executable path (or the path configured by
+`PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE`), rejects explicit/custom executable paths, and
+compares the exact startup HEAD again immediately before spawn. Before release, verify:
+private-socket attach,
 multi-line paste, prompt stability while
 Claude is busy, trust/permission policy handling, duplicate send prevention, pane
 replacement refusal, pause/resume, owned-session stop, adopted-session

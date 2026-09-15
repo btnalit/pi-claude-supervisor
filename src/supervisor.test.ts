@@ -193,6 +193,38 @@ test("automatic supervision rejects a supplied baseline that is not an existing 
   }
 });
 
+test("automatic supervision rechecks the exact startup HEAD before spawning", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-head-race-"));
+  try {
+    await initializeGitRepository(cwd, "worker/head-race");
+    let closed = false;
+    const supervisor = new Supervisor(new ProcessWorkerAdapter({ mode: "claude-jsonl" }), undefined, { reviewer: automaticReviewer() });
+    await assert.rejects(() => supervisor.start({
+      task: "head race",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: automaticSpec(),
+      decisionWorkerFactory: () => ({
+        start: async () => {
+          await writeFile(join(cwd, "decision-started.txt"), "changed\n");
+          await execFileAsync("git", ["add", "decision-started.txt"], { cwd });
+          await execFileAsync("git", ["commit", "-qm", "unexpected startup change"], { cwd });
+        },
+        updateContext: () => {},
+        notify: () => {},
+        close: async () => { closed = true; },
+      }),
+    }), /repository HEAD changed/u);
+    assert.equal(supervisor.handle, undefined);
+    assert.equal(closed, true);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("protected branches are rejected even when local commits are optional", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-protected-start-"));
   try {

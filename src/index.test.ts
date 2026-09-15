@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
@@ -55,8 +55,9 @@ test("index recovers an idle Decision Worker without replaying the original task
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-index-"));
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-state-"));
   const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-leases-"));
+  const fakeBin = await mkdtemp(join(process.cwd(), ".pi-claude-supervisor-recover-bin-"));
   const taskId = "22222222-2222-4222-8222-222222222222";
-  const fakeClaude = join(cwd, "claude");
+  const fakeClaude = join(fakeBin, "claude");
   await copyFile(process.execPath, fakeClaude);
   assert.equal(spawnSync("git", ["init", "-q"], { cwd, stdio: "ignore" }).status, 0);
   assert.equal(spawnSync("git", ["config", "user.email", "test@example.invalid"], { cwd, stdio: "ignore" }).status, 0);
@@ -77,7 +78,7 @@ test("index recovers an idle Decision Worker without replaying the original task
     taskId,
     task: "original task must not be replayed",
     cwd,
-    command: fakeClaude,
+    command: "claude",
     args: ["-e", fakeWorker, marker],
     decisionSessionFile,
     maxTurns: 2,
@@ -89,8 +90,9 @@ test("index recovers an idle Decision Worker without replaying the original task
     turn: 0,
     state: "active",
   });
-  const keys = ["PI_CLAUDE_SUPERVISOR_STATE_DIR", "PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR", "PI_CLAUDE_SUPERVISOR_TRANSPORT", "PI_CLAUDE_SUPERVISOR_CGROUP_MODE", "PI_CLAUDE_SUPERVISOR_MODE", "PI_CLAUDE_SUPERVISOR_AUTOMATION"] as const;
+  const keys = ["PI_CLAUDE_SUPERVISOR_STATE_DIR", "PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR", "PI_CLAUDE_SUPERVISOR_TRANSPORT", "PI_CLAUDE_SUPERVISOR_CGROUP_MODE", "PI_CLAUDE_SUPERVISOR_MODE", "PI_CLAUDE_SUPERVISOR_AUTOMATION", "PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE"] as const;
   const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]])) as Record<typeof keys[number], string | undefined>;
+  const previousPath = process.env.PATH;
   for (const key of keys) delete process.env[key];
   process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
   process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
@@ -98,6 +100,8 @@ test("index recovers an idle Decision Worker without replaying the original task
   process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "off";
   process.env.PI_CLAUDE_SUPERVISOR_MODE = "auto";
   process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "1";
+  process.env.PATH = `${fakeBin}${delimiter}${previousPath ?? ""}`;
+  delete process.env.PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE;
   const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
   const messages: string[] = [];
   const context: TestContext = { cwd, hasUI: true, ui: { confirm: async () => false, notify: (message) => messages.push(message) } };
@@ -143,6 +147,9 @@ test("index recovers an idle Decision Worker without replaying the original task
       if (previous[key] === undefined) delete process.env[key];
       else process.env[key] = previous[key];
     }
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await rm(fakeBin, { recursive: true, force: true });
     await rm(cwd, { recursive: true, force: true });
     await rm(stateDir, { recursive: true, force: true });
     await rm(leaseDir, { recursive: true, force: true });

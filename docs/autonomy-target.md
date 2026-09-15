@@ -26,8 +26,9 @@ synchronous dependency for ordinary progress, routine ambiguity, or a normal fai
 The system must still provide a kill switch, bounded execution, cleanup verification and a
 complete audit trail. These are reliability and containment mechanisms, not requests for a human
 to approve every development action. Automatic mode also records and revalidates a full existing
-repository baseline, requires a non-protected branch and direct Claude JSONL Worker, and by
-default requires a local commit before a candidate is deliverable.
+repository baseline, captures the startup HEAD and requires that exact HEAD again at
+final pre-spawn, requires a non-protected branch and a pinned operator-owned direct Claude
+JSONL Worker, and by default requires a local commit before a candidate is deliverable.
 
 ## 2. Hard authority boundary
 
@@ -46,9 +47,10 @@ A completed local task is a candidate until it passes the independent boundary. 
 be a later read-only review, CI policy, a maintainer action, or an explicit shutdown/rejection.
 The Worker must not be able to bypass it through a prompt, a local decision, or a model response.
 
-This is the required authority boundary. Automatic mode admits only the direct Claude executable
-because its fail-closed Claude Code sandbox is part of the supported boundary; arbitrary custom
-executables must use manual mode or an independently hardened integration. No additional
+This is the required authority boundary. Automatic mode admits only the bare direct Claude
+command name and pins its operator-owned resolved executable because its fail-closed Claude Code
+sandbox is part of the supported boundary; explicit paths and arbitrary custom executables must
+use manual mode or an independently hardened integration. No additional
 synchronous human-approval boundary should be invented for local editing, local tests, local
 commits, or local repair unless the task owner explicitly configures one.
 
@@ -98,8 +100,8 @@ Automatic mode implements the local loop: policy decisions allow ordinary local 
 continue/redirect/answer/repair, acceptance and independent Review run without a human callback,
 and unresolved situations become `blocked` candidates. The default task autonomy is unattended, requires a local commit, and permits two bounded
 Decision Worker request retries. Automatic startup rejects non-Git/detached/bare/protected
-repository states, malformed baselines, non-JSONL transports and non-Claude executables before
-Worker startup.
+repository states, malformed baselines, startup-HEAD races, non-JSONL transports and
+non-Claude or untrusted executable identities before Worker startup.
 
 Legacy `humanRequired`, takeover and approval fields remain for compatibility and explicit operator
 control. They are not entered by ordinary uncertainty, and a legacy approval object cannot override

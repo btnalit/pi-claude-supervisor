@@ -1,3 +1,7 @@
+import { constants as fsConstants } from "node:fs";
+import { access, realpath, stat } from "node:fs/promises";
+import { delimiter, dirname, join } from "node:path";
+
 const inheritedNames = [
   "PATH",
   "HOME",
@@ -63,13 +67,13 @@ export function automaticWorkerEnvironment(explicit: NodeJS.ProcessEnv = {}): No
  * Ask Claude Code to sandbox Bash and its descendants. The API process keeps
  * its provider connection, while Worker-launched commands get no outbound
  * network and cannot silently fall back to an unsandboxed shell. Automatic mode
- * admits only a direct Claude executable so this boundary cannot be silently
- * omitted by a custom Worker.
+ * admits only the direct Claude command name. Startup resolves and pins its
+ * operator-owned executable path so a custom path or writable replacement
+ * cannot silently omit this boundary.
  */
 export function automaticClaudeArgs(command: string, args: readonly string[] = []): string[] {
-  const executable = command.split(/[\\/]/u).at(-1)?.toLowerCase();
-  if (executable !== "claude" && executable !== "claude.exe") {
-    throw new Error("automatic supervision requires a direct Claude executable with the fail-closed sandbox boundary");
+  if (!isDirectClaudeName(command)) {
+    throw new Error("automatic supervision requires the direct Claude executable command name; custom executable paths need their own host boundary");
   }
   if (args.some((arg) => arg === "--settings" || arg.startsWith("--settings="))) {
     throw new Error("automatic Claude supervision controls --settings; remove the caller-provided settings override");
@@ -86,6 +90,76 @@ export function automaticClaudeArgs(command: string, args: readonly string[] = [
       },
     }),
   ];
+}
+
+/**
+ * Resolve and pin the executable used by automatic mode before preflight and
+ * spawn. A bare command is resolved from the supervisor's own PATH; explicit
+ * paths and writable/untrusted executable locations are rejected. Operators
+ * who do not want PATH to be the trust root can set
+ * PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE to the expected executable path.
+ */
+export async function assertTrustedAutomaticClaudeExecutable(command: string): Promise<string> {
+  if (!isDirectClaudeName(command)) {
+    throw new Error("automatic supervision requires the direct Claude executable command name; custom executable paths need their own host boundary");
+  }
+  const candidate = await resolveExecutable(command, process.env.PATH);
+  if (!candidate) throw new Error("automatic supervision could not resolve the trusted Claude executable from PATH");
+  const resolved = await realpath(candidate);
+  await assertSecureExecutablePath(resolved);
+  const configured = process.env.PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE?.trim();
+  if (configured) {
+    let expected: string;
+    try {
+      expected = await realpath(configured);
+    } catch {
+      throw new Error("PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE is not a readable executable path");
+    }
+    if (expected !== resolved) {
+      throw new Error("resolved Claude executable does not match PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE");
+    }
+  }
+  return resolved;
+}
+
+function isDirectClaudeName(command: string): boolean {
+  if (command.includes("/") || command.includes("\\")) return false;
+  const executable = command.toLowerCase();
+  return executable === "claude" || executable === "claude.exe";
+}
+
+async function resolveExecutable(command: string, pathValue: string | undefined): Promise<string | undefined> {
+  for (const directory of (pathValue ?? "").split(delimiter).filter(Boolean)) {
+    const candidate = join(directory, command);
+    try {
+      await access(candidate, fsConstants.X_OK);
+      return candidate;
+    } catch {
+      // Continue to the next PATH entry.
+    }
+  }
+  return undefined;
+}
+
+async function assertSecureExecutablePath(path: string): Promise<void> {
+  const executable = await stat(path);
+  if (!executable.isFile()) throw new Error("resolved Claude executable is not a regular file");
+  if (process.platform !== "win32") {
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    if ((executable.mode & 0o022) !== 0 || (uid !== undefined && executable.uid !== uid && executable.uid !== 0)) {
+      throw new Error("resolved Claude executable is writable by or owned by an untrusted user");
+    }
+    let directory = dirname(path);
+    while (true) {
+      const info = await stat(directory);
+      if ((info.mode & 0o022) !== 0 || (uid !== undefined && info.uid !== uid && info.uid !== 0)) {
+        throw new Error("a directory containing the resolved Claude executable is writable by or owned by an untrusted user");
+      }
+      const parent = dirname(directory);
+      if (parent === directory) break;
+      directory = parent;
+    }
+  }
 }
 
 const automaticEnvironmentAllowlist = new Set([

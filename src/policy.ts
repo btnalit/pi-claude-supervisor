@@ -64,14 +64,13 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
       if (nestedResult.decision === "deny") return nestedResult;
     }
   }
-  const hasDynamicCommand = commandPositionTokens(tokens).some((token) => token.dynamic);
-  const hasDynamicGit = hasGit && tokens.some((token) => token.dynamic);
+  const hasDynamicArgument = tokens.some((token) => !token.operator && token.dynamic);
   const hasProtectedBranch = lower.some((value) => protectedBranches.has(value))
     || /(?:^|\s)(?:[^\s]*\.git[\\/]refs[\\/]heads[\\/]|[^\s]*refs[\\/]heads[\\/])(?:main|master|trunk|integration|develop)(?:$|\s)/iu.test(canonical);
   const gitOperation = lower.find((value) => protectedBranchOperations.has(value));
 
-  if (hasDynamicCommand || hasDynamicGit) {
-    return { decision: "deny", reason: "dynamic shell command or Git argument cannot be capability-checked safely" };
+  if (hasDynamicArgument) {
+    return { decision: "deny", reason: "dynamic shell arguments cannot be capability-checked safely" };
   }
   if (/\bgit\b[\s\S]*\b(?:push|merge|send-pack|receive-pack|update-ref)\b/iu.test(canonical)
     || /\bgit-(?:send|receive|upload)-pack\b/iu.test(canonical)
@@ -145,20 +144,6 @@ function evaluateCommandInternal(command: string, depth: number): PolicyResult {
     return { decision: "deny", reason: "command matches a prohibited destructive pattern" };
   }
   return { decision: "allow", reason: "command is allowed for unattended local development" };
-}
-
-function commandPositionTokens(tokens: readonly ShellToken[]): ShellToken[] {
-  const result: ShellToken[] = [];
-  let commandPosition = true;
-  for (const token of tokens) {
-    if (token.operator) {
-      commandPosition = true;
-      continue;
-    }
-    if (commandPosition) result.push(token);
-    commandPosition = false;
-  }
-  return result;
 }
 
 function lexShell(input: string): { tokens: ShellToken[]; error?: string } {

@@ -8,16 +8,22 @@ current implementation and regression tests.
 
 Automatic mode is fail-closed at its supported Worker boundary: it requires a
 validated non-bare Git worktree, an existing full baseline commit, a non-protected
-branch, the Claude JSONL transport, and a direct `claude`/`claude.exe` executable.
-The built-in Claude path requests Claude Code's fail-closed Bash sandbox with no
-outbound domains. Arbitrary custom executables are not admitted to automatic mode;
-manual/custom integrations remain responsible for their own host sandbox and
-network boundary.
+branch, the Claude JSONL transport, and the bare `claude`/`claude.exe` command name.
+Startup resolves and pins an operator-owned, non-writable executable path (or an
+explicit `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` path), and the final pre-spawn check
+compares the current repository HEAD with the exact startup HEAD. The built-in Claude
+path requests Claude Code's fail-closed Bash sandbox with no outbound domains.
+Arbitrary custom executables and explicit paths are not admitted to automatic mode;
+manual/custom integrations remain responsible for their own host sandbox and network
+boundary.
 
 ## Findings addressed in this pass
 
-- Policy now evaluates the executable and argv together, including Claude
-  permission-bypass flags.
+- Policy now evaluates every shell argument as well as the executable and argv
+  together; dynamic arguments are denied because their capability cannot be checked,
+  including Claude permission-bypass flags.
+- Automatic startup pins a secure resolved Claude executable identity and rejects
+  explicit paths, and rechecks the exact startup HEAD immediately before spawn.
 - Worker and verifier processes use a minimal environment; explicit worker
   variables can be selected with `PI_CLAUDE_SUPERVISOR_WORKER_ENV` or an
   embedding caller's `WorkerStartInput.env`.
