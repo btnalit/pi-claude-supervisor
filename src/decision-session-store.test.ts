@@ -103,6 +103,17 @@ test("Decision Worker recovery claims are durable and only one attempt can start
   await store.save({ ...stale, recoveryState: "starting", recoveryOwnerPid: 999999999, recoveryOwnerStartTime: "1" });
   await store.reconcileStaleRecovery(taskId);
   assert.equal((await store.load(taskId))?.recoveryState, "interrupted");
+
+  const runningOwner = await store.load(taskId);
+  assert.ok(runningOwner);
+  await store.save({ ...runningOwner, recoveryState: "starting", recoveryOwnerPid: process.pid, recoveryOwnerStartTime: "0" });
+  await store.reconcileStaleRecovery(taskId);
+  assert.equal((await store.load(taskId))?.recoveryState, "interrupted");
+
+  const missingIdentity = await store.load(taskId);
+  assert.ok(missingIdentity);
+  await store.save({ ...missingIdentity, recoveryState: "starting", recoveryOwnerPid: process.pid, recoveryOwnerStartTime: undefined });
+  await assert.rejects(() => store.reconcileStaleRecovery(taskId), /identity is unavailable/u);
 });
 
 test("Decision Worker session registry ignores corrupt and misnamed records during discovery", async () => {

@@ -264,8 +264,8 @@ export class Supervisor {
         },
       });
       this.#reportProgress("starting", "preflight and Worker startup");
-      if (this.#automation && this.#adapter.capabilities().transport !== "jsonl") {
-        throw new Error("automatic supervision requires the claude-jsonl transport; tmux is manual-only");
+      if (this.#automation && !["jsonl", "tmux"].includes(this.#adapter.capabilities().transport)) {
+        throw new Error("automatic supervision requires the claude-jsonl or automated tmux transport");
       }
       const workerEnvironment = this.#automation ? automaticWorkerEnvironment(options.env) : options.env;
       if (this.#automation) {
@@ -279,6 +279,7 @@ export class Supervisor {
         args: workerArgs,
         env: workerEnvironment,
         approval: options.approval,
+        automatic: this.#automation,
       });
       this.#assertStartNotAborted(startAbortController.signal);
       if (this.#automation) {
@@ -328,6 +329,7 @@ export class Supervisor {
         tmuxSocket: options.tmuxSocket,
         tmuxExpectedIdentity: options.tmuxExpectedIdentity,
         sendInitialInput: options.sendInitialInput,
+        automatic: this.#automation,
         eventListener: (event) => this.#receiveWorkerEvent(event),
         env: workerEnvironment,
         abortSignal: startAbortController.signal,
@@ -518,7 +520,7 @@ export class Supervisor {
           await this.#parkCandidate(`Permission response is unavailable for ${event.type}`, event);
           return;
         }
-        const policy = evaluatePermission(event.request.toolName, event.request.input);
+        const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd);
         const behavior = policy.decision === "deny" ? "deny" : action.action === "allow_permission" ? "allow" : "deny";
         await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, {
           behavior,
@@ -629,7 +631,7 @@ export class Supervisor {
       const request = requestId ? this.#pendingPermissions.get(requestId) : [...this.#pendingPermissions.values()].at(-1);
       if (!request) throw new Error("no pending permission request");
       if (this.#humanRequired && this.#humanGate !== "permission") throw new Error("automatic decisions are held by a separate human gate; use resume-auto explicitly");
-      const policy = evaluatePermission(request.toolName, request.input);
+      const policy = evaluatePermission(request.toolName, request.input, task.cwd);
       if (policy.decision === "deny" && behavior === "allow") throw new Error(`permission denied by policy: ${policy.reason}`);
       await this.#adapter.respondPermission(handle, request.requestId, request.toolUseId, { behavior: policy.decision === "deny" ? "deny" : behavior }, behavior === "allow" ? request.input : undefined);
       this.#pendingPermissions.delete(request.requestId);

@@ -57,7 +57,9 @@ uses Claude Code 2.1.270 at
 `/home/yancao/.local/share/mise/installs/claude/2.1.270/claude`, including real
 owned tmux turns, pause/resume, and restart re-adoption.
 The adapter regression suite also verifies event subscription, parsed
-`permission_request` events, and the exact nested `control_response` envelope.
+`permission_request` events, the exact nested `control_response` envelope, and
+that an automatic tmux Worker cannot launch a second Claude executable from a
+Worker-created script.
 The automation spike additionally exercises a real Pi SDK Decision Worker with
 Claude: ordinary completion, harmless Bash permission handling, and an
 `AskUserQuestion` denial-to-text fallback followed by automatic verification.
@@ -118,19 +120,24 @@ relevant checks from a clean host perspective.
 
 Automatic mode is enabled with `PI_CLAUDE_SUPERVISOR_MODE=auto`; it defaults to
 JSONL and routes `result`, permission, and process-exit events to the persistent
-Pi Decision Worker. Task autonomy defaults to unattended local work, a required
+Pi Decision Worker. Setting `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux` selects the
+Supervisor-owned live bridge, which carries the same structured records through
+private framing on the PTY rather than an independent JSONL sidecar. Task autonomy
+defaults to unattended local work, a required
 local commit on a non-protected task branch and two bounded Decision Worker retries. Configure
 `PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=0` or task `autonomy.requireLocalCommit`
 only to disable the local-commit deliverability check; automatic mode still requires a Git
-baseline and non-protected worktree. An explicit `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux` selection
-remains screen-based and does not use the JSONL permission protocol. `process-pipe` remains the manual compatibility mode. Candidate/failure notification is optional and outbound-only through
+baseline and non-protected worktree. Adopted tmux sessions remain manual-only; the automatic bridge requires
+Supervisor ownership. `process-pipe` remains the manual compatibility mode. Candidate/failure notification is optional and outbound-only through
 `PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL`; it is not a synchronous approval
 callback. Approval callbacks are deliberately not accepted without a separately
 authenticated endpoint.
 
 The tmux transport is selected with `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`.
-Automatic mode rejects explicit `process-pipe` and `tmux` transports; use JSONL for
-bounded decisions and repair. Built-in Claude workers also receive a fail-closed
+Automatic mode rejects explicit `process-pipe`; use JSONL or the Supervisor-owned
+bridge for bounded decisions and repair. Automatic JSONL and tmux workers also
+require Linux cgroup v2 containment (and the tmux parent-death guardian); startup
+fails closed when it is unavailable. Built-in Claude workers also receive a fail-closed
 sandbox setting (`failIfUnavailable`, `allowUnsandboxedCommands=false`, no outbound
 network domains); verify that startup fails if the sandbox cannot be initialized.
 Automatic startup also requires a full existing Git baseline, non-bare non-protected
@@ -141,7 +148,7 @@ compares the exact startup HEAD again immediately before spawn. Before release, 
 private-socket attach,
 multi-line paste, prompt stability while
 Claude is busy, trust/permission policy handling, duplicate send prevention, pane
-replacement refusal, pause/resume, owned-session stop, adopted-session
+replacement refusal, live bridge event framing, pause/resume, owned-session stop, adopted-session
 detach/re-adoption, bounded shutdown, and Pi shutdown without closing an
 attached window. The two gated real-Claude spikes above cover the trust prompt,
 permission prompt, exact output, optional takeover, and adopted detach paths. Use
@@ -156,7 +163,8 @@ response.
 The automated adapter matrix covers external `SIGTERM`, `SIGINT`, `SIGKILL`,
 `SIGSTOP`/`SIGCONT`, SIGTERM refusal/escalation, leader-early-exit descendant
 cleanup, required cgroup bootstrap containment of a pre-attachment detached
-and `setsid()` descendant, repeated stop, spawn failure, output truncation,
+and `setsid()` descendant, automatic nested-Claude detection across the worker
+cgroup, repeated stop, spawn failure, output truncation,
 blocked stdin write timeouts, and immediate JSONL results. The Supervisor
 matrix also covers retrying failed lifecycle events, preserving startup event
 order, stopping under persistent timeout-event failure, and restoring output
@@ -185,8 +193,12 @@ isolated temporary worktree. The current hardening plan and evidence paths are r
 in [`docs/automation-hardening-plan.md`](automation-hardening-plan.md). Deterministic
 coverage now includes repairable-vs-persistent capability assertions, cancellation
 of acceptance commands, stop-from-verifying precedence, paused watchdog baselining,
-staged/untracked evidence and untracked symlink rejection. The remaining release gate
-is the exact-head independent read-only review.
+staged/untracked evidence, and untracked symlink/hard-link rejection. The exact-head
+independent read-only review was rerun. Its pathname TOCTOU finding is recorded as a
+false positive for the trusted local-development threat model: automatic workers are
+trusted development agents, and this policy is a metadata guard rather than a host
+filesystem isolation boundary. A hostile same-UID worker would require a separate
+sandbox/broker design and is out of scope for this release.
 
 ### Acceptance and Reviewer fixtures
 

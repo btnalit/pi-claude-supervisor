@@ -52,6 +52,8 @@ export interface WorkerStartInput {
   };
   /** Adopted sessions must not replay the task as a new user message. */
   sendInitialInput?: boolean;
+  /** Automatic mode selects the structured tmux bridge instead of the manual TUI transport. */
+  automatic?: boolean;
   /** Cancel startup before a worker is fully returned to the supervisor. */
   abortSignal?: AbortSignal;
   /** Internal token that scopes out-of-band startup cancellation. */
@@ -111,7 +113,7 @@ export interface PermissionDecision {
 export interface WorkerAdapter {
   capabilities(): WorkerCapabilities;
   /** Validate host/transport prerequisites before starting a Worker. */
-  preflight?(input: Pick<WorkerStartInput, "cwd" | "command" | "args" | "env" | "approval">): Promise<void>;
+  preflight?(input: Pick<WorkerStartInput, "cwd" | "command" | "args" | "env" | "approval" | "automatic">): Promise<void>;
   start(input: WorkerStartInput): Promise<WorkerHandle>;
   /** Cancel adapter-owned startup work before a WorkerHandle is returned. */
   abortStart?(reason: string, startupToken?: string): Promise<void>;

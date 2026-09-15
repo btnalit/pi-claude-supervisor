@@ -36,7 +36,7 @@ Claude Code Worker
 4. Supervisor 因误判导致无限循环、危险操作或不可审计的修改。
 5. 人工无法随时接管或恢复任务。
 
-**当前状态：`v0.5.2` 已正式发布，已完成固定 Claude Code `2.1.270` 稳定性验证、单 Worker recovery、真实只读 Review drill、隔离临时 worktree 的允许编辑 repair/reacceptance drill、exact-head 独立 Review 和受保护发布。当前工作树已落实 repairable/persistent 能力拆分、verifying stop、paused watchdog、baseline-relative repository evidence、可取消验收/Reviewer、启动 preflight、无人值守权限决策、local-commit enforcement、候选挂起和阶段进度通知。自动模式现在要求 direct Claude JSONL、完整 Git baseline、非保护分支，并请求不可用即失败的 Claude Code sandbox 和无出站域名；任意自定义可执行文件不会进入自动模式。Legacy human/takeover APIs 仅保留显式兼容控制；普通不确定性不再阻塞本地循环。协同多 Worker、手动/自定义集成的 host-level 低权限和网络隔离仍是独立后续里程碑。**
+**当前状态：`v0.5.3` 已正式发布，已完成固定 Claude Code `2.1.270` 稳定性验证、单 Worker recovery、真实只读 Review drill、隔离临时 worktree 的允许编辑 repair/reacceptance drill、exact-head 独立 Review 和受保护发布。当前工作树已落实 repairable/persistent 能力拆分、verifying stop、paused watchdog、baseline-relative repository evidence、可取消验收/Reviewer、启动 preflight、无人值守权限决策、local-commit enforcement、候选挂起和阶段进度通知。自动模式现在要求 direct Claude JSONL 或 Supervisor 自有 tmux bridge、完整 Git baseline、非保护分支，并请求不可用即失败的 Claude Code sandbox 和无出站域名；任意自定义可执行文件不会进入自动模式。Legacy human/takeover APIs 仅保留显式兼容控制；普通不确定性不再阻塞本地循环。协同多 Worker、手动/自定义集成的 host-level 低权限和网络隔离仍是独立后续里程碑。**
 
 ---
 

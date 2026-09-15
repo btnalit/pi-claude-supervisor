@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
@@ -134,6 +134,21 @@ test("repository evidence rejects untracked symlinks", async () => {
   } finally {
     await rm(cwd, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("repository evidence omits untracked hard-link aliases", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-evidence-hard-link-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd });
+    await writeFile(join(cwd, "secret.txt"), "sensitive metadata\n");
+    await link(join(cwd, "secret.txt"), join(cwd, "alias.txt"));
+    const evidence = await collectRepositoryEvidence(cwd);
+    assert.equal(evidence.complete, false);
+    assert.match(evidence.untracked ?? "", /hard-link|read failed|untracked/i);
+    assert.doesNotMatch(evidence.untracked ?? "", /sensitive metadata/u);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
   }
 });
 

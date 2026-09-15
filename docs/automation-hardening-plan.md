@@ -144,7 +144,8 @@ diff:   (none)
 - Reviewer evidence 使用任务 baseline-relative diff、baseline 后 commit summaries、受限 untracked regular-file 内容、路径组件/symlink 门禁，并对 incomplete/truncated fail-closed。
 - Acceptance 子进程、证据收集和 Reviewer 共享 abort signal；Pi UI 可看到 startup、Worker heartbeat、acceptance、review、repair 和 candidate/decision phases。
 - 自动模式启动前检查运行目录、cwd、Worker 可执行文件、transport 依赖和 required cgroup；显式
-`process-pipe` 和 `tmux` 不再进入自动模式，后者保留为手动 PTY transport。
+`process-pipe` 仍仅限手动模式，Supervisor 自有 tmux bridge 可进入自动模式，被接管的
+session 仍仅限手动 PTY transport。
 - Reviewer/Decision Worker 只解析 assistant message 边界的最终文本；permission pending 会在自动响应后清除，候选状态不会被错误解除；扩大的 exec buffer 避免普通大测试报告被误判为命令失败。
 
 本轮已完成：

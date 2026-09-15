@@ -77,24 +77,25 @@ one capability from the other.
 
 This is a control-boundary fixture and headless transport. It does not emulate a
 terminal. Manual compatibility mode remains `process-pipe`; automatic mode
-(`PI_CLAUDE_SUPERVISOR_MODE=auto`) defaults to Claude JSONL and uses the CLI
-contract validated by the fixed-version spike; an explicit tmux transport remains
-screen-based.
+(`PI_CLAUDE_SUPERVISOR_MODE=auto`) defaults to Claude JSONL and can select the
+Supervisor-owned tmux bridge. The bridge uses the CLI contract validated by the
+fixed-version spike, renders the stream in the pane and carries structured records
+through private framing on the same PTY; explicit adoption remains manual-only.
 
 A worker exit automatically triggers cleanup, and terminal status waits for
-that cleanup to be confirmed (or reports a cleanup error). On Linux the adapter
-uses cgroup v2 automatically when the current user cgroup is writable; the
-`required` mode performs a preflight and fails before Claude starts if cgroup
-attachment or cleanup is unavailable. Cgroup
-cleanup kills descendants even when they call `setsid()` or create another
-process group. Attachment occurs immediately after spawn, so a worker that
-forks before attachment remains a documented startup-window limitation.
+that cleanup to be confirmed (or reports a cleanup error). On Linux, manual
+workers may use cgroup v2 automatically when the current user cgroup is writable;
+the `required` mode performs a preflight and fails before Claude starts if cgroup
+attachment or cleanup is unavailable. Automatic JSONL workers always require the
+same preflight and a guarded cgroup bootstrap; automatic startup fails closed on
+non-Linux hosts or when the boundary cannot be established. Cgroup cleanup kills
+descendants even when they call `setsid()` or create another process group.
 
-When cgroup v2 is unavailable, the adapter falls back to detached
-process-group cleanup. That fallback is not recursive: `setsid()` descendants
-can escape, and PID reuse between leader exit and cleanup is a host-level
-limitation. Production deployments that require an atomic boundary should use a
-service-manager scope, Job Object, pidfd-aware reaper, or equivalent supervisor.
+When cgroup v2 is unavailable, manual mode falls back to detached process-group
+cleanup. That fallback is not recursive: `setsid()` descendants can escape, and
+PID reuse between leader exit and cleanup is a host-level limitation. Production
+deployments that require an atomic boundary should use a service-manager scope,
+Job Object, pidfd-aware reaper, or equivalent supervisor.
 Pi owns graceful `SIGTERM`/`SIGINT` handling and invokes the extension's
 `session_shutdown` hook. The extension does not install a second `process.exit()`
 handler, avoiding races with Pi terminal restoration and other extensions. `SIGSTOP`
@@ -104,25 +105,37 @@ host-fatal signals.
 ## tmux/PTY transport
 
 `TmuxWorkerAdapter` is an explicit second transport, selected with
-`PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`. Because tmux has no equivalent cgroup
-containment boundary, `PI_CLAUDE_SUPERVISOR_CGROUP_MODE=required` is rejected
-with this transport; use `auto`/`off` only when the tmux boundary is acceptable.
-An owned worker gets a private tmux server/socket and executes the validated Claude command directly in the pane,
-so its pane identity remains re-adoptable after a Pi restart. The worker
+`PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`. Both owned and adopted tmux currently
+require Linux because pane identity and cleanup use `/proc`; manual tmux may use
+cgroup `auto`/`off`. Automatic owned tmux additionally creates a required Linux
+cgroup for the bridge and its descendants; it is rejected when cgroup v2 or the
+parent-death guardian is unavailable.
+An owned manual worker gets a private tmux server/socket and executes the
+validated Claude command directly in the pane. An owned automatic worker instead
+starts the Supervisor bridge through a cgroup-joining pane bootstrap, so its
+bridge identity is not a manual adoption target. The worker
 environment is supplied to the tmux server through the same least-privilege
 environment builder; credentials are not copied into a file; credential-shaped
 command arguments are rejected.
 `load-buffer`, bracketed `paste-buffer` and `send-keys Enter` provide the input
 boundary without interpolating a task into a shell command. C0/C1 terminal
-control bytes are rejected; CRLF is normalized to a newline.
+control bytes are rejected; CRLF is normalized to a newline. In automatic mode,
+the adapter snapshots the trusted direct Claude process and checks both the
+required Linux cgroup and process tree on every poll; a newly executed Claude or
+Reviewer descendant is a runtime policy failure and the owned session is stopped.
+This supplements the lexical Bash/file-tool boundary and is disabled for
+manual/adopted sessions.
 
 The transport has three deliberately separate observations:
 
 - `pipe-pane` provides an append-only raw PTY log for output polling and audit;
 - `capture-pane` provides a bounded screen snapshot used only for stable prompt
   detection and human display;
-- Claude's own transcript, when available, remains the structured history. The
-  screen is never relabeled as JSONL or permission evidence.
+- the Supervisor-owned bridge emits Claude stream-json records as private framed
+  PTY control data; `pipe-pane` carries those records to the adapter without an
+  independent JSONL sidecar;
+- Claude's own transcript, when available, remains the structured history. Ordinary
+  screen text is never relabeled as JSONL or permission evidence.
 
 For an owned initial turn, the adapter emits a synthetic `turn_completed` only
 after output activity and two stable input-prompt observations. Adopting an idle
@@ -139,9 +152,12 @@ process identity before attaching. Every later input, capture and signal uses
 that immutable pane target; a replacement process is refused. Adopted sessions
 are not owned: stop and Pi shutdown detach rather than kill them. Tmux commands
 and serialized input waits have bounded deadlines so shutdown cannot hang
-forever. Sessions started by the adapter also survive a Pi disconnect, but
-recovery after restart is explicit re-adoption; the extension never claims to
-attach to an arbitrary non-tmux PTY. A normal Claude
+forever. Manual sessions started by the adapter survive a Pi disconnect, but recovery
+after restart is explicit re-adoption; automatic sessions are intentionally
+terminated by their parent-death guardian when the Supervisor disappears. The
+extension never claims to attach to an arbitrary non-tmux PTY. Startup cleanup always attempts the
+private tmux server teardown, including after partial session creation, and a
+confirmed `kill-server` is sufficient cleanup evidence. A normal Claude
 `--resume` starts another process from history and is not a live PTY migration.
 
 ## State machine

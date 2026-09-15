@@ -43,10 +43,12 @@ All notable changes to this project will be documented here.
 - Replace shell-policy lexical bypasses with quote-aware parsing, nested-shell inspection and protected Git-ref checks; deny dynamic shell expansions while preserving literal argv values, and reject arbitrary non-Claude automatic executables.
 - Normalize malformed custom Reviewer values to blocking reports, persist recovery baselines and the resolved Claude executable identity, filter automatic environment variables with a deny-by-default allowlist, and compare the exact startup HEAD at the adapter spawn boundary.
 - Keep protected CI checks on the exact checked-out commit while giving automatic-mode fixtures a local validation branch and an owned deterministic Claude executable.
+- Add a Supervisor-owned automatic tmux bridge that renders Claude stream-json in a live PTY and carries structured records through private framing instead of an independent event sidecar; adopted sessions remain manual-only.
+- Add parent-identity tmux guardians, guarded Linux bootstrap readiness/cleanup, explicit nested-Agent/background-reviewer denial, and tolerant Reviewer prose/fence/repeated-JSON parsing with separate display-truncation markers.
 
-### Remaining hardening gate
+### Release readiness
 
-- Open the protected pull request and complete independent CI/integration review; the exact-head read-only review, real editable Claude `2.1.270` repair/reacceptance drill and cleanup/lease evidence are recorded in `docs/automation-hardening-plan.md`.
+- The exact-head read-only review, real editable Claude `2.1.270` repair/reacceptance drill and cleanup/lease evidence are recorded in `docs/automation-hardening-plan.md`. The review's pathname TOCTOU concern is explicitly accepted as a false positive for the trusted local-development threat model; host-side broker isolation remains future work for an untrusted-worker mode.
 
 ### Added
 

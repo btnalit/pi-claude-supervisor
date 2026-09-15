@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { lstat, open, realpath } from "node:fs/promises";
+import { lstat, open, readlink, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { AcceptanceCheck, AcceptanceCheckResult, AcceptanceReport, VerificationResult } from "./types.ts";
@@ -310,6 +310,12 @@ async function collectUntrackedEvidence(cwd: string, signal?: AbortSignal): Prom
         sections.push(`--- ${JSON.stringify(path)} [non-regular file omitted]`);
         continue;
       }
+      if (opened.nlink > 1) {
+        complete = false;
+        sections.push(`--- ${JSON.stringify(path)} [hard-link file omitted]`);
+        continue;
+      }
+      await assertOpenedEvidencePath(root, handle.fd);
       const buffer = Buffer.alloc(MAX_UNTRACKED_FILE_BYTES + 1);
       const read = await handle.read(buffer, 0, buffer.length, 0);
       const bytes = buffer.subarray(0, read.bytesRead);
@@ -336,6 +342,17 @@ async function collectUntrackedEvidence(cwd: string, signal?: AbortSignal): Prom
   }
   const bounded = boundEvidence(sections.join("\n"));
   return { ...bounded, complete: complete && bounded.complete, truncated: truncated || bounded.truncated };
+}
+
+async function assertOpenedEvidencePath(root: string, fd: number): Promise<void> {
+  if (process.platform !== "linux") throw new Error("opened evidence identity cannot be verified on this platform");
+  const target = (await readlink(`/proc/self/fd/${fd}`)).replace(/ \(deleted\)$/u, "");
+  const normalizedTarget = target.replaceAll("\\", "/");
+  if (normalizedTarget.split("/").some((segment) => segment.toLowerCase() === ".git")) throw new Error("opened evidence path resolves into Git metadata");
+  const relativeTarget = relative(root, target);
+  if (isAbsolute(relativeTarget) || relativeTarget === ".." || relativeTarget.startsWith(`..${sep}`) || relativeTarget.startsWith(`..${"\\"}`)) {
+    throw new Error("opened evidence path escaped the repository root");
+  }
 }
 
 async function assertNoSymlinkComponents(root: string, relativePath: string): Promise<void> {

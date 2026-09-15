@@ -1,9 +1,17 @@
 import assert from "node:assert/strict";
+import { link, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import test from "node:test";
-import { assertSafeWorkerCommand, evaluateCommand } from "./policy.ts";
+import { assertSafeWorkerCommand, evaluateCommand, evaluatePermission } from "./policy.ts";
 
 test("policy denies destructive commands", () => {
   assert.equal(evaluateCommand("rm -rf /").decision, "deny");
+});
+
+test("policy hard-denies Git alias redefinition", () => {
+  assert.equal(evaluateCommand("git config alias.c checkout").decision, "deny");
+  assert.equal(evaluateCommand("git -c alias.c=checkout c main").decision, "deny");
 });
 
 test("policy hard-denies publication and remote/integration writes", () => {
@@ -47,6 +55,60 @@ test("policy denies every dynamic shell argument", () => {
 test("policy allows ordinary read-only commands and literal argv values", () => {
   assert.equal(evaluateCommand("git diff --check").decision, "allow");
   assert.equal(evaluateCommand("node", ["-e", "console.log({ value: 1 })"]).decision, "allow");
+});
+
+test("permission policy rejects nested Claude Reviewer launches", () => {
+  assert.equal(evaluatePermission("Bash", { command: "claude --print review" }).decision, "deny");
+  assert.equal(evaluatePermission("Bash", { command: "c'l'a'u'd'e --print review" }).decision, "deny");
+  assert.equal(evaluatePermission("Bash", { command: "/usr/local/bin/claude --print review" }).decision, "deny");
+  assert.equal(evaluatePermission("Bash", { command: "'/usr/local/bin/claude' --print review" }).decision, "deny");
+  assert.equal(evaluatePermission("Bash", { command: "'/opt/Claude Code/bin/claude' --print review" }).decision, "deny");
+  assert.equal(evaluatePermission("Bash", { command: "env CLAUDE_ENV=1 /usr/local/bin/claude --print review" }).decision, "deny");
+  assert.equal(evaluatePermission("Bash", { command: "env CLAUDE_ENV=1 './claude' --print review" }).decision, "deny");
+  assert.equal(evaluatePermission("Bash", { command: "env CLAUDE_ENV=1 '/opt/Claude Code/bin/claude' --print review" }).decision, "deny");
+  assert.equal(evaluatePermission("Bash", { command: "python3 -c 'import os; os.execv(\"/opt/Claude Code/bin/claude\", [\"claude\"])'" }).decision, "deny");
+  assert.equal(evaluatePermission("Bash", { command: "command /usr/local/bin/claude --print review" }).decision, "deny");
+  assert.equal(evaluatePermission("Bash", { command: "command -- \"/tmp/claude\" --print review" }).decision, "deny");
+  assert.equal(evaluatePermission("Bash", { command: "bash -c 'claude --print review'" }).decision, "deny");
+  assert.equal(evaluatePermission("Bash", { command: "npm test" }).decision, "allow");
+  assert.equal(evaluatePermission("Task", {}).decision, "deny");
+  assert.equal(evaluatePermission("Agent", {}).decision, "deny");
+  assert.equal(evaluatePermission("UnknownTool", {}).decision, "deny");
+});
+
+test("file tools cannot write Git metadata", () => {
+  assert.equal(evaluatePermission("Write", { file_path: "src/index.ts", content: "ok" }).decision, "allow");
+  assert.equal(evaluatePermission("Write", { file_path: ".git/config", content: "[alias]" }).decision, "deny");
+  assert.equal(evaluatePermission("Edit", { file_path: ".git/refs/heads/main", old_string: "a", new_string: "b" }).decision, "deny");
+  assert.equal(evaluatePermission("NotebookEdit", { notebook_path: "work/../.git/objects/x" }).decision, "deny");
+  assert.equal(evaluatePermission("Write", { content: "missing path" }).decision, "deny");
+});
+
+test("file tools reject outside-cwd and hard-link Git aliases", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-policy-hardlink-"));
+  try {
+    await mkdir(join(root, ".git", "refs", "heads"), { recursive: true });
+    const ref = join(root, ".git", "refs", "heads", "main");
+    const alias = join(root, "main-alias");
+    await writeFile(ref, "base\n");
+    await link(ref, alias);
+    assert.equal(evaluatePermission("Write", { file_path: "main-alias", content: "moved\n" }, root).decision, "deny");
+    assert.equal(evaluatePermission("Write", { file_path: "../outside.txt", content: "outside\n" }, root).decision, "deny");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("file tools cannot follow a symlink into Git metadata", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-policy-"));
+  try {
+    await mkdir(join(root, ".git"));
+    await symlink(join(root, ".git"), join(root, "safe-link"), "dir");
+    assert.equal(evaluatePermission("Write", { file_path: "safe-link/config", content: "[core]" }, root).decision, "deny");
+    assert.equal(evaluatePermission("Write", { file_path: "safe-link/../outside", content: "escape" }, root).decision, "deny");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("policy denies unsafe worker permission flags even when passed as arguments", () => {

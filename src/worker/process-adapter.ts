@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants as fsConstants, readFileSync } from "node:fs";
-import { access, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { delimiter, isAbsolute, join } from "node:path";
 import type {
   WorkerAdapter,
@@ -15,6 +15,7 @@ import type {
 } from "../types.ts";
 import { assertSafeWorkerCommand } from "../policy.ts";
 import { workerEnvironment } from "./environment.ts";
+import { isClaudeProcess, linuxCgroupProcesses, linuxProcessTree, sameProcessIdentity, unexpectedClaudeProcess, unexpectedReviewerProcess, type ProcessTreeEntry } from "./process-tree.ts";
 
 export interface ProcessWorkerAdapterOptions {
   /** Use Claude Code's documented stream-json stdin/stdout framing. */
@@ -79,6 +80,9 @@ interface ProcessRecord {
   inputTail: Promise<void>;
   listeners: Set<WorkerEventListener>;
   permissionResponses: Set<string>;
+  enforceNestedClaude: boolean;
+  expectedClaudeCommand?: string;
+  trustedClaudeProcesses: Map<number, ProcessTreeEntry>;
   stopping?: boolean;
   starting: boolean;
   abortRequested: boolean;
@@ -129,19 +133,19 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     };
   }
 
-  async preflight(input: Pick<WorkerStartInput, "cwd" | "command" | "args" | "env" | "approval">): Promise<void> {
+  async preflight(input: Pick<WorkerStartInput, "cwd" | "command" | "args" | "env" | "approval" | "automatic">): Promise<void> {
     const args = this.#mode === "claude-jsonl" ? claudeJsonlArgs(input.args) : (input.args ?? []);
     assertSafeWorkerCommand(input.command, args, input.approval);
     await assertWorkerCwd(input.cwd);
     await assertExecutable(input.command, input.env?.PATH ?? process.env.PATH);
-    if (this.#cgroupMode === "required") await this.#preflightRequiredCgroup();
+    if (this.#cgroupMode === "required" || input.automatic) await this.#preflightRequiredCgroup();
   }
 
   async start(input: WorkerStartInput): Promise<WorkerHandle> {
     if (input.abortSignal?.aborted) throw new Error("worker startup aborted before spawn");
     const args = this.#mode === "claude-jsonl" ? claudeJsonlArgs(input.args) : (input.args ?? []);
     assertSafeWorkerCommand(input.command, args, input.approval);
-    if (this.#cgroupMode === "required") await this.preflight(input);
+    if (this.#cgroupMode === "required" || input.automatic) await this.preflight(input);
     const handle: WorkerHandle = {
       id: randomUUID(),
       startedAt: new Date().toISOString(),
@@ -154,23 +158,30 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     if (pendingAbortReason !== undefined) throw new Error(`worker startup aborted: ${pendingAbortReason}`);
     let cgroupPath: string | undefined;
     let cgroupError: Error | undefined;
-    if (this.#cgroupMode !== "off" && process.platform === "linux") {
+    if (input.automatic && this.#cgroupMode === "off") throw new Error("automatic supervision requires cgroup containment");
+    if ((this.#cgroupMode !== "off" || input.automatic) && process.platform === "linux") {
       try {
         cgroupPath = await this.#createCgroup(handle.id);
         handle.cgroupPath = cgroupPath;
       } catch (error) {
         cgroupError = error instanceof Error ? error : new Error(String(error));
-        if (this.#cgroupMode === "required") throw new Error(`unable to create a worker cgroup: ${cgroupError.message}`, { cause: cgroupError });
+        if (this.#cgroupMode === "required" || input.automatic) throw new Error(`unable to create a worker cgroup: ${cgroupError.message}`, { cause: cgroupError });
       }
     }
     const delayedAbortReason = input.startupToken ? this.#pendingStartupAborts.get(input.startupToken) : undefined;
     if (input.startupToken) this.#pendingStartupAborts.delete(input.startupToken);
     if (input.abortSignal?.aborted || delayedAbortReason !== undefined) {
-      if (cgroupPath) await rm(cgroupPath, { recursive: true, force: true }).catch(() => {});
+      if (cgroupPath) await removeCgroupDirectory(cgroupPath).catch(() => {});
       throw new Error(`worker startup aborted${delayedAbortReason ? `: ${delayedAbortReason}` : " before spawn"}`);
     }
-    const launch = cgroupPath
-      ? cgroupBootstrapLaunch(input.command, args, input.cwd, workerEnv, cgroupPath)
+    const parentStartTime = process.platform === "linux" ? readProcessStartTimeSync(process.pid) : undefined;
+    if (input.automatic && process.platform === "linux" && !parentStartTime) {
+      if (cgroupPath) await removeCgroupDirectory(cgroupPath).catch(() => {});
+      throw new Error("automatic worker parent identity is unavailable");
+    }
+    const useGuardedBootstrap = process.platform === "linux" && Boolean(parentStartTime) && Boolean(cgroupPath);
+    const launch = useGuardedBootstrap
+      ? guardedBootstrapLaunch(input.command, args, input.cwd, workerEnv, cgroupPath, process.pid, parentStartTime!)
       : { command: input.command, args, env: workerEnv };
     try {
       // This is the last asynchronous operation before spawn. Automatic mode
@@ -178,15 +189,17 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       // setup work must invoke the hook only after that work is complete.
       await input.preSpawnCheck?.();
     } catch (error) {
-      if (cgroupPath) await rm(cgroupPath, { recursive: true, force: true }).catch(() => {});
+      if (cgroupPath) await removeCgroupDirectory(cgroupPath).catch(() => {});
       throw error;
     }
     const finalAbortReason = input.startupToken ? this.#pendingStartupAborts.get(input.startupToken) : undefined;
     if (input.startupToken) this.#pendingStartupAborts.delete(input.startupToken);
     if (input.abortSignal?.aborted || finalAbortReason !== undefined) {
-      if (cgroupPath) await rm(cgroupPath, { recursive: true, force: true }).catch(() => {});
+      if (cgroupPath) await removeCgroupDirectory(cgroupPath).catch(() => {});
       throw new Error(`worker startup aborted${finalAbortReason ? `: ${finalAbortReason}` : " before spawn"}`);
     }
+    const guardedLaunch = useGuardedBootstrap;
+    let bootstrapReady = !guardedLaunch;
     let child: ChildProcess;
     try {
       child = spawn(launch.command, launch.args, {
@@ -196,7 +209,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (error) {
-      if (cgroupPath) await rm(cgroupPath, { recursive: true, force: true }).catch(() => {});
+      if (cgroupPath) await removeCgroupDirectory(cgroupPath).catch(() => {});
       throw error;
     }
     handle.pid = child.pid;
@@ -233,6 +246,9 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       inputTail: Promise.resolve(),
       listeners: new Set(input.eventListener ? [input.eventListener] : []),
       permissionResponses: new Set(),
+      enforceNestedClaude: Boolean(input.automatic),
+      expectedClaudeCommand: input.automatic ? input.command : undefined,
+      trustedClaudeProcesses: new Map(),
       starting: true,
       abortRequested: false,
       startupToken: input.startupToken,
@@ -249,7 +265,13 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     this.#records.set(handle.id, record);
     if (input.abortSignal?.aborted) abortListener();
     const capture = (stream: "stdout" | "stderr") => (chunk: Buffer | string) => {
-      const text = String(chunk);
+      let text = String(chunk);
+      if (guardedLaunch && stream === "stderr" && text.includes(BOOTSTRAP_READY_MARKER)) {
+        text = text.replaceAll(`${BOOTSTRAP_READY_MARKER}\n`, "").replaceAll(BOOTSTRAP_READY_MARKER, "");
+        bootstrapReady = true;
+        resolveSpawn();
+      }
+      if (!text) return;
       record.lastOutputAt = new Date().toISOString();
       const outputChunk = { stream, text, at: record.lastOutputAt } as WorkerOutputChunk;
       this.#appendOutput(record, outputChunk);
@@ -271,7 +293,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
           record.processGroupIdentityError = error instanceof Error ? error : new Error(String(error));
         }
       }
-      resolveSpawn();
+      if (!guardedLaunch) resolveSpawn();
     });
     child.once("error", (error) => {
       if (!record.spawnedSuccessfully) {
@@ -287,6 +309,11 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       }
     });
     child.once("exit", (code, signal) => {
+      if (guardedLaunch && !bootstrapReady && !record.spawnError) {
+        const error = new Error("worker bootstrap exited before reporting readiness");
+        record.spawnError = error;
+        rejectSpawn(error);
+      }
       if (!record.spawnError) {
         record.exitCode = code;
         record.signal = signal ?? undefined;
@@ -315,6 +342,23 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
           Object.defineProperty(startupError, "workerCleanupRequired", { value: true, enumerable: false });
         }
         throw startupError;
+      }
+      if (record.enforceNestedClaude) {
+        try {
+          await this.#rememberClaudeProcesses(record);
+        } catch (error) {
+          let cleanupError: unknown;
+          try { await this.stop(handle, "worker containment startup failed"); }
+          catch (stopError) { cleanupError = stopError; }
+          if (cleanupError) {
+            const startupError = error instanceof Error ? error : new Error(String(error));
+            startupError.message = `${startupError.message}; startup cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
+            Object.defineProperty(startupError, "workerHandle", { value: handle, enumerable: false });
+            Object.defineProperty(startupError, "workerCleanupRequired", { value: true, enumerable: false });
+            throw startupError;
+          }
+          throw error;
+        }
       }
       if (input.task) {
         this.#assertNotAborted(record);
@@ -366,6 +410,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   async getStatus(handle: WorkerHandle): Promise<WorkerStatus> {
     const record = this.#record(handle);
     const running = record.exitCode === undefined;
+    if (running && record.enforceNestedClaude) await this.#checkNestedClaude(record);
     if (!running && record.groupCleanup) {
       try {
         await record.groupCleanup;
@@ -381,10 +426,10 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       lastOutputAt: record.lastOutputAt,
       lastInputAt: record.lastInputAt,
       activeRequests: this.#mode === "claude-jsonl" ? record.activeRequests : undefined,
-      exitReason: running ? undefined : record.stopping ? "stopped" : record.signal ? "crashed" : record.exitCode === 0 ? "completed" : "failed",
+      exitReason: running ? undefined : record.runtimeError ? "failed" : record.stopping ? "stopped" : record.signal ? "crashed" : record.exitCode === 0 ? "completed" : "failed",
       processGroupCleaned: record.groupCleanupComplete,
       cgroupCleaned: record.cgroupPath ? record.groupCleanupComplete : undefined,
-      cgroupRequired: this.#cgroupMode === "required",
+      cgroupRequired: this.#cgroupMode === "required" || record.enforceNestedClaude,
       cgroupError: record.cgroupError?.message,
       cleanupError: record.cleanupError?.message,
       runtimeError: record.runtimeError?.message,
@@ -650,30 +695,80 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   }
 
   async #preflightRequiredCgroup(): Promise<void> {
-    if (process.platform !== "linux") throw new Error("required cgroup cleanup is unavailable on this platform");
-    let probePath: string | undefined;
-    try {
-      const parent = this.#cgroupParentPath ?? await currentCgroupPath();
-      await access(parent, fsConstants.W_OK);
-      probePath = `${parent}/pi-claude-supervisor-preflight-${process.pid}-${randomUUID()}`;
-      await mkdir(probePath);
-      await stat(`${probePath}/cgroup.kill`);
-      await stat(`${probePath}/cgroup.events`);
-      await writeFile(`${probePath}/cgroup.kill`, "1\n");
-      const events = await readFile(`${probePath}/cgroup.events`, "utf8");
-      if (!/^populated 0$/mu.test(events)) throw new Error("preflight cgroup did not report populated 0");
-    } catch (error) {
-      throw new Error(`required cgroup preflight failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
-    } finally {
-      if (probePath) await rm(probePath, { recursive: true, force: true }).catch(() => {});
-    }
+    await preflightCgroupContainment(this.#cgroupParentPath);
   }
 
   async #createCgroup(id: string): Promise<string> {
     const parent = this.#cgroupParentPath ?? await currentCgroupPath();
     const path = `${parent}/pi-claude-supervisor-${id}`;
     await mkdir(path);
+    try {
+      await access(`${path}/cgroup.procs`, fsConstants.R_OK | fsConstants.W_OK);
+      await access(`${path}/cgroup.events`, fsConstants.R_OK);
+      await access(`${path}/cgroup.kill`, fsConstants.W_OK);
+    } catch (error) {
+      await removeCgroupDirectory(path).catch(() => {});
+      throw new Error(`worker cgroup controls are unavailable: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+    }
     return path;
+  }
+
+  async #processScope(record: ProcessRecord): Promise<ProcessTreeEntry[]> {
+    const rootPid = record.handle.pid ?? 0;
+    const tree = await linuxProcessTree(rootPid);
+    if (!record.cgroupPath) return tree;
+    const group = await linuxCgroupProcesses(record.cgroupPath);
+    if (record.enforceNestedClaude && !group.some((entry) => entry.pid === rootPid)) {
+      throw new Error("automatic worker is not contained by its required cgroup");
+    }
+    return [...new Map([...tree, ...group].map((entry) => [entry.pid, entry])).values()];
+  }
+
+  async #rememberClaudeProcesses(record: ProcessRecord): Promise<void> {
+    const rootPid = record.handle.pid ?? 0;
+    let entries: ProcessTreeEntry[] = [];
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        entries = await this.#processScope(record);
+        if (entries.some((entry) => entry.ppid === rootPid && isClaudeProcess(entry, record.expectedClaudeCommand))) break;
+      } catch (error) {
+        if (attempt === 19) throw error;
+      }
+      await delay(25);
+    }
+    record.trustedClaudeProcesses = new Map(entries.filter((entry) => entry.ppid === rootPid && isClaudeProcess(entry, record.expectedClaudeCommand)).map((entry) => [entry.pid, entry]));
+  }
+
+  async #checkNestedClaude(record: ProcessRecord): Promise<void> {
+    const rootPid = record.handle.pid ?? 0;
+    let entries: ProcessTreeEntry[];
+    try { entries = await this.#processScope(record); }
+    catch (error) {
+      if (process.platform === "linux" && !record.runtimeError) {
+        record.runtimeError = new Error(`nested Claude guard unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        record.stopping = true;
+        try { record.child.kill("SIGTERM"); } catch {}
+        this.#appendOutput(record, { stream: "stderr", text: `${record.runtimeError.message}\n`, at: new Date().toISOString() });
+      }
+      return;
+    }
+    if (record.trustedClaudeProcesses.size === 0) {
+      const directClaude = entries.filter((entry) => entry.ppid === rootPid && isClaudeProcess(entry, record.expectedClaudeCommand));
+      if (directClaude.length > 0) {
+        record.trustedClaudeProcesses = new Map(directClaude.map((entry) => [entry.pid, entry]));
+        return;
+      }
+    }
+    const nestedClaude = unexpectedClaudeProcess(entries, record.trustedClaudeProcesses, record.expectedClaudeCommand);
+    const reviewerCandidate = unexpectedReviewerProcess(entries);
+    const trustedReviewerCandidate = reviewerCandidate && record.trustedClaudeProcesses.get(reviewerCandidate.pid);
+    const nestedReviewer = reviewerCandidate && (!trustedReviewerCandidate || !sameProcessIdentity(trustedReviewerCandidate, reviewerCandidate)) ? reviewerCandidate : undefined;
+    const nested = nestedClaude ?? nestedReviewer;
+    if (!nested || record.runtimeError) return;
+    record.runtimeError = new Error(`${nested === nestedReviewer ? "nested Reviewer" : "nested Claude"} process denied (pid=${nested.pid})`);
+    record.stopping = true;
+    try { record.child.kill("SIGTERM"); } catch {}
+    this.#appendOutput(record, { stream: "stderr", text: `${record.runtimeError.message}\n`, at: new Date().toISOString() });
   }
 
   #record(handle: WorkerHandle): ProcessRecord {
@@ -724,12 +819,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     }
     const deadline = Date.now() + this.#killGraceMs;
     while (Date.now() <= deadline) {
-      try {
-        process.kill(-pid, 0);
-      } catch (error) {
-        if (error instanceof Error && /ESRCH/u.test(error.message)) return;
-        throw error;
-      }
+      if (!(await processGroupHasLiveMember(pid))) return;
       await delay(Math.min(10, Math.max(1, deadline - Date.now())));
     }
     throw new Error(`worker process group ${pid} did not exit before cleanup deadline`);
@@ -742,91 +832,176 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   }
 }
 
-const CGROUP_BOOTSTRAP_KEYS = {
+const BOOTSTRAP_READY_MARKER = "PI_CLAUDE_SUPERVISOR_BOOTSTRAP_READY";
+
+const BOOTSTRAP_KEYS = {
   command: "PI_CLAUDE_SUPERVISOR_BOOTSTRAP_COMMAND",
   args: "PI_CLAUDE_SUPERVISOR_BOOTSTRAP_ARGS",
   cwd: "PI_CLAUDE_SUPERVISOR_BOOTSTRAP_CWD",
   cgroup: "PI_CLAUDE_SUPERVISOR_BOOTSTRAP_CGROUP",
+  parentPid: "PI_CLAUDE_SUPERVISOR_BOOTSTRAP_PARENT_PID",
+  parentStartTime: "PI_CLAUDE_SUPERVISOR_BOOTSTRAP_PARENT_START",
 } as const;
 
-const CGROUP_BOOTSTRAP_SCRIPT = `
+/**
+ * Keep the worker in a small bootstrap process group which watches the
+ * Supervisor's PID/start-time identity. A SIGKILL cannot run cleanup in the
+ * Supervisor itself, so the detached worker must notice that its owner died
+ * and terminate its own descendants. The cgroup path remains an additional
+ * descendant boundary when v2 is available.
+ */
+const GUARDED_BOOTSTRAP_SCRIPT = `
 const { spawn } = require("node:child_process");
-const { writeFileSync } = require("node:fs");
-const keys = ${JSON.stringify(Object.values(CGROUP_BOOTSTRAP_KEYS))};
+const { readFileSync, rmSync, rmdirSync, writeFileSync } = require("node:fs");
+const { dirname } = require("node:path");
+const keys = ${JSON.stringify(Object.values(BOOTSTRAP_KEYS))};
 const decode = (key) => Buffer.from(process.env[key] || "", "base64").toString("utf8");
+const readStart = (pid) => {
+  try {
+    const stat = readFileSync("/proc/" + pid + "/stat", "utf8");
+    const close = stat.lastIndexOf(")");
+    return close < 0 ? undefined : stat.slice(close + 2).trim().split(/\\s+/u)[19];
+  } catch { return undefined; }
+};
+const parentPid = Number(decode(${JSON.stringify(BOOTSTRAP_KEYS.parentPid)}));
+const parentStart = decode(${JSON.stringify(BOOTSTRAP_KEYS.parentStartTime)});
+const cgroup = decode(${JSON.stringify(BOOTSTRAP_KEYS.cgroup)});
+const parentCgroup = cgroup ? dirname(cgroup) : undefined;
+const parentAlive = () => Boolean(parentPid > 0 && process.ppid === parentPid && (() => {
+  try { process.kill(parentPid, 0); } catch { return false; }
+  return !parentStart || readStart(parentPid) === parentStart;
+})());
+const moveOutOfCgroup = () => {
+  if (!parentCgroup) return;
+  try { writeFileSync(parentCgroup + "/cgroup.procs", String(process.pid) + "\\n"); } catch {}
+};
+const removeCgroup = () => {
+  if (!cgroup) return;
+  try { rmdirSync(cgroup); return; } catch {}
+  try { rmSync(cgroup, { recursive: true, force: true }); } catch {}
+  try { rmdirSync(cgroup); } catch {}
+};
+const killGroup = (signal) => {
+  try { process.kill(-process.pid, signal); } catch {}
+};
+const finishAfterCgroup = (code, signal) => {
+  const finish = () => {
+    removeCgroup();
+    if (signal) {
+      for (const forwarded of ["SIGTERM", "SIGINT", "SIGQUIT"]) process.removeAllListeners(forwarded);
+      try { process.kill(process.pid, signal); } catch {}
+      setTimeout(() => process.exit(128), 50).unref();
+      return;
+    }
+    process.exit(code ?? 1);
+  };
+  if (!cgroup) { killGroup("SIGKILL"); return; }
+  try { writeFileSync(cgroup + "/cgroup.kill", "1\\n"); } catch {}
+  const deadline = Date.now() + 250;
+  const reap = () => {
+    let empty = false;
+    try { empty = /^populated 0$/mu.test(readFileSync(cgroup + "/cgroup.events", "utf8")); }
+    catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") { finish(); return; }
+    }
+    if (empty || Date.now() >= deadline) { finish(); return; }
+    setTimeout(reap, 25).unref();
+  };
+  reap();
+};
 let child;
+let finished = false;
+let orphaning = false;
+let parentWatch;
+const stopParentlessWorker = () => {
+  if (orphaning || finished) return;
+  orphaning = true;
+  if (parentWatch) clearInterval(parentWatch);
+  try { child?.kill("SIGTERM"); } catch {}
+  // Move the bootstrap out first so cgroup.kill cannot kill the cleanup code.
+  moveOutOfCgroup();
+  setTimeout(() => finishAfterCgroup(143), 250).unref();
+};
 try {
-  const cgroup = decode(${JSON.stringify(CGROUP_BOOTSTRAP_KEYS.cgroup)});
-  writeFileSync(cgroup + "/cgroup.procs", String(process.pid) + "\\n");
+  if (cgroup) writeFileSync(cgroup + "/cgroup.procs", String(process.pid) + "\\n");
   const env = { ...process.env };
   for (const key of keys) delete env[key];
   child = spawn(
-    decode(${JSON.stringify(CGROUP_BOOTSTRAP_KEYS.command)}),
-    JSON.parse(decode(${JSON.stringify(CGROUP_BOOTSTRAP_KEYS.args)})),
-    { cwd: decode(${JSON.stringify(CGROUP_BOOTSTRAP_KEYS.cwd)}), env, stdio: "inherit" },
+    decode(${JSON.stringify(BOOTSTRAP_KEYS.command)}),
+    JSON.parse(decode(${JSON.stringify(BOOTSTRAP_KEYS.args)})),
+    { cwd: decode(${JSON.stringify(BOOTSTRAP_KEYS.cwd)}), env, stdio: "inherit" },
   );
 } catch (error) {
-  console.error("worker cgroup bootstrap failed:", error instanceof Error ? error.message : String(error));
-  process.exit(125);
+  console.error("worker bootstrap failed:", error instanceof Error ? error.message : String(error));
+  moveOutOfCgroup();
+  finishAfterCgroup(125);
 }
+if (child) {
+process.stderr.write("${BOOTSTRAP_READY_MARKER}\\n");
+parentWatch = setInterval(() => { if (!parentAlive()) stopParentlessWorker(); }, 100);
+parentWatch.unref();
 const forwardedSignals = ["SIGTERM", "SIGINT", "SIGQUIT"];
-for (const signal of forwardedSignals) {
-  process.on(signal, () => {
-    try { child.kill(signal); } catch {}
-  });
-}
-let finished = false;
+for (const signal of forwardedSignals) process.on(signal, () => { try { child.kill(signal); } catch {} });
 child.once("error", (error) => {
-  if (finished) return;
+  if (finished || orphaning) return;
   finished = true;
+  clearInterval(parentWatch);
   console.error("worker bootstrap child failed:", error.message);
-  process.exit(127);
+  moveOutOfCgroup();
+  finishAfterCgroup(127);
 });
 child.once("exit", (code, signal) => {
-  if (finished) return;
+  if (finished || orphaning) return;
   finished = true;
-  if (signal) {
-    for (const forwarded of forwardedSignals) process.removeAllListeners(forwarded);
-    try { process.kill(process.pid, signal); } catch {}
-    setTimeout(() => process.exit(128), 50).unref();
-    return;
-  }
-  process.exit(code ?? 1);
+  clearInterval(parentWatch);
+  moveOutOfCgroup();
+  finishAfterCgroup(code ?? 1, signal);
 });
+}
 `;
 
-function cgroupBootstrapLaunch(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv, cgroupPath: string): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
+function guardedBootstrapLaunch(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv, cgroupPath: string | undefined, parentPid: number, parentStartTime: string): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
   const encode = (value: string) => Buffer.from(value, "utf8").toString("base64");
   return {
     command: process.execPath,
-    args: ["-e", CGROUP_BOOTSTRAP_SCRIPT],
+    args: ["-e", GUARDED_BOOTSTRAP_SCRIPT],
     env: {
       ...env,
-      [CGROUP_BOOTSTRAP_KEYS.command]: encode(command),
-      [CGROUP_BOOTSTRAP_KEYS.args]: encode(JSON.stringify(args)),
-      [CGROUP_BOOTSTRAP_KEYS.cwd]: encode(cwd),
-      [CGROUP_BOOTSTRAP_KEYS.cgroup]: encode(cgroupPath),
+      [BOOTSTRAP_KEYS.command]: encode(command),
+      [BOOTSTRAP_KEYS.args]: encode(JSON.stringify(args)),
+      [BOOTSTRAP_KEYS.cwd]: encode(cwd),
+      [BOOTSTRAP_KEYS.cgroup]: encode(cgroupPath ?? ""),
+      [BOOTSTRAP_KEYS.parentPid]: encode(String(parentPid)),
+      [BOOTSTRAP_KEYS.parentStartTime]: encode(parentStartTime),
     },
   };
 }
 
-function claudeJsonlArgs(args: readonly string[] = []): string[] {
+export function claudeJsonlArgs(args: readonly string[] = []): string[] {
   const result = [...args];
   if (!result.includes("-p") && !result.includes("--print")) result.push("-p");
   ensureOption(result, "--input-format", "stream-json");
   ensureOption(result, "--output-format", "stream-json");
   ensureOption(result, "--permission-prompt-tool", "stdio");
+  ensureOption(result, "--permission-prompts", "host");
   if (!result.includes("--verbose")) result.push("--verbose");
   return result;
 }
 
 function ensureOption(args: string[], option: string, expected: string): void {
-  const index = args.indexOf(option);
-  if (index < 0) {
+  const equalPrefix = `${option}=`;
+  const indexes = args.flatMap((value, index) => value === option || value.startsWith(equalPrefix) ? [index] : []);
+  if (indexes.length > 1) throw new Error(`${option} may not be repeated in claude-jsonl mode`);
+  const index = indexes[0];
+  if (index === undefined) {
     args.push(option, expected);
     return;
   }
-  if (args[index + 1] !== expected) throw new Error(`${option} must be ${expected} in claude-jsonl mode`);
+  if (args[index] === equalPrefix + expected) {
+    args.splice(index, 1, option, expected);
+    return;
+  }
+  if (args[index] !== option || args[index + 1] !== expected) throw new Error(`${option} must be ${expected} in claude-jsonl mode`);
 }
 
 async function assertWorkerCwd(cwd: string): Promise<void> {
@@ -850,13 +1025,78 @@ async function assertExecutable(command: string, pathValue: string | undefined):
   throw new Error(`worker executable preflight failed (ENOENT): ${command}`);
 }
 
-async function currentCgroupPath(): Promise<string> {
+export async function currentCgroupPath(): Promise<string> {
   const contents = await readFile("/proc/self/cgroup", "utf8");
   const match = contents.match(/^0::([^\n]*)$/mu);
   if (!match) throw new Error("cgroup v2 is not active");
   // /proc/self/cgroup uses the same escaped component spelling as the cgroup
   // filesystem (for example, a literal `\\x2d` in a systemd scope name).
   return `/sys/fs/cgroup${match[1]}`;
+}
+
+export async function preflightCgroupContainment(parentPath?: string): Promise<void> {
+  if (process.platform !== "linux") throw new Error("required cgroup cleanup is unavailable on this platform");
+  let probePath: string | undefined;
+  let probeChild: ChildProcess | undefined;
+  try {
+    const parent = parentPath ?? await currentCgroupPath();
+    await access(parent, fsConstants.W_OK);
+    probePath = `${parent}/pi-claude-supervisor-preflight-${process.pid}-${randomUUID()}`;
+    await mkdir(probePath);
+    await stat(`${probePath}/cgroup.kill`);
+    await stat(`${probePath}/cgroup.events`);
+    const script = "const fs=require('node:fs'); fs.writeFileSync(process.env.PI_CLAUDE_SUPERVISOR_PREFLIGHT_CGROUP + '/cgroup.procs', String(process.pid) + String.fromCharCode(10)); setInterval(() => {}, 10000);";
+    probeChild = spawn(process.execPath, ["-e", script], {
+      env: { PATH: process.env.PATH ?? "", PI_CLAUDE_SUPERVISOR_PREFLIGHT_CGROUP: probePath },
+      stdio: "ignore",
+    });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("preflight child did not join cgroup")), 1_000);
+      const poll = async (): Promise<void> => {
+        if (!probeChild || probeChild.exitCode !== null) {
+          clearTimeout(timer);
+          reject(new Error("preflight cgroup probe exited before joining"));
+          return;
+        }
+        try {
+          const members = await readFile(`${probePath}/cgroup.procs`, "utf8");
+          if (members.split(/\s+/u).includes(String(probeChild.pid))) {
+            clearTimeout(timer);
+            resolve();
+            return;
+          }
+        } catch {
+          // Retry until the bounded probe deadline.
+        }
+        setTimeout(() => { void poll(); }, 10).unref();
+      };
+      void poll();
+    });
+    await writeFile(`${probePath}/cgroup.kill`, "1" + String.fromCharCode(10));
+    const deadline = Date.now() + 1_000;
+    let empty = false;
+    while (Date.now() <= deadline) {
+      const events = await readFile(`${probePath}/cgroup.events`, "utf8");
+      if (/^populated 0$/mu.test(events)) { empty = true; break; }
+      await delay(10);
+    }
+    if (!empty) throw new Error("preflight cgroup did not report populated 0");
+  } catch (error) {
+    throw new Error(`required cgroup preflight failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  } finally {
+    if (probePath) {
+      try { await writeFile(`${probePath}/cgroup.kill`, "1" + String.fromCharCode(10)); } catch {}
+    }
+    const child = probeChild;
+    if (child && child.exitCode === null) {
+      try { child.kill("SIGKILL"); } catch {}
+      await Promise.race([
+        new Promise<void>((resolve) => child.once("close", () => resolve())),
+        delay(250),
+      ]);
+    }
+    if (probePath) await removeCgroupDirectory(probePath).catch(() => {});
+  }
 }
 
 function parseProcessGroupIdentity(contents: string, pid: number): ProcessGroupIdentity {
@@ -871,6 +1111,11 @@ function parseProcessGroupIdentity(contents: string, pid: number): ProcessGroupI
 
 function readProcessGroupIdentitySync(pid: number): ProcessGroupIdentity {
   return parseProcessGroupIdentity(readFileSync(`/proc/${pid}/stat`, "utf8"), pid);
+}
+
+function readProcessStartTimeSync(pid: number): string | undefined {
+  try { return parseProcessGroupIdentity(readFileSync(`/proc/${pid}/stat`, "utf8"), pid).startTime; }
+  catch { return undefined; }
 }
 
 async function readProcessGroupIdentity(pid: number): Promise<ProcessGroupIdentity> {
@@ -892,7 +1137,21 @@ async function assertProcessGroupIdentity(record: ProcessRecord, pid: number): P
   }
 }
 
-async function cleanupCgroup(path: string, graceMs: number): Promise<void> {
+async function removeCgroupDirectory(path: string): Promise<void> {
+  try {
+    await rmdir(path);
+    return;
+  } catch (error) {
+    if (error instanceof Error && /ENOENT/u.test(error.message)) return;
+  }
+  await rm(path, { recursive: true, force: true });
+  try { await rmdir(path); }
+  catch (error) {
+    if (!(error instanceof Error && /ENOENT/u.test(error.message))) throw error;
+  }
+}
+
+export async function cleanupCgroup(path: string, graceMs: number): Promise<void> {
   try {
     await stat(path);
   } catch (error) {
@@ -918,7 +1177,7 @@ async function cleanupCgroup(path: string, graceMs: number): Promise<void> {
     try {
       const events = await readFile(`${path}/cgroup.events`, "utf8");
       if (/^populated 0$/mu.test(events)) {
-        await rm(path, { recursive: true, force: true });
+        await removeCgroupDirectory(path);
         return;
       }
     } catch (error) {
@@ -968,4 +1227,32 @@ function boundedDelay(value: number): number {
 function boundedPositiveInteger(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
   return value;
+}
+
+async function processGroupHasLiveMember(pgid: number): Promise<boolean> {
+  if (process.platform !== "linux") {
+    try { process.kill(-pgid, 0); return true; }
+    catch (error) {
+      if (error instanceof Error && /ESRCH/u.test(error.message)) return false;
+      throw error;
+    }
+  }
+  let names: string[];
+  try { names = await readdir("/proc"); }
+  catch { return true; }
+  for (const name of names) {
+    if (!/^\\d+$/u.test(name)) continue;
+    try {
+      const statText = await readFile(`/proc/${name}/stat`, "utf8");
+      const closeParen = statText.lastIndexOf(")");
+      if (closeParen < 0) continue;
+      const fields = statText.slice(closeParen + 2).trim().split(/\\s+/u);
+      const state = fields[0];
+      const processGroup = Number(fields[2]);
+      if (processGroup === pgid && state !== "Z") return true;
+    } catch {
+      // A process can disappear between /proc enumeration and stat read.
+    }
+  }
+  return false;
 }
