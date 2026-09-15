@@ -56,6 +56,11 @@ export interface WorkerStartInput {
   abortSignal?: AbortSignal;
   /** Internal token that scopes out-of-band startup cancellation. */
   startupToken?: string;
+  /**
+   * Automatic-start repository assertion. Built-in adapters invoke this after
+   * all asynchronous setup and immediately before spawning the Worker.
+   */
+  preSpawnCheck?: () => Promise<void>;
 }
 
 export interface WorkerHandle {

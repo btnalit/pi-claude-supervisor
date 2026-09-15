@@ -99,7 +99,7 @@ export function automaticClaudeArgs(command: string, args: readonly string[] = [
  * who do not want PATH to be the trust root can set
  * PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE to the expected executable path.
  */
-export async function assertTrustedAutomaticClaudeExecutable(command: string): Promise<string> {
+export async function assertTrustedAutomaticClaudeExecutable(command: string, expectedPath?: string): Promise<string> {
   if (!isDirectClaudeName(command)) {
     throw new Error("automatic supervision requires the direct Claude executable command name; custom executable paths need their own host boundary");
   }
@@ -107,16 +107,18 @@ export async function assertTrustedAutomaticClaudeExecutable(command: string): P
   if (!candidate) throw new Error("automatic supervision could not resolve the trusted Claude executable from PATH");
   const resolved = await realpath(candidate);
   await assertSecureExecutablePath(resolved);
-  const configured = process.env.PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE?.trim();
+  const configured = expectedPath?.trim() || process.env.PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE?.trim();
   if (configured) {
     let expected: string;
     try {
       expected = await realpath(configured);
-    } catch {
-      throw new Error("PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE is not a readable executable path");
+      await assertSecureExecutablePath(expected);
+    } catch (error) {
+      if (error instanceof Error && /writable|owned|regular file/u.test(error.message)) throw error;
+      throw new Error("the expected Claude executable path is not a readable executable");
     }
     if (expected !== resolved) {
-      throw new Error("resolved Claude executable does not match PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE");
+      throw new Error("resolved Claude executable does not match the expected pinned identity");
     }
   }
   return resolved;
@@ -142,6 +144,7 @@ async function resolveExecutable(command: string, pathValue: string | undefined)
 }
 
 async function assertSecureExecutablePath(path: string): Promise<void> {
+  await access(path, fsConstants.X_OK);
   const executable = await stat(path);
   if (!executable.isFile()) throw new Error("resolved Claude executable is not a regular file");
   if (process.platform !== "win32") {

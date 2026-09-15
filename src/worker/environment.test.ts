@@ -62,3 +62,7 @@ test("automatic Claude args require a fail-closed sandbox", () => {
 test("automatic mode rejects an explicit executable path before resolution", async () => {
   await assert.rejects(() => assertTrustedAutomaticClaudeExecutable("/tmp/attacker/claude"), /direct Claude executable/u);
 });
+
+test("automatic mode rejects a recovery executable identity mismatch", async () => {
+  await assert.rejects(() => assertTrustedAutomaticClaudeExecutable("claude", process.execPath), /expected pinned identity/u);
+});

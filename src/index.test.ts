@@ -80,6 +80,7 @@ test("index recovers an idle Decision Worker without replaying the original task
     cwd,
     command: "claude",
     args: ["-e", fakeWorker, marker],
+    resolvedExecutable: fakeClaude,
     decisionSessionFile,
     maxTurns: 2,
     deadlineMs: 60_000,
@@ -124,6 +125,7 @@ test("index recovers an idle Decision Worker without replaying the original task
     assert.equal(recovered?.recoveryState, "recovered_idle");
     assert.equal(recovered?.baseCommit, baseCommit);
     assert.equal(recovered?.baseBranch, "worker/recovery");
+    assert.equal(recovered?.resolvedExecutable, fakeClaude);
     assert.ok(recovered?.recoveryWorker?.id);
     await new Promise((resolve) => setTimeout(resolve, 100));
     await assert.rejects(() => readFile(marker, "utf8"), /ENOENT/u);

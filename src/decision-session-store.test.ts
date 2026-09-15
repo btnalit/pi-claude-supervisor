@@ -18,6 +18,7 @@ test("Decision Worker session registry survives a fresh store instance", async (
     cwd: "/tmp/fixture",
     command: "claude",
     args: ["--print"],
+    resolvedExecutable: "/usr/bin/claude",
     approval: { actor: "human", reason: "test approval" },
     decisionSessionFile: sessionFile,
     maxTurns: 100,
@@ -35,6 +36,7 @@ test("Decision Worker session registry survives a fresh store instance", async (
   assert.equal(restored?.recoveryState, "ready");
   assert.equal(restored?.recoveryAttempt, 0);
   assert.equal(restored?.decisionSessionFile, sessionFile);
+  assert.equal(restored?.resolvedExecutable, "/usr/bin/claude");
   assert.deepEqual(restored?.args, ["--print"]);
   assert.equal((await stat(join(directory, `${taskId}.json`))).mode & 0o777, 0o600);
   assert.equal(await store.sessionFileExists(taskId), false);

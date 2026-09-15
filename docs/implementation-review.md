@@ -23,7 +23,8 @@ boundary.
   together; dynamic arguments are denied because their capability cannot be checked,
   including Claude permission-bypass flags.
 - Automatic startup pins a secure resolved Claude executable identity and rejects
-  explicit paths, and rechecks the exact startup HEAD immediately before spawn.
+  explicit paths, persists that identity for recovery, and rechecks the exact startup
+  HEAD through the built-in adapter's final `preSpawnCheck` immediately before spawn.
 - Worker and verifier processes use a minimal environment; explicit worker
   variables can be selected with `PI_CLAUDE_SUPERVISOR_WORKER_ENV` or an
   embedding caller's `WorkerStartInput.env`.

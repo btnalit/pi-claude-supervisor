@@ -37,12 +37,16 @@ test("policy denies every dynamic shell argument", () => {
   assert.equal(evaluateCommand("rm -rf \"$TARGET\"").decision, "deny");
   assert.equal(evaluateCommand("claude --permission-mode \"$MODE\"").decision, "deny");
   assert.equal(evaluateCommand("bash -c 'claude --permission-mode \"$MODE\"'").decision, "deny");
+  assert.equal(evaluateCommand("git pu{sh,} origin main").decision, "deny");
+  assert.equal(evaluateCommand("bash -c 'git pu{sh,} origin main'").decision, "deny");
+  assert.equal(evaluateCommand("rm -rf /tmp/*").decision, "deny");
   assert.equal(evaluateCommand("echo ref > .git/refs/heads/$BRANCH").decision, "deny");
   assert.equal(evaluateCommand("echo \"$VALUE\" > \"$TARGET\"").decision, "deny");
 });
 
-test("policy allows ordinary read-only commands", () => {
+test("policy allows ordinary read-only commands and literal argv values", () => {
   assert.equal(evaluateCommand("git diff --check").decision, "allow");
+  assert.equal(evaluateCommand("node", ["-e", "console.log({ value: 1 })"]).decision, "allow");
 });
 
 test("policy denies unsafe worker permission flags even when passed as arguments", () => {

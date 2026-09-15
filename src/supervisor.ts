@@ -42,6 +42,7 @@ export interface DecisionSessionReadyInfo {
   repairRound: number;
   baseCommit?: string;
   baseBranch?: string;
+  resolvedExecutable: string;
   lastFindingSignature?: string;
 }
 
@@ -97,6 +98,8 @@ export interface SupervisorStartOptions {
   decisionSessionDir?: string;
   /** Repository HEAD before this task; recovery reuses the recorded baseline. */
   baseCommit?: string;
+  /** Internal recovery identity: the executable resolved by the original start. */
+  expectedClaudeExecutable?: string;
   /** Non-protected local branch before automatic work begins. */
   baseBranch?: string;
   /** Internal recovery values; elapsed wall time remains cumulative. */
@@ -240,6 +243,8 @@ export class Supervisor {
         throw new Error("automatic supervision requires a full hexadecimal git baseline");
       }
       let startupHead: string | undefined;
+      let trustedWorkerCommand = options.command;
+      let workerArgs = options.args;
       if (this.#automation) {
         if (recovering && !options.baseCommit) throw new Error("automatic recovery requires a persisted git baseline");
         const boundary = await automaticRepositoryBoundary(options.cwd, options.baseCommit, options.baseBranch, startAbortController.signal);
@@ -263,10 +268,11 @@ export class Supervisor {
         throw new Error("automatic supervision requires the claude-jsonl transport; tmux is manual-only");
       }
       const workerEnvironment = this.#automation ? automaticWorkerEnvironment(options.env) : options.env;
-      const trustedWorkerCommand = this.#automation
-        ? await assertTrustedAutomaticClaudeExecutable(options.command)
-        : options.command;
-      const workerArgs = this.#automation ? automaticClaudeArgs(options.command, options.args) : options.args;
+      if (this.#automation) {
+        trustedWorkerCommand = await assertTrustedAutomaticClaudeExecutable(options.command, options.expectedClaudeExecutable);
+        workerArgs = automaticClaudeArgs(options.command, options.args);
+        await this.#appendEvent({ type: "worker_executable_pinned", taskId, data: { command: options.command, resolvedExecutable: trustedWorkerCommand } });
+      }
       await this.#adapter.preflight?.({
         cwd: options.cwd,
         command: trustedWorkerCommand,
@@ -293,6 +299,7 @@ export class Supervisor {
                 deadlineMs: this.#deadlineMs,
                 noOutputTimeoutMs: this.#noOutputTimeoutMs,
                 startedAt: this.#task!.startedAt,
+                resolvedExecutable: trustedWorkerCommand,
                 turn: this.#turn,
                 repairRound: this.#repairRound,
                 ...(this.#task?.baseCommit ? { baseCommit: this.#task.baseCommit } : {}),
@@ -325,6 +332,12 @@ export class Supervisor {
         env: workerEnvironment,
         abortSignal: startAbortController.signal,
         startupToken: this.#startToken,
+        preSpawnCheck: this.#automation
+          ? async () => {
+              await automaticRepositoryBoundary(options.cwd, this.#task!.baseCommit, this.#task!.baseBranch, startAbortController.signal, startupHead);
+              this.#assertStartNotAborted(startAbortController.signal);
+            }
+          : undefined,
       };
       this.#handle = await this.#adapter.start(input);
       this.#assertStartNotAborted(startAbortController.signal);

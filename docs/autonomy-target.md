@@ -101,7 +101,9 @@ continue/redirect/answer/repair, acceptance and independent Review run without a
 and unresolved situations become `blocked` candidates. The default task autonomy is unattended, requires a local commit, and permits two bounded
 Decision Worker request retries. Automatic startup rejects non-Git/detached/bare/protected
 repository states, malformed baselines, startup-HEAD races, non-JSONL transports and
-non-Claude or untrusted executable identities before Worker startup.
+non-Claude or untrusted executable identities before Worker startup. The resolved
+executable identity is persisted with the Decision Worker recovery record and must match
+again during recovery.
 
 Legacy `humanRequired`, takeover and approval fields remain for compatibility and explicit operator
 control. They are not entered by ordinary uncertainty, and a legacy approval object cannot override

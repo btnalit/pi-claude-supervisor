@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import type { SupervisorEvent } from "./events.ts";
-import type { WorkerAdapter, WorkerHandle, WorkerOutputChunk, WorkerStatus } from "./types.ts";
+import type { WorkerAdapter, WorkerHandle, WorkerOutputChunk, WorkerStartInput, WorkerStatus } from "./types.ts";
 import { Supervisor } from "./supervisor.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
 import { TmuxWorkerAdapter } from "./worker/tmux-adapter.ts";
@@ -198,7 +198,15 @@ test("automatic supervision rechecks the exact startup HEAD before spawning", as
   try {
     await initializeGitRepository(cwd, "worker/head-race");
     let closed = false;
-    const supervisor = new Supervisor(new ProcessWorkerAdapter({ mode: "claude-jsonl" }), undefined, { reviewer: automaticReviewer() });
+    const adapter = new (class extends ProcessWorkerAdapter {
+      override async start(input: WorkerStartInput): Promise<WorkerHandle> {
+        await writeFile(join(cwd, "adapter-started.txt"), "changed\n");
+        await execFileAsync("git", ["add", "adapter-started.txt"], { cwd });
+        await execFileAsync("git", ["commit", "-qm", "unexpected adapter startup change"], { cwd });
+        return super.start(input);
+      }
+    })({ mode: "claude-jsonl", cgroupMode: "off" });
+    const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
     await assert.rejects(() => supervisor.start({
       task: "head race",
       cwd,
@@ -207,16 +215,7 @@ test("automatic supervision rechecks the exact startup HEAD before spawning", as
       deadlineMs: 0,
       noOutputTimeoutMs: 0,
       spec: automaticSpec(),
-      decisionWorkerFactory: () => ({
-        start: async () => {
-          await writeFile(join(cwd, "decision-started.txt"), "changed\n");
-          await execFileAsync("git", ["add", "decision-started.txt"], { cwd });
-          await execFileAsync("git", ["commit", "-qm", "unexpected startup change"], { cwd });
-        },
-        updateContext: () => {},
-        notify: () => {},
-        close: async () => { closed = true; },
-      }),
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => { closed = true; } }),
     }), /repository HEAD changed/u);
     assert.equal(supervisor.handle, undefined);
     assert.equal(closed, true);

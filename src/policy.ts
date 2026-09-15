@@ -46,7 +46,12 @@ const protectedBranchOperations = new Set(["checkout", "switch", "branch", "rese
 const remoteOperations = new Set(["push", "merge", "send-pack", "receive-pack", "update-ref"]);
 
 export function evaluateCommand(command: string, args: readonly string[] = []): PolicyResult {
-  return evaluateCommandInternal([command, ...args].join(" "), 0);
+  const normalized = command.trim();
+  if (!normalized) return { decision: "deny", reason: "empty command" };
+  const lexical = lexShell(normalized);
+  if (lexical.error) return { decision: "deny", reason: `command could not be safely parsed: ${lexical.error}` };
+  const literalArgs = args.map((value) => ({ value, operator: false, dynamic: false }));
+  return evaluateTokens([...lexical.tokens, ...literalArgs], 0);
 }
 
 function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: string, depth: number): PolicyResult | undefined {
@@ -127,9 +132,13 @@ function evaluateCommandInternal(command: string, depth: number): PolicyResult {
   if (!normalized) return { decision: "deny", reason: "empty command" };
   const lexical = lexShell(normalized);
   if (lexical.error) return { decision: "deny", reason: `command could not be safely parsed: ${lexical.error}` };
-  const canonical = lexical.tokens.map((token) => token.value).join(" ").trim();
+  return evaluateTokens(lexical.tokens, depth);
+}
+
+function evaluateTokens(tokens: readonly ShellToken[], depth: number): PolicyResult {
+  const canonical = tokens.map((token) => token.value).join(" ").trim();
   if (!canonical) return { decision: "deny", reason: "empty command" };
-  const boundary = evaluateRepositoryBoundary(lexical.tokens, canonical, depth);
+  const boundary = evaluateRepositoryBoundary(tokens, canonical, depth);
   if (boundary) return boundary;
   if (deniedPatterns.some((pattern) => pattern.test(canonical))) {
     if (/\b(?:curl|wget)\b[\s\S]*(?:github|gitlab|bitbucket|registry\.npmjs)\b/iu.test(canonical)) {
@@ -190,6 +199,10 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
     }
     if (/\s/u.test(character)) { flush(); continue; }
     if (character === "$" || character === "`") { dynamic = true; value += character; started = true; continue; }
+    // Brace, tilde and pathname expansion can change command names, targets or
+    // Git refs after this lexical pass. Treat all unquoted expansion markers as
+    // dynamic rather than attempting to model Bash's expansion order.
+    if ("*?[]{}~".includes(character)) { dynamic = true; value += character; started = true; continue; }
     if (";&|<>".includes(character)) {
       const operator = next && ((character === "&" && next === "&") || (character === "|" && next === "|") || (character === ">" && next === ">") || (character === "<" && next === "<"))
         ? `${character}${next}`

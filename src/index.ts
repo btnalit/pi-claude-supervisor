@@ -312,6 +312,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                     startedAt: info.startedAt,
                     ...(info.baseCommit ? { baseCommit: info.baseCommit } : {}),
                     ...(info.baseBranch ? { baseBranch: info.baseBranch } : {}),
+                    ...(info.resolvedExecutable ? { resolvedExecutable: info.resolvedExecutable } : {}),
                     turn: info.turn,
                     repairRound: info.repairRound,
                     ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}),
@@ -446,6 +447,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           }
           const policy = evaluateCommand(record.command, record.args);
           if (policy.decision === "deny") throw new Error(`Worker command denied: ${policy.reason}`);
+          const automaticRecovery = record.spec?.autonomy.unattended !== false;
+          if (automaticRecovery && !record.resolvedExecutable) throw new Error("automatic recovery requires a persisted resolved Claude executable identity");
           const approval = record.approval;
           const lease = await cwdLeaseStore.acquire(cwdKey, record.taskId, adapter.capabilities().transport, takeover
             ? {
@@ -498,9 +501,10 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 cwd: cwdKey,
                 command: record.command,
                 args: record.args,
-                env: selectedWorkerEnvironment(record.spec?.autonomy.unattended !== false),
+                env: selectedWorkerEnvironment(automaticRecovery),
                 approval,
-                automation: record.spec?.autonomy.unattended !== false,
+                automation: automaticRecovery,
+                ...(automaticRecovery && record.resolvedExecutable ? { expectedClaudeExecutable: record.resolvedExecutable } : {}),
                 maxTurns: record.maxTurns,
                 deadlineMs: record.deadlineMs,
                 noOutputTimeoutMs: record.noOutputTimeoutMs,
@@ -530,6 +534,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                     startedAt: info.startedAt,
                     ...(info.baseCommit ? { baseCommit: info.baseCommit } : {}),
                     ...(info.baseBranch ? { baseBranch: info.baseBranch } : {}),
+                    ...(info.resolvedExecutable ? { resolvedExecutable: info.resolvedExecutable } : {}),
                     turn: info.turn,
                     repairRound: info.repairRound,
                     ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}),

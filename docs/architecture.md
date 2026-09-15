@@ -198,7 +198,9 @@ and, when requested, the real writable cgroup-v2 boundary. The resolved Claude
 executable is checked for an operator-owned, non-writable path and then pinned by
 absolute path; `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` can pin the expected identity. The initial repository HEAD is captured, and the repository boundary immediately
 before the Worker adapter starts must report that exact same HEAD (recovery captures
-and compares its current HEAD separately while retaining the persisted baseline). A failed preflight
+and compares its current HEAD separately while retaining the persisted baseline).
+The built-in process adapter invokes the same assertion through `preSpawnCheck`
+after cgroup/executable setup and immediately before `spawn`; a failed preflight
 is fail-closed and does not start Claude. Long acceptance commands and Reviewer
 sessions share an abort signal with the Supervisor, so operator stop/shutdown
 wins without waiting for a full check timeout. Progress hooks expose starting,
