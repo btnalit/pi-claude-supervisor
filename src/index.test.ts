@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -59,6 +59,7 @@ test("index recovers an idle Decision Worker without replaying the original task
   const taskId = "22222222-2222-4222-8222-222222222222";
   const fakeClaude = join(fakeBin, "claude");
   await copyFile(process.execPath, fakeClaude);
+  await chmod(fakeClaude, 0o700);
   assert.equal(spawnSync("git", ["init", "-q"], { cwd, stdio: "ignore" }).status, 0);
   assert.equal(spawnSync("git", ["config", "user.email", "test@example.invalid"], { cwd, stdio: "ignore" }).status, 0);
   assert.equal(spawnSync("git", ["config", "user.name", "Test"], { cwd, stdio: "ignore" }).status, 0);
@@ -164,6 +165,7 @@ test("adopted tmux detach retains a live lease and reaps it after the session di
   const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-adopted-leases-"));
   const fakeClaude = join(stateDir, "claude");
   await copyFile(process.execPath, fakeClaude);
+  await chmod(fakeClaude, 0o700);
   const fixture = "process.stdout.write('>\\n--------------------\\n'); process.stdin.resume(); setInterval(() => {}, 10000);";
   const seededAdapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000 });
   const seeded = await seededAdapter.start({ task: "seeded session", cwd, command: fakeClaude, args: ["-e", fixture], sendInitialInput: false });
