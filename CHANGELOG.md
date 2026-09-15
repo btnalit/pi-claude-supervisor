@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.4](https://github.com/btnalit/pi-claude-supervisor/compare/v0.5.3...v0.5.4) (2026-09-15)
+
+
+### Bug Fixes
+
+* harden unattended local lifecycle ([4f68760](https://github.com/btnalit/pi-claude-supervisor/commit/4f6876044cd8be00b0376239377b02b70aae8473))
+
 ## [0.5.3](https://github.com/btnalit/pi-claude-supervisor/compare/v0.5.2...v0.5.3) (2026-09-15)
 
 
