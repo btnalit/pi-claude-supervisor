@@ -1,5 +1,7 @@
 # Testing
 
+> Autonomy target: local editing, testing, repair and local commits run without a human being online. Invalid output, unavailable evidence, duplicate findings, P0/P1 findings and exhausted budgets become parked/non-publishable candidates rather than synchronous human gates. Remote push and main/integration merge remain independent-boundary tests. See [autonomy-target.md](autonomy-target.md).
+
 ## Local checks
 
 ```bash
@@ -17,7 +19,7 @@ the published TypeScript source directly and there is no second runtime bundle.
 
 ## Test layers
 
-- `policy.test.ts`: deterministic allow/review/deny behavior.
+- `policy.test.ts`: deterministic local allow and hard-boundary deny behavior; legacy approval cannot override denial.
 - `state.test.ts`: legal and illegal lifecycle transitions.
 - `events.test.ts`: ordered JSONL persistence, sequence recovery and credential-shaped redaction.
 - `decision-session-store.test.ts`: atomic Decision Worker task mapping, permissions, restart discovery and corrupt-record isolation.
@@ -57,13 +59,12 @@ owned tmux turns, pause/resume, and restart re-adoption.
 The adapter regression suite also verifies event subscription, parsed
 `permission_request` events, and the exact nested `control_response` envelope.
 The automation spike additionally exercises a real Pi SDK Decision Worker with
-Claude: ordinary completion, harmless Bash permission approval, and an
+Claude: ordinary completion, harmless Bash permission handling, and an
 `AskUserQuestion` denial-to-text fallback followed by automatic verification.
 A local pinned-CLI run completed all three scenarios with `state=completed`,
 `verified=true`, and zero human interventions. Provider/model latency can still
-cause a later run to fail closed as human-required after the bounded Decision
-Worker or Reviewer timeout; this is evidence for the manual spike only, not a CI
-guarantee.
+cause a later run to fail closed as a parked/non-publishable candidate after the bounded Decision
+Worker or Reviewer timeout; this is evidence for the manual spike only, not a CI guarantee.
 The extension persists each automatic Decision Worker session as Pi JSONL plus a
 0600 task mapping. Automatic startup preflights the state/lease directories, cwd,
 worker executable, transport dependency and required cgroup boundary before model
@@ -92,7 +93,7 @@ PI_CLAUDE_SUPERVISOR_REAL_CLAUDE=1 npm run spike:tmux-interactive
 The tmux spike is gated, authenticated, and excluded from normal CI. It uses
 plan mode with a fixed `opus` model, records only protocol metadata, and
 verifies three real Claude turns, exact screen-result markers, pause/resume,
-automation enabled with human takeover, direct human PTY input, owned detach,
+manual takeover, direct PTY input, owned detach,
 and identity-bound restart re-adoption. The interactive spike uses a fresh temporary
 cwd to verify Claude's trust prompt, a real Bash permission prompt, an allow-once
 response, and an exact result marker; it also records metadata only.
@@ -117,21 +118,33 @@ relevant checks from a clean host perspective.
 
 Automatic mode is enabled with `PI_CLAUDE_SUPERVISOR_MODE=auto`; it defaults to
 JSONL and routes `result`, permission, and process-exit events to the persistent
-Pi Decision Worker. An explicit `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux` selection
-remains screen-based and does not use the JSONL permission protocol. `process-pipe` remains the manual compatibility mode. Human
-escalation is outbound-only through `PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL`;
-approval callbacks are deliberately not accepted without a separately
+Pi Decision Worker. Task autonomy defaults to unattended local work, a required
+local commit on a non-protected task branch and two bounded Decision Worker retries. Configure
+`PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=0` or task `autonomy.requireLocalCommit`
+only to disable the local-commit deliverability check; automatic mode still requires a Git
+baseline and non-protected worktree. An explicit `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux` selection
+remains screen-based and does not use the JSONL permission protocol. `process-pipe` remains the manual compatibility mode. Candidate/failure notification is optional and outbound-only through
+`PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL`; it is not a synchronous approval
+callback. Approval callbacks are deliberately not accepted without a separately
 authenticated endpoint.
 
 The tmux transport is selected with `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`.
-Automatic mode rejects an explicit `process-pipe` transport; use JSONL or tmux for
-bounded decisions and repair. Before
-release, verify: private-socket attach, multi-line paste, prompt stability while
-Claude is busy, trust/permission dialog takeover, duplicate send prevention, pane
+Automatic mode rejects explicit `process-pipe` and `tmux` transports; use JSONL for
+bounded decisions and repair. Built-in Claude workers also receive a fail-closed
+sandbox setting (`failIfUnavailable`, `allowUnsandboxedCommands=false`, no outbound
+network domains); verify that startup fails if the sandbox cannot be initialized.
+Automatic startup also requires a full existing Git baseline, non-bare non-protected
+worktree and the bare `claude`/`claude.exe` command name. It resolves and pins an
+operator-owned, non-writable executable path (or the path configured by
+`PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE`), rejects explicit/custom executable paths, and
+compares the exact startup HEAD again immediately before spawn. Before release, verify:
+private-socket attach,
+multi-line paste, prompt stability while
+Claude is busy, trust/permission policy handling, duplicate send prevention, pane
 replacement refusal, pause/resume, owned-session stop, adopted-session
 detach/re-adoption, bounded shutdown, and Pi shutdown without closing an
 attached window. The two gated real-Claude spikes above cover the trust prompt,
-permission prompt, exact output, human takeover, and adopted detach paths. Use
+permission prompt, exact output, optional takeover, and adopted detach paths. Use
 `--permission-mode plan` and read-only tools for ordinary live Claude checks;
 the interactive spike is restricted to one harmless `rm -f` in a disposable
 fresh directory. Do not run JSONL and tmux control against the same Claude
@@ -165,7 +178,7 @@ the managed process group.
 
 The `v0.5.0` implementation of the acceptance—independent Review—repair—reacceptance
 loop is shipped. The `v0.5.1` real read-only drill reached acceptance and independent
-Review, then correctly stopped at human intervention after two P1 and two P2 findings.
+Review, then correctly produced a non-publishable candidate after two P1 and two P2 findings under the then-current human-gated compatibility path.
 A separate real edit-capable Claude Code `2.1.270` drill then exercised one bounded
 acceptance failure, repair turn, reacceptance and independent Reviewer `pass` in an
 isolated temporary worktree. The current hardening plan and evidence paths are recorded
@@ -182,8 +195,8 @@ Deterministic tests must cover:
 - legacy text tasks normalized to a Goal with the default `git diff --check`;
 - multiple required/optional checks with bounded output, timeout and exit-code evidence;
 - independent read-only Reviewer pass/revise/human results;
-- invalid Reviewer JSON and Reviewer API failure escalating to human;
-- repair rounds, repeated finding detection, P0/P1 escalation and repair-budget exhaustion;
+- invalid Reviewer JSON and Reviewer API failure becoming a parked/non-publishable candidate without requiring a live callback;
+- repair rounds, repeated finding detection, P0/P1 parking and repair-budget exhaustion;
 - non-persistent JSONL verification failure without duplicate terminal transitions;
 - repairable-but-not-persistent JSONL multi-turn repair;
 - stop and Pi shutdown from `verifying`, including Decision Worker closure and cwd lease release;
@@ -191,7 +204,8 @@ Deterministic tests must cover:
 
 Reviewer sessions use only `read`, `grep`, `find` and `ls`; they must not modify
 the worktree or send Worker input. Decision Worker and Reviewer model calls are
-bounded; timeout or API failure escalates instead of auto-completing. Review reports
+bounded; timeout or API failure parks the candidate instead of auto-completing or
+requiring a human to be online. Review reports
 are persisted as bounded event payloads and are not treated as permission grants.
 
 ### JSONL protocol and replay fixtures
@@ -233,7 +247,7 @@ Required deterministic and integration coverage:
 - independent child acceptance followed by root-task aggregate acceptance and Review;
 - single-child recovery, whole-graph recovery and Pi shutdown during scheduling;
 - no child can grant permissions, send control input to another child or bypass Policy Gate;
-- explicit human-controlled integration in a separate worktree; no automatic merge or publish.
+- independent integration in a separate worktree; the Worker has no remote push or main/integration merge authority, and no candidate bypasses that boundary.
 
 The multi-worker gate should be added only after the pinned single-worker stability
 and recovery gates pass. CI should use fake Workers and replay fixtures; authenticated
@@ -243,8 +257,8 @@ Claude multi-worker Spikes remain manual and version-pinned.
 
 A live review must record the exact Claude executable/version, transport, cgroup mode,
 permission flags, task id, acceptance result, Reviewer result, cleanup status and cwd lease
-status. A human-required result is a valid safety outcome and must not be converted into a
-pass by retrying the same task automatically.
+status. A parked/non-publishable result is a valid safety outcome and must not be converted into a
+pass by retrying the same task automatically or by treating the absence of a human callback as approval.
 
 For the hardening release, the completed gate record is:
 

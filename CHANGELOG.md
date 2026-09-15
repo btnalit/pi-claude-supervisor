@@ -32,10 +32,14 @@ All notable changes to this project will be documented here.
 - Pause and rebase the no-output watchdog clock across pause/resume while retaining the cumulative deadline.
 - Include staged, unstaged and bounded untracked evidence in independent Review, with symlink/path safety and fail-closed completeness.
 - Harden assistant-message output framing, startup/runtime preflight, permission gates, bounded acceptance buffers and lifecycle progress reporting.
+- Close automatic startup baseline/worktree/branch validation gaps, including persisted recovery baselines and the final pre-spawn boundary recheck.
+- Replace shell-policy lexical bypasses with quote-aware parsing, nested-shell inspection and protected Git-ref checks; deny dynamic shell expansions while preserving literal argv values, and reject arbitrary non-Claude automatic executables.
+- Normalize malformed custom Reviewer values to blocking reports, persist recovery baselines and the resolved Claude executable identity, filter automatic environment variables with a deny-by-default allowlist, and compare the exact startup HEAD at the adapter spawn boundary.
+- Keep protected CI checks on the exact checked-out commit while giving automatic-mode fixtures a local validation branch and an owned deterministic Claude executable.
 
 ### Remaining hardening gate
 
-- Complete the exact-head independent read-only Review; the real editable Claude `2.1.270` repair/reacceptance drill and cleanup/lease evidence are recorded in `docs/automation-hardening-plan.md`.
+- Open the protected pull request and complete independent CI/integration review; the exact-head read-only review, real editable Claude `2.1.270` repair/reacceptance drill and cleanup/lease evidence are recorded in `docs/automation-hardening-plan.md`.
 
 ### Added
 

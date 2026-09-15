@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
+import { promisify } from "node:util";
 import { join } from "node:path";
 import test from "node:test";
 import { EventLog, type SupervisorEvent } from "./events.ts";
@@ -84,6 +86,18 @@ function replayDecisionWorkerFactory(): DecisionWorkerFactory {
   });
 }
 
+const execFileAsync = promisify(execFile);
+
+async function initGit(cwd: string): Promise<void> {
+  await execFileAsync("git", ["init", "-q"], { cwd });
+  await execFileAsync("git", ["config", "user.email", "test@example.invalid"], { cwd });
+  await execFileAsync("git", ["config", "user.name", "Test"], { cwd });
+  await writeFile(join(cwd, "base.txt"), "base\n");
+  await execFileAsync("git", ["add", "base.txt"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "base"], { cwd });
+  await execFileAsync("git", ["switch", "-c", "worker/replay"], { cwd });
+}
+
 const reviewer: TaskReviewer = {
   review: async (input) => ({ verdict: "pass", summary: `replayed round ${input.round}`, findings: [], round: input.round, checkedAt: new Date().toISOString() }),
 };
@@ -98,12 +112,12 @@ test("automation replay covers permission allow, result, acceptance and independ
   const supervisor = new Supervisor(adapter, events, { reviewer });
   await supervisor.start({
     task: "replay a harmless permission task",
-    cwd: "/tmp",
-    command: "fixture",
+    cwd: process.cwd(),
+    command: "claude",
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
-    spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
     decisionWorkerFactory: replayDecisionWorkerFactory(),
   });
 
@@ -128,6 +142,7 @@ test("automation replay covers permission allow, result, acceptance and independ
 test("automation replay repairs a required-check failure before reacceptance and review", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-automation-replay-"));
   try {
+    await initGit(cwd);
     const marker = join(cwd, "repair-fixture.marker");
     const checkScript = [
       "const fs = require('node:fs');",
@@ -143,11 +158,11 @@ test("automation replay repairs a required-check failure before reacceptance and
     await supervisor.start({
       task: "replay a repairable required-check failure",
       cwd,
-      command: "fixture",
+      command: "claude",
       automation: true,
       deadlineMs: 0,
       noOutputTimeoutMs: 0,
-      spec: { acceptance: [{ id: "repairable", name: "repairable", command: process.execPath, args: ["-e", checkScript], required: true, timeoutMs: 1_000 }] },
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "repairable", name: "repairable", command: process.execPath, args: ["-e", checkScript], required: true, timeoutMs: 1_000 }] },
       decisionWorkerFactory: replayDecisionWorkerFactory(),
     });
 
@@ -177,12 +192,12 @@ test("automation replay denies AskUserQuestion instead of inventing permission",
   const supervisor = new Supervisor(adapter, new ReplayEventLog(), { reviewer });
   await supervisor.start({
     task: "replay an answerable question",
-    cwd: "/tmp",
-    command: "fixture",
+    cwd: process.cwd(),
+    command: "claude",
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
-    spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
     decisionWorkerFactory: replayDecisionWorkerFactory(),
   });
   adapter.emit({ type: "permission_request", request: { requestId: "question-1", toolUseId: "tool-question", toolName: "AskUserQuestion", input: { questions: [] }, raw: {} } });

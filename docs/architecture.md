@@ -1,5 +1,7 @@
 # Architecture
 
+> The confirmed target is fully unattended local development with an independent remote/main boundary. Automatic mode implements the local editing, testing, repair, acceptance, Review and local-commit loop; unresolved work becomes a parked candidate. Legacy human/takeover APIs remain compatibility controls only. See [autonomy-target.md](autonomy-target.md).
+
 ## Control boundary
 
 Pi owns the `Supervisor`. The supervisor owns the task state machine, event log,
@@ -17,12 +19,16 @@ Supervisor -> Policy Gate -> WorkerAdapter -> child process
 ```
 
 The Worker cannot advance a task directly to `completed`. A clean worker exit
-moves the supervisor to `verifying`; only a successful verifier moves it to
-`completed`.
+moves the supervisor to `verifying`; only successful acceptance, independent Review,
+complete evidence and the configured local-commit boundary move it to `completed`.
+An unresolvable automatic path moves it to `blocked`, never to a publishable result.
 
 The extension keeps a registry of independent task sessions. Each session has
 its own Supervisor, watchdog, state machine and Worker handle, while the event
-log is shared and protected by an inter-process lock. Concurrent active sessions must use non-overlapping canonical working
+log is shared and protected by an inter-process lock. Once a task starts, the
+local development loop is intended to run unattended: the Worker may edit, test,
+repair and commit locally. Remote push and merge into `main`/an integration branch
+are outside Worker authority and cross an independent boundary. Concurrent active sessions must use non-overlapping canonical working
 directories/worktrees; same-cwd and parent/child cwd starts are rejected before
 spawn, including concurrent starts, to prevent uncoordinated edits. Pending starts
 are also awaited during Pi shutdown.
@@ -40,8 +46,11 @@ graph, roles, dependencies, bounded concurrency and structured handoff
 artifacts. Child Workers must communicate through validated evidence and event
 references rather than another Worker's control channel. Each child is accepted
 independently; the parent can complete only after aggregate acceptance and
-independent Review. Integration, conflict resolution, merge and publication
-remain explicit human-controlled operations in a separate integration worktree.
+independent Review. Integration and conflict resolution remain separate from the local development
+loop. The Worker cannot push remotely or merge into `main`/an integration branch;
+the independent integration boundary may combine read-only review, CI and an
+authorized integration action in a separate integration worktree. Rejection or
+shutdown leaves the candidate local.
 
 Recovery and shutdown must be graph-aware: a parent with an unknown child state
 cannot complete, cancellation must propagate within a bounded budget, and Pi
@@ -119,9 +128,11 @@ For an owned initial turn, the adapter emits a synthetic `turn_completed` only
 after output activity and two stable input-prompt observations. Adopting an idle
 prompt remains inactive and emits no synthetic completion. This is a liveness
 signal, not proof that the task succeeded; the independent verifier remains
-mandatory. Interactive dialogs,
-trust prompts and ambiguous screens are not auto-approved. Human takeover sets a
-Supervisor gate that stops automatic messages until `resume-auto`.
+mandatory. Interactive dialogs, trust prompts and ambiguous screens are interpreted by
+the configured autonomy policy and recorded as evidence. An unresolved task is
+parked or failed as a non-publishable candidate rather than requiring a human to
+remain online. Human takeover remains an explicit kill/control path and stops
+automatic messages until `resume-auto`.
 
 `/supervise adopt-tmux` is explicit and validates the pinned pane's cwd and
 process identity before attaching. Every later input, capture and signal uses
@@ -165,7 +176,9 @@ unconfirmed lease left by a crashed Pi is intentionally retained. Ordinary
 recovery refuses it; an operator may use `recover --takeover` only when the old
 owner is dead, the Worker process group is gone, and the lease independently
 reads a real empty cgroup boundary for the old Worker. Missing or unverifiable
-Worker evidence still requires manual cleanup rather than unsafe reclamation.
+Worker evidence retains the lease and parks the task rather than performing unsafe
+reclamation; later recovery can inspect or clean it without requiring an operator to
+be online.
 An explicitly adopted tmux session may hand off an existing lease only after
 its owner identity is no longer live and its canonical cwd, tmux session/socket,
 pane id, pane PID/start time, and pane command all match; ordinary starts
@@ -178,13 +191,20 @@ is alive; the extension periodically rechecks released sessions and removes the
 lease only after the pane is confirmed gone. If that check fails, the lease is
 retained rather than allowing a cwd overlap.
 
-Before model or Worker execution, automatic starts preflight the validated cwd,
-worker executable, transport dependencies, runtime state/lease directories and,
-when requested, the real writable cgroup-v2 boundary. A failed preflight is
-fail-closed and does not start Claude. Long acceptance commands and Reviewer
+Before model or Worker execution, automatic starts validate a full existing Git
+baseline, a non-bare worktree, a readable non-protected branch, the direct bare
+`claude`/`claude.exe` command name, JSONL transport, runtime state/lease directories
+and, when requested, the real writable cgroup-v2 boundary. The resolved Claude
+executable is checked for an operator-owned, non-writable path and then pinned by
+absolute path; `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` can pin the expected identity. The initial repository HEAD is captured, and the repository boundary immediately
+before the Worker adapter starts must report that exact same HEAD (recovery captures
+and compares its current HEAD separately while retaining the persisted baseline).
+The built-in process adapter invokes the same assertion through `preSpawnCheck`
+after cgroup/executable setup and immediately before `spawn`; a failed preflight
+is fail-closed and does not start Claude. Long acceptance commands and Reviewer
 sessions share an abort signal with the Supervisor, so operator stop/shutdown
 wins without waiting for a full check timeout. Progress hooks expose starting,
-Worker heartbeat, acceptance, review, repair and human-gate phases in the Pi UI.
+Worker heartbeat, acceptance, review, repair and candidate/decision phases in the Pi UI.
 
 Startup owns an `AbortController` and passes its signal to the adapter. A stop
 or shutdown request aborts the controller and calls the adapter's out-of-band
@@ -221,20 +241,22 @@ unclean Pi restart, recovery is explicit: `/supervise recover [--takeover]
 <task-id>` restores
 the Decision Worker context and starts a new Claude Worker. It does not silently
 resume or duplicate a task. It does not poll to detect turn completion. A watchdog timer remains only as a deadlock safety
-fallback. Permission actions pass through `evaluatePermission` and can be
-approved or denied manually with `/supervise approve`; human escalation is sent
-to an outbound webhook when configured. If the Decision Worker API/model call
-fails, the system records `decision_worker_failed` and directly alerts the
-human operator; it does not attempt a second LLM fallback. Alert delivery is
-kept independent from event-log persistence so an audit write failure cannot
-suppress the alert.
+fallback. Permission and other actions pass through the configured autonomy policy and
+are recorded. The local development loop must not require synchronous human
+approval for ordinary actions; a task that cannot safely produce a candidate is
+parked or failed without granting remote/main authority. If the Decision Worker
+API/model call fails, the system records `decision_worker_failed`, applies the
+bounded retry/park policy and preserves the candidate evidence. Optional alert
+delivery remains independent from event-log persistence, but notification is not
+the control boundary.
 
 ## Acceptance, review and repair loop
 
 A task may provide a structured `TaskSpec` with `goal`, `scope`, `constraints`,
-`forbidden` and an ordered list of required or optional acceptance checks. A
+`forbidden`, an ordered list of required or optional acceptance checks, and
+`autonomy` (`unattended`, `requireLocalCommit`, `maxDecisionRetries`). A
 legacy plain-text task is normalized to a goal with the default `git diff
---check` acceptance check. The verifier runs every configured check with argv,
+--check` acceptance check and unattended defaults. The verifier runs every configured check with argv,
 bounded output and the same deterministic command policy; a Worker completion
 claim never substitutes for these results.
 
@@ -243,35 +265,40 @@ fresh read-only Reviewer session. The Reviewer receives the task specification, 
 check results and bounded Worker completion evidence, but not the Decision Worker
 conversation or control channel. It can inspect only `read`, `grep`, `find` and `ls`, and must return
 `pass`, `revise` or `human` with bounded structured findings. Invalid Reviewer
-output or a Reviewer API failure is a human-required condition.
+output, incomplete evidence or a Reviewer API failure must prevent a candidate
+from crossing the remote/main boundary; the local system may retry, repair or
+park it without requiring a human to be online.
 
 A `revise` result produces an audited repair round and sends a bounded corrective
 instruction to a still-live `repairableSession` Worker. Checks and review then run again.
 The repair budget defaults to three rounds; repeated findings and P0/P1 findings
-stop automation and escalate. A Worker that has already exited cannot be silently recreated
+stop automation and park a non-publishable candidate. A Worker that has already exited cannot be silently recreated
 for repair; it remains failed/recoverable rather than replaying the original task. If a repair
-or human-review branch cannot continue, a single idempotent terminalizer records
+or candidate branch cannot continue, a single idempotent terminalizer records
 `verification_failed`, closes the Decision Worker and reports cleanup evidence; it never performs
 a second `failed -> failed` transition.
 
-Repository evidence is HEAD-relative: tracked staged and unstaged changes are collected together,
-and untracked regular files are included through bounded, component-safe, no-symlink reads. Incomplete or
-truncated evidence is not sufficient for an independent `pass` verdict. Acceptance
+Repository evidence is baseline-relative: the Supervisor records the initial HEAD,
+then collects tracked committed/staged/unstaged changes, commit summaries after that
+baseline and untracked regular files through bounded, component-safe, no-symlink reads.
+Incomplete or truncated evidence is not sufficient for an independent `pass` verdict;
+automatic mode parks a task when the required git baseline or local commit is unavailable. Acceptance
 process output uses a bounded execution buffer before the smaller persisted evidence
 limit, so a normal large test report is not misclassified as a failed command.
 
 ## Deliberate non-goals
 
-- automatic merge/deploy/release;
-- unauthenticated inbound webhook commands; outbound notifications do not grant
-  permission and do not replace Pi human takeover;
-- treating an unknown Claude interactive question as safe to answer automatically;
-- bypassing Claude Code permissions;
+- giving the Worker remote push or main/integration merge authority;
+- unauthenticated inbound webhook commands; outbound notifications are optional,
+  do not grant permission and do not replace the remote/main independent boundary;
+- treating an unknown Claude interactive question as safe without task evidence or configured authorization;
+- bypassing the configured Claude Code/task permissions;
 - accepting model text as verification;
 - shell command interpolation;
-- automatic network denial or a fake domain allowlist. Network access follows
-  Claude's own permission model and the command policy; suspicious download-to-
-  shell patterns require human review rather than blanket network rejection;
+- a host-level network sandbox for manual integrations. Automatic mode does not admit
+  arbitrary custom executables: its supported Worker is direct Claude, which requests a
+  fail-closed Claude Code Bash sandbox with no outbound domains; command policy and
+  credential filtering remain defense in depth;
 - Claude CLI multi-version compatibility in the current stability milestone;
-- OS sandbox, low-privilege execution and network isolation in the current
+- full OS sandbox and low-privilege execution for custom Worker integrations in the current
   lifecycle milestone.

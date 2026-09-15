@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { redactSensitive } from "./redaction.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import type { TaskSpec } from "./types.ts";
@@ -27,6 +27,10 @@ export interface DecisionSessionRecord {
   deadlineMs: number;
   noOutputTimeoutMs: number;
   startedAt: string;
+  baseCommit?: string;
+  baseBranch?: string;
+  /** Real executable identity pinned by automatic startup and recovery. */
+  resolvedExecutable?: string;
   turn: number;
   repairRound?: number;
   lastFindingSignature?: string;
@@ -75,6 +79,7 @@ export class DecisionSessionStore {
     assertSessionPath(decisionSessionFile, this.#directory, record.taskId);
     assertNoCredentialPath(decisionSessionFile);
     assertNoCredentialPath(record.cwd);
+    if (record.resolvedExecutable !== undefined) assertResolvedExecutable(record.resolvedExecutable);
     await this.#withLock(() => this.#saveUnlocked({ ...record, decisionSessionFile }));
   }
 
@@ -354,6 +359,9 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     || (value.recoveryOwnerStartTime !== undefined && (typeof value.recoveryOwnerStartTime !== "string" || !/^\d+$/u.test(value.recoveryOwnerStartTime)))
     || (value.recoveryState !== undefined && !isRecoveryState(value.recoveryState))
     || (value.lastFindingSignature !== undefined && (typeof value.lastFindingSignature !== "string" || value.lastFindingSignature.length > 128))
+    || (value.baseCommit !== undefined && (typeof value.baseCommit !== "string" || !/^[0-9a-f]{40,64}$/iu.test(value.baseCommit)))
+    || (value.baseBranch !== undefined && (typeof value.baseBranch !== "string" || !/^[A-Za-z0-9._/-]+$/u.test(value.baseBranch)))
+    || (value.resolvedExecutable !== undefined && (typeof value.resolvedExecutable !== "string" || !isAbsolute(value.resolvedExecutable) || value.resolvedExecutable.length > 4_096))
     || (value.startedAt !== undefined && (typeof value.startedAt !== "string" || !Number.isFinite(Date.parse(value.startedAt))))
     || (value.recoveryWorker !== undefined && !isRecoveryWorker(value.recoveryWorker))) {
     throw new Error("invalid Decision Worker session record");
@@ -362,6 +370,7 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
   assertSessionPath(decisionSessionFile, directory, value.taskId);
   assertNoCredentialPath(decisionSessionFile);
   assertNoCredentialPath(value.cwd);
+  if (value.resolvedExecutable !== undefined) assertResolvedExecutable(value.resolvedExecutable);
   const recoveryWorker = value.recoveryWorker && {
     id: value.recoveryWorker.id,
     ...(value.recoveryWorker.pid !== undefined ? { pid: value.recoveryWorker.pid } : {}),
@@ -381,6 +390,9 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     deadlineMs: value.deadlineMs ?? 4 * 60 * 60_000,
     noOutputTimeoutMs: value.noOutputTimeoutMs ?? 20 * 60_000,
     startedAt: value.startedAt ?? value.updatedAt,
+    ...(typeof value.baseCommit === "string" ? { baseCommit: value.baseCommit } : {}),
+    ...(typeof value.baseBranch === "string" ? { baseBranch: value.baseBranch } : {}),
+    ...(typeof value.resolvedExecutable === "string" ? { resolvedExecutable: value.resolvedExecutable } : {}),
     turn: value.turn ?? 0,
     repairRound: value.repairRound ?? 0,
     ...(typeof value.lastFindingSignature === "string" ? { lastFindingSignature: value.lastFindingSignature } : {}),
@@ -413,6 +425,12 @@ async function assertTaskDirectorySafe(directory: string, taskId: string): Promi
 
 function assertNoCredentialPath(path: string): void {
   if (!path || String(redactSensitive(path)) !== path) throw new Error("Decision Worker session path contains credential-shaped text");
+}
+
+function assertResolvedExecutable(path: string): void {
+  if (!isAbsolute(path) || path.length > 4_096 || String(redactSensitive(path)) !== path) {
+    throw new Error("Decision Worker resolved executable identity is invalid");
+  }
 }
 
 function assertTaskId(taskId: string): void {

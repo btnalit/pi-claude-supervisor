@@ -38,9 +38,83 @@ export interface RepositoryEvidence {
   untracked?: string;
   /** False when a command/file could not be safely or completely collected. */
   complete?: boolean;
+  /** Commit summaries made after the task baseline. */
+  commits?: string;
+  /** Baseline HEAD used for the diff and commit range, when available. */
+  baseRef?: string;
+  /** Current branch used for the local candidate, when available. */
+  branch?: string;
   /** True when any evidence field was bounded or omitted. */
   truncated?: boolean;
   collectedAt: string;
+}
+
+/** Read the repository HEAD without invoking a shell. */
+export async function repositoryHead(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
+  try {
+    const result = await execFileAsync("git", ["rev-parse", "--verify", "HEAD"], {
+      cwd,
+      timeout: 30_000,
+      maxBuffer: 1024,
+      signal,
+      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
+    });
+    const head = String(result.stdout).trim();
+    return /^[0-9a-f]{40,64}$/u.test(head) ? head : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Verify that a full commit object is still present without invoking a shell. */
+export async function repositoryCommitExists(cwd: string, commit: string, signal?: AbortSignal): Promise<boolean> {
+  if (!/^[0-9a-f]{40,64}$/iu.test(commit)) return false;
+  try {
+    const result = await execFileAsync("git", ["cat-file", "-e", `${commit}^{commit}`], {
+      cwd,
+      timeout: 30_000,
+      maxBuffer: 1024,
+      signal,
+      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
+    });
+    return result.stderr.length === 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Determine whether cwd is a non-bare Git worktree without invoking a shell. */
+export async function repositoryWorkTree(cwd: string, signal?: AbortSignal): Promise<boolean | undefined> {
+  try {
+    const result = await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], {
+      cwd,
+      timeout: 30_000,
+      maxBuffer: 1024,
+      signal,
+      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
+    });
+    const value = String(result.stdout).trim();
+    return value === "true" ? true : value === "false" ? false : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read the current symbolic branch without invoking a shell. */
+export async function repositoryBranch(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
+  try {
+    const result = await execFileAsync("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], {
+      cwd,
+      timeout: 30_000,
+      maxBuffer: 1024,
+      signal,
+      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
+    });
+    const branch = String(result.stdout).trim();
+    return branch && /^[A-Za-z0-9._/-]+$/u.test(branch) ? branch : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function verify(
@@ -91,21 +165,29 @@ export async function verifyAll(cwd: string, checks: readonly AcceptanceCheck[],
 }
 
 /** Collect bounded repository evidence for the independent read-only Reviewer. */
-export async function collectRepositoryEvidence(cwd: string, options: Pick<VerificationOptions, "signal"> = {}): Promise<RepositoryEvidence> {
+export async function collectRepositoryEvidence(cwd: string, options: Pick<VerificationOptions, "signal"> & { baseRef?: string } = {}): Promise<RepositoryEvidence> {
   throwIfAborted(options.signal);
-  const [statusResult, diffResult, untrackedResult] = await Promise.all([
+  const baseRef = options.baseRef;
+  const diffRef = baseRef ?? "HEAD";
+  const commitArgs = baseRef ? ["log", "--format=%h %s", "--no-decorate", `${baseRef}..HEAD`, "--"] : ["log", "--format=%h %s", "--no-decorate", "-20", "--"];
+  const [statusResult, diffResult, commitsResult, branchResult, untrackedResult] = await Promise.all([
     readGitEvidence(cwd, ["status", "--short", "--untracked-files=all"], options.signal),
-    // HEAD-relative diff includes both staged and unstaged changes for tracked files.
-    readGitEvidence(cwd, ["diff", "--no-ext-diff", "--unified=3", "HEAD", "--"], options.signal),
+    // A baseline-relative diff includes committed, staged, and unstaged changes.
+    readGitEvidence(cwd, ["diff", "--no-ext-diff", "--unified=3", diffRef, "--"], options.signal),
+    readGitEvidence(cwd, commitArgs, options.signal),
+    readGitEvidence(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"], options.signal),
     collectUntrackedEvidence(cwd, options.signal),
   ]);
   throwIfAborted(options.signal);
   return {
     status: statusResult.text,
     diff: diffResult.text,
+    commits: commitsResult.text,
     untracked: untrackedResult.text,
-    complete: statusResult.complete && diffResult.complete && untrackedResult.complete,
-    truncated: statusResult.truncated || diffResult.truncated || untrackedResult.truncated,
+    ...(baseRef ? { baseRef } : {}),
+    ...(branchResult.text.trim() !== "(none)" ? { branch: branchResult.text.trim() } : {}),
+    complete: statusResult.complete && diffResult.complete && commitsResult.complete && branchResult.complete && untrackedResult.complete,
+    truncated: statusResult.truncated || diffResult.truncated || commitsResult.truncated || branchResult.truncated || untrackedResult.truncated,
     collectedAt: new Date().toISOString(),
   };
 }

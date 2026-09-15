@@ -55,12 +55,13 @@ try {
   firstSupervisor = new Supervisor(firstAdapter, new EventLog(join(stateDir, "events.jsonl")));
   owned = await firstSupervisor.start({
     task: "interactive tmux validation",
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 } },
     initialInput: "",
     sendInitialInput: false,
     cwd,
     command: claude,
     args: ["--model", model, "--permission-mode", "plan"],
-    automation: true,
+    automation: false,
     maxTurns: 4,
     decisionSessionDir: join(stateDir, "decision-sessions"),
   });
@@ -127,7 +128,7 @@ try {
     ownedTurns: 3,
     exactOutput: true,
     pauseResume: true,
-    automationEnabled: true,
+    automationEnabled: false,
     humanTakeover: true,
     automaticActionsAfterTakeover: 0,
     restartReadoption: true,

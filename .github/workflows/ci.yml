@@ -64,6 +64,19 @@ jobs:
         with:
           ref: ${{ env.CHECKOUT_REF }}
           persist-credentials: false
+      # Automatic-mode tests intentionally reject detached HEADs. Keep the
+      # exact checked-out commit while giving the fixture a non-protected local
+      # branch, just as an operator would provide to the supervisor.
+      - name: Create local validation branch
+        run: git switch --create ci-validation "$CHECKOUT_REF"
+      # CI does not install Claude Code. This owned, non-writable fixture lets
+      # executable-identity tests exercise the same bare-command resolution.
+      - name: Provide deterministic Claude test executable
+        run: |
+          mkdir -m 700 .ci-bin
+          printf '#!/usr/bin/env bash\nexit 0\n' > .ci-bin/claude
+          chmod 700 .ci-bin/claude
+          echo "$GITHUB_WORKSPACE/.ci-bin" >> "$GITHUB_PATH"
       - name: Install tmux transport test dependency
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y tmux
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
@@ -89,6 +102,16 @@ jobs:
         with:
           ref: ${{ env.CHECKOUT_REF }}
           persist-credentials: false
+      # Keep the exact checked-out commit while making automatic-mode tests
+      # run from a readable, non-protected local branch.
+      - name: Create local validation branch
+        run: git switch --create ci-validation "$CHECKOUT_REF"
+      - name: Provide deterministic Claude test executable
+        run: |
+          mkdir -m 700 .ci-bin
+          printf '#!/usr/bin/env bash\nexit 0\n' > .ci-bin/claude
+          chmod 700 .ci-bin/claude
+          echo "$GITHUB_WORKSPACE/.ci-bin" >> "$GITHUB_PATH"
       - name: Install tmux transport test dependency
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y tmux
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4

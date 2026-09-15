@@ -172,6 +172,21 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     const launch = cgroupPath
       ? cgroupBootstrapLaunch(input.command, args, input.cwd, workerEnv, cgroupPath)
       : { command: input.command, args, env: workerEnv };
+    try {
+      // This is the last asynchronous operation before spawn. Automatic mode
+      // uses it for an exact repository HEAD assertion; adapters that add
+      // setup work must invoke the hook only after that work is complete.
+      await input.preSpawnCheck?.();
+    } catch (error) {
+      if (cgroupPath) await rm(cgroupPath, { recursive: true, force: true }).catch(() => {});
+      throw error;
+    }
+    const finalAbortReason = input.startupToken ? this.#pendingStartupAborts.get(input.startupToken) : undefined;
+    if (input.startupToken) this.#pendingStartupAborts.delete(input.startupToken);
+    if (input.abortSignal?.aborted || finalAbortReason !== undefined) {
+      if (cgroupPath) await rm(cgroupPath, { recursive: true, force: true }).catch(() => {});
+      throw new Error(`worker startup aborted${finalAbortReason ? `: ${finalAbortReason}` : " before spawn"}`);
+    }
     let child: ChildProcess;
     try {
       child = spawn(launch.command, launch.args, {

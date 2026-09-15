@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import type { SupervisorEvent } from "./events.ts";
-import type { WorkerAdapter, WorkerHandle, WorkerOutputChunk, WorkerStatus } from "./types.ts";
+import type { WorkerAdapter, WorkerHandle, WorkerOutputChunk, WorkerStartInput, WorkerStatus } from "./types.ts";
 import { Supervisor } from "./supervisor.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
+import { TmuxWorkerAdapter } from "./worker/tmux-adapter.ts";
+
+const execFileAsync = promisify(execFile);
 
 class FlakyEventLog {
   readonly events: Array<Omit<SupervisorEvent, "seq" | "at">> = [];
@@ -42,6 +47,26 @@ class SelectiveFailingEventLog {
   }
 }
 
+async function initializeGitRepository(cwd: string, branch = "worker/test"): Promise<string> {
+  await execFileAsync("git", ["init", "-q"], { cwd });
+  await execFileAsync("git", ["config", "user.email", "test@example.invalid"], { cwd });
+  await execFileAsync("git", ["config", "user.name", "Test"], { cwd });
+  await writeFile(join(cwd, "base.txt"), "base\n");
+  await execFileAsync("git", ["add", "base.txt"], { cwd });
+  await execFileAsync("git", ["commit", "-qm", "base"], { cwd });
+  await execFileAsync("git", ["switch", "-c", branch], { cwd });
+  const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
+  return stdout.trim();
+}
+
+function automaticSpec() {
+  return { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1 } };
+}
+
+function automaticReviewer() {
+  return { review: async () => ({ verdict: "pass" as const, summary: "unused", findings: [], round: 0, checkedAt: new Date().toISOString() }) };
+}
+
 test("supervisor rejects spawn failure before reporting a worker start", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-spawn-error-"));
   const supervisor = new Supervisor(new ProcessWorkerAdapter());
@@ -54,6 +79,176 @@ test("supervisor rejects spawn failure before reporting a worker start", async (
   }), /spawn|ENOENT/u);
   assert.equal(supervisor.state, "failed");
   assert.equal(supervisor.handle, undefined);
+});
+
+test("automatic supervision requires an independent Reviewer", async () => {
+  const supervisor = new Supervisor(new ProcessWorkerAdapter());
+  await assert.rejects(() => supervisor.start({
+    task: "missing reviewer",
+    cwd: "/tmp",
+    command: process.execPath,
+    args: ["-e", "setInterval(() => {}, 1000)"],
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 } },
+  }), /independent Reviewer/u);
+});
+
+test("automatic supervision rejects tmux before Worker startup", async () => {
+  const adapter = new TmuxWorkerAdapter();
+  const supervisor = new Supervisor(adapter, undefined, {
+    reviewer: { review: async () => ({ verdict: "pass", summary: "unused", findings: [], round: 0, checkedAt: new Date().toISOString() }) },
+  });
+  await assert.rejects(() => supervisor.start({
+    task: "tmux is manual",
+    cwd: process.cwd(),
+    command: "claude",
+    args: ["-e", "setInterval(() => {}, 1000)"],
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 } },
+  }), /tmux is manual-only/u);
+});
+
+test("automatic supervision rejects a non-Git cwd before Worker startup", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-non-git-start-"));
+  try {
+    const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
+    const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
+    await assert.rejects(() => supervisor.start({
+      task: "non-Git cwd",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: automaticSpec(),
+    }), /verified git baseline/u);
+    assert.equal(supervisor.handle, undefined);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("automatic supervision rejects a detached or bare repository", async () => {
+  const detachedCwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-detached-start-"));
+  const bareCwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-bare-start-"));
+  try {
+    const detachedBase = await initializeGitRepository(detachedCwd, "worker/detached");
+    await execFileAsync("git", ["checkout", "--detach", detachedBase], { cwd: detachedCwd });
+    const detached = new Supervisor(new ProcessWorkerAdapter({ mode: "claude-jsonl" }), undefined, { reviewer: automaticReviewer() });
+    await assert.rejects(() => detached.start({ task: "detached", cwd: detachedCwd, command: "claude", automation: true, deadlineMs: 0, noOutputTimeoutMs: 0, spec: automaticSpec() }), /detached, unreadable, or missing git branch/u);
+
+    const bareBase = await initializeGitRepository(bareCwd, "worker/bare");
+    await execFileAsync("git", ["config", "core.bare", "true"], { cwd: bareCwd });
+    const bare = new Supervisor(new ProcessWorkerAdapter({ mode: "claude-jsonl" }), undefined, { reviewer: automaticReviewer() });
+    await assert.rejects(() => bare.start({ task: "bare", cwd: bareCwd, command: "claude", automation: true, baseCommit: bareBase, baseBranch: "worker/bare", deadlineMs: 0, noOutputTimeoutMs: 0, spec: automaticSpec() }), /non-bare git worktree/u);
+  } finally {
+    await rm(detachedCwd, { recursive: true, force: true });
+    await rm(bareCwd, { recursive: true, force: true });
+  }
+});
+
+test("automatic supervision rejects a non-Claude executable after repository validation", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-custom-worker-start-"));
+  try {
+    await initializeGitRepository(cwd, "worker/custom-worker");
+    const supervisor = new Supervisor(new ProcessWorkerAdapter({ mode: "claude-jsonl" }), undefined, { reviewer: automaticReviewer() });
+    await assert.rejects(() => supervisor.start({
+      task: "custom automatic worker",
+      cwd,
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: automaticSpec(),
+    }), /direct Claude executable/u);
+    assert.equal(supervisor.handle, undefined);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("automatic supervision rejects a supplied baseline that is not an existing commit", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-missing-baseline-"));
+  try {
+    await initializeGitRepository(cwd, "worker/missing-baseline");
+    const supervisor = new Supervisor(new ProcessWorkerAdapter({ mode: "claude-jsonl" }), undefined, { reviewer: automaticReviewer() });
+    await assert.rejects(() => supervisor.start({
+      task: "missing baseline",
+      cwd,
+      command: "claude",
+      baseCommit: "0".repeat(40),
+      baseBranch: "worker/missing-baseline",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: automaticSpec(),
+    }), /not an existing git commit/u);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("automatic supervision rechecks the exact startup HEAD before spawning", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-head-race-"));
+  try {
+    await initializeGitRepository(cwd, "worker/head-race");
+    let closed = false;
+    const adapter = new (class extends ProcessWorkerAdapter {
+      override async start(input: WorkerStartInput): Promise<WorkerHandle> {
+        await writeFile(join(cwd, "adapter-started.txt"), "changed\n");
+        await execFileAsync("git", ["add", "adapter-started.txt"], { cwd });
+        await execFileAsync("git", ["commit", "-qm", "unexpected adapter startup change"], { cwd });
+        return super.start(input);
+      }
+    })({ mode: "claude-jsonl", cgroupMode: "off" });
+    const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
+    await assert.rejects(() => supervisor.start({
+      task: "head race",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: automaticSpec(),
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => { closed = true; } }),
+    }), /repository HEAD changed/u);
+    assert.equal(supervisor.handle, undefined);
+    assert.equal(closed, true);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("protected branches are rejected even when local commits are optional", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-protected-start-"));
+  try {
+    await execFileAsync("git", ["init", "-q", "-b", "main"], { cwd });
+    await execFileAsync("git", ["config", "user.email", "test@example.invalid"], { cwd });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd });
+    await writeFile(join(cwd, "base.txt"), "base\n");
+    await execFileAsync("git", ["add", "base.txt"], { cwd });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd });
+    const supervisor = new Supervisor(new ProcessWorkerAdapter(), undefined, {
+      reviewer: { review: async () => ({ verdict: "pass", summary: "unused", findings: [], round: 0, checkedAt: new Date().toISOString() }) },
+    });
+    await assert.rejects(() => supervisor.start({
+      task: "protected branch",
+      cwd,
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 } },
+    }), /protected integration branch/u);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
 
 test("stop preempts a startup blocked before a worker handle exists", async () => {
@@ -562,13 +757,14 @@ test("non-persistent verification failure finalizes once and closes the decision
   };
   const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
     onHumanRequired: () => {},
+    reviewer: { review: async (input) => ({ verdict: "pass", summary: "not reached", findings: [], round: input.round, checkedAt: new Date().toISOString() }) },
   });
   await supervisor.start({
     task: "non-persistent repair failure",
-    cwd: "/tmp",
-    command: "fixture",
+    cwd: process.cwd(),
+    command: "claude",
     automation: true,
-    spec: { acceptance: [{ id: "fail", name: "fail", command: process.execPath, args: ["-e", "process.exit(7)"], required: true, timeoutMs: 1_000 }] },
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "fail", name: "fail", command: process.execPath, args: ["-e", "process.exit(7)"], required: true, timeoutMs: 1_000 }] },
     decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => { decisionClosed += 1; } }),
   });
   running = false;
@@ -576,9 +772,10 @@ test("non-persistent verification failure finalizes once and closes the decision
   assert.equal(supervisor.state, "verifying");
   const result = await supervisor.verify();
   assert.equal(result.ok, false);
-  assert.equal(supervisor.state, "failed");
+  assert.equal(supervisor.state, "blocked");
+  assert.equal(supervisor.candidateParked, true);
   assert.equal(decisionClosed, 1);
-  assert.ok(events.events.some((event) => event.type === "verification_failed"));
+  assert.ok(events.events.some((event) => event.type === "candidate_parked"));
 });
 
 test("stop from verifying performs cleanup and reaches stopped", async () => {
@@ -694,12 +891,12 @@ test("automatic acceptance review requests a bounded repair before completing", 
   });
   await supervisor.start({
     task: "reviewed fixture",
-    cwd: "/tmp",
-    command: "fixture",
+    cwd: process.cwd(),
+    command: "claude",
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
-    spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
     decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
   });
   await supervisor.poll();
@@ -715,6 +912,67 @@ test("automatic acceptance review requests a bounded repair before completing", 
   assert.equal(second.review?.verdict, "pass");
   assert.equal(reviews, 2);
   assert.equal(supervisor.state, "completed");
+});
+
+test("automatic candidates require and review a local commit", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-local-commit-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd });
+    await execFileAsync("git", ["config", "user.email", "test@example.invalid"], { cwd });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd });
+    await writeFile(join(cwd, "base.txt"), "base\\n");
+    await execFileAsync("git", ["add", "base.txt"], { cwd });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd });
+    await execFileAsync("git", ["switch", "-c", "worker/candidate"], { cwd });
+
+    const handle: WorkerHandle = { id: "local-commit-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    let sends = 0;
+    let reviewedCommits = "";
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async () => handle,
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+      readOutput: async () => [],
+      send: async () => {
+        sends += 1;
+        await execFileAsync("git", ["add", "candidate.txt"], { cwd });
+        await execFileAsync("git", ["commit", "-qm", "automatic local candidate"], { cwd });
+      },
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const supervisor = new Supervisor(adapter, undefined, {
+      reviewer: { review: async (input) => { reviewedCommits = input.evidence.commits ?? ""; return { verdict: "pass", summary: "verified", findings: [], round: input.round, checkedAt: new Date().toISOString() }; } },
+    });
+    await supervisor.start({
+      task: "commit the candidate locally",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    });
+    await writeFile(join(cwd, "candidate.txt"), "candidate\\n");
+    await supervisor.poll();
+    const first = await supervisor.verify();
+    assert.equal(first.ok, true);
+    assert.equal(supervisor.state, "running");
+    assert.equal(sends, 1);
+
+    await supervisor.poll();
+    const second = await supervisor.verify();
+    assert.equal(second.ok, true);
+    assert.equal(supervisor.state, "completed");
+    assert.match(reviewedCommits, /automatic local candidate/u);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
 
 test("repeated Reviewer findings escalate instead of looping forever", async () => {
@@ -739,12 +997,12 @@ test("repeated Reviewer findings escalate instead of looping forever", async () 
   });
   await supervisor.start({
     task: "duplicate finding fixture",
-    cwd: "/tmp",
-    command: "fixture",
+    cwd: process.cwd(),
+    command: "claude",
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
-    spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
     decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
   });
   await supervisor.poll();
@@ -755,11 +1013,13 @@ test("repeated Reviewer findings escalate instead of looping forever", async () 
   await supervisor.poll();
   const second = await supervisor.verify();
   assert.equal(second.review?.verdict, "human");
-  assert.equal(supervisor.humanRequired, true);
+  assert.equal(supervisor.humanRequired, false);
+  assert.equal(supervisor.candidateParked, true);
+  assert.equal(supervisor.state, "blocked");
   assert.equal(sends, 1);
 });
 
-test("repair-round exhaustion fails closed after the final automatic repair", async () => {
+test("repair-round exhaustion parks the candidate after the final automatic repair", async () => {
   const handle: WorkerHandle = { id: "exhausted-repair-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
   let running = true;
   let sends = 0;
@@ -793,12 +1053,12 @@ test("repair-round exhaustion fails closed after the final automatic repair", as
   });
   await supervisor.start({
     task: "exhaust automatic repairs",
-    cwd: "/tmp",
-    command: "fixture",
+    cwd: process.cwd(),
+    command: "claude",
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
-    spec: { maxRepairRounds: 1, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    spec: { maxRepairRounds: 1, autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
     decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
   });
   await supervisor.poll();
@@ -811,10 +1071,11 @@ test("repair-round exhaustion fails closed after the final automatic repair", as
   const second = await supervisor.verify();
   assert.equal(second.ok, false);
   assert.equal(second.review?.verdict, "revise");
-  assert.equal(supervisor.state, "failed");
+  assert.equal(supervisor.state, "blocked");
+  assert.equal(supervisor.candidateParked, true);
   assert.equal(sends, 1);
   assert.ok(events.events.some((event) => event.type === "repair_round_exhausted"));
-  assert.ok(events.events.some((event) => event.type === "verification_failed"));
+  assert.ok(events.events.some((event) => event.type === "candidate_parked"));
 });
 
 test("P0 and P1 Reviewer findings never enter automatic repair", async () => {
@@ -838,22 +1099,24 @@ test("P0 and P1 Reviewer findings never enter automatic repair", async () => {
   });
   await supervisor.start({
     task: "blocking finding fixture",
-    cwd: "/tmp",
-    command: "fixture",
+    cwd: process.cwd(),
+    command: "claude",
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
-    spec: { acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
     decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
   });
   await supervisor.poll();
   const result = await supervisor.verify();
   assert.equal(result.review?.verdict, "human");
-  assert.equal(supervisor.humanRequired, true);
+  assert.equal(supervisor.humanRequired, false);
+  assert.equal(supervisor.candidateParked, true);
+  assert.equal(supervisor.state, "blocked");
   assert.equal(sends, 0);
 });
 
-test("Reviewer API failure is fail-closed and recorded as human review", async () => {
+test("Reviewer API failure parks a candidate without human review", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-reviewer-error-"));
   const supervisor = new Supervisor(new ProcessWorkerAdapter({ cgroupMode: "off" }), undefined, {
     onHumanRequired: () => {},
@@ -867,8 +1130,31 @@ test("Reviewer API failure is fail-closed and recorded as human review", async (
   }
   const result = await supervisor.verify({ command: process.execPath, args: ["-e", "process.exit(0)"] });
   assert.equal(result.review?.verdict, "human");
-  assert.equal(supervisor.humanRequired, true);
-  assert.equal(supervisor.state, "failed");
+  assert.equal(supervisor.humanRequired, false);
+  assert.equal(supervisor.candidateParked, true);
+  assert.equal(supervisor.state, "blocked");
+});
+
+test("malformed custom Reviewer output parks and cleans up the Worker", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-reviewer-malformed-"));
+  const supervisor = new Supervisor(new ProcessWorkerAdapter({ cgroupMode: "off" }), undefined, {
+    reviewer: { review: async () => ({ verdict: "pass" } as never) },
+  });
+  try {
+    await supervisor.start({ task: "malformed reviewer fixture", cwd, command: process.execPath, args: ["-e", "console.log('worker complete')"] });
+    let polled = await supervisor.poll();
+    for (let attempt = 0; polled.status.running && attempt < 40; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      polled = await supervisor.poll();
+    }
+    const result = await supervisor.verify({ command: process.execPath, args: ["-e", "process.exit(0)"] });
+    assert.equal(result.review?.verdict, "human");
+    assert.equal(supervisor.candidateParked, true);
+    assert.equal(supervisor.state, "blocked");
+    assert.equal((await supervisor.poll()).status.running, false);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
 });
 
 test("supervisor requires independent verification after worker exit", async () => {

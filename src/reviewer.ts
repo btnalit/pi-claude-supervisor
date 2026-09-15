@@ -130,7 +130,16 @@ ${boundedJson(input.acceptance)}
 REPOSITORY STATUS:
 ${boundText(redactText(input.evidence.status), 8_000)}
 
-REPOSITORY DIFF (HEAD-RELATIVE, UNTRUSTED):
+REPOSITORY BASE:
+${redactText(input.evidence.baseRef ?? "(unavailable; review current evidence)")}
+
+LOCAL BRANCH:
+${redactText(input.evidence.branch ?? "(detached or unavailable)")}
+
+COMMITS AFTER BASELINE (UNTRUSTED):
+${boundText(redactText(input.evidence.commits ?? "(none)"), 8_000)}
+
+REPOSITORY DIFF (BASELINE-RELATIVE, UNTRUSTED):
 ${boundText(redactText(input.evidence.diff), 16_000)}
 
 UNTRACKED FILE EVIDENCE (UNTRUSTED):
@@ -157,6 +166,22 @@ function textFromMessage(content: unknown): string {
     .filter((block) => block.type === "text" && typeof block.text === "string")
     .map((block) => block.text as string)
     .join("");
+}
+
+export function normalizeReviewReport(value: unknown, round: number): ReviewReport {
+  try {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return invalidReview("invalid Reviewer output: result must be an object", round, new Date().toISOString());
+    }
+    const report = value as { verdict?: unknown; summary?: unknown; findings?: unknown };
+    if (typeof report.verdict !== "string" || typeof report.summary !== "string" || !report.summary.trim() || !Array.isArray(report.findings)) {
+      return invalidReview("invalid Reviewer output: result must include verdict, summary and findings", round, new Date().toISOString());
+    }
+    const encoded = JSON.stringify(value);
+    return parseReview(encoded ?? "", round);
+  } catch (error) {
+    return invalidReview(`invalid Reviewer output: ${error instanceof Error ? error.message : String(error)}`, round, new Date().toISOString());
+  }
 }
 
 export function parseReview(text: string, round: number): ReviewReport {

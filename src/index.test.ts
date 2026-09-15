@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { delimiter, join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
@@ -55,7 +55,19 @@ test("index recovers an idle Decision Worker without replaying the original task
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-index-"));
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-state-"));
   const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-leases-"));
+  const fakeBin = await mkdtemp(join(process.cwd(), ".pi-claude-supervisor-recover-bin-"));
   const taskId = "22222222-2222-4222-8222-222222222222";
+  const fakeClaude = join(fakeBin, "claude");
+  await copyFile(process.execPath, fakeClaude);
+  await chmod(fakeClaude, 0o700);
+  assert.equal(spawnSync("git", ["init", "-q"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["config", "user.email", "test@example.invalid"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["config", "user.name", "Test"], { cwd, stdio: "ignore" }).status, 0);
+  await writeFile(join(cwd, "base.txt"), "base\n");
+  assert.equal(spawnSync("git", ["add", "base.txt"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["commit", "-qm", "base"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["switch", "-c", "worker/recovery"], { cwd, stdio: "ignore" }).status, 0);
+  const baseCommit = spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).stdout.trim();
   const marker = join(stateDir, "received-input.jsonl");
   const decisionStore = new DecisionSessionStore(join(stateDir, "decision-sessions"));
   const decisionSessionDirectory = decisionStore.sessionDirectory(taskId);
@@ -67,18 +79,22 @@ test("index recovers an idle Decision Worker without replaying the original task
     taskId,
     task: "original task must not be replayed",
     cwd,
-    command: process.execPath,
+    command: "claude",
     args: ["-e", fakeWorker, marker],
+    resolvedExecutable: fakeClaude,
     decisionSessionFile,
     maxTurns: 2,
     deadlineMs: 60_000,
     noOutputTimeoutMs: 60_000,
     startedAt: new Date().toISOString(),
+    baseCommit,
+    baseBranch: "worker/recovery",
     turn: 0,
     state: "active",
   });
-  const keys = ["PI_CLAUDE_SUPERVISOR_STATE_DIR", "PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR", "PI_CLAUDE_SUPERVISOR_TRANSPORT", "PI_CLAUDE_SUPERVISOR_CGROUP_MODE", "PI_CLAUDE_SUPERVISOR_MODE", "PI_CLAUDE_SUPERVISOR_AUTOMATION"] as const;
+  const keys = ["PI_CLAUDE_SUPERVISOR_STATE_DIR", "PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR", "PI_CLAUDE_SUPERVISOR_TRANSPORT", "PI_CLAUDE_SUPERVISOR_CGROUP_MODE", "PI_CLAUDE_SUPERVISOR_MODE", "PI_CLAUDE_SUPERVISOR_AUTOMATION", "PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE"] as const;
   const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]])) as Record<typeof keys[number], string | undefined>;
+  const previousPath = process.env.PATH;
   for (const key of keys) delete process.env[key];
   process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
   process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
@@ -86,6 +102,8 @@ test("index recovers an idle Decision Worker without replaying the original task
   process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "off";
   process.env.PI_CLAUDE_SUPERVISOR_MODE = "auto";
   process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "1";
+  process.env.PATH = `${fakeBin}${delimiter}${previousPath ?? ""}`;
+  delete process.env.PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE;
   const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
   const messages: string[] = [];
   const context: TestContext = { cwd, hasUI: true, ui: { confirm: async () => false, notify: (message) => messages.push(message) } };
@@ -106,6 +124,9 @@ test("index recovers an idle Decision Worker without replaying the original task
     const recovered = await decisionStore.load(taskId);
     assert.equal(recovered?.state, "active");
     assert.equal(recovered?.recoveryState, "recovered_idle");
+    assert.equal(recovered?.baseCommit, baseCommit);
+    assert.equal(recovered?.baseBranch, "worker/recovery");
+    assert.equal(recovered?.resolvedExecutable, fakeClaude);
     assert.ok(recovered?.recoveryWorker?.id);
     await new Promise((resolve) => setTimeout(resolve, 100));
     await assert.rejects(() => readFile(marker, "utf8"), /ENOENT/u);
@@ -129,6 +150,9 @@ test("index recovers an idle Decision Worker without replaying the original task
       if (previous[key] === undefined) delete process.env[key];
       else process.env[key] = previous[key];
     }
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await rm(fakeBin, { recursive: true, force: true });
     await rm(cwd, { recursive: true, force: true });
     await rm(stateDir, { recursive: true, force: true });
     await rm(leaseDir, { recursive: true, force: true });
@@ -141,6 +165,7 @@ test("adopted tmux detach retains a live lease and reaps it after the session di
   const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-adopted-leases-"));
   const fakeClaude = join(stateDir, "claude");
   await copyFile(process.execPath, fakeClaude);
+  await chmod(fakeClaude, 0o700);
   const fixture = "process.stdout.write('>\\n--------------------\\n'); process.stdin.resume(); setInterval(() => {}, 10000);";
   const seededAdapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000 });
   const seeded = await seededAdapter.start({ task: "seeded session", cwd, command: fakeClaude, args: ["-e", fixture], sendInitialInput: false });
