@@ -260,12 +260,11 @@ test("leader exit automatically cleans descendants before status is terminal", a
   const status = await waitForStatus(adapter, handle, (value) => !value.running);
   assert.equal(status.processGroupCleaned, true);
   assert.equal(status.cleanupError, undefined);
-  try {
-    process.kill(childPid, 0);
-    assert.fail(`descendant process ${childPid} survived automatic cleanup`);
-  } catch (error) {
-    assert.ok(error instanceof Error && /ESRCH/u.test(error.message));
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (!(await processIsLive(childPid))) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
   }
+  assert.fail(`descendant process ${childPid} survived automatic cleanup`);
 });
 
 test("required cgroup bootstrap contains a descendant created before attachment", { skip: !requiredCgroupTestAvailable }, async () => {
@@ -646,6 +645,17 @@ async function canCreateCgroup(): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function processIsLive(pid: number): Promise<boolean> {
+  try {
+    const contents = await readFile(`/proc/${pid}/stat`, "utf8");
+    const close = contents.lastIndexOf(")");
+    return close < 0 || contents[close + 2] !== "Z";
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
   }
 }
 
