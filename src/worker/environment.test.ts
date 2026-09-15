@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import test from "node:test";
 import { assertTrustedAutomaticClaudeExecutable, automaticClaudeArgs, automaticWorkerEnvironment, workerEnvironment } from "./environment.ts";
 
@@ -64,5 +66,12 @@ test("automatic mode rejects an explicit executable path before resolution", asy
 });
 
 test("automatic mode rejects a recovery executable identity mismatch", async () => {
-  await assert.rejects(() => assertTrustedAutomaticClaudeExecutable("claude", process.execPath), /expected pinned identity/u);
+  const directory = await mkdtemp(join(process.cwd(), ".pi-claude-supervisor-expected-"));
+  const expectedPath = join(directory, "expected-claude");
+  try {
+    await writeFile(expectedPath, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    await assert.rejects(() => assertTrustedAutomaticClaudeExecutable("claude", expectedPath), /expected pinned identity/u);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
