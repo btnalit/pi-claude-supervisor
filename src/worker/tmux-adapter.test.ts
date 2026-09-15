@@ -173,8 +173,45 @@ process.stdin.on("data", data => {
     await waitFor(() => events.filter((event) => event.type === "turn_completed").length === 2);
     assert.match((await adapter.readOutput(handle)).map((chunk) => chunk.text).join(""), /ACK:human-next/u);
     await adapter.stop(handle, "bridge test complete");
+    const status = await adapter.getStatus(handle);
+    assert.equal(status.cleanupError, undefined);
+    assert.equal(status.runtimeError, undefined);
   } finally {
     if (handle) await adapter.stop(handle, "bridge test cleanup").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("automatic tmux pane exit is clean teardown, not a nested-process failure", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-pane-exit-test-"));
+  const fixture = join(stateDir, "fixture.mjs");
+  const fakeClaude = join(stateDir, "claude");
+  await writeFile(fixture, `
+process.stdout.write(JSON.stringify({ type: "system", subtype: "ready" }) + "\\n");
+process.stdin.resume();
+setInterval(() => {}, 10000);
+`);
+  await writeFile(fakeClaude, `#!/usr/bin/env node\nawait import(${JSON.stringify(fixture)});\n`);
+  await chmod(fakeClaude, 0o700);
+  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 100 });
+  let handle;
+  try {
+    handle = await adapter.start({ task: "pane exit", cwd: process.cwd(), command: fakeClaude, args: [], automatic: true });
+    assert.equal(spawnSync("tmux", ["-S", handle.tmuxSocket!, "kill-pane", "-t", handle.tmuxPaneId!], { stdio: "ignore" }).status, 0);
+    let status;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      status = await adapter.getStatus(handle);
+      if (!status.running) break;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    assert.equal(status?.running, false);
+    assert.equal(status?.processGroupCleaned, true);
+    assert.equal(status?.cgroupCleaned, true);
+    assert.equal(status?.runtimeError, undefined);
+    assert.equal(status?.cleanupError, undefined);
+    assert.notEqual(spawnSync("tmux", ["-S", handle.tmuxSocket!, "has-session", "-t", handle.sessionName!], { stdio: "ignore" }).status, 0);
+  } finally {
+    if (handle) await adapter.stop(handle, "pane exit cleanup").catch(() => {});
     await rm(stateDir, { recursive: true, force: true });
   }
 });

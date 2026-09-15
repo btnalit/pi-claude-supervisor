@@ -890,8 +890,11 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     try {
       const outputBeforeInput = record.lastOutputAt;
       await this.#collectOutput(record);
-      if (record.structured) await this.#checkNestedClaude(record);
       if (record.inputAt && record.lastOutputAt && Date.parse(record.lastOutputAt) >= record.inputAt && record.lastOutputAt !== outputBeforeInput) record.turnObservedOutput = true;
+      // Inspect the pane before walking its process tree. A normal stop or an
+      // externally killed pane can remove the bridge between these two reads;
+      // treating that expected exit as a nested-process/containment failure
+      // would turn successful cleanup into a false runtime error.
       const pane = await this.#paneStatus(record);
       record.paneDead = pane.dead;
       record.panePid = pane.pid;
@@ -905,6 +908,9 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         this.#emit(record, { type: "exited", handle: record.handle, exitCode: record.exitCode, signal: record.signal });
         return;
       }
+      // During explicit cleanup the bridge is expected to disappear. Do not
+      // race that teardown with the nested Claude/Reviewer guard.
+      if (record.structured && !record.stopping) await this.#checkNestedClaude(record);
       const screen = await this.#capture(record);
       if (record.structured) {
         if (record.activeRequests === 0 && hasBridgePromptInput(screen)) {
