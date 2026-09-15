@@ -199,13 +199,16 @@ test("automatic supervision rechecks the exact startup HEAD before spawning", as
     await initializeGitRepository(cwd, "worker/head-race");
     let closed = false;
     const adapter = new (class extends ProcessWorkerAdapter {
+      override async preflight(_input: Pick<WorkerStartInput, "cwd" | "command" | "args" | "env" | "approval" | "automatic">): Promise<void> {}
+
       override async start(input: WorkerStartInput): Promise<WorkerHandle> {
         await writeFile(join(cwd, "adapter-started.txt"), "changed\n");
         await execFileAsync("git", ["add", "adapter-started.txt"], { cwd });
         await execFileAsync("git", ["commit", "-qm", "unexpected adapter startup change"], { cwd });
-        return super.start(input);
+        await input.preSpawnCheck?.();
+        throw new Error("adapter start should not be reached after the pre-spawn check");
       }
-    })({ mode: "claude-jsonl", cgroupMode: "required" });
+    })({ mode: "claude-jsonl", cgroupMode: "off" });
     const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
     await assert.rejects(() => supervisor.start({
       task: "head race",

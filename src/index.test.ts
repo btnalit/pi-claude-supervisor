@@ -9,6 +9,9 @@ import { CwdLeaseStore, type CwdLeaseHandle, workerIdentity } from "./cwd-lease.
 import { DecisionSessionStore } from "./decision-session-store.ts";
 import { TmuxWorkerAdapter } from "./worker/tmux-adapter.ts";
 import extension from "./index.ts";
+import { preflightCgroupContainment } from "./worker/process-adapter.ts";
+
+const requiredCgroupTestAvailable = process.platform === "linux" && await canUseRequiredCgroup();
 
 test("index rejects an unknown worker transport instead of falling back", () => {
   const previous = process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
@@ -51,7 +54,7 @@ test("index rejects required cgroup mode for manual tmux instead of ignoring it"
   }
 });
 
-test("index recovers an idle Decision Worker without replaying the original task", { concurrency: false }, async () => {
+test("index recovers an idle Decision Worker without replaying the original task", { skip: !requiredCgroupTestAvailable, concurrency: false }, async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-index-"));
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-state-"));
   const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-leases-"));
@@ -410,6 +413,15 @@ test("index releases a confirmed-clean failed worker cwd reservation", async () 
     await rm(leaseDir, { recursive: true, force: true });
   }
 });
+
+async function canUseRequiredCgroup(): Promise<boolean> {
+  try {
+    await preflightCgroupContainment();
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 type TestContext = {
   cwd: string;
