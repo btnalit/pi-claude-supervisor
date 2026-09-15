@@ -35,6 +35,7 @@ All notable changes to this project will be documented here.
 - Close automatic startup baseline/worktree/branch validation gaps, including persisted recovery baselines and the final pre-spawn boundary recheck.
 - Replace shell-policy lexical bypasses with quote-aware parsing, nested-shell inspection and protected Git-ref checks; deny dynamic shell expansions while preserving literal argv values, and reject arbitrary non-Claude automatic executables.
 - Normalize malformed custom Reviewer values to blocking reports, persist recovery baselines and the resolved Claude executable identity, filter automatic environment variables with a deny-by-default allowlist, and compare the exact startup HEAD at the adapter spawn boundary.
+- Keep protected CI checks on the exact checked-out commit while giving automatic-mode fixtures a local validation branch and an owned deterministic Claude executable.
 
 ### Remaining hardening gate
 
