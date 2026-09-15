@@ -36,13 +36,13 @@ test("index rejects explicit process-pipe in automatic mode", () => {
   }
 });
 
-test("index rejects required cgroup mode with tmux instead of ignoring it", () => {
+test("index rejects required cgroup mode for manual tmux instead of ignoring it", () => {
   const previousTransport = process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
   const previousCgroupMode = process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE;
   process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "tmux";
   process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "required";
   try {
-    assert.throws(() => extension({} as never), /required is unsupported with tmux/u);
+    assert.throws(() => extension({} as never), /unsupported with manual tmux/u);
   } finally {
     if (previousTransport === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
     else process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = previousTransport;
@@ -99,7 +99,7 @@ test("index recovers an idle Decision Worker without replaying the original task
   process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
   process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
   process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "jsonl";
-  process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "off";
+  process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "required";
   process.env.PI_CLAUDE_SUPERVISOR_MODE = "auto";
   process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "1";
   process.env.PATH = `${fakeBin}${delimiter}${previousPath ?? ""}`;
@@ -204,8 +204,8 @@ test("adopted tmux detach retains a live lease and reaps it after the session di
   process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
   process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "tmux";
   process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "auto";
-  process.env.PI_CLAUDE_SUPERVISOR_MODE = "manual";
-  process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "0";
+  process.env.PI_CLAUDE_SUPERVISOR_MODE = "auto";
+  process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "1";
   process.env.PI_CLAUDE_SUPERVISOR_TMUX_SOCKET = seeded.tmuxSocket!;
   const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
   const messages: string[] = [];

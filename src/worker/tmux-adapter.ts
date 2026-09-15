@@ -16,6 +16,8 @@ import type {
 import { assertSafeWorkerCommand } from "../policy.ts";
 import { redactSensitive } from "../redaction.ts";
 import { workerEnvironment } from "./environment.ts";
+import { claudeJsonlArgs, cleanupCgroup, currentCgroupPath, preflightCgroupContainment } from "./process-adapter.ts";
+import { isClaudeLauncherProcess, isClaudeProcess, linuxCgroupProcesses, linuxProcessTree, readProcess, sameProcessIdentity, unexpectedClaudeProcess, unexpectedReviewerProcess, type ProcessTreeEntry } from "./process-tree.ts";
 
 export interface TmuxWorkerAdapterOptions {
   /** Directory for launcher and output state. */
@@ -28,6 +30,8 @@ export interface TmuxWorkerAdapterOptions {
   pollIntervalMs?: number;
   /** Time allowed for an interactive /exit before killing the owned server. */
   terminationGraceMs?: number;
+  /** Linux cgroup mode for automatic tmux bridge descendants. */
+  cgroupMode?: "off" | "auto" | "required";
 }
 
 interface TmuxRecord {
@@ -44,6 +48,11 @@ interface TmuxRecord {
   output: WorkerOutputChunk[];
   outputBytes: number;
   outputTruncated: boolean;
+  structured: boolean;
+  eventBuffer: string;
+  seenResultIds: Set<string>;
+  seenPermissionRequestIds: Set<string>;
+  permissionResponses: Set<string>;
   lastOutputAt?: string;
   lastInputAt?: string;
   activeRequests: number;
@@ -75,6 +84,14 @@ interface TmuxRecord {
   replacementPaneStartTime?: string;
   replacementPaneCommand?: string;
   paneDead?: boolean;
+  guardianPid?: number;
+  guardianStartTime?: string;
+  cgroupPath?: string;
+  cgroupError?: Error;
+  cgroupCleaned?: boolean;
+  expectedClaudeCommand?: string;
+  trustedClaudeProcesses: Map<number, ProcessTreeEntry>;
+  runtimeError?: Error;
 }
 
 interface TmuxPaneStatus {
@@ -82,6 +99,238 @@ interface TmuxPaneStatus {
   exitCode?: number;
   pid?: number;
 }
+
+const BRIDGE_KEYS = {
+  command: "PI_CLAUDE_SUPERVISOR_TMUX_COMMAND",
+  args: "PI_CLAUDE_SUPERVISOR_TMUX_ARGS",
+  cgroup: "PI_CLAUDE_SUPERVISOR_TMUX_CGROUP",
+} as const;
+const BRIDGE_EVENT_START = "\u001bPPI_CLAUDE_SUPERVISOR_EVENT;";
+const BRIDGE_INPUT_START = "\u001bPPI_CLAUDE_SUPERVISOR_INPUT;";
+const BRIDGE_EVENT_END = "\u001b\\";
+
+/**
+ * A single process in the tmux pane owns both the interactive display and the
+ * Claude stream-json control channel. Human input is ordinary text; Supervisor
+ * input/permission responses use private @pi:* lines, so the same pane remains
+ * live and attachable without making the safety-critical event stream a second
+ * worker process.
+ */
+const TMUX_PANE_BOOTSTRAP_SCRIPT = `
+const { writeFileSync } = require("node:fs");
+const key = ${JSON.stringify(BRIDGE_KEYS.cgroup)};
+const cgroup = Buffer.from(process.env[key] || "", "base64").toString("utf8");
+if (cgroup) {
+  try { writeFileSync(cgroup + "/cgroup.procs", String(process.pid) + "\\n"); }
+  catch (error) { process.stderr.write("tmux pane bootstrap failed: " + (error instanceof Error ? error.message : String(error)) + "\\n"); process.exit(125); }
+}
+process.stdin.resume();
+setInterval(() => {}, 10_000).unref();
+`;
+
+const TMUX_BRIDGE_SCRIPT = `
+const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const readline = require("node:readline");
+const decode = (key) => Buffer.from(process.env[key] || "", "base64").toString("utf8");
+const command = decode("${BRIDGE_KEYS.command}");
+const args = JSON.parse(decode("${BRIDGE_KEYS.args}"));
+const bridgeKeys = ${JSON.stringify(Object.values(BRIDGE_KEYS))};
+const cgroup = decode("${BRIDGE_KEYS.cgroup}");
+const eventStart = String.fromCharCode(27) + "PPI_CLAUDE_SUPERVISOR_EVENT;";
+const inputStart = String.fromCharCode(27) + "PPI_CLAUDE_SUPERVISOR_INPUT;";
+const eventEnd = String.fromCharCode(27) + "\\\\";
+// Claude text is untrusted and shares the PTY with the Supervisor's private
+// DCS event stream. Strip every ESC from display text so a model cannot forge a
+// frame, including by splitting an escape sequence across output records.
+const output = (value) => { process.stdout.write(String(value).split(String.fromCharCode(27)).join("")); };
+const control = (value) => { process.stdout.write(String(value)); };
+// Structured records share the bridge's PTY with the human-readable display.
+// DCS is ignored by normal terminals, while pipe-pane preserves it for the
+// Supervisor's parser; there is no independent JSONL event sidecar.
+const writeEvent = (value) => {
+  const payload = Buffer.from(JSON.stringify(value), "utf8").toString("base64");
+  control(eventStart + payload + eventEnd);
+};
+if (cgroup) {
+  try { writeFileSync(cgroup + "/cgroup.procs", String(process.pid) + "\\n"); }
+  catch (error) {
+    writeEvent({ type: "bridge_exit", code: 125, error: error instanceof Error ? error.message : String(error) });
+    process.exit(125);
+  }
+}
+const prompt = () => output("\\n> ");
+const decodeLine = (value) => Buffer.from(value, "base64").toString("utf8");
+const clearSupervisorInput = () => control("\\x1b[1A\\r\\x1b[2K\\x1b[1B\\r");
+const childEnv = { ...process.env };
+for (const key of bridgeKeys) delete childEnv[key];
+let child;
+let inputActive = false;
+let stdoutBuffer = "";
+try {
+  child = spawn(command, args, { cwd: process.cwd(), env: childEnv, stdio: ["pipe", "pipe", "pipe"] });
+} catch (error) {
+  writeEvent({ type: "bridge_exit", code: 125, error: error instanceof Error ? error.message : String(error) });
+  process.exit(125);
+}
+const render = (record) => {
+  if (record.type === "stream_event") {
+    const event = record.event;
+    const delta = event && typeof event === "object" ? event.delta : undefined;
+    if (delta && typeof delta === "object" && delta.type === "text_delta" && typeof delta.text === "string") output(delta.text);
+    return;
+  }
+  if (record.type === "assistant") {
+    const content = record.message && typeof record.message === "object" ? record.message.content : undefined;
+    if (Array.isArray(content)) for (const block of content) {
+      if (block && block.type === "text" && typeof block.text === "string") output(block.text);
+      else if (block && block.type === "tool_use") output("\\n[tool " + String(block.name || "unknown") + "]\\n");
+    }
+    return;
+  }
+  if (record.type === "control_request") {
+    const request = record.request;
+    const name = request && typeof request === "object" ? request.tool_name : "unknown";
+    output("\\n[permission requested: " + String(name) + "]\\n");
+    return;
+  }
+  if (record.type === "result") {
+    inputActive = false;
+    output("\\n[result " + String(record.subtype || "completed") + "]");
+    prompt();
+    return;
+  }
+  if (record.type === "system") output("\\n[system " + String(record.subtype || "event") + "]\\n");
+};
+const processLine = (line) => {
+  if (!line) return;
+  let record;
+  try { record = JSON.parse(line); } catch { output("\\n[invalid Claude JSONL output]\\n"); return; }
+  writeEvent(record);
+  render(record);
+};
+child.stdout.setEncoding("utf8");
+child.stdout.on("data", (chunk) => {
+  stdoutBuffer += String(chunk);
+  let newline;
+  while ((newline = stdoutBuffer.indexOf("\\n")) >= 0) {
+    processLine(stdoutBuffer.slice(0, newline).replace(/\\r$/u, ""));
+    stdoutBuffer = stdoutBuffer.slice(newline + 1);
+  }
+});
+child.stderr.setEncoding("utf8");
+child.stderr.on("data", (chunk) => output("\\n[claude stderr] " + String(chunk)));
+child.once("error", (error) => {
+  writeEvent({ type: "bridge_exit", code: 127, error: error.message });
+  process.exit(127);
+});
+child.once("exit", (code, signal) => {
+  if (stdoutBuffer.trim()) processLine(stdoutBuffer.trim());
+  writeEvent({ type: "bridge_exit", code, signal });
+  output("\\n[Claude exited " + String(code === null ? signal : code) + "]\\n");
+  process.exit(code ?? 1);
+});
+const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+input.on("line", (line) => {
+  if (line.startsWith(inputStart)) {
+    const end = line.indexOf(eventEnd, inputStart.length);
+    if (end >= 0) {
+      try {
+        const frame = JSON.parse(Buffer.from(line.slice(inputStart.length, end), "base64").toString("utf8"));
+        if (frame.type === "user") {
+          inputActive = true;
+          child.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: String(frame.message || "") } }) + "\\n");
+        } else if (frame.type === "json") {
+          child.stdin.write(String(frame.message || "").replace(/\\n$/u, "") + "\\n");
+        } else if (frame.type === "stop") {
+          try { child.kill("SIGTERM"); } catch {}
+        }
+      } catch (error) {
+        output("\\n[invalid Supervisor input frame: " + (error instanceof Error ? error.message : String(error)) + "]\\n");
+      }
+      return;
+    }
+  }
+  if (line.startsWith("@pi:user ")) {
+    clearSupervisorInput();
+    inputActive = true;
+    child.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: decodeLine(line.slice("@pi:user ".length)) } }) + "\\n");
+    return;
+  }
+  if (line.startsWith("@pi:json ")) {
+    clearSupervisorInput();
+    const message = decodeLine(line.slice("@pi:json ".length));
+    child.stdin.write(message.endsWith("\\n") ? message : message + "\\n");
+    return;
+  }
+  if (line === "@pi:stop") {
+    clearSupervisorInput();
+    try { child.kill("SIGTERM"); } catch {}
+    return;
+  }
+  if (!line.trim()) return;
+  inputActive = true;
+  child.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: line } }) + "\\n");
+});
+input.on("close", () => { try { child.kill("SIGTERM"); } catch {} });
+prompt();
+`;
+
+const GUARDIAN_KEYS = {
+  tmux: "PI_CLAUDE_SUPERVISOR_TMUX_BINARY",
+  socket: "PI_CLAUDE_SUPERVISOR_TMUX_SOCKET",
+  session: "PI_CLAUDE_SUPERVISOR_TMUX_SESSION",
+  cgroup: "PI_CLAUDE_SUPERVISOR_TMUX_CGROUP",
+  parentPid: "PI_CLAUDE_SUPERVISOR_TMUX_PARENT_PID",
+  parentStart: "PI_CLAUDE_SUPERVISOR_TMUX_PARENT_START",
+} as const;
+
+const TMUX_GUARDIAN_SCRIPT = `
+const { spawnSync } = require("node:child_process");
+const { readFileSync, rmSync, rmdirSync, writeFileSync } = require("node:fs");
+const decode = (key) => Buffer.from(process.env[key] || "", "base64").toString("utf8");
+const tmux = decode("${GUARDIAN_KEYS.tmux}");
+const socket = decode("${GUARDIAN_KEYS.socket}");
+const session = decode("${GUARDIAN_KEYS.session}");
+const cgroup = decode("${GUARDIAN_KEYS.cgroup}");
+const parentPid = Number(decode("${GUARDIAN_KEYS.parentPid}"));
+const parentStart = decode("${GUARDIAN_KEYS.parentStart}");
+const readStart = (pid) => {
+  try {
+    const stat = readFileSync("/proc/" + pid + "/stat", "utf8");
+    const close = stat.lastIndexOf(")");
+    return close < 0 ? undefined : stat.slice(close + 2).trim().split(/\\s+/u)[19];
+  } catch { return undefined; }
+};
+const alive = () => Boolean(parentPid > 0 && (() => {
+  try { process.kill(parentPid, 0); } catch { return false; }
+  return !parentStart || readStart(parentPid) === parentStart;
+})());
+const timer = setInterval(() => {
+  if (alive()) return;
+  clearInterval(timer);
+  try { spawnSync(tmux, ["-S", socket, "kill-session", "-t", session], { stdio: "ignore" }); } catch {}
+  if (cgroup) {
+    try { writeFileSync(cgroup + "/cgroup.kill", "1\\n"); } catch {}
+    const reap = () => {
+      try {
+        if (/^populated 0$/mu.test(readFileSync(cgroup + "/cgroup.events", "utf8"))) {
+          try { rmdirSync(cgroup); } catch { try { rmSync(cgroup, { recursive: true, force: true }); } catch {} }
+          process.exit(0);
+          return;
+        }
+      } catch (error) {
+        if (error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "ENOENT") {
+          process.exit(0);
+          return;
+        }
+      }
+      setTimeout(reap, 50).unref();
+    };
+    reap();
+  } else process.exit(0);
+}, 100);
+`;
 
 /**
  * Interactive Claude Code transport backed by a private tmux server and PTY.
@@ -97,6 +346,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   readonly #startupTimeoutMs: number;
   readonly #pollIntervalMs: number;
   readonly #terminationGraceMs: number;
+  readonly #cgroupMode: "off" | "auto" | "required";
   readonly #maxOutputBytes = 8 * 1024 * 1024;
   readonly #maxLogBytes = 16 * 1024 * 1024;
   readonly #commandTimeoutMs = 10_000;
@@ -107,13 +357,23 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     this.#startupTimeoutMs = boundedDelay(options.startupTimeoutMs ?? 60_000);
     this.#pollIntervalMs = boundedDelay(options.pollIntervalMs ?? 500);
     this.#terminationGraceMs = boundedDelay(options.terminationGraceMs ?? 2_000);
+    this.#cgroupMode = options.cgroupMode ?? "auto";
   }
 
-  async preflight(input: Pick<WorkerStartInput, "cwd" | "command" | "args" | "env" | "approval">): Promise<void> {
-    assertSafeWorkerCommand(input.command, input.args ?? [], input.approval);
+  async preflight(input: Pick<WorkerStartInput, "cwd" | "command" | "args" | "env" | "approval" | "automatic">): Promise<void> {
+    const args = input.automatic ? claudeJsonlArgs(input.args) : (input.args ?? []);
+    assertSafeWorkerCommand(input.command, args, input.approval);
     await assertDirectory(input.cwd);
+    if (process.platform !== "linux") throw new Error("tmux supervision currently requires Linux process identity and cleanup support");
     await assertExecutableAvailable(input.command, input.env?.PATH ?? process.env.PATH);
     await assertExecutableAvailable(this.#tmuxBinary, process.env.PATH);
+    if (input.automatic) {
+      if (process.platform !== "linux") throw new Error("automatic tmux supervision requires Linux cgroup v2 and a parent-death guardian");
+      if (this.#cgroupMode === "off") throw new Error("automatic tmux supervision requires cgroup containment");
+      await preflightCgroupContainment();
+      const parent = await processIdentity(process.pid);
+      if (!parent?.startTime) throw new Error("automatic tmux supervision cannot verify the parent process identity");
+    }
     await mkdir(this.#stateDir, { recursive: true, mode: 0o700 });
     const stateInfo = await lstat(this.#stateDir);
     if (!stateInfo.isDirectory() || stateInfo.isSymbolicLink()) throw new Error(`tmux state directory is not a real directory: ${this.#stateDir}`);
@@ -135,6 +395,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   async start(input: WorkerStartInput): Promise<WorkerHandle> {
     const id = randomUUID();
     const owned = !input.tmuxSession;
+    const structured = Boolean(input.automatic);
+    if (input.tmuxSession && input.sendInitialInput === true) throw new Error("adopted tmux sessions cannot replay the original task");
+    if (structured && !owned) throw new Error("automatic tmux supervision requires a Supervisor-owned tmux bridge; adopted sessions are manual-only");
+    const sendInitialInput = owned && input.sendInitialInput !== false;
     const sessionName = input.tmuxSession ?? `pi-supervisor-${id}`;
     if (!/^[A-Za-z0-9_.-]+$/u.test(sessionName)) throw new Error("tmux session names must contain only letters, numbers, dot, underscore or hyphen");
     const socketPath = input.tmuxSession ? input.tmuxSocket : join(tmpdir(), `pi-cs-${id}.sock`);
@@ -151,6 +415,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       ownership: owned ? "owned" : "adopted",
       tmuxTarget: target,
     };
+    if (process.platform !== "linux") throw new Error("tmux supervision currently requires Linux process identity and cleanup support");
     const record: TmuxRecord = {
       handle,
       sessionName,
@@ -165,6 +430,13 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       output: [],
       outputBytes: 0,
       outputTruncated: false,
+      structured,
+      eventBuffer: "",
+      seenResultIds: new Set(),
+      seenPermissionRequestIds: new Set(),
+      permissionResponses: new Set(),
+      expectedClaudeCommand: structured ? input.command : undefined,
+      trustedClaudeProcesses: new Map(),
       activeRequests: 0,
       turnSequence: 0,
       readyStreak: 0,
@@ -194,22 +466,49 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
       await writeFile(logPath, "", { mode: 0o600 });
       if (owned) {
-        assertSafeWorkerCommand(input.command, input.args ?? [], input.approval);
-        assertNoCredentialArguments(input.command, input.args ?? []);
+        if (process.platform !== "linux") throw new Error("owned tmux supervision requires a Linux parent-death guardian");
+        if (structured && this.#cgroupMode === "off") throw new Error("automatic tmux supervision requires cgroup containment");
+        if (structured) {
+          try {
+            record.cgroupPath = await this.#createCgroup(id);
+            record.handle.cgroupPath = record.cgroupPath;
+          } catch (error) {
+            record.cgroupError = asError(error);
+            throw new Error(`automatic tmux cgroup setup failed: ${record.cgroupError.message}`, { cause: record.cgroupError });
+          }
+        }
         const env = workerEnvironment(process.env, input.env);
-        // Create the window with its shell first so remain-on-exit is set
-        // before the launcher can finish instantly.
-        await this.#run(record, ["new-session", "-d", "-s", sessionName, "-x", "140", "-y", "40", "-c", input.cwd], undefined, env);
+        const workerArgs = structured ? claudeJsonlArgs(input.args) : (input.args ?? []);
+        assertSafeWorkerCommand(input.command, workerArgs, input.approval);
+        assertNoCredentialArguments(input.command, workerArgs);
+        const bridgeEnv = structured
+          ? bridgeEnvironment(env, input.command, workerArgs, record.cgroupPath)
+          : env;
+        // Arm the guardian before creating the session. If the Supervisor dies
+        // in the tmux startup window, the guardian removes any server created
+        // after it and also reaps the automatic bridge cgroup.
+        if (!socketPath) throw new Error("owned tmux startup did not allocate a private socket");
+        await this.#startGuardian(record, socketPath);
+        if (record.cleanupError) throw record.cleanupError;
+        const paneBootstrap = [process.execPath, "-e", TMUX_PANE_BOOTSTRAP_SCRIPT];
+        await this.#run(record, ["new-session", "-d", "-s", sessionName, "-x", "140", "-y", "40", "-c", input.cwd, "--", ...paneBootstrap], undefined, bridgeEnv);
         record.sessionCreated = true;
         await this.#run(record, ["set-window-option", "-t", sessionName, "remain-on-exit", "on"]);
-        await this.#run(record, ["respawn-pane", "-k", "-t", target, "--", input.command, ...(input.args ?? [])], undefined, env);
+        await input.preSpawnCheck?.();
+        const launch = structured
+          ? [process.execPath, "-e", TMUX_BRIDGE_SCRIPT]
+          : [input.command, ...workerArgs];
+        await this.#run(record, ["respawn-pane", "-k", "-t", target, "--", ...launch], undefined, bridgeEnv);
         await this.#pinTarget(record);
         const ownedPane = await this.#paneStatus(record);
         record.paneDead = ownedPane.dead;
         if (!ownedPane.dead) {
+          // respawn-pane may still be replacing the old shell when the first
+          // pane_pid is observed. Pin the identity only after the bridge has
+          // rendered its ready prompt below; #send repeats the check immediately
+          // before input reservation.
           record.panePid = ownedPane.pid;
           record.handle.pid = ownedPane.pid;
-          await this.#rememberPaneIdentity(record, ownedPane.pid);
         }
       } else {
         await this.#assertExistingSession(record, input.cwd, input.approval);
@@ -220,8 +519,17 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       record.pipeAttached = true;
       const attachedPipe = await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_pipe}"]);
       if (attachedPipe.stdout.trim() !== "1") throw new Error("tmux output pipe could not be attached to the pinned pane");
-      if (input.sendInitialInput !== false || !input.tmuxSession) await this.#waitForReady(record);
-      if (input.sendInitialInput !== false) {
+      if (sendInitialInput || !input.tmuxSession) await this.#waitForReady(record);
+      if (owned) {
+        const readyPane = await this.#paneStatus(record);
+        if (readyPane.dead) throw new Error("tmux worker exited before identity could be pinned");
+        record.paneDead = false;
+        record.panePid = readyPane.pid;
+        record.handle.pid = readyPane.pid;
+        await this.#rememberPaneIdentity(record, readyPane.pid);
+      }
+      if (record.structured) await this.#rememberClaudeProcesses(record);
+      if (sendInitialInput) {
         await this.#send(record, input.task, `${id}:initial`);
       } else if (input.tmuxSession) {
         const screen = await this.#capture(record);
@@ -263,8 +571,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     for (const record of starts) {
       record.abortRequested = true;
       record.stopping = true;
-      if (record.owned) await this.#run(record, ["kill-server"], undefined, undefined, true).catch(() => {});
-      else await this.#detachPipe(record);
+      if (record.owned) {
+        await this.#stopGuardian(record).catch((error) => { record.cleanupError ??= asError(error); });
+        await this.#run(record, ["kill-server"], undefined, undefined, true).catch(() => {});
+      } else await this.#detachPipe(record);
     }
     const deadline = Date.now() + 25_000;
     while (starts.some((record) => record.starting) && Date.now() < deadline) await delay(25);
@@ -349,6 +659,27 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     await this.#send(record, message, idempotencyKey);
   }
 
+  async respondPermission(handle: WorkerHandle, requestId: string, toolUseId: string, decision: { behavior: "allow" | "deny"; message?: string }, updatedInput?: unknown): Promise<void> {
+    const record = this.#record(handle);
+    if (!record.structured) throw new Error("permission responses require the automated tmux bridge");
+    if (record.permissionResponses.has(requestId)) return;
+    if (record.released || record.stopping) throw new Error("tmux worker is no longer supervised");
+    const response = {
+      type: "control_response",
+      response: {
+        subtype: "success",
+        request_id: requestId,
+        response: decision.behavior === "allow"
+          ? { behavior: "allow", updatedInput }
+          : { behavior: "deny", message: decision.message ?? "permission denied by supervisor" },
+        toolUseID: toolUseId,
+      },
+    };
+    await this.#sendControl(record, response);
+    record.permissionResponses.add(requestId);
+    record.lastInputAt = new Date().toISOString();
+  }
+
   async pause(handle: WorkerHandle): Promise<void> {
     const record = this.#record(handle);
     if (record.released) throw new Error("tmux worker is no longer supervised");
@@ -383,7 +714,8 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       await this.#collectOutput(record);
       if (!record.paneDead) {
         try {
-          await this.#sendRaw(record, "/exit");
+          if (record.structured) await this.#sendControl(record, undefined, "@pi:stop");
+          else await this.#sendRaw(record, "/exit");
           await this.#waitForPaneExit(record, this.#terminationGraceMs);
         } catch {
           // The private tmux server is still the authoritative cleanup boundary.
@@ -414,6 +746,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     catch (error) { record.cleanupError = asError(error); }
     if (record.monitor) clearInterval(record.monitor);
     record.monitor = undefined;
+    if (!record.structured) {
+      try { await this.#stopGuardian(record); }
+      catch (error) { record.cleanupError ??= asError(error); }
+    }
     record.listeners.clear();
     try { await this.#collectOutput(record); }
     catch (error) { record.cleanupError ??= asError(error); }
@@ -451,7 +787,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   }
 
   async #detachPipe(record: TmuxRecord): Promise<void> {
-    if (!record.pipeAttached) return;
+    if (!record.pipeAttached || record.paneDead) {
+      record.pipeAttached = false;
+      return;
+    }
     try { await this.#run(record, ["pipe-pane", "-t", record.target], undefined, undefined, true); }
     catch (error) { if (!isMissingSession(error)) record.cleanupError = asError(error); }
     record.pipeAttached = false;
@@ -497,12 +836,40 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   }
 
   async #sendRaw(record: TmuxRecord, message: string): Promise<void> {
+    if (record.structured) {
+      const encoded = Buffer.from(safeTmuxMessage(message), "utf8").toString("base64");
+      await this.#sendLine(record, `@pi:user ${encoded}`);
+      return;
+    }
     const safeMessage = safeTmuxMessage(message);
     const bufferName = `pi-cs-${record.handle.id}`;
     // Ask tmux to emit a real bracketed paste. Embedding the escape markers
     // in the buffer makes Claude's TUI render them literally instead of
     // entering paste mode.
     await this.#run(record, ["load-buffer", "-b", bufferName, "-"], safeMessage);
+    await this.#run(record, ["paste-buffer", "-p", "-d", "-b", bufferName, "-t", record.target]);
+    await this.#run(record, ["send-keys", "-t", record.target, "Enter"]);
+  }
+
+  async #sendControl(record: TmuxRecord, value?: Record<string, unknown>, rawCommand?: string): Promise<void> {
+    if (!record.structured) throw new Error("tmux control messages require the automated bridge");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const previous = record.inputTail;
+    record.inputTail = previous.then(() => gate);
+    await previous;
+    try {
+      const encoded = rawCommand ?? `@pi:json ${Buffer.from(`${JSON.stringify(value)}\n`, "utf8").toString("base64")}`;
+      await this.#sendLine(record, encoded);
+    } finally {
+      release();
+    }
+  }
+
+  async #sendLine(record: TmuxRecord, line: string): Promise<void> {
+    const safeLine = safeTmuxMessage(line);
+    const bufferName = `pi-cs-${record.handle.id}`;
+    await this.#run(record, ["load-buffer", "-b", bufferName, "-"], safeLine);
     await this.#run(record, ["paste-buffer", "-p", "-d", "-b", bufferName, "-t", record.target]);
     await this.#run(record, ["send-keys", "-t", record.target, "Enter"]);
   }
@@ -523,6 +890,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     try {
       const outputBeforeInput = record.lastOutputAt;
       await this.#collectOutput(record);
+      if (record.structured) await this.#checkNestedClaude(record);
       if (record.inputAt && record.lastOutputAt && Date.parse(record.lastOutputAt) >= record.inputAt && record.lastOutputAt !== outputBeforeInput) record.turnObservedOutput = true;
       const pane = await this.#paneStatus(record);
       record.paneDead = pane.dead;
@@ -538,6 +906,15 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         return;
       }
       const screen = await this.#capture(record);
+      if (record.structured) {
+        if (record.activeRequests === 0 && hasBridgePromptInput(screen)) {
+          // A human may have typed directly into the attached bridge prompt.
+          record.activeRequests = 1;
+          record.inputAt = Date.now();
+          record.lastInputAt = new Date().toISOString();
+        }
+        return;
+      }
       if (record.activeRequests === 0 && hasPromptInput(screen)) {
         // A human may have typed directly into the attached PTY. Treat that
         // input as an active turn so automatic sends cannot race it.
@@ -615,12 +992,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     } catch (error) {
       throw new Error(`cannot inspect tmux pane command: ${error instanceof Error ? error.message : String(error)}`);
     }
-    const commandName = command.split(/[\\/]/u).at(-1) ?? command;
     const argsText = processArgs.stdout.trim();
-    const processExecutable = argsText.split(/\s+/u)[0] ?? "";
-    const processExecutableName = processExecutable.split(/[\\/]/u).at(-1) ?? processExecutable;
     const commandLine = `${command} ${argsText}`.trim();
-    if (commandName !== "claude" || !argsText || processExecutableName !== "claude") {
+    const paneProcess = await readProcess(pane.pid);
+    if (!argsText || !paneProcess || !isClaudeLauncherProcess(paneProcess)) {
       throw new Error(`tmux pane is not a Claude Code executable: ${redactSensitiveText(commandLine || "unknown")}`);
     }
     assertSafeWorkerCommand(command, [argsText], approval);
@@ -677,6 +1052,70 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     }
   }
 
+  async #createCgroup(id: string): Promise<string> {
+    const parent = await currentCgroupPath();
+    const path = `${parent}/pi-claude-supervisor-tmux-${id}`;
+    await mkdir(path);
+    return path;
+  }
+
+  async #startGuardian(record: TmuxRecord, socketPath: string): Promise<void> {
+    if (process.platform !== "linux") return;
+    const parent = await processIdentity(process.pid);
+    if (!parent?.startTime) throw new Error("cannot start tmux parent-death guardian without a parent process identity");
+    const encode = (value: string) => Buffer.from(value, "utf8").toString("base64");
+    const env: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH ?? "",
+      [GUARDIAN_KEYS.tmux]: encode(this.#tmuxBinary),
+      [GUARDIAN_KEYS.socket]: encode(socketPath),
+      [GUARDIAN_KEYS.session]: encode(record.sessionName),
+      [GUARDIAN_KEYS.cgroup]: encode(record.cgroupPath ?? ""),
+      [GUARDIAN_KEYS.parentPid]: encode(String(process.pid)),
+      [GUARDIAN_KEYS.parentStart]: encode(parent.startTime),
+    };
+    const child = spawn(process.execPath, ["-e", TMUX_GUARDIAN_SCRIPT], { detached: true, stdio: "ignore", env });
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", () => resolve());
+      child.once("error", reject);
+    });
+    if (!child.pid) throw new Error("tmux parent-death guardian did not expose a pid");
+    record.guardianPid = child.pid;
+    const identity = await processIdentity(child.pid);
+    if (!identity?.startTime) {
+      try { process.kill(child.pid, "SIGKILL"); } catch {}
+      throw new Error("tmux parent-death guardian identity is unavailable");
+    }
+    record.guardianStartTime = identity.startTime;
+    child.once("exit", () => {
+      if (!record.cleanupComplete && !record.stopping && !record.paneDead) record.cleanupError ??= new Error("tmux parent-death guardian exited unexpectedly");
+    });
+    child.unref();
+    await delay(10);
+    if (!isPidAlive(child.pid) || await isZombie(child.pid)) throw new Error("tmux parent-death guardian exited during startup");
+  }
+
+  async #stopGuardian(record: TmuxRecord): Promise<void> {
+    const pid = record.guardianPid;
+    if (!pid) return;
+    record.guardianPid = undefined;
+    if (!isPidAlive(pid) || await isZombie(pid)) return;
+    const identity = await processIdentity(pid);
+    if (!identity || !record.guardianStartTime || identity.startTime !== record.guardianStartTime) {
+      throw new Error(`refusing to terminate an unverified tmux guardian process: ${pid}`);
+    }
+    try { process.kill(pid, "SIGTERM"); }
+    catch (error) { if (!(error instanceof Error) || !/ESRCH/u.test(error.message)) throw error; }
+    for (let attempt = 0; attempt < 20 && isPidAlive(pid); attempt += 1) await delay(25);
+    if (isPidAlive(pid) && !(await isZombie(pid))) {
+      const replacement = await processIdentity(pid);
+      if (replacement?.startTime !== record.guardianStartTime) throw new Error(`tmux guardian identity changed during cleanup: ${pid}`);
+      try { process.kill(pid, "SIGKILL"); }
+      catch (error) { if (!(error instanceof Error) || !/ESRCH/u.test(error.message)) throw error; }
+    }
+    for (let attempt = 0; attempt < 20 && isPidAlive(pid); attempt += 1) await delay(25);
+    if (isPidAlive(pid) && !(await isZombie(pid))) throw new Error(`tmux parent-death guardian did not exit: ${pid}`);
+  }
+
   async #cleanup(record: TmuxRecord, _force: boolean): Promise<void> {
     if (record.cleanupComplete) return;
     // A later cleanup call is a retry, so do not let a transient prior error
@@ -700,6 +1139,8 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     try { await this.#flushOutput(record); }
     catch (error) { record.cleanupError ??= asError(error); }
     record.monitor = undefined;
+    try { await this.#stopGuardian(record); }
+    catch (error) { record.cleanupError ??= asError(error); }
     try {
       await this.#run(record, ["kill-server"], undefined, undefined, true);
       record.serverKilled = true;
@@ -707,10 +1148,19 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       if (isMissingSession(error)) record.serverKilled = true;
       else record.cleanupError = asError(error);
     }
-    await this.#ensurePaneGone(record);
+    if (!record.serverKilled) await this.#ensurePaneGone(record);
+    if (record.cgroupPath) {
+      try {
+        await cleanupCgroup(record.cgroupPath, this.#terminationGraceMs);
+        record.cgroupCleaned = true;
+      } catch (error) {
+        record.cgroupError ??= asError(error);
+        record.cleanupError ??= record.cgroupError;
+      }
+    }
     try { await rm(record.runtimeDir, { recursive: true, force: true }); }
     catch (error) { record.cleanupError ??= asError(error); }
-    record.cleanupComplete = !record.cleanupError && Boolean(record.paneStartTime || (record.serverKilled && (!record.sessionCreated || record.paneDead)));
+    record.cleanupComplete = !record.cleanupError && (record.serverKilled || !record.sessionCreated) && (!record.cgroupPath || record.cgroupCleaned === true);
   }
 
   async #ensurePaneGone(record: TmuxRecord): Promise<void> {
@@ -763,7 +1213,9 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
 
   async #run(record: TmuxRecord, args: string[], input?: string, env = workerEnvironment(process.env), ignoreAbort = false): Promise<{ stdout: string; stderr: string }> {
     if (record.abortRequested && !ignoreAbort) throw new Error("tmux worker startup was aborted");
-    const tmuxArgs = record.socketPath ? ["-S", record.socketPath, ...args] : args;
+    const tmuxArgs = record.socketPath
+      ? [...(record.structured ? ["-f", "/dev/null"] : []), "-S", record.socketPath, ...args]
+      : args;
     const result = await runCommand(this.#tmuxBinary, tmuxArgs, input, env, this.#commandTimeoutMs);
     if (record.abortRequested && !ignoreAbort) throw new Error("tmux worker startup was aborted");
     return result;
@@ -812,10 +1264,11 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
           const buffer = Buffer.alloc(length);
           const { bytesRead } = await file.read(buffer, 0, length, start);
           if (bytesRead > 0) {
-            const text = buffer.subarray(0, bytesRead).toString("utf8");
+            const rawText = buffer.subarray(0, bytesRead).toString("utf8");
             record.outputOffset = start + bytesRead;
             record.lastOutputAt = new Date().toISOString();
-            this.#appendOutput(record, { stream: "stdout", text, at: record.lastOutputAt });
+            const text = record.structured ? this.#consumeBridgeStream(record, rawText) : rawText;
+            if (text) this.#appendOutput(record, { stream: "stdout", text, at: record.lastOutputAt });
           }
         } finally {
           await file.close();
@@ -831,6 +1284,82 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       if (!isMissingFile(error)) throw error;
     }
     return [...record.output];
+  }
+
+  #consumeBridgeStream(record: TmuxRecord, text: string): string {
+    record.eventBuffer += text;
+    if (Buffer.byteLength(record.eventBuffer, "utf8") > this.#maxLogBytes) {
+      record.eventBuffer = "";
+      record.outputTruncated = true;
+      return "";
+    }
+    let visible = "";
+    while (record.eventBuffer) {
+      const eventStart = record.eventBuffer.indexOf(BRIDGE_EVENT_START);
+      const inputStart = record.eventBuffer.indexOf(BRIDGE_INPUT_START);
+      const candidates = [
+        ...(eventStart >= 0 ? [{ index: eventStart, prefix: BRIDGE_EVENT_START, structured: true }] : []),
+        ...(inputStart >= 0 ? [{ index: inputStart, prefix: BRIDGE_INPUT_START, structured: false }] : []),
+      ].sort((left, right) => left.index - right.index);
+      const candidate = candidates[0];
+      if (!candidate) {
+        const keep = Math.max(
+          partialFramePrefixLength(record.eventBuffer, BRIDGE_EVENT_START),
+          partialFramePrefixLength(record.eventBuffer, BRIDGE_INPUT_START),
+        );
+        visible += record.eventBuffer.slice(0, record.eventBuffer.length - keep);
+        record.eventBuffer = keep ? record.eventBuffer.slice(-keep) : "";
+        break;
+      }
+      visible += record.eventBuffer.slice(0, candidate.index);
+      const end = record.eventBuffer.indexOf(BRIDGE_EVENT_END, candidate.index + candidate.prefix.length);
+      if (end < 0) {
+        record.eventBuffer = record.eventBuffer.slice(candidate.index);
+        break;
+      }
+      const payload = record.eventBuffer.slice(candidate.index + candidate.prefix.length, end);
+      record.eventBuffer = record.eventBuffer.slice(end + BRIDGE_EVENT_END.length);
+      if (!candidate.structured) continue;
+      try {
+        const parsed = JSON.parse(Buffer.from(payload, "base64").toString("utf8")) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) this.#handleStructuredEvent(record, parsed as Record<string, unknown>);
+      } catch {
+        record.outputTruncated = true;
+      }
+    }
+    return stripInternalBridgeEcho(visible);
+  }
+
+  #handleStructuredEvent(record: TmuxRecord, event: Record<string, unknown>): void {
+    this.#emit(record, { type: "jsonl", handle: record.handle, record: event });
+    const request = event.request;
+    if (isPermissionRequest(event, request)) {
+      const requestId = String(event.request_id);
+      if (!record.seenPermissionRequestIds.has(requestId)) {
+        rememberBounded(record.seenPermissionRequestIds, requestId);
+        this.#emit(record, {
+          type: "permission_request",
+          handle: record.handle,
+          request: {
+            requestId,
+            toolUseId: request.tool_use_id,
+            toolName: request.tool_name,
+            input: request.input,
+            raw: event,
+          },
+        });
+      }
+    }
+    if (event.type === "result" && record.activeRequests > 0) {
+      const resultId = jsonlRecordId(event, record.turnSequence + 1);
+      if (!record.seenResultIds.has(resultId)) {
+        rememberBounded(record.seenResultIds, resultId);
+        record.activeRequests = Math.max(0, record.activeRequests - 1);
+        record.turnSequence += 1;
+        this.#emit(record, { type: "turn_completed", handle: record.handle, result: event, sequence: record.turnSequence });
+      }
+    }
+    if (event.type === "bridge_exit") record.activeRequests = 0;
   }
 
   async #withOutputLock<T>(record: TmuxRecord, operation: () => Promise<T>): Promise<T> {
@@ -868,11 +1397,71 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       lastOutputAt: record.lastOutputAt,
       lastInputAt: record.lastInputAt,
       activeRequests: record.activeRequests,
-      exitReason: running ? undefined : record.stopping ? "stopped" : record.exitCode === 0 ? "completed" : "failed",
+      exitReason: running ? undefined : record.runtimeError ? "failed" : record.stopping ? "stopped" : record.exitCode === 0 ? "completed" : "failed",
       processGroupCleaned: record.cleanupComplete,
       cleanupError: record.cleanupError?.message,
+      runtimeError: record.runtimeError?.message,
+      cgroupCleaned: record.cgroupPath ? record.cgroupCleaned : undefined,
+      cgroupRequired: record.cgroupPath ? true : undefined,
+      cgroupError: record.cgroupError?.message,
       outputTruncated: record.outputTruncated,
     };
+  }
+
+  async #processScope(record: TmuxRecord): Promise<ProcessTreeEntry[]> {
+    const rootPid = record.handle.pid ?? 0;
+    const tree = await linuxProcessTree(rootPid);
+    if (!record.cgroupPath) return tree;
+    const group = await linuxCgroupProcesses(record.cgroupPath);
+    if (!group.some((entry) => entry.pid === rootPid)) throw new Error("automatic tmux bridge is not contained by its required cgroup");
+    return [...new Map([...tree, ...group].map((entry) => [entry.pid, entry])).values()];
+  }
+
+  async #rememberClaudeProcesses(record: TmuxRecord): Promise<void> {
+    const rootPid = record.handle.pid ?? 0;
+    let entries: ProcessTreeEntry[] = [];
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        entries = await this.#processScope(record);
+        if (entries.some((entry) => entry.ppid === rootPid && isClaudeProcess(entry, record.expectedClaudeCommand))) break;
+      } catch (error) {
+        if (attempt === 19) throw error;
+      }
+      await delay(25);
+    }
+    record.trustedClaudeProcesses = new Map(entries.filter((entry) => entry.ppid === rootPid && isClaudeProcess(entry, record.expectedClaudeCommand)).map((entry) => [entry.pid, entry]));
+  }
+
+  async #checkNestedClaude(record: TmuxRecord): Promise<void> {
+    const rootPid = record.handle.pid ?? 0;
+    let entries: ProcessTreeEntry[];
+    try { entries = await this.#processScope(record); }
+    catch (error) {
+      if (process.platform === "linux" && !record.runtimeError) {
+        record.runtimeError = new Error(`nested Claude guard unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        this.#appendOutput(record, { stream: "stderr", text: `${record.runtimeError.message}\n`, at: new Date().toISOString() });
+        try { await this.#run(record, ["kill-session", "-t", record.sessionName], undefined, undefined, true); }
+        catch (cleanupError) { record.cleanupError ??= asError(cleanupError); }
+      }
+      return;
+    }
+    if (record.trustedClaudeProcesses.size === 0) {
+      const directClaude = entries.filter((entry) => entry.ppid === rootPid && isClaudeProcess(entry, record.expectedClaudeCommand));
+      if (directClaude.length > 0) {
+        record.trustedClaudeProcesses = new Map(directClaude.map((entry) => [entry.pid, entry]));
+        return;
+      }
+    }
+    const nestedClaude = unexpectedClaudeProcess(entries, record.trustedClaudeProcesses, record.expectedClaudeCommand);
+    const reviewerCandidate = unexpectedReviewerProcess(entries);
+    const trustedReviewerCandidate = reviewerCandidate && record.trustedClaudeProcesses.get(reviewerCandidate.pid);
+    const nestedReviewer = reviewerCandidate && (!trustedReviewerCandidate || !sameProcessIdentity(trustedReviewerCandidate, reviewerCandidate)) ? reviewerCandidate : undefined;
+    const nested = nestedClaude ?? nestedReviewer;
+    if (!nested || record.runtimeError) return;
+    record.runtimeError = new Error(`${nested === nestedReviewer ? "nested Reviewer" : "nested Claude"} process denied (pid=${nested.pid})`);
+    this.#appendOutput(record, { stream: "stderr", text: `${record.runtimeError.message}\n`, at: new Date().toISOString() });
+    try { await this.#run(record, ["kill-session", "-t", record.sessionName], undefined, undefined, true); }
+    catch (error) { record.cleanupError ??= asError(error); }
   }
 
   #record(handle: WorkerHandle): TmuxRecord {
@@ -891,6 +1480,16 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       }
     }
   }
+}
+
+function bridgeEnvironment(env: NodeJS.ProcessEnv, command: string, args: readonly string[], cgroupPath?: string): NodeJS.ProcessEnv {
+  const encode = (value: string) => Buffer.from(value, "utf8").toString("base64");
+  return {
+    ...env,
+    [BRIDGE_KEYS.command]: encode(command),
+    [BRIDGE_KEYS.args]: encode(JSON.stringify(args)),
+    [BRIDGE_KEYS.cgroup]: encode(cgroupPath ?? ""),
+  };
 }
 
 export function attachCommand(handle: Pick<WorkerHandle, "tmuxSocket" | "sessionName">): string {
@@ -940,6 +1539,11 @@ function isReadyScreen(screen: string): boolean {
   return latestPrompt(normalized) === "ready";
 }
 
+function hasBridgePromptInput(screen: string): boolean {
+  const lines = stripAnsi(screen).replaceAll("\u00a0", " ").split(/\r?\n/u).map((line) => line.trim());
+  return lines.some((line) => /^>\s+.+$/u.test(line));
+}
+
 function hasPromptInput(screen: string): boolean {
   // `>` is retained as a fixture-compatible ready marker, but is too common in
   // arbitrary command output to identify human typing. Claude's TUI uses ❯/›.
@@ -985,6 +1589,21 @@ function safeTmuxMessage(value: string): string {
     }
   }
   return normalized;
+}
+
+function stripInternalBridgeEcho(value: string): string {
+  return value
+    .replaceAll("\u001b[1A\r\u001b[2K\u001b[1B\r", "")
+    .replace(/(?:^|\r?\n)[^\r\n]*@pi:(?:user|json) [A-Za-z0-9+/=]+\r?(?=\n|$)/gu, "\n")
+    .replace(/(?:^|\r?\n)[^\r\n]*@pi:stop\r?(?=\n|$)/gu, "\n");
+}
+
+function partialFramePrefixLength(value: string, prefix: string): number {
+  const limit = Math.min(value.length, prefix.length - 1);
+  for (let length = limit; length > 0; length -= 1) {
+    if (value.endsWith(prefix.slice(0, length))) return length;
+  }
+  return 0;
 }
 
 function boundText(value: string, maxBytes: number): string {
@@ -1092,6 +1711,31 @@ function isMissingSession(error: unknown): boolean {
 
 function isMissingFile(error: unknown): boolean {
   return error instanceof Error && /ENOENT/u.test(error.message);
+}
+
+function rememberBounded(values: Set<string>, value: string, limit = 2_000): void {
+  values.add(value);
+  while (values.size > limit) {
+    const first = values.values().next().value;
+    if (first === undefined) break;
+    values.delete(first);
+  }
+}
+
+function jsonlRecordId(record: Record<string, unknown>, sequence?: number): string {
+  for (const key of ["uuid", "request_id"]) {
+    if (typeof record[key] === "string" && record[key]) return `${key}:${record[key]}`;
+  }
+  return `result:${sequence ?? "unknown"}:${JSON.stringify(record).slice(0, 512)}`;
+}
+
+function isPermissionRequest(event: Record<string, unknown>, request: unknown): request is { subtype: "can_use_tool"; tool_use_id: string; tool_name: string; input: unknown } {
+  if (event.type !== "control_request" || typeof event.request_id !== "string" || !request || typeof request !== "object") return false;
+  const value = request as { subtype?: unknown; tool_use_id?: unknown; tool_name?: unknown; input?: unknown };
+  return value.subtype === "can_use_tool"
+    && typeof value.tool_use_id === "string"
+    && typeof value.tool_name === "string"
+    && "input" in value;
 }
 
 function delay(ms: number): Promise<void> {

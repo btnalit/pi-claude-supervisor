@@ -39,19 +39,19 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   if (!["off", "auto", "required"].includes(cgroupMode)) {
     throw new Error(`Unsupported PI_CLAUDE_SUPERVISOR_CGROUP_MODE: ${cgroupMode}; expected off, auto, or required`);
   }
-  if (transport === "tmux" && cgroupMode === "required") {
-    throw new Error("PI_CLAUDE_SUPERVISOR_CGROUP_MODE=required is unsupported with tmux; use process-pipe/jsonl or set cgroup mode to auto/off");
+  if (transport === "tmux" && cgroupMode === "required" && !automation) {
+    throw new Error("PI_CLAUDE_SUPERVISOR_CGROUP_MODE=required is unsupported with manual tmux; use automatic mode or cgroup mode auto/off");
   }
-  if (automation && transport !== "jsonl") {
-    throw new Error("automatic supervision requires PI_CLAUDE_SUPERVISOR_TRANSPORT=jsonl; process-pipe and tmux are manual-only");
+  if (automation && !["jsonl", "tmux"].includes(transport)) {
+    throw new Error("automatic supervision requires PI_CLAUDE_SUPERVISOR_TRANSPORT=jsonl or tmux; process-pipe is manual-only");
   }
   const adapter = transport === "tmux"
-    ? new TmuxWorkerAdapter({ stateDir })
+    ? new TmuxWorkerAdapter({ stateDir, cgroupMode: automation ? "required" : cgroupMode as "off" | "auto" | "required" })
     : new ProcessWorkerAdapter({
       // Automatic decisions require Claude's structured event stream. The pipe
       // transport remains available for manual/compatibility sessions.
       mode: automation || transport === "jsonl" ? "claude-jsonl" : "process-pipe",
-      cgroupMode: cgroupMode as "off" | "auto" | "required",
+      cgroupMode: automation ? "required" : cgroupMode as "off" | "auto" | "required",
     });
   const humanWebhook = new HumanWebhookNotifier({
     url: process.env.PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL,
@@ -232,7 +232,10 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           const fileSpec = specPath ? await readTaskSpecFile(specPath, ctx.cwd) : undefined;
           const spec = fileSpec ?? { autonomy: autonomyDefaults() };
           const goal = fileSpec?.goal ?? task;
-          const taskAutomation = automation && spec.autonomy.unattended;
+          // Adopted sessions are explicit manual compatibility controls. They
+          // never enter the automatic Reviewer/decision loop, even when the
+          // extension is globally configured for unattended starts.
+          const taskAutomation = operation !== "adopt-tmux" && automation && spec.autonomy.unattended;
           if (!goal) throw new Error(operation === "adopt-tmux" ? "Usage: /supervise adopt-tmux [--spec <file>] <tmux-session> <task>" : "Usage: /supervise start [--spec <file>] <task>");
           if (operation === "adopt-tmux" && adapter.capabilities().transport !== "tmux") throw new Error("/supervise adopt-tmux requires PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux");
           const [command, ...workerArgs] = parseCommand(process.env.PI_CLAUDE_SUPERVISOR_WORKER ?? "claude");
@@ -259,7 +262,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           }
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
-            reviewer,
+            reviewer: taskAutomation ? reviewer : undefined,
             onCandidate: async (notice) => {
               if (ctx.hasUI) notify(ctx, `Candidate ${notice.status}: ${notice.reason}`, notice.status === "ready" ? "info" : "warning");
               if (humanWebhook.enabled) {
@@ -475,7 +478,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           }
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
-            reviewer,
+            reviewer: automaticRecovery ? reviewer : undefined,
             onCandidate: async (notice) => {
               if (ctx.hasUI) notify(ctx, `Candidate ${notice.status}: ${notice.reason}`, notice.status === "ready" ? "info" : "warning");
               if (humanWebhook.enabled) {

@@ -1,4 +1,5 @@
 import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
+import { isDeepStrictEqual } from "node:util";
 import { redactSensitive } from "./redaction.ts";
 import type { AcceptanceReport, ReviewFinding, ReviewReport, TaskSpec } from "./types.ts";
 import type { RepositoryEvidence } from "./verifier.ts";
@@ -147,7 +148,7 @@ ${boundText(redactText(input.evidence.untracked ?? "(none)"), 16_000)}
 
 EVIDENCE COMPLETE:
 ${String(input.evidence.complete !== false && input.evidence.truncated !== true)}
-If repository evidence is incomplete or truncated, do not return pass; return human and explain which evidence is unavailable.
+DISPLAY NOTE: fields below may end with [DISPLAY_TRUNCATED] because the prompt has a bounded presentation window. This is presentation-only and is not evidence loss. If EVIDENCE COMPLETE is true, do not return human merely because a displayed field is shortened; inspect the repository with the read-only tools instead. If EVIDENCE COMPLETE is false, do not return pass; return human and explain which evidence is unavailable.
 
 WORKER OUTPUT (UNTRUSTED):
 ${boundTailText(redactSensitive(input.workerOutput ?? "(none)"), 8_000)}
@@ -187,22 +188,76 @@ export function normalizeReviewReport(value: unknown, round: number): ReviewRepo
 export function parseReview(text: string, round: number): ReviewReport {
   const checkedAt = new Date().toISOString();
   if (Buffer.byteLength(text, "utf8") > MAX_REVIEW_RESPONSE_BYTES) return invalidReview(`Reviewer response exceeded ${MAX_REVIEW_RESPONSE_BYTES} bytes`, round, checkedAt);
-  const candidate = text.trim();
-  if (!candidate) return invalidReview("Reviewer returned no JSON object", round, checkedAt);
+  if (!text.trim()) return invalidReview("Reviewer returned no JSON object", round, checkedAt);
   try {
-    const value = JSON.parse(candidate) as Record<string, unknown>;
+    const objects = extractJsonObjects(text);
+    if (objects.length === 0) throw new Error("Reviewer output did not contain a JSON object");
+    if (objects.slice(1).some((value) => !isDeepStrictEqual(value, objects[0]))) {
+      throw new Error("Reviewer output contained multiple distinct JSON objects");
+    }
+    const value = objects[0] as Record<string, unknown>;
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Reviewer output must be a JSON object");
     const verdict = value.verdict;
     if (verdict !== "pass" && verdict !== "revise" && verdict !== "human") throw new Error("unsupported verdict");
     const summary = typeof value.summary === "string" && value.summary.trim() ? value.summary.trim() : "no summary provided";
-    if (value.findings !== undefined && !Array.isArray(value.findings)) throw new Error("findings must be an array");
-    if (Array.isArray(value.findings) && value.findings.length > MAX_REVIEW_FINDINGS) throw new Error(`findings exceed the limit of ${MAX_REVIEW_FINDINGS}`);
-    const findings = (value.findings ?? []).map((finding, index) => parseFinding(finding, index));
+    if (!Array.isArray(value.findings)) throw new Error("findings must be an array");
+    if (value.findings.length > MAX_REVIEW_FINDINGS) throw new Error(`findings exceed the limit of ${MAX_REVIEW_FINDINGS}`);
+    const findings = value.findings.map((finding, index) => parseFinding(finding, index));
     if (verdict === "revise" && findings.length === 0) throw new Error("revise verdict requires at least one finding");
     return { verdict, summary: boundText(summary, 4_000), findings, round, checkedAt };
   } catch (error) {
     return invalidReview(`invalid Reviewer output: ${error instanceof Error ? error.message : String(error)}`, round, checkedAt);
   }
+}
+
+/**
+ * Claude occasionally wraps its answer in a fence, a sentence, or repeats
+ * the same JSON object. Extract one bounded object while rejecting conflicting
+ * objects: prose is harmless, but ambiguity must remain non-publishable.
+ */
+function extractJsonObjects(text: string): unknown[] {
+  const objects: unknown[] = [];
+  let offset = 0;
+  while (offset < text.length) {
+    const start = text.indexOf("{", offset);
+    if (start < 0) break;
+    const end = balancedObjectEnd(text, start);
+    if (end < 0) {
+      offset = start + 1;
+      continue;
+    }
+    const candidate = text.slice(start, end + 1);
+    try {
+      const value = JSON.parse(candidate) as unknown;
+      if (value && typeof value === "object" && !Array.isArray(value)) objects.push(value);
+      offset = end + 1;
+    } catch {
+      offset = start + 1;
+    }
+  }
+  return objects;
+}
+
+function balancedObjectEnd(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const character = text[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+      continue;
+    }
+    if (character === "{") depth += 1;
+    else if (character === "}" && --depth === 0) return index;
+  }
+  return -1;
 }
 
 function parseFinding(value: unknown, index: number): ReviewFinding {
@@ -273,11 +328,11 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
 function boundTailText(value: unknown, maxBytes: number): string {
   const text = String(value);
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  return `[TRUNCATED]\n${Buffer.from(text, "utf8").subarray(-maxBytes).toString("utf8")}`;
+  return `[DISPLAY_TRUNCATED]\n${Buffer.from(text, "utf8").subarray(-maxBytes).toString("utf8")}`;
 }
 
 function boundText(value: unknown, maxBytes: number): string {
   const text = String(value);
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  return `${Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8")}\n[TRUNCATED]`;
+  return `${Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8")}\n[DISPLAY_TRUNCATED]`;
 }

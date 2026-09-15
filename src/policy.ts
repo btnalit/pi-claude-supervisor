@@ -1,3 +1,6 @@
+import { lstatSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+
 export type PolicyDecision = "allow" | "review" | "deny";
 
 export interface PolicyResult {
@@ -11,14 +14,83 @@ export interface PolicyResult {
  * turn. AskUserQuestion is denied so the Worker can restate the question as
  * ordinary text and the Decision Worker can answer it from task evidence.
  */
-export function evaluatePermission(toolName: string, input: unknown): PolicyResult {
+const allowedWorkerTools = new Set(["Bash", "Edit", "Glob", "Grep", "Read", "Write", "NotebookEdit"]);
+
+export function evaluatePermission(toolName: string, input: unknown, cwd = process.cwd()): PolicyResult {
   if (toolName === "AskUserQuestion") return { decision: "deny", reason: "interactive questions are converted to ordinary Worker text" };
+  if (!allowedWorkerTools.has(toolName)) return { decision: "deny", reason: `Worker tool is outside the automatic allowlist: ${toolName}` };
+  if (toolName === "Edit" || toolName === "Write" || toolName === "NotebookEdit") {
+    const paths = fileToolPaths(input);
+    if (paths.length === 0) return { decision: "deny", reason: `${toolName} request has no recognizable file path` };
+    if (paths.some((path) => isGitMetadataPath(path, cwd))) return { decision: "deny", reason: "Worker cannot write Git metadata or protected branch refs" };
+    return { decision: "allow", reason: `local Claude file tool is allowed by the task policy: ${toolName}` };
+  }
   if (toolName !== "Bash") return { decision: "allow", reason: `local Claude tool is allowed by the task policy: ${toolName}` };
   const command = input && typeof input === "object" && typeof (input as { command?: unknown }).command === "string"
     ? (input as { command: string }).command
     : "";
   if (!command) return { decision: "deny", reason: "Bash request has no recognizable command" };
+  if (containsNestedClaude(command)) {
+    return { decision: "deny", reason: "Worker cannot start a nested Claude or background Reviewer" };
+  }
   return evaluateCommand("bash", ["-lc", command]);
+}
+
+function fileToolPaths(input: unknown): string[] {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return [];
+  const value = input as Record<string, unknown>;
+  return ["file_path", "filePath", "path", "notebook_path", "notebookPath"]
+    .map((key) => value[key])
+    .filter((path): path is string => typeof path === "string" && path.trim().length > 0);
+}
+
+function isGitMetadataPath(value: string, cwd: string): boolean {
+  if (value.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return true;
+  let root: string;
+  try { root = realpathSync(cwd); }
+  catch { return true; }
+  const raw = value.replaceAll("\\", "/");
+  const canonicalRoot = root.replaceAll("\\", "/").replace(/\/+$/u, "") || "/";
+  let components: string[];
+  if (isAbsolute(value)) {
+    const prefix = canonicalRoot === "/" ? "/" : `${canonicalRoot}/`;
+    if (raw !== canonicalRoot && !raw.startsWith(prefix)) return true;
+    components = raw === canonicalRoot ? [] : raw.slice(prefix.length).split("/");
+  } else {
+    components = raw.split("/");
+  }
+  const normalized: string[] = [];
+  for (const segment of components) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      if (normalized.length === 0) return true;
+      normalized.pop();
+      continue;
+    }
+    if (segment.toLowerCase() === ".git") return true;
+    const candidate = join(root, ...normalized, segment);
+    try {
+      const info = lstatSync(candidate);
+      if (info.isSymbolicLink()) return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") return true;
+    }
+    normalized.push(segment);
+  }
+  const absolute = join(root, ...normalized);
+  try {
+    const info = statSync(absolute);
+    // A regular file with multiple links may be an alias for a Git ref or
+    // other metadata file even when its pathname contains no `.git` segment.
+    if (info.isFile() && info.nlink > 1) return true;
+    const resolved = realpathSync(absolute);
+    if (resolved.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") return true;
+  }
+  return false;
 }
 
 const deniedPatterns = [
@@ -63,6 +135,7 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   const hasGhRemote = lower.some((value) => value === "gh" || value === "glab" || value === "hub")
     && lower.some((value) => value === "api" || value === "release" || value === "pull-request" || value === "pr" || value === "mr");
   const hasPackagePublication = lower.some((value) => value === "npm" || value === "pnpm" || value === "yarn") && lower.includes("publish");
+  const hasGitAliasConfiguration = hasGit && lower.some((value) => /^alias\.[^=]*(?:=|$)/u.test(value));
   if (depth < 4) {
     for (const nested of nestedShellCommands(lower, values)) {
       const nestedResult = evaluateCommandInternal(nested, depth + 1);
@@ -85,6 +158,9 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   if (hasGit && (hasRemoteOperation || hasGitTransport) || hasGhRemote) {
     return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
   }
+  if (hasGitAliasConfiguration) {
+    return { decision: "deny", reason: "Worker cannot redefine Git command aliases" };
+  }
   if (hasGit && gitOperation && hasProtectedBranch) {
     return { decision: "deny", reason: "Worker cannot switch to or mutate a protected integration branch" };
   }
@@ -103,6 +179,27 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
     return { decision: "deny", reason: "Worker cannot bypass Claude permission prompts" };
   }
   return undefined;
+}
+
+function containsNestedClaude(command: string, depth = 0): boolean {
+  // Bash can hand an opaque quoted program to Python, Node, eval, env,
+  // command, or another interpreter. Once this permission boundary sees a
+  // Claude executable reference, fail closed rather than trying to prove which
+  // wrapper will eventually exec it. This intentionally rejects harmless prose
+  // mentions too; false positives cannot grant a nested Worker capability.
+  if (/\b(?:claude(?:\.exe)?|review(?:er)?|code[-_ ]?review|read[-_ ]?only[-_ ]?review|independent[-_ ]?review|codex|cursor(?:-agent)?|aider|opencode|gemini)\b/iu.test(command)) return true;
+  if (depth > 4) return false;
+  const lexical = lexShell(command);
+  if (lexical.error) return true;
+  for (const token of lexical.tokens) {
+    if (token.operator) continue;
+    const executable = token.value.split(/[\\/]/u).at(-1)?.toLowerCase();
+    if (executable === "claude" || executable === "claude.exe") return true;
+    // Quote concatenation such as c'l'a'u'd'e is normalized by the shell
+    // lexer into one token. Recurse into quoted interpreter payloads too.
+    if (/\s/u.test(token.value) && containsNestedClaude(token.value, depth + 1)) return true;
+  }
+  return false;
 }
 
 function nestedShellCommands(lower: readonly string[], values: readonly string[]): string[] {

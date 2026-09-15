@@ -1,9 +1,58 @@
 import assert from "node:assert/strict";
-import { access, constants, readFile } from "node:fs/promises";
+import { access, chmod, constants, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import test from "node:test";
-import { ProcessWorkerAdapter } from "./process-adapter.ts";
+import { claudeJsonlArgs, preflightCgroupContainment, ProcessWorkerAdapter } from "./process-adapter.ts";
 
 const requiredCgroupTestAvailable = process.platform === "linux" && await canCreateCgroup();
+
+test("claude-jsonl arguments normalize controlled equals options and reject duplicates", () => {
+  assert.deepEqual(claudeJsonlArgs(["--input-format=stream-json", "--output-format=stream-json", "--permission-prompt-tool=stdio", "--permission-prompts=host"]), [
+    "--input-format", "stream-json", "--output-format", "stream-json", "--permission-prompt-tool", "stdio", "--permission-prompts", "host", "-p", "--verbose",
+  ]);
+  assert.throws(() => claudeJsonlArgs(["--input-format=stream-json", "--input-format", "stream-json"]), /may not be repeated/u);
+  assert.throws(() => claudeJsonlArgs(["--permission-prompts=none"]), /must be host/u);
+});
+
+test("automatic process scope catches a detached nested Claude in the worker cgroup", { skip: !requiredCgroupTestAvailable }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-process-nested-test-"));
+  const fakeClaude = join(root, "claude");
+  const nestedClaude = join(root, "nested", "claude");
+  await mkdir(join(root, "nested"), { recursive: true });
+  await copyFile(process.execPath, nestedClaude);
+  await chmod(nestedClaude, 0o700);
+  await writeFile(fakeClaude, `#!/usr/bin/env node
+import { spawn } from "node:child_process";
+const nested = ${JSON.stringify(nestedClaude)};
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", data => {
+  if (!data.trim()) return;
+  const child = spawn(nested, ["-e", "setInterval(() => {}, 10000)"], { detached: true, stdio: "ignore" });
+  child.unref();
+  process.stdout.write(JSON.stringify({ type: "result", subtype: "success", session_id: "nested-test" }) + "\\n");
+});
+`);
+  await chmod(fakeClaude, 0o700);
+  const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl", cgroupMode: "required", terminationGraceMs: 100, killGraceMs: 100 });
+  let handle;
+  try {
+    handle = await adapter.start({ task: "trigger", cwd: root, command: fakeClaude, args: [], automatic: true });
+    let status = await adapter.getStatus(handle);
+    for (let attempt = 0; attempt < 100 && !status.runtimeError; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      status = await adapter.getStatus(handle);
+    }
+    assert.match(status.runtimeError ?? "", /nested Claude process denied/u);
+  } finally {
+    if (handle) await adapter.stop(handle, "nested Claude test cleanup").catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cgroup preflight probes attachment and returns within its bounded cleanup", { skip: !requiredCgroupTestAvailable, timeout: 5_000 }, async () => {
+  await preflightCgroupContainment();
+});
 
 test("process adapter reports spawn failures instead of leaving a running record", async () => {
   const adapter = new ProcessWorkerAdapter();
@@ -245,6 +294,21 @@ test("required cgroup bootstrap contains a descendant created before attachment"
   assert.fail(`early detached descendant process ${childPid} survived cgroup cleanup`);
 });
 
+test("guarded bootstrap cleans a detached descendant when the worker leader exits", { skip: !requiredCgroupTestAvailable }, async () => {
+  const adapter = new ProcessWorkerAdapter({ cgroupMode: "required", terminationGraceMs: 25, killGraceMs: 200 });
+  const handle = await adapter.start({
+    task: "",
+    cwd: process.cwd(),
+    command: process.execPath,
+    args: ["-e", "const {spawn}=require('node:child_process'); spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'}); setTimeout(() => process.exit(0), 40)", "--"],
+  });
+  const cgroupPath = handle.cgroupPath;
+  const status = await waitForStatus(adapter, handle, (value) => !value.running);
+  assert.equal(status.exitCode, 0);
+  assert.equal(status.cgroupCleaned, true);
+  if (cgroupPath) await assert.rejects(() => access(cgroupPath), /ENOENT/u);
+});
+
 test("required cgroup cleanup kills a setsid descendant", { skip: !requiredCgroupTestAvailable }, async () => {
   const adapter = new ProcessWorkerAdapter({ cgroupMode: "required", terminationGraceMs: 25, killGraceMs: 200 });
   const handle = await adapter.start({
@@ -260,7 +324,10 @@ test("required cgroup cleanup kills a setsid descendant", { skip: !requiredCgrou
     if (!childPid) await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.ok(childPid);
+  const cgroupPath = handle.cgroupPath;
   await adapter.stop(handle, "setsid descendant cleanup");
+  assert.equal((await adapter.getStatus(handle)).cgroupCleaned, true);
+  if (cgroupPath) await assert.rejects(() => access(cgroupPath), /ENOENT/u);
   for (let attempt = 0; attempt < 20; attempt++) {
     try { process.kill(childPid, 0); } catch (error) {
       if (error instanceof Error && /ESRCH/u.test(error.message)) return;

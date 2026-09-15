@@ -168,8 +168,15 @@ export class DecisionSessionStore {
       const record = await this.#loadUnlocked(taskId);
       if (!record || record.state !== "active") throw new Error(`Decision Worker recovery record is unavailable: ${taskId}`);
       if (record.recoveryState === "ready" || record.recoveryState === "interrupted") return;
-      if (!record.recoveryOwnerPid || await processExists(record.recoveryOwnerPid)) {
+      if (!record.recoveryOwnerPid || !record.recoveryOwnerStartTime) {
+        throw new Error(`Decision Worker recovery owner identity is unavailable: ${taskId}`);
+      }
+      const currentOwnerStartTime = await processStartTime(record.recoveryOwnerPid);
+      if (currentOwnerStartTime === record.recoveryOwnerStartTime) {
         throw new Error(`Decision Worker recovery owner is still live: ${taskId}`);
+      }
+      if (!currentOwnerStartTime && await processExists(record.recoveryOwnerPid)) {
+        throw new Error(`Decision Worker recovery owner identity is unavailable: ${taskId}`);
       }
       await this.#saveUnlocked({
         ...record,

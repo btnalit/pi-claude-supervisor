@@ -39,6 +39,14 @@ boundary.
 
 ## Residual risks and follow-up hardening
 
+The final independent review also raised a pathname TOCTOU concern for Claude
+file-tool authorization. That finding is intentionally recorded as a false positive
+for this release's trusted local-development threat model: normal edits may replace
+file contents, but automatic workers are not treated as hostile same-UID filesystem
+actors, and this policy is a metadata guard rather than a host filesystem isolation
+boundary. A future untrusted-worker mode would need a host-side broker or an OS
+sandbox that prevents `.git` writes.
+
 These are verified limitations and follow-up work after the automatic boundary
 hardening:
 

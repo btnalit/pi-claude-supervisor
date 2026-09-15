@@ -71,6 +71,24 @@ export function automaticWorkerEnvironment(explicit: NodeJS.ProcessEnv = {}): No
  * operator-owned executable path so a custom path or writable replacement
  * cannot silently omit this boundary.
  */
+const automaticToolAllowlist = new Set([
+  "Bash",
+  "Edit",
+  "Glob",
+  "Grep",
+  "Read",
+  "Write",
+  "NotebookEdit",
+  "AskUserQuestion",
+]);
+
+/**
+ * The automatic Worker is the only Claude session allowed to drive the local
+ * lifecycle. Keep its tool surface explicit: nested agents/background tasks
+ * can start a second reviewer, outlive the Worker, or hide work from the
+ * Supervisor's event stream. The safe-mode and strict-MCP flags also prevent
+ * project/user customizations from reintroducing that capability.
+ */
 export function automaticClaudeArgs(command: string, args: readonly string[] = []): string[] {
   if (!isDirectClaudeName(command)) {
     throw new Error("automatic supervision requires the direct Claude executable command name; custom executable paths need their own host boundary");
@@ -78,8 +96,22 @@ export function automaticClaudeArgs(command: string, args: readonly string[] = [
   if (args.some((arg) => arg === "--settings" || arg.startsWith("--settings="))) {
     throw new Error("automatic Claude supervision controls --settings; remove the caller-provided settings override");
   }
-  return [
-    ...args,
+  for (const option of ["--allowedTools", "--allowed-tools", "--agent", "--agents", "--plugin-dir", "--plugin-url", "--resume", "-r", "--continue", "-c", "--bg", "--background", "--remote-control", "--tmux", "--worktree", "-w"]) {
+    if (args.some((arg) => arg === option || arg.startsWith(`${option}=`))) {
+      throw new Error(`automatic Claude supervision controls ${option}; remove the caller-provided session or tool-extension override`);
+    }
+  }
+  const result = [...args];
+  const tools = requestedAutomaticTools(result);
+  if (tools === undefined) result.push("--tools", [...automaticToolAllowlist].join(","));
+  else if (tools.some((tool) => !automaticToolAllowlist.has(tool))) {
+    throw new Error("automatic Claude supervision permits only the bounded local tool allowlist; nested agents and background reviewers are disabled");
+  }
+  result.push(
+    "--safe-mode",
+    "--strict-mcp-config",
+    "--disallowed-tools",
+    "Task,TaskOutput,Agent,Skill,SendUserMessage",
     "--settings",
     JSON.stringify({
       sandbox: {
@@ -89,7 +121,23 @@ export function automaticClaudeArgs(command: string, args: readonly string[] = [
         network: { allowedDomains: [] },
       },
     }),
-  ];
+  );
+  return result;
+}
+
+function requestedAutomaticTools(args: string[]): string[] | undefined {
+  const index = args.findIndex((arg) => arg === "--tools" || arg.startsWith("--tools="));
+  if (index < 0) return undefined;
+  const values = args[index].startsWith("--tools=")
+    ? [args[index].slice("--tools=".length)]
+    : (() => {
+        const collected: string[] = [];
+        for (let cursor = index + 1; cursor < args.length && !args[cursor]!.startsWith("-"); cursor += 1) collected.push(args[cursor]!);
+        return collected;
+      })();
+  const tools = values.flatMap((value) => value.split(/[\s,]+/u)).map((value) => value.trim()).filter(Boolean);
+  if (tools.includes("default")) throw new Error("automatic Claude supervision requires an explicit tool allowlist; --tools default is not permitted");
+  return tools.map((tool) => tool.replace(/\(.*/u, ""));
 }
 
 /**

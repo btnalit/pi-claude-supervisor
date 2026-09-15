@@ -8,14 +8,14 @@
 
 用于 Pi 的 Claude Code Worker 监督扩展。MVP 中 Pi 负责生命周期、状态机、策略门和独立验收；Worker 只是被显式启动的子进程。
 
-> `v0.5.2` 已发布为单 Worker recovery 基线。默认手动 transport 是无额外依赖的
-> process pipe，不是 PTY；自动模式只使用 Claude JSONL，tmux 保留为手动交互。当前工作树已实现
+> `v0.5.3` 已发布为单 Worker recovery 基线。默认手动 transport 是无额外依赖的
+> process pipe，不是 PTY；自动模式支持 Claude JSONL 或 Supervisor 自有的 tmux bridge，被接管的
+> tmux session 仍仅限手动交互。当前工作树已实现
 > repairable/persistent 能力拆分、可取消验收/Reviewer、证据完整性门禁、启动前
 > preflight 和阶段进度通知；真实 Claude Code `2.1.270` 允许编辑的
 > repair/reacceptance 演练已在隔离临时 worktree 通过。确认的产品目标是本地开发
 > 完全无人值守；详见 [自动化目标](docs/autonomy-target.md)。代码进入远程仓库或
-> main/integration 分支必须经过独立边界，Worker 不拥有 push/merge 权限；自动模式仅使用
-> JSONL，tmux 保留为手动交互 transport。
+> main/integration 分支必须经过独立边界，Worker 不拥有 push/merge 权限。
 >
 > **无人值守状态：** 自动模式会自主完成本地修改、测试、有限修复、验收、独立 Review
 > 和本地提交检查；无法形成候选时自动挂起为不可发布候选。可选出站通知不授予权限，
@@ -55,9 +55,10 @@ export PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_FORMAT=generic
 # export PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_SECRET='shared-secret'
 ```
 
-自动模式默认并且只能使用 `claude-jsonl`，通过 `result`、`control_request` 和进程
-`exit` 事件唤醒 Decision Worker；tmux 仅用于手动屏幕交互，不使用 JSONL 权限协议，也不会依赖 `/supervise poll` 轮询。本版本固定按已验证设备的
-Claude CLI `2.1.270` 运行，跨版本兼容性不在本轮范围内。
+自动模式支持 `claude-jsonl` 和 Supervisor 自有的 tmux bridge；JSONL 的 `result`、
+`control_request` 和进程 `exit` 事件会唤醒 Decision Worker。tmux bridge 把结构化记录
+通过同一个 live PTY 的私有 terminal framing 传回适配器，不创建独立 JSONL sidecar；
+`adopt-tmux` 仍是手动模式。本版本固定按已验证设备的 Claude CLI `2.1.270` 运行，跨版本兼容性不在本轮范围内。
 
 然后在 Pi 中使用：
 
@@ -114,8 +115,9 @@ Claude CLI `2.1.270` 运行，跨版本兼容性不在本轮范围内。
 自动模式会将 Decision Worker 会话持久化到状态目录。Pi 非正常重启后，`/supervise sessions`
 会显示 `recoverable` 任务；显式执行 `/supervise recover [--takeover] <task-id>` 会恢复 Decision Worker 上下文并
 重新启动 Claude Worker，不会静默恢复或重复执行任务。旧 Pi 进程已退出且租约确认旧 Worker
-进程组已消失且 cgroup 仍是真实、可读取的空边界时，才可显式添加 `--takeover`；缺失、仍存活或无法确认的 Worker 会被拒绝。持久 tmux
-Worker 应使用 `adopt-tmux`，而不是 takeover。
+进程组已消失且 cgroup 仍是真实、可读取的空边界时，才可显式添加 `--takeover`；缺失、仍存活或无法确认的 Worker 会被拒绝。手动 owned tmux
+Worker 可在重启后使用 `adopt-tmux`，而不是 takeover；自动 bridge 会由 parent-death guardian
+在 Supervisor 消失时终止，不提供自动 session 的重接管。
 自动模式下，Decision Worker 在任务授权范围内自动处理普通问题、测试失败和修复轮次，记录假设和证据；无法形成可交付候选时自动挂起并保留证据，而不是要求人工必须在线。可通过 `PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=0` 或 task `autonomy.requireLocalCommit` 关闭本地 commit 要求，但自动模式仍要求有效 Git baseline 和非保护 worktree；远程 push 和 main/integration merge 仍由独立边界控制。
 
 `v0.5.0` 已完成并发布“多命令验收—独立只读 Reviewer—结构化修复轮次—再次验收”闭环。
@@ -124,7 +126,7 @@ Worker 应使用 `adopt-tmux`，而不是 takeover。
 Reviewer 只能使用 `read`、`grep`、`find`、`ls`，不会修改工作树或批准权限。自动模式在
 Worker 启动前捕获 git baseline，要求完整的 baseline-relative tracked/commit/untracked evidence，
 并在默认情况下要求 Worker 在非保护分支本地 commit；无效输出、证据不完整、重复 finding、P0/P1 或预算耗尽
-会自动挂起候选。自动模式拒绝 process-pipe 和 tmux，并在模型执行前检查目录、可执行文件、依赖
+会自动挂起候选。自动模式拒绝 process-pipe，并在模型执行前检查目录、可执行文件、依赖
 和 cgroup；Worker 环境会过滤远程仓库凭据并禁用 Git 全局凭据 helper。详见 [自动化目标](docs/autonomy-target.md)。协同多 Worker 属于后续独立开发阶段，
 自动模式只接受裸的直接 Claude 命令名，会固定解析后的操作者拥有的可执行文件，并请求 fail-closed 的 Claude Code Bash sandbox；任意自定义可执行文件和显式可执行路径会在自动模式拒绝。需要固定路径时设置 `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE`。手动/自定义 Worker 的完整 host-level sandbox 仍需由集成方提供。
 
@@ -134,8 +136,10 @@ Worker 启动前捕获 git baseline，要求完整的 baseline-relative tracked/
 
 ```bash
 export PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux
-export PI_CLAUDE_SUPERVISOR_WORKER='claude --permission-mode plan'
-# tmux 仅为手动交互；无人值守 Decision Worker 必须使用 JSONL。
+export PI_CLAUDE_SUPERVISOR_WORKER='claude'
+# 当前手动 tmux 也要求 Linux（用于 pane identity 和清理）；可使用 cgroup auto/off。
+# 设置 PI_CLAUDE_SUPERVISOR_MODE=auto 启用 Supervisor 自有的自动 bridge；自动 tmux
+# 要求 Linux cgroup v2 和 parent-death guardian，缺失时会 fail closed。
 # 接管非默认 tmux server 时可选：
 # export PI_CLAUDE_SUPERVISOR_TMUX_SOCKET=/path/to/tmux.sock
 ```
@@ -143,8 +147,12 @@ export PI_CLAUDE_SUPERVISOR_WORKER='claude --permission-mode plan'
 `/supervise start <task>` 会在私有 tmux server 中启动 Claude，并返回可复制的 attach 命令。
 可以在另一个终端 attach 到同一个 PTY，观察或人工输入。多行消息通过 tmux buffer 和 Enter
 发送，不会把消息拼接进 shell 命令；`pipe-pane` 记录原始输出，`capture-pane` 检测稳定的 Claude
-输入提示，并复用 watchdog、审计和独立验收流程；由于 tmux 没有结构化权限边界，
-不会在 tmux 中启用自动 Decision Worker 或无人值守远程边界策略。
+输入提示，并复用 watchdog、审计和独立验收流程。自动模式会在 pane 内启动 bridge：它运行
+Claude stream-json、把可读输出渲染到附着的终端，并通过同一 PTY 的私有 framing 返回结构化
+记录；bridge 及其后代放入受 Supervisor 管理的 Linux cgroup，并由 parent-death guardian
+保护；任一 containment 机制不可用时 fail closed。适配器直接从 PTY 原始 pipe 解析，因此没有
+独立 JSONL sidecar。自动模式拒绝被接管的 session；Supervisor 自有 bridge 支持自动输入串行化、
+权限响应、turn 完成和 stop。
 
 如果 Claude 已由你在 tmux 中启动，可以显式接管且不会重放原始任务：
 
@@ -159,7 +167,8 @@ export PI_CLAUDE_SUPERVISOR_WORKER='claude --permission-mode plan'
 `tmux kill-session`。`/supervise takeover <task-id>` 会暂停 Decision Worker 自动发送，只有
 `/supervise resume-auto <task-id>` 才恢复。
 
-PTY 屏幕文字不是 Claude JSONL，不能把屏幕文字当作结构化权限证据。TUI 决策应按任务授权策略处理并记录；无法形成候选时可以自动挂起，不要求人工持续在线。普通终端里已经运行的 Claude 不能安全迁移进 tmux；`--resume`
+PTY 屏幕文字本身不是 Claude JSONL，不能把屏幕文字当作结构化权限证据；只有 Supervisor bridge
+的私有 framing 记录才是结构化证据。TUI 决策应按任务授权策略处理并记录；无法形成候选时可以自动挂起，不要求人工持续在线。普通终端里已经运行的 Claude 不能安全迁移进 tmux；`--resume`
 是读取历史的新进程，不是实时 attach。实时测试请使用 plan/read-only 参数。
 
 可以从不同工作目录启动多个任务会话；活动会话不能共享同一 cwd，建议每个任务使用独立 worktree：

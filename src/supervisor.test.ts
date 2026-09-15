@@ -95,21 +95,21 @@ test("automatic supervision requires an independent Reviewer", async () => {
   }), /independent Reviewer/u);
 });
 
-test("automatic supervision rejects tmux before Worker startup", async () => {
-  const adapter = new TmuxWorkerAdapter();
+test("automatic supervision rejects the unstructured process-pipe transport", async () => {
+  const adapter = new ProcessWorkerAdapter();
   const supervisor = new Supervisor(adapter, undefined, {
     reviewer: { review: async () => ({ verdict: "pass", summary: "unused", findings: [], round: 0, checkedAt: new Date().toISOString() }) },
   });
   await assert.rejects(() => supervisor.start({
-    task: "tmux is manual",
+    task: "process-pipe is manual",
     cwd: process.cwd(),
-    command: "claude",
+    command: process.execPath,
     args: ["-e", "setInterval(() => {}, 1000)"],
     automation: true,
     deadlineMs: 0,
     noOutputTimeoutMs: 0,
     spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 } },
-  }), /tmux is manual-only/u);
+  }), /claude-jsonl or automated tmux/u);
 });
 
 test("automatic supervision rejects a non-Git cwd before Worker startup", async () => {
@@ -205,7 +205,7 @@ test("automatic supervision rechecks the exact startup HEAD before spawning", as
         await execFileAsync("git", ["commit", "-qm", "unexpected adapter startup change"], { cwd });
         return super.start(input);
       }
-    })({ mode: "claude-jsonl", cgroupMode: "off" });
+    })({ mode: "claude-jsonl", cgroupMode: "required" });
     const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
     await assert.rejects(() => supervisor.start({
       task: "head race",

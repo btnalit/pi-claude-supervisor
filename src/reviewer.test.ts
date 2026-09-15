@@ -24,8 +24,27 @@ test("malformed custom Reviewer values are normalized to a blocking report", () 
   }
 });
 
+test("Reviewer parser tolerates fences, prose and an identical repeated object", () => {
+  const object = JSON.stringify({ verdict: "pass", summary: "ok", findings: [] });
+  const fenced = "```json\n" + object + "\n```";
+  for (const output of [fenced, `Here is the review:\n${object}\nDone.`, `${object}\n${object}`]) {
+    const report = parseReview(output, 2);
+    assert.equal(report.verdict, "pass");
+    assert.equal(report.findings.length, 0);
+  }
+});
+
+test("conflicting Reviewer JSON objects remain blocking", () => {
+  const report = parseReview(
+    `${JSON.stringify({ verdict: "pass", summary: "ok", findings: [] })}\n${JSON.stringify({ verdict: "human", summary: "uncertain", findings: [] })}`,
+    2,
+  );
+  assert.equal(report.verdict, "human");
+  assert.match(report.summary, /multiple distinct JSON objects/u);
+});
+
 test("invalid Reviewer output escalates to human", () => {
-  for (const output of ["not JSON", "```json\n{\"verdict\":\"pass\",\"summary\":\"ok\"}\n```", "{} trailing", JSON.stringify({ verdict: "revise", summary: "missing findings", findings: [] })]) {
+  for (const output of ["not JSON", "{} trailing", JSON.stringify({ verdict: "pass", summary: "missing findings" }), JSON.stringify({ verdict: "revise", summary: "missing findings", findings: [] })]) {
     const report = parseReview(output, 2);
     assert.equal(report.verdict, "human");
     assert.equal(report.findings[0]?.severity, "P1");

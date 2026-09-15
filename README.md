@@ -10,10 +10,10 @@ A policy-gated [Pi](https://pi.dev) extension for supervising a Claude Code work
 The MVP keeps Pi in control of lifecycle, state, policy and verification while the
 worker remains an explicitly started child process.
 
-> **Release status:** `v0.5.2` is the released single-Worker recovery baseline. The
+> **Release status:** `v0.5.3` is the released single-Worker recovery baseline. The
 > default manual transport is dependency-free process pipes, not PTY. Automatic
-> supervision uses Claude JSONL only; tmux is manual-only because it has no structured
-> permission boundary. Repairable-vs-persistent capabilities,
+> supervision uses Claude JSONL or the Supervisor-owned tmux bridge; adopted tmux
+> sessions remain manual-only. Repairable-vs-persistent capabilities,
 > cancellable verification, evidence completeness gates, startup preflight and phase
 > progress reporting. A real edit-capable Claude Code `2.1.270` repair/reacceptance
 > drill passed in an isolated temporary worktree. The confirmed product target is
@@ -148,6 +148,10 @@ candidate from crossing the remote/main boundary. Automatic mode rejects explici
 `process-pipe` and preflights runtime prerequisites. Invalid output, unavailable
 evidence, duplicate findings, P0/P1 findings and exhausted repair budgets park the
 candidate without waiting for a human; see [the autonomy target](docs/autonomy-target.md).
+The automatic tmux bridge carries Claude stream-json records inside the same live PTY
+as display output using private terminal framing; it does not create an independent
+structured-event sidecar. Automatic tmux accepts only Supervisor-owned sessions,
+while `adopt-tmux` remains manual-only.
 Coordinated multi-worker scheduling is a later milestone; CI uses deterministic fake
 Workers/replay fixtures, and real multi-worker Claude tests remain authenticated
 manual Spikes. Full host-level sandboxing and low-privilege execution for custom
@@ -175,9 +179,11 @@ For an interactive Claude Code window, opt in to the tmux transport:
 
 ```bash
 export PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux
-export PI_CLAUDE_SUPERVISOR_WORKER='claude --permission-mode plan'
-# tmux does not support cgroup required mode; use cgroup mode auto/off.
-# tmux is manual-only; automatic Decision Worker supervision requires JSONL.
+export PI_CLAUDE_SUPERVISOR_WORKER='claude'
+# Manual tmux currently requires Linux for process identity and cleanup;
+# it may use cgroup mode auto/off.
+# Set PI_CLAUDE_SUPERVISOR_MODE=auto for the Supervisor-owned automatic bridge;
+# automatic tmux additionally requires Linux cgroup v2 and a parent-death guardian.
 # Optional, only when adopting a non-default tmux server:
 # export PI_CLAUDE_SUPERVISOR_TMUX_SOCKET=/path/to/tmux.sock
 ```
@@ -187,10 +193,14 @@ literal attach command. Use that command in another terminal to watch or
 manually interact with the same PTY; attaching is optional for unattended local
 development. The adapter sends multi-line input through
 tmux buffers and Enter, never by interpolating the message into a shell command.
-It records the PTY stream with `pipe-pane` and uses `capture-pane` to detect a
-stable Claude input prompt. Because tmux has no structured permission boundary,
-automatic Decision Worker supervision is disabled for this transport; use JSONL for
-unattended decisions, repair and protected command enforcement.
+In automatic mode the Supervisor starts a bridge in the pane: it runs Claude's
+stream-json protocol inside the live PTY, contains the bridge and descendants in
+an owned cgroup, fails closed when that containment or the Linux guardian is
+unavailable, renders readable deltas for the attached terminal, and returns
+structured records through private terminal framing on the same PTY.
+The adapter parses those records from the raw PTY pipe, so there is no independent
+JSONL event sidecar. Automatic mode refuses adopted sessions; use JSONL or the owned
+bridge for unattended decisions, repair and protected command enforcement.
 
 A session that you started yourself can be explicitly adopted without replaying
 the task:
@@ -211,13 +221,15 @@ kill-session` yourself when the adopted window should be closed.
 `/supervise takeover <task-id>` disables automatic Decision Worker messages;
 resume them only with `/supervise resume-auto <task-id>`.
 
-PTY screen text is not Claude JSONL and must not be treated as structured
-permission evidence. TUI decisions follow the configured autonomy policy and are
+PTY screen text is not itself Claude JSONL and must not be treated as structured
+permission evidence; only the Supervisor bridge's private framed records are
+authoritative. TUI decisions follow the configured autonomy policy and are
 recorded; an unresolved task may be parked without requiring a human to remain
 online. A normal terminal Claude process cannot be migrated into tmux, and
-`--resume` is historical recovery rather than live PTY attach. Owned tmux sessions
-survive a Pi disconnect and require an explicit `adopt-tmux` after restart. Use
-plan/read-only flags for live testing.
+`--resume` is historical recovery rather than live PTY attach. Manual owned tmux
+sessions survive a Pi disconnect and require an explicit `adopt-tmux` after
+restart; automatic owned sessions are terminated by their parent-death guardian
+when the Supervisor disappears. Use plan/read-only flags for live testing.
 
 ## Development
 

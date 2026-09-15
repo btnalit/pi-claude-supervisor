@@ -28,13 +28,15 @@ complete audit trail. These are reliability and containment mechanisms, not requ
 to approve every development action. Automatic mode also records and revalidates a full existing
 repository baseline, captures the startup HEAD and requires that exact HEAD again at
 final pre-spawn, requires a non-protected branch and a pinned operator-owned direct Claude
-JSONL Worker, and by default requires a local commit before a candidate is deliverable.
+JSONL Worker or Supervisor-owned tmux bridge, and by default requires a local commit before a candidate is deliverable.
 
 ## 2. Hard authority boundary
 
-Automatic Worker supervision uses the structured JSONL transport; the interactive tmux transport
-remains manual-only because it has no equivalent permission-response boundary. The Worker and local
-automation do **not** receive authority or credentials for:
+Automatic Worker supervision uses either the structured JSONL transport or a
+Supervisor-owned tmux bridge. The bridge runs Claude's stream-json protocol inside the live
+PTY, renders a human-readable display, and returns private framed records through the same
+PTY; adopted tmux sessions remain manual-only. The Worker and local automation do **not**
+receive authority or credentials for:
 
 - pushing code to a remote repository;
 - merging into `main` or another protected integration branch;
@@ -100,8 +102,9 @@ Automatic mode implements the local loop: policy decisions allow ordinary local 
 continue/redirect/answer/repair, acceptance and independent Review run without a human callback,
 and unresolved situations become `blocked` candidates. The default task autonomy is unattended, requires a local commit, and permits two bounded
 Decision Worker request retries. Automatic startup rejects non-Git/detached/bare/protected
-repository states, malformed baselines, startup-HEAD races, non-JSONL transports and
-non-Claude or untrusted executable identities before Worker startup. The resolved
+repository states, malformed baselines, startup-HEAD races, the unstructured
+process-pipe transport and non-Claude or untrusted executable identities before Worker
+startup. The resolved
 executable identity is persisted with the Decision Worker recovery record and must match
 again during recovery.
 
