@@ -229,7 +229,13 @@ test("startup takeover reconciles a cgroup created after its provisional plan", 
     ownership: "owned",
     retainCgroupUntilLeaseRelease: true,
   }, { preserveStartup: true });
-  await mkdir(cgroupPath);
+  try {
+    await mkdir(cgroupPath);
+  } catch {
+    await rm(root, { recursive: true, force: true });
+    t.skip("the current cgroup does not allow test children");
+    return;
+  }
   const oldPath = join(leaseDir, `${old.record.leaseId}.json`);
   const oldRecord = JSON.parse(await readFile(oldPath, "utf8")) as Record<string, unknown>;
   oldRecord.ownerPid = 999999995;
@@ -273,7 +279,13 @@ test("automatic tmux startup takeover reconciles a planned cgroup before server 
     ownership: "owned",
     retainCgroupUntilLeaseRelease: true,
   }, { preserveStartup: true });
-  await mkdir(cgroupPath);
+  try {
+    await mkdir(cgroupPath);
+  } catch {
+    await rm(root, { recursive: true, force: true });
+    t.skip("the current cgroup does not allow test children");
+    return;
+  }
   const oldPath = join(leaseDir, `${old.record.leaseId}.json`);
   const oldRecord = JSON.parse(await readFile(oldPath, "utf8")) as Record<string, unknown>;
   oldRecord.ownerPid = 999999990;
