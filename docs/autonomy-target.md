@@ -125,6 +125,8 @@ This target does not authorize:
 - silently treating incomplete evidence as success;
 - claiming that a failed or parked task completed.
 
-Coordinated multi-Worker scheduling, OS sandboxing and broader CLI compatibility remain separate
-engineering milestones. They must not be used to add synchronous human approval to the local
-development loop.
+Coordinated multi-Worker scheduling, OS sandboxing and validation of future breaking CLI/API
+changes remain separate engineering milestones. The supported Claude Code compatibility floor is
+`2.1.270`; versioned install paths are not fixed, but a newer CLI should still rerun the real
+spikes before release. These milestones must not be used to add synchronous human approval to the
+local development loop.
