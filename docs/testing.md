@@ -52,10 +52,14 @@ It must not be added to the normal CI gate because authentication is an owner
 controlled prerequisite.
 
 The transport fixtures validate one prompt, multiple turns, session resume,
-permission allow/deny and SIGTERM/SIGINT behavior. The current release validation
-uses Claude Code 2.1.270 at
-`/home/yancao/.local/share/mise/installs/claude/2.1.270/claude`, including real
-owned tmux turns, pause/resume, and restart re-adoption.
+permission allow/deny and SIGTERM/SIGINT behavior. The compatibility floor for the current release line is Claude Code `2.1.270`.
+The real-Claude spikes resolve the current `claude` executable from `PATH` by
+default, so installer-managed `latest` paths work without naming a versioned
+installation directory; `PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH` is an optional
+explicit override. Versions older than `2.1.270` are rejected, while newer
+versions are accepted and recorded in the spike output. The recorded baseline
+run used Claude Code `2.1.270` and covered real owned tmux turns, pause/resume,
+and restart re-adoption.
 The adapter regression suite also verifies event subscription, parsed
 `permission_request` events, the exact nested `control_response` envelope, and
 that an automatic tmux Worker cannot launch a second Claude executable from a
@@ -63,7 +67,7 @@ Worker-created script.
 The automation spike additionally exercises a real Pi SDK Decision Worker with
 Claude: ordinary completion, harmless Bash permission handling, and an
 `AskUserQuestion` denial-to-text fallback followed by automatic verification.
-A local pinned-CLI run completed all three scenarios with `state=completed`,
+A local baseline-CLI run completed all three scenarios with `state=completed`,
 `verified=true`, and zero human interventions. Provider/model latency can still
 cause a later run to fail closed as a parked/non-publishable candidate after the bounded Decision
 Worker or Reviewer timeout; this is evidence for the manual spike only, not a CI guarantee.
@@ -86,10 +90,11 @@ npm run spike:signals
 npm run spike:automation
 SPIKE_AUTOMATION_PERMISSION=1 npm run spike:automation
 SPIKE_AUTOMATION_QUESTION=1 npm run spike:automation
-PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH=/home/yancao/.local/share/mise/installs/claude/2.1.270/claude \
 PI_CLAUDE_SUPERVISOR_REAL_CLAUDE=1 npm run spike:tmux
-PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH=/home/yancao/.local/share/mise/installs/claude/2.1.270/claude \
 PI_CLAUDE_SUPERVISOR_REAL_CLAUDE=1 npm run spike:tmux-interactive
+# Optional explicit override; PATH/latest is preferred:
+PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH="$HOME/.local/share/mise/installs/claude/latest/claude" \
+PI_CLAUDE_SUPERVISOR_REAL_CLAUDE=1 npm run spike:tmux
 ```
 
 The tmux spike is gated, authenticated, and excluded from normal CI. It uses
@@ -100,11 +105,12 @@ and identity-bound restart re-adoption. The interactive spike uses a fresh tempo
 cwd to verify Claude's trust prompt, a real Bash permission prompt, an allow-once
 response, and an exact result marker; it also records metadata only.
 
-For each release, pin and record the validated Claude Code version, resolved
-executable path, and model. The spikes reject an unpinned/mismatched executable
-version. For this release the validated version is `2.1.270` with model `opus`;
-the bounded matrix and its fail-closed outliers are recorded in
-[`docs/stability-matrix-2.1.270.md`](stability-matrix-2.1.270.md).
+For each release, record the validated Claude Code version, resolved executable
+path, and model. The spikes resolve `claude` from `PATH` by default and reject
+versions below the compatibility floor `2.1.270`; they do not require an exact
+versioned installation path. The recorded baseline for this release is `2.1.270`
+with model `opus`; the bounded matrix and its fail-closed outliers are recorded
+in [`docs/stability-matrix-2.1.270.md`](stability-matrix-2.1.270.md).
 Record:
 
 1. exact version and resolved executable path;
@@ -187,7 +193,7 @@ the managed process group.
 The `v0.5.0` implementation of the acceptance—independent Review—repair—reacceptance
 loop is shipped. The `v0.5.1` real read-only drill reached acceptance and independent
 Review, then correctly produced a non-publishable candidate after two P1 and two P2 findings under the then-current human-gated compatibility path.
-A separate real edit-capable Claude Code `2.1.270` drill then exercised one bounded
+A separate real edit-capable Claude Code `2.1.270` baseline drill then exercised one bounded
 acceptance failure, repair turn, reacceptance and independent Reviewer `pass` in an
 isolated temporary worktree. The current hardening plan and evidence paths are recorded
 in [`docs/automation-hardening-plan.md`](automation-hardening-plan.md). Deterministic
@@ -235,10 +241,12 @@ The adapter/replay matrix must cover:
 - paused watchdog behavior and resume-time no-output rebasing;
 - assistant-message-bounded Reviewer and Decision Worker output parsing.
 
-Real Claude tests remain authenticated manual Spikes and are pinned to
-`2.1.270`; they are not part of normal CI. Normal CI runs deterministic fake
-Worker and replay fixtures. The pinned stability matrix is the compatibility evidence
-for this release line; any future CLI change must rerun ten consecutive ordinary
+Real Claude tests remain authenticated manual Spikes and are not part of normal
+CI. The spikes accept Claude Code `2.1.270` and newer, resolve the current
+executable from `PATH`, and report the actual version/path. Normal CI runs
+deterministic fake Worker and replay fixtures. The `2.1.270` stability matrix is
+the baseline compatibility evidence for this release line; any future CLI change
+must rerun ten consecutive ordinary
 automatic runs and at least five runs each for permission and question handling, with
 no duplicate action, false completion or unreaped Worker.
 
@@ -261,9 +269,10 @@ Required deterministic and integration coverage:
 - no child can grant permissions, send control input to another child or bypass Policy Gate;
 - independent integration in a separate worktree; the Worker has no remote push or main/integration merge authority, and no candidate bypasses that boundary.
 
-The multi-worker gate should be added only after the pinned single-worker stability
-and recovery gates pass. CI should use fake Workers and replay fixtures; authenticated
-Claude multi-worker Spikes remain manual and version-pinned.
+The multi-worker gate should be added only after the minimum-version single-worker
+stability and recovery gates pass. CI should use fake Workers and replay fixtures;
+authenticated Claude multi-worker Spikes remain manual and must meet the same
+`2.1.270` minimum.
 
 ## Live drill and hardening gate
 

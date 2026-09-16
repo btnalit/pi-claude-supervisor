@@ -36,7 +36,7 @@ Claude Code Worker
 4. Supervisor 因误判导致无限循环、危险操作或不可审计的修改。
 5. 人工无法随时接管或恢复任务。
 
-**当前状态：`v0.5.3` 已正式发布，已完成固定 Claude Code `2.1.270` 稳定性验证、单 Worker recovery、真实只读 Review drill、隔离临时 worktree 的允许编辑 repair/reacceptance drill、exact-head 独立 Review 和受保护发布。当前工作树已落实 repairable/persistent 能力拆分、verifying stop、paused watchdog、baseline-relative repository evidence、可取消验收/Reviewer、启动 preflight、无人值守权限决策、local-commit enforcement、候选挂起和阶段进度通知。自动模式现在要求 direct Claude JSONL 或 Supervisor 自有 tmux bridge、完整 Git baseline、非保护分支，并请求不可用即失败的 Claude Code sandbox 和无出站域名；任意自定义可执行文件不会进入自动模式。Legacy human/takeover APIs 仅保留显式兼容控制；普通不确定性不再阻塞本地循环。协同多 Worker、手动/自定义集成的 host-level 低权限和网络隔离仍是独立后续里程碑。**
+**当前状态：`v0.5.3` 已正式发布，已完成以 Claude Code `2.1.270` 为兼容下限的稳定性验证、单 Worker recovery、真实只读 Review drill、隔离临时 worktree 的允许编辑 repair/reacceptance drill、exact-head 独立 Review 和受保护发布。当前工作树已落实 repairable/persistent 能力拆分、verifying stop、paused watchdog、baseline-relative repository evidence、可取消验收/Reviewer、启动 preflight、无人值守权限决策、local-commit enforcement、候选挂起和阶段进度通知。自动模式现在要求 direct Claude JSONL 或 Supervisor 自有 tmux bridge、完整 Git baseline、非保护分支，并请求不可用即失败的 Claude Code sandbox 和无出站域名；任意自定义可执行文件不会进入自动模式。Legacy human/takeover APIs 仅保留显式兼容控制；普通不确定性不再阻塞本地循环。协同多 Worker、手动/自定义集成的 host-level 低权限和网络隔离仍是独立后续里程碑。**
 
 ---
 
@@ -917,7 +917,7 @@ PTY 和 headless JSONL 只能选择一个作为 MVP 的主 transport，禁止两
 
 ## 20. 近期落地与剩余门禁：稳定的自动验收闭环
 
-本轮已落地 TaskSpec 多命令验收和 autonomy 字段、独立只读 Reviewer、结构化 repair round、重复 finding/P0/P1 候选挂起、JSONL 去重、baseline-relative commit evidence 和确定性 replay fixture。剩余门禁是固定 CLI 的重复运行统计，而不是继续扩大本地同步安全边界。当前只验证固定的 Claude Code `2.1.270`，不把多版本兼容作为本阶段任务。自动 Claude 路径已请求 fail-closed sandbox 和无出站域名；OS 级低权限、host-level sandbox、手动/自定义集成的 network allowlist、SBOM 和更深的供应链加固后置，不作为本阶段门禁；远程 push/main merge、保护 CI 和发布仍保持独立边界。
+本轮已落地 TaskSpec 多命令验收和 autonomy 字段、独立只读 Reviewer、结构化 repair round、重复 finding/P0/P1 候选挂起、JSONL 去重、baseline-relative commit evidence 和确定性 replay fixture。剩余门禁是兼容下限以上 CLI 的重复运行统计，而不是继续扩大本地同步安全边界。Claude Code 以 `2.1.270` 为最低兼容版本；真实 Spike 默认从 `PATH` 解析当前安装（包括 `latest` 路径），接受该版本及更新版本，并记录实际版本和路径。自动 Claude 路径已请求 fail-closed sandbox 和无出站域名；OS 级低权限、host-level sandbox、手动/自定义集成的 network allowlist、SBOM 和更深的供应链加固后置，不作为本阶段门禁；远程 push/main merge、保护 CI 和发布仍保持独立边界。
 
 ### 20.1 Goal / Evidence / Sign-off 模型
 
@@ -962,7 +962,7 @@ Reviewer 必须使用独立 Pi session，只允许 `read`、`grep`、`find`、`l
 
 ### 20.2 JSONL 稳定性证据
 
-只对 Claude Code `2.1.270` 建立证据，覆盖：
+以 Claude Code `2.1.270` 为最低兼容版本建立以下证据；真实 Spike 可使用 `PATH` 中当前的更高版本：
 
 - JSONL 跨 chunk 拆分、单 chunk 多记录和 malformed 行；malformed 行不能触发完成事件；
 - 重复 result、重复 permission request、重复 Supervisor idempotency key 不产生重复动作；
@@ -973,7 +973,6 @@ Reviewer 必须使用独立 Pi session，只允许 `read`、`grep`、`find`、`l
 
 ### 20.3 明确不属于本阶段
 
-- Claude CLI 多版本兼容；
 - OS sandbox、低权限执行和网络隔离；
 - Worker 获得远程 push 或 main/integration merge 权限；
 - 多 Worker 在同一工作树协作。
@@ -988,7 +987,7 @@ Reviewer 必须使用独立 Pi session，只允许 `read`、`grep`、`find`、`l
 
 ### 21.1 短期：稳定性收尾
 
-- 完成真实 Claude Code `2.1.270` 重复 Spike：普通任务连续 10 次，权限和问题回退各至少 5 次；
+- 使用 PATH 中当前的 Claude Code（不得低于 `2.1.270`）完成重复 Spike：普通任务连续 10 次，权限和问题回退各至少 5 次，并记录实际版本/路径；
 - 补齐 replay：多轮修复、验收失败修复、repair budget 耗尽、takeover、recover 和 Pi shutdown；
 - 补齐边界测试：Reviewer 流式输出上限、`DecisionSessionStore.list()` 任务 ID 校验、跨进程恢复和超时/输出截断；
 - 继续观察 npm `0.5.2`、GitHub Release 资产、provenance 和回滚路径；
@@ -1025,7 +1024,7 @@ Reviewer 必须使用独立 Pi session，只允许 `read`、`grep`、`find`、`l
 
 ### 21.4 后置：安全加固
 
-- CLI 多版本兼容矩阵；
+- Claude CLI 破坏性变更检测和跨版本兼容矩阵（当前最低兼容版本为 `2.1.270`）；
 - OS sandbox、低权限执行、网络隔离/allowlist；
 - 更深的供应链、SBOM、密钥隔离和生产监控。
 

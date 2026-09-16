@@ -4,17 +4,16 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { workerEnvironment } from "../src/worker/environment.ts";
+import { assertSupportedClaudeVersion, MIN_SUPPORTED_CLAUDE_VERSION, resolveClaudeExecutable } from "./claude-version.mjs";
 
 if (process.env.PI_CLAUDE_SUPERVISOR_REAL_CLAUDE !== "1") {
   throw new Error("Set PI_CLAUDE_SUPERVISOR_REAL_CLAUDE=1 to run the authenticated Claude tmux interactive spike");
 }
 
-const claude = process.env.PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH;
-const expectedVersion = process.env.PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_VERSION ?? "2.1.270 (Claude Code)";
+const claude = resolveClaudeExecutable();
 const model = process.env.PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_MODEL ?? "opus";
-if (!claude) throw new Error("Set PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH to the pinned Claude executable");
 const version = execFileSync(claude, ["--version"], { encoding: "utf8" }).trim();
-assert.equal(version, expectedVersion, `unexpected Claude version: expected ${expectedVersion}, got ${version}`);
+assertSupportedClaudeVersion(version);
 const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-real-tmux-interactive-"));
 const cwd = await mkdtemp(join(root, "untrusted-cwd-"));
 const socket = join(root, "tmux.sock");
@@ -41,12 +40,13 @@ const paste = (text) => {
 };
 const waitFor = async (predicate, timeoutMs, description) => {
   const deadline = Date.now() + timeoutMs;
+  let lastScreen = "";
   while (Date.now() < deadline) {
-    const screen = capture();
-    if (predicate(screen)) return screen;
+    lastScreen = capture();
+    if (predicate(lastScreen)) return lastScreen;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  throw new Error(`timed out waiting for ${description}`);
+  throw new Error(`timed out waiting for ${description}; last screen:\n${lastScreen.slice(-4_000)}`);
 };
 
 try {
@@ -63,16 +63,20 @@ try {
     "Claude trust prompt",
   );
   assert.match(trustPrompt, /No, exit[\s\S]*Yes, I trust this folder/iu);
+  // Wait for Ink to finish mounting the choice before sending keys; newer
+  // Claude releases can render the prompt before they accept input.
+  await new Promise((resolve) => setTimeout(resolve, 500));
   sendKeys("Down", "Enter");
   await waitFor((screen) => /manual mode on/iu.test(screen) && /❯/u.test(screen), 30_000, "trusted Claude prompt");
 
   paste(`Use Bash to run exactly: rm -f ${target}. Then reply with exactly TMUX_PERMISSION_DONE. Do not use any other tools.`);
   const permissionPrompt = await waitFor(
-    (screen) => /Do you want to proceed\?/u.test(screen) && /1\. Yes/u.test(screen) && /4\. No/u.test(screen),
+    (screen) => /Do you want to proceed\?/u.test(screen) && /\d+\. Yes(?:,|\s|$)/u.test(screen) && /\d+\. No(?:\s|$)/u.test(screen),
     120_000,
     "Claude Bash permission prompt",
   );
-  assert.match(permissionPrompt, /(?:Delete|Remove) the permission-target/u);
+  assert.match(permissionPrompt, /permission-target/u);
+  await new Promise((resolve) => setTimeout(resolve, 500));
   sendKeys("Enter");
   const result = await waitFor(
     (screen) => /(?:^|\n)\s*●\s*TMUX_PERMISSION_DONE(?:\s|$)/u.test(screen),
@@ -84,6 +88,7 @@ try {
 
   console.log(JSON.stringify({
     claudeVersion: version,
+    claudeMinimumVersion: MIN_SUPPORTED_CLAUDE_VERSION,
     claudePath: claude,
     claudeModel: model,
     trustPrompt: true,

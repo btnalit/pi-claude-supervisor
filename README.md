@@ -16,8 +16,9 @@ worker remains an explicitly started child process.
 > sessions remain manual-only. Repairable-vs-persistent capabilities,
 > cancellable verification, evidence completeness gates, startup preflight and phase
 > progress reporting. A real edit-capable Claude Code `2.1.270` repair/reacceptance
-> drill passed in an isolated temporary worktree. The confirmed product target is
-> unattended local development; see [the autonomy target](docs/autonomy-target.md).
+> drill passed in an isolated temporary worktree. Real-Claude validation resolves the
+> current executable from `PATH` and accepts Claude Code `2.1.270` or newer. The
+> confirmed product target is unattended local development; see [the autonomy target](docs/autonomy-target.md).
 > Remote push and merge into the main/integration branch remain outside Worker authority
 > and must cross an independent boundary.
 >
@@ -57,6 +58,11 @@ npm ci --ignore-scripts
 npm run check
 npm run build
 ```
+
+Authenticated real-Claude spikes resolve `claude` from `PATH` by default, so
+installer-managed `latest` links work without a versioned path. Set
+`PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH` only when an explicit executable is needed;
+the spikes require Claude Code `2.1.270` or newer and report the resolved path and version.
 
 ## Use
 

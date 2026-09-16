@@ -58,7 +58,7 @@ export PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_FORMAT=generic
 自动模式支持 `claude-jsonl` 和 Supervisor 自有的 tmux bridge；JSONL 的 `result`、
 `control_request` 和进程 `exit` 事件会唤醒 Decision Worker。tmux bridge 把结构化记录
 通过同一个 live PTY 的私有 terminal framing 传回适配器，不创建独立 JSONL sidecar；
-`adopt-tmux` 仍是手动模式。本版本固定按已验证设备的 Claude CLI `2.1.270` 运行，跨版本兼容性不在本轮范围内。
+`adopt-tmux` 仍是手动模式。真实 Claude 检查默认从 `PATH` 解析当前 CLI（包括安装器提供的 `latest` 路径），支持 Claude Code `2.1.270` 及以上版本；本轮的已记录演练版本为 `2.1.270`。
 
 然后在 Pi 中使用：
 
@@ -183,7 +183,7 @@ PTY 屏幕文字本身不是 Claude JSONL，不能把屏幕文字当作结构化
 当前支持的是**独立任务会话并行**，不是共享工作树的协同多 Worker。后续多 Worker
 开发任务会引入 parent/child 任务图、依赖、并发上限、结构化 handoff、汇总验收和
 跨进程恢复，但不会放宽“一个 worktree 一个写入者”的边界，也不会自动 merge 或 publish。
-该阶段应安排在固定 Claude `2.1.270` 稳定性统计和单 Worker recovery 语义完成之后。
+该阶段应安排在 Claude `2.1.270` 以上版本的稳定性统计和单 Worker recovery 语义完成之后。
 
 Pull Request 必须通过聚合的 `CI / Quality gate`。Release Please 根据 Conventional Commits 创建版本 PR；维护者合并后，Release workflow 会针对精确 tag commit 重新验证，并通过受保护的 `npm` environment 使用 npm provenance 发布。
 

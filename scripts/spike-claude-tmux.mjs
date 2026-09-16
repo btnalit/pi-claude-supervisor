@@ -6,18 +6,17 @@ import { tmpdir } from "node:os";
 import { EventLog } from "../src/events.ts";
 import { Supervisor } from "../src/supervisor.ts";
 import { TmuxWorkerAdapter } from "../src/worker/tmux-adapter.ts";
+import { assertSupportedClaudeVersion, MIN_SUPPORTED_CLAUDE_VERSION, resolveClaudeExecutable } from "./claude-version.mjs";
 
 if (process.env.PI_CLAUDE_SUPERVISOR_REAL_CLAUDE !== "1") {
   throw new Error("Set PI_CLAUDE_SUPERVISOR_REAL_CLAUDE=1 to run the authenticated Claude tmux spike");
 }
 
 const cwd = process.env.PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_CWD ?? process.cwd();
-const claude = process.env.PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH;
-const expectedVersion = process.env.PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_VERSION ?? "2.1.270 (Claude Code)";
+const claude = resolveClaudeExecutable();
 const model = process.env.PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_MODEL ?? "opus";
-if (!claude) throw new Error("Set PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH to the pinned Claude executable");
 const version = execFileSync(claude, ["--version"], { encoding: "utf8" }).trim();
-assert.equal(version, expectedVersion, `unexpected Claude version: expected ${expectedVersion}, got ${version}`);
+assertSupportedClaudeVersion(version);
 const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-real-tmux-"));
 const completed = [];
 let owned;
@@ -122,6 +121,7 @@ try {
 
   console.log(JSON.stringify({
     claudeVersion: version,
+    claudeMinimumVersion: MIN_SUPPORTED_CLAUDE_VERSION,
     claudePath: claude,
     claudeModel: model,
     cwd,
