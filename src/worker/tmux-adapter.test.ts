@@ -252,23 +252,27 @@ setInterval(() => {}, 10000);
   }
 });
 
-test("automatic tmux rejects a Claude child started by a Worker script", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+test("automatic tmux allows a Claude child and cgroup cleanup reaps it", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-nested-test-"));
   const fixture = join(stateDir, "fixture.mjs");
   const fakeClaude = join(stateDir, "claude");
   const nestedClaude = join(stateDir, "nested", "claude");
+  const nestedPidFile = join(stateDir, "nested.pid");
   await mkdir(join(stateDir, "nested"), { recursive: true });
   await copyFile(process.execPath, nestedClaude);
   await chmod(nestedClaude, 0o700);
   await writeFile(fixture, `
 import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
 const nested = ${JSON.stringify(nestedClaude)};
+const nestedPidFile = ${JSON.stringify(nestedPidFile)};
 process.stdout.write(JSON.stringify({ type: "system", subtype: "ready" }) + "\\n");
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", data => {
   for (const line of data.split("\\n").filter(Boolean)) {
     const request = JSON.parse(line);
-    spawn(nested, ["-e", "setTimeout(() => {}, 10000)"], { stdio: "ignore" });
+    const child = spawn(nested, ["-e", "setTimeout(() => {}, 10000)"], { stdio: "ignore" });
+    if (child.pid) writeFileSync(nestedPidFile, String(child.pid));
     process.stdout.write(JSON.stringify({ type: "result", subtype: "success", uuid: request.message.content }) + "\\n");
   }
 });
@@ -277,18 +281,33 @@ process.stdin.on("data", data => {
   await chmod(fakeClaude, 0o700);
   const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 100 });
   let handle;
+  let nestedPid: number | undefined;
   try {
     handle = await adapter.start({ task: "trigger", cwd: process.cwd(), command: fakeClaude, args: [], automatic: true });
     let status;
     for (let attempt = 0; attempt < 100; attempt += 1) {
       status = await adapter.getStatus(handle);
-      if (!status.running) break;
+      if (status.activeRequests === 0 || status.runtimeError || !status.running) break;
       await new Promise((resolve) => setTimeout(resolve, 30));
     }
-    assert.equal(status?.running, false);
-    assert.match(status?.runtimeError ?? "", /nested Claude process denied/u);
+    assert.equal(status?.running, true);
+    assert.equal(status?.runtimeError, undefined);
+    assert.equal(status?.activeRequests, 0);
+    for (let attempt = 0; attempt < 20 && nestedPid === undefined; attempt += 1) {
+      try { nestedPid = Number(await readFile(nestedPidFile, "utf8")); }
+      catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
+    }
+    assert.ok(nestedPid && nestedPid > 0);
   } finally {
     if (handle) await adapter.stop(handle, "nested Claude test cleanup").catch(() => {});
+    if (nestedPid) {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        try { process.kill(nestedPid, 0); }
+        catch { break; }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.throws(() => process.kill(nestedPid!, 0), /ESRCH/u);
+    }
     await rm(stateDir, { recursive: true, force: true });
   }
 });

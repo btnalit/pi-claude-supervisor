@@ -11,14 +11,12 @@ export interface PolicyResult {
 /**
  * Permission decisions are autonomous for local development. A denial is a
  * hard capability boundary, not a request for a human to approve the next
- * turn. AskUserQuestion is denied so the Worker can restate the question as
- * ordinary text and the Decision Worker can answer it from task evidence.
+ * turn. Claude's built-in tools, agents, background tasks and MCP tools are
+ * allowed; only the explicit unattended interaction and repository/remote
+ * authority boundaries below remain special-cased.
  */
-const allowedWorkerTools = new Set(["Bash", "Edit", "Glob", "Grep", "Read", "Write", "NotebookEdit"]);
-
 export function evaluatePermission(toolName: string, input: unknown, cwd = process.cwd()): PolicyResult {
   if (toolName === "AskUserQuestion") return { decision: "deny", reason: "interactive questions are converted to ordinary Worker text" };
-  if (!allowedWorkerTools.has(toolName)) return { decision: "deny", reason: `Worker tool is outside the automatic allowlist: ${toolName}` };
   if (toolName === "Edit" || toolName === "Write" || toolName === "NotebookEdit") {
     const paths = fileToolPaths(input);
     if (paths.length === 0) return { decision: "deny", reason: `${toolName} request has no recognizable file path` };
@@ -30,9 +28,6 @@ export function evaluatePermission(toolName: string, input: unknown, cwd = proce
     ? (input as { command: string }).command
     : "";
   if (!command) return { decision: "deny", reason: "Bash request has no recognizable command" };
-  if (containsNestedClaude(command)) {
-    return { decision: "deny", reason: "Worker cannot start a nested Claude or background Reviewer" };
-  }
   return evaluateCommand("bash", ["-lc", command]);
 }
 
@@ -95,8 +90,7 @@ function isGitMetadataPath(value: string, cwd: string): boolean {
 
 const deniedPatterns = [
   /\b(?:npm|pnpm|yarn)\b[\s\S]*\bpublish\b/iu,
-  /\b(?:ssh|scp|sftp|rsync)\b/iu,
-  /\b(?:curl|wget)\b[\s\S]*(?:-X\s*(?:POST|PUT|PATCH|DELETE)|--method(?:=|\s+)(?:POST|PUT|PATCH|DELETE)|https?:\/\/(?:api\.)?(?:github|gitlab|bitbucket|registry\.npmjs)\.)/iu,
+  /\b(?:curl|wget)\b[\s\S]*(?:-X\s*(?:POST|PUT|PATCH|DELETE)|--request(?:=|\s+)(?:POST|PUT|PATCH|DELETE)|--method(?:=|\s+)(?:POST|PUT|PATCH|DELETE)|(?:^|\s)(?:-d|--data(?:[-a-z]*)(?:=|\s+)|--post-data(?:=|\s+)|--body-data(?:=|\s+)))[\s\S]*https?:\/\/(?:api\.)?(?:github|gitlab|bitbucket|registry\.npmjs)\b/iu,
   /(?:\$\{?[^\s`}]+\}?|`[^`]*`|\$\([^)]*\))[\s\S]*\b(?:push|merge|publish)\b|\b(?:push|merge|publish)\b[\s\S]*(?:\$\{?[^\s`}]+\}?|`[^`]*`|\$\([^)]*\))/iu,
   /--(?:allow-)?dangerously-skip-permissions\b/iu,
   /--permission-mode\s+(?:bypasspermissions|dontask)\b/iu,
@@ -117,6 +111,18 @@ const protectedBranches = new Set(["main", "master", "trunk", "integration", "de
 const protectedBranchOperations = new Set(["checkout", "switch", "branch", "reset", "restore", "worktree", "update-ref", "symbolic-ref"]);
 const remoteOperations = new Set(["push", "merge", "send-pack", "receive-pack", "update-ref"]);
 
+function containsRemoteCliMutation(command: string): boolean {
+  return /\b(?:gh|glab|hub)\b[\s\S]*(?:\b(?:pr|mr|pull-request)\s+(?:merge|create|close|delete|edit|comment)\b|\b(?:release)\s+(?:create|delete|edit|upload)\b|\bapi\b[\s\S]*(?:-X|--request|--method(?:=|\s+))(?:\s*=?)\s*(?:POST|PUT|PATCH|DELETE)\b)/iu.test(command);
+}
+
+function containsRemoteHttpMutation(command: string): boolean {
+  const hasHttpClient = /\b(?:curl|wget)\b/iu.test(command);
+  const hasMutationFlag = /(?:-X\s*(?:POST|PUT|PATCH|DELETE)\b|--request(?:=|\s+)(?:POST|PUT|PATCH|DELETE)\b|--method(?:=|\s+)(?:POST|PUT|PATCH|DELETE)\b)/iu.test(command)
+    || /(?:^|\s)(?:-d\b|--data(?:[-a-z]*)(?:=|\s+)|--post-data(?:=|\s+)|--body-data(?:=|\s+))/iu.test(command);
+  const hasProtectedEndpoint = /https:\/\/(?:api\.)?(?:github|gitlab|bitbucket|registry\.npmjs)\b/iu.test(command);
+  return hasHttpClient && hasMutationFlag && hasProtectedEndpoint;
+}
+
 export function evaluateCommand(command: string, args: readonly string[] = []): PolicyResult {
   const normalized = command.trim();
   if (!normalized) return { decision: "deny", reason: "empty command" };
@@ -132,8 +138,7 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   const hasGit = values.some((value) => /(?:^|[\\/])git$/iu.test(value) || /^(?:git-(?:send|receive|upload)-pack)$/iu.test(value));
   const hasGitTransport = lower.some((value) => /^(?:git-(?:send|receive|upload)-pack)$/u.test(value));
   const hasRemoteOperation = lower.some((value) => remoteOperations.has(value));
-  const hasGhRemote = lower.some((value) => value === "gh" || value === "glab" || value === "hub")
-    && lower.some((value) => value === "api" || value === "release" || value === "pull-request" || value === "pr" || value === "mr");
+  const hasGhRemote = containsRemoteCliMutation(canonical);
   const hasPackagePublication = lower.some((value) => value === "npm" || value === "pnpm" || value === "yarn") && lower.includes("publish");
   const hasGitAliasConfiguration = hasGit && lower.some((value) => /^alias\.[^=]*(?:=|$)/u.test(value));
   if (depth < 4) {
@@ -152,7 +157,7 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   }
   if (/\bgit\b[\s\S]*\b(?:push|merge|send-pack|receive-pack|update-ref)\b/iu.test(canonical)
     || /\bgit-(?:send|receive|upload)-pack\b/iu.test(canonical)
-    || /\b(?:gh|glab|hub)\b[\s\S]*\b(?:api|pr|mr|pull-request|release)\b/iu.test(canonical)) {
+    || containsRemoteCliMutation(canonical)) {
     return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
   }
   if (hasGit && (hasRemoteOperation || hasGitTransport) || hasGhRemote) {
@@ -179,27 +184,6 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
     return { decision: "deny", reason: "Worker cannot bypass Claude permission prompts" };
   }
   return undefined;
-}
-
-function containsNestedClaude(command: string, depth = 0): boolean {
-  // Bash can hand an opaque quoted program to Python, Node, eval, env,
-  // command, or another interpreter. Once this permission boundary sees a
-  // Claude executable reference, fail closed rather than trying to prove which
-  // wrapper will eventually exec it. This intentionally rejects harmless prose
-  // mentions too; false positives cannot grant a nested Worker capability.
-  if (/\b(?:claude(?:\.exe)?|review(?:er)?|code[-_ ]?review|read[-_ ]?only[-_ ]?review|independent[-_ ]?review|codex|cursor(?:-agent)?|aider|opencode|gemini)\b/iu.test(command)) return true;
-  if (depth > 4) return false;
-  const lexical = lexShell(command);
-  if (lexical.error) return true;
-  for (const token of lexical.tokens) {
-    if (token.operator) continue;
-    const executable = token.value.split(/[\\/]/u).at(-1)?.toLowerCase();
-    if (executable === "claude" || executable === "claude.exe") return true;
-    // Quote concatenation such as c'l'a'u'd'e is normalized by the shell
-    // lexer into one token. Recurse into quoted interpreter payloads too.
-    if (/\s/u.test(token.value) && containsNestedClaude(token.value, depth + 1)) return true;
-  }
-  return false;
 }
 
 function nestedShellCommands(lower: readonly string[], values: readonly string[]): string[] {
@@ -237,6 +221,9 @@ function evaluateTokens(tokens: readonly ShellToken[], depth: number): PolicyRes
   if (!canonical) return { decision: "deny", reason: "empty command" };
   const boundary = evaluateRepositoryBoundary(tokens, canonical, depth);
   if (boundary) return boundary;
+  if (containsRemoteHttpMutation(canonical)) {
+    return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
+  }
   if (deniedPatterns.some((pattern) => pattern.test(canonical))) {
     if (/\b(?:curl|wget)\b[\s\S]*(?:github|gitlab|bitbucket|registry\.npmjs)\b/iu.test(canonical)) {
       return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };

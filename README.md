@@ -31,12 +31,13 @@ worker remains an explicitly started child process.
 
 - The extension never starts a worker automatically.
 - Worker commands are launched without a shell.
-- Workers receive a minimal environment; automatic mode uses a deny-by-default variable allowlist, strips remote credentials and disables Git/package credential helpers. Only documented Claude provider variables may be selected for automatic mode; arbitrary custom variables remain manual-only.
-- Local command and permission behavior follows the configured task/runtime policy; actions outside that authority are rejected or parked without requiring a synchronous human response.
-- Automatic mode admits only the bare `claude`/`claude.exe` command name, resolves and pins an operator-owned executable from the supervisor PATH (or `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE`), and rejects explicit paths or writable/untrusted locations. It requests a fail-closed Claude Code Bash sandbox with no outbound domains; command policy remains a second guard. Manual/custom integrations must provide their own equivalent host/network boundary.
+- Manual workers retain the small inherited environment unless the caller supplies explicit variables. Automatic Claude workers inherit the supervisor environment unchanged except for `CLAUDECODE`, which must be removed so Claude can intentionally launch nested Claude sessions; credentials, Git/package helpers, custom settings and network configuration are not filtered.
+- The full Claude Code tool surface is available in automatic mode, including agents, background tasks, plugins and MCP. The adapter adds only the stream-json transport framing and keeps every Worker descendant inside the Supervisor-owned cleanup boundary. `AskUserQuestion` is converted to ordinary text because no human is synchronously present.
+- Local command and permission behavior follows the configured task/runtime policy; known direct remote push/main-integration operations and protected Git metadata remain rejected or parked without requiring a synchronous human response. Nested/custom tools run with the inherited capabilities and are cleaned with the Worker; they are not a second Supervisor permission loop.
+- Automatic mode still admits only the bare `claude`/`claude.exe` command name, resolves and pins an operator-owned executable from the supervisor PATH (or `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE`), and rejects explicit paths or writable/untrusted locations. Manual/custom integrations must provide their own executable and host authority boundary.
 - A worker completion is only a transition to `verifying`; it is not evidence of success.
 - Verification is an independent host command (default: `git diff --check`).
-- Target local development runs unattended after a task starts: the Worker may edit, test, repair and commit locally. The Worker must have no authority or credentials to push remotely or merge into `main`/an integration branch.
+- Target local development runs unattended after a task starts: the Worker may edit, test, repair and commit locally. Supervisor-managed requests for remote push or merge into `main`/an integration branch remain denied, while the final remote/main boundary must independently protect trusted nested/custom capabilities.
 - The extension never performs merge, deploy, release, or publish at runtime. Remote/main integration and repository releases cross independent protected boundaries.
 - A 4-hour wall-clock and 20-minute no-output watchdog stop a worker by default for long development tasks; embedding callers can set either to `0` to disable.
 - On Linux, the adapter automatically uses a writable cgroup v2 for descendant cleanup, including `setsid()` descendants; it falls back to process-group cleanup when unavailable. Use `cgroupMode: "required"` for a fail-closed integration; required mode is preflighted before Claude starts.
@@ -114,7 +115,7 @@ be selected explicitly:
 
 ```bash
 export PI_CLAUDE_SUPERVISOR_TRANSPORT=jsonl
-export PI_CLAUDE_SUPERVISOR_WORKER='claude --safe-mode --tools ""'
+export PI_CLAUDE_SUPERVISOR_WORKER='claude --permission-mode acceptEdits'
 ```
 
 This adds Claude Code stream-json flags and frames supervisor messages as JSONL.
@@ -130,12 +131,17 @@ scheduling, structured handoffs, aggregate acceptance and graph-aware recovery;
 it will not grant any Worker remote push or main/integration merge authority.
 Unattended local development is the target operating mode; a blocked or failed
 candidate is parked with its evidence rather than made dependent on a human being
-online. Automatic mode accepts only the bare direct Claude command name, pins its
-operator-owned resolved executable path, and uses a fail-closed Bash sandbox with no
-outbound domains; arbitrary custom executables and explicit executable paths are rejected
-in automatic mode. Set `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` when the resolved path must
-be pinned explicitly. Manual/custom integrations must provide an equivalent host/network
-boundary.
+online. Automatic mode preserves Claude Code's normal argument and extension surface:
+its tools, agents, background tasks, plugins, MCP configuration, credentials and network
+access are not replaced with a sandbox or allowlist. `CLAUDECODE` is removed from the
+Worker environment so nested Claude sessions can start, and the Supervisor-owned cgroup
+still cleans every descendant. The adapter adds only the stream-json transport framing
+and its known direct command policy refuses remote push/main integration operations.
+Automatic mode still accepts only the bare direct Claude command name, pins its
+operator-owned resolved executable path, and rejects explicit executable paths or
+writable/untrusted locations. Set `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` when the resolved
+path must be pinned explicitly. Custom tools and nested workers are trusted capabilities,
+so a hard remote/main boundary must remain independently protected outside this process.
 Set `PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=0` only for a task that intentionally
 produces no local commit candidate, or set `autonomy.requireLocalCommit` in its spec;
 automatic mode still requires a valid Git baseline and non-protected worktree.
@@ -171,13 +177,12 @@ work. If the old Pi owner is dead, add `--takeover` only after the lease proves
 the old Worker's process group is gone and its cgroup is a real, readable empty
 boundary; missing or unverifiable Worker evidence is refused.
 For a persistent tmux Worker, use explicit `adopt-tmux` instead of takeover.
-The adapter intentionally does not inherit arbitrary host environment variables.
 Manual embedding integrations may pass credentials through an explicit
-`WorkerStartInput.env`; automatic mode accepts only documented Claude provider
-variables, for example `PI_CLAUDE_SUPERVISOR_WORKER_ENV=ANTHROPIC_API_KEY`, and
-filters remote credentials and configuration-injection variables. The host-side
-`PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` setting pins the executable identity and is not
-passed into the Worker environment.
+`WorkerStartInput.env`. Automatic mode passes the full supervisor environment to the
+Worker (except `CLAUDECODE`), including provider/remote credentials, credential helpers,
+configuration and proxy settings. Keep the Supervisor's own environment appropriate for
+the task; `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` pins executable identity but is otherwise
+not used to select the Claude binary.
 
 ### tmux/PTY transport
 

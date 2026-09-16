@@ -17,8 +17,8 @@ const inheritedNames = [
 ] as const;
 
 /**
- * Build a least-privilege worker environment. Credentials and arbitrary host
- * variables are not inherited unless the caller explicitly supplies them.
+ * Build the baseline Worker environment. The small inherited set keeps manual
+ * embedding behavior stable; callers may add any explicit variables they need.
  */
 export function workerEnvironment(
   inherited: NodeJS.ProcessEnv = process.env,
@@ -35,109 +35,34 @@ export function workerEnvironment(
 }
 
 /**
- * Restrict explicit variables supplied to an unattended Worker. This is not a
- * network sandbox, but it removes common remote-repository credentials and
- * disables the Git/package-manager credential helpers before command policy
- * gets a chance to inspect a structured Bash request.
+ * Automatic mode intentionally does not filter credentials, network settings,
+ * package-manager configuration or Claude extensions. It inherits the full
+ * explicit environment so Claude Code, MCP servers and nested agents retain
+ * their normal capabilities. CLAUDECODE is removed because Claude Code uses it
+ * to reject a deliberately nested session; process/cgroup cleanup still owns
+ * every descendant of the Worker.
  */
 export function automaticWorkerEnvironment(explicit: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(explicit)) {
-    if (value !== undefined && isAutomaticAllowedName(name) && (!isRemoteCredentialName(name) || isProviderCredentialName(name))) result[name] = value;
+    if (value !== undefined && name !== "CLAUDECODE") result[name] = value;
   }
-  result.GIT_CONFIG_NOSYSTEM = "1";
-  result.GIT_CONFIG_SYSTEM = process.platform === "win32" ? "NUL" : "/dev/null";
-  result.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
-  result.GIT_CONFIG_COUNT = "3";
-  result.GIT_CONFIG_KEY_0 = "credential.helper";
-  result.GIT_CONFIG_VALUE_0 = "";
-  result.GIT_CONFIG_KEY_1 = "http.proxy";
-  result.GIT_CONFIG_VALUE_1 = "http://127.0.0.1:9";
-  result.GIT_CONFIG_KEY_2 = "https.proxy";
-  result.GIT_CONFIG_VALUE_2 = "http://127.0.0.1:9";
-  result.GIT_TERMINAL_PROMPT = "0";
-  result.GIT_SSH_COMMAND = "false";
-  result.GH_CONFIG_DIR = process.platform === "win32" ? "NUL" : "/dev/null";
-  result.NPM_CONFIG_USERCONFIG = process.platform === "win32" ? "NUL" : "/dev/null";
-  result.npm_config_userconfig = result.NPM_CONFIG_USERCONFIG;
   return result;
 }
 
 /**
- * Ask Claude Code to sandbox Bash and its descendants. The API process keeps
- * its provider connection, while Worker-launched commands get no outbound
- * network and cannot silently fall back to an unsandboxed shell. Automatic mode
- * admits only the direct Claude command name. Startup resolves and pins its
- * operator-owned executable path so a custom path or writable replacement
- * cannot silently omit this boundary.
- */
-const automaticToolAllowlist = new Set([
-  "Bash",
-  "Edit",
-  "Glob",
-  "Grep",
-  "Read",
-  "Write",
-  "NotebookEdit",
-  "AskUserQuestion",
-]);
-
-/**
- * The automatic Worker is the only Claude session allowed to drive the local
- * lifecycle. Keep its tool surface explicit: nested agents/background tasks
- * can start a second reviewer, outlive the Worker, or hide work from the
- * Supervisor's event stream. The safe-mode and strict-MCP flags also prevent
- * project/user customizations from reintroducing that capability.
+ * Validate the executable identity used by automatic mode. Claude's normal
+ * command-line arguments are otherwise left untouched: tool extensions,
+ * agents, background tasks, MCP configuration and network access belong to
+ * Claude Code's full development surface. Stream-json transport flags are
+ * added by the adapter, while the supervisor policy still blocks known remote
+ * push/main integration and destructive operations.
  */
 export function automaticClaudeArgs(command: string, args: readonly string[] = []): string[] {
   if (!isDirectClaudeName(command)) {
     throw new Error("automatic supervision requires the direct Claude executable command name; custom executable paths need their own host boundary");
   }
-  if (args.some((arg) => arg === "--settings" || arg.startsWith("--settings="))) {
-    throw new Error("automatic Claude supervision controls --settings; remove the caller-provided settings override");
-  }
-  for (const option of ["--allowedTools", "--allowed-tools", "--agent", "--agents", "--plugin-dir", "--plugin-url", "--resume", "-r", "--continue", "-c", "--bg", "--background", "--remote-control", "--tmux", "--worktree", "-w"]) {
-    if (args.some((arg) => arg === option || arg.startsWith(`${option}=`))) {
-      throw new Error(`automatic Claude supervision controls ${option}; remove the caller-provided session or tool-extension override`);
-    }
-  }
-  const result = [...args];
-  const tools = requestedAutomaticTools(result);
-  if (tools === undefined) result.push("--tools", [...automaticToolAllowlist].join(","));
-  else if (tools.some((tool) => !automaticToolAllowlist.has(tool))) {
-    throw new Error("automatic Claude supervision permits only the bounded local tool allowlist; nested agents and background reviewers are disabled");
-  }
-  result.push(
-    "--safe-mode",
-    "--strict-mcp-config",
-    "--disallowed-tools",
-    "Task,TaskOutput,Agent,Skill,SendUserMessage",
-    "--settings",
-    JSON.stringify({
-      sandbox: {
-        enabled: true,
-        failIfUnavailable: true,
-        allowUnsandboxedCommands: false,
-        network: { allowedDomains: [] },
-      },
-    }),
-  );
-  return result;
-}
-
-function requestedAutomaticTools(args: string[]): string[] | undefined {
-  const index = args.findIndex((arg) => arg === "--tools" || arg.startsWith("--tools="));
-  if (index < 0) return undefined;
-  const values = args[index].startsWith("--tools=")
-    ? [args[index].slice("--tools=".length)]
-    : (() => {
-        const collected: string[] = [];
-        for (let cursor = index + 1; cursor < args.length && !args[cursor]!.startsWith("-"); cursor += 1) collected.push(args[cursor]!);
-        return collected;
-      })();
-  const tools = values.flatMap((value) => value.split(/[\s,]+/u)).map((value) => value.trim()).filter(Boolean);
-  if (tools.includes("default")) throw new Error("automatic Claude supervision requires an explicit tool allowlist; --tools default is not permitted");
-  return tools.map((tool) => tool.replace(/\(.*/u, ""));
+  return [...args];
 }
 
 /**
@@ -211,38 +136,4 @@ async function assertSecureExecutablePath(path: string): Promise<void> {
       directory = parent;
     }
   }
-}
-
-const automaticEnvironmentAllowlist = new Set([
-  "ANTHROPIC_API_KEY",
-  "ANTHROPIC_AUTH_TOKEN",
-  "ANTHROPIC_BASE_URL",
-  "CLAUDE_CODE_OAUTH_TOKEN",
-  "CLAUDE_CODE_USE_BEDROCK",
-  "CLAUDE_CODE_USE_VERTEX",
-  "CLAUDE_CODE_USE_FOUNDRY",
-  "AWS_PROFILE",
-  "AWS_REGION",
-  "AWS_DEFAULT_REGION",
-  "AWS_SDK_LOAD_CONFIG",
-  "GOOGLE_CLOUD_PROJECT",
-  "GOOGLE_CLOUD_REGION",
-  "CLOUD_ML_REGION",
-  "NO_COLOR",
-  "CI",
-]);
-
-function isAutomaticAllowedName(name: string): boolean {
-  return automaticEnvironmentAllowlist.has(name);
-}
-
-function isProviderCredentialName(name: string): boolean {
-  return name === "ANTHROPIC_API_KEY" || name === "ANTHROPIC_AUTH_TOKEN" || name === "CLAUDE_CODE_OAUTH_TOKEN";
-}
-
-export function isRemoteCredentialName(name: string): boolean {
-  if (isProviderCredentialName(name)) return false;
-  return /^(?:SSH_AUTH_SOCK|GIT_ASKPASS|GIT_SSH_COMMAND|GIT_CREDENTIAL_HELPER|GIT_CONFIG(?:_|$)|GH_CONFIG_DIR|NPM_CONFIG_USERCONFIG|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|AZURE_CLIENT_ID|AZURE_CLIENT_SECRET|AZURE_TENANT_ID|GOOGLE_APPLICATION_CREDENTIALS|KUBECONFIG)$/iu.test(name)
-    || /(?:^|_)(?:GITHUB|GH|GITLAB|BITBUCKET|NPM|NODE_AUTH|CODEARTIFACT|HUGGINGFACE|DOCKER|AWS|AZURE|GOOGLE|CI_JOB)(?:_|$)/iu.test(name)
-    || /(?:^|_)(?:TOKEN|PASSWORD|PASSWD|SECRET|PRIVATE_KEY|ACCESS_KEY|AUTH_TOKEN|API_KEY|CREDENTIALS?)(?:_|$)/iu.test(name);
 }

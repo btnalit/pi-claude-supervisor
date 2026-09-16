@@ -15,7 +15,8 @@
 > preflight 和阶段进度通知；真实 Claude Code `2.1.270` 允许编辑的
 > repair/reacceptance 演练已在隔离临时 worktree 通过。确认的产品目标是本地开发
 > 完全无人值守；详见 [自动化目标](docs/autonomy-target.md)。代码进入远程仓库或
-> main/integration 分支必须经过独立边界，Worker 不拥有 push/merge 权限。
+> main/integration 分支仍必须经过独立边界；Supervisor 管理的直接 push/merge 请求会拒绝，
+> 而嵌套/自定义能力的硬边界必须由独立保护机制提供。
 >
 > **无人值守状态：** 自动模式会自主完成本地修改、测试、有限修复、验收、独立 Review
 > 和本地提交检查；无法形成候选时自动挂起为不可发布候选。可选出站通知不授予权限，
@@ -25,13 +26,14 @@
 
 - 不会在扩展加载时自动启动 Worker。
 - 不经过 shell 启动子进程。
-- Worker 只继承最小环境；自动模式采用默认拒绝的环境变量 allowlist，过滤远程凭据并禁用 Git/包管理器 credential helper。自动模式只能选择文档列出的 Claude provider 变量；任意自定义变量仅限手动集成。
-- 本地命令和权限行为按任务/运行时授权策略处理；超出授权的动作自动拒绝或挂起，不要求同步人工响应。
+- 手动 Worker 保留小型继承环境，调用方也可以显式传入任意变量。自动 Claude Worker 继承 Supervisor 的完整环境，只移除 `CLAUDECODE`（Claude Code 用它拒绝嵌套会话）；远程凭据、Git/包管理器 helper、自定义配置和网络设置都不会被过滤。
+- 自动模式保留完整 Claude Code 工具面，包括 Agent、Task、后台任务、插件和 MCP；适配器只添加 stream-json transport framing，并把所有 Worker 后代放入 Supervisor 自有的清理边界。由于没有同步在线用户，`AskUserQuestion` 会转换为普通文本。
+- 本地命令和权限行为按任务/运行时策略处理；已知的直接 remote push/main-integration 操作和 Git 元数据写入仍会拒绝或挂起，不要求同步人工响应。嵌套/自定义工具继承这些能力并随 Worker 清理，不另起第二套 Supervisor 权限循环。
 - Linux 上优先使用可写的 cgroup v2 清理后代进程，包括 `setsid()` 后代；不可用时回退到进程组清理。需要强制失败闭环时，embedding 集成可使用 `cgroupMode: "required"`，并会在 Claude 启动前执行 preflight。
-- 自动模式只接受裸的 `claude`/`claude.exe` 命令名，并从 Supervisor 的 PATH 解析、固定由操作者拥有的可执行文件（或使用 `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` 固定路径）；显式路径和可写/不可信位置会被拒绝。它请求 fail-closed 的 Claude Code Bash sandbox，禁止 Bash 子进程出站联网；命令策略仍是第二道门。手动/自定义集成必须自行提供等效 host/network 边界。
+- 自动模式只接受裸的 `claude`/`claude.exe` 命令名，并从 Supervisor 的 PATH 解析、固定由操作者拥有的可执行文件（或使用 `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` 固定路径）；显式路径和可写/不可信位置会被拒绝。自定义工具和嵌套 Worker 是受信任能力，硬性的 remote/main 边界仍必须由此进程之外的独立受保护边界提供。
 - Worker 声称完成只会进入 `verifying`，不能作为成功证据。
 - 默认独立验收命令为 `git diff --check`。
-- 目标是任务启动后本地开发无人值守：Worker 可以修改、测试、修复和本地提交；Worker 必须没有远程 push 或合并到 `main`/integration 分支的权限。
+- 目标是任务启动后本地开发无人值守：Worker 可以修改、测试、修复和本地提交；Supervisor 管理的 remote push 或合并到 `main`/integration 分支请求仍会拒绝，嵌套/自定义能力的最终 remote/main 边界必须由独立保护机制提供。
 - 扩展运行时不执行 merge、deploy、release 或 publish；远程/main 集成和仓库 Release 必须经过独立受保护边界。
 - 默认 4 小时总时限、20 分钟无输出 watchdog 超时即停止 Worker；paused 期间不消耗无输出预算，resume 会重建基准但不会重置总时限。嵌入调用方可将对应选项设为 `0` 关闭。
 - 验收命令、仓库证据收集和独立 Reviewer 共用 abort signal，人工 stop/shutdown 不必等待完整超时。
@@ -48,7 +50,7 @@ pi install npm:pi-claude-supervisor
 
 ```bash
 export PI_CLAUDE_SUPERVISOR_MODE=auto
-export PI_CLAUDE_SUPERVISOR_WORKER='claude --safe-mode --tools Bash'
+export PI_CLAUDE_SUPERVISOR_WORKER='claude --permission-mode acceptEdits'
 # 可选：候选/失败通知；generic 或 wecom
 export PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL='https://example.invalid/webhook'
 export PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_FORMAT=generic
@@ -127,8 +129,8 @@ Reviewer 只能使用 `read`、`grep`、`find`、`ls`，不会修改工作树或
 Worker 启动前捕获 git baseline，要求完整的 baseline-relative tracked/commit/untracked evidence，
 并在默认情况下要求 Worker 在非保护分支本地 commit；无效输出、证据不完整、重复 finding、P0/P1 或预算耗尽
 会自动挂起候选。自动模式拒绝 process-pipe，并在模型执行前检查目录、可执行文件、依赖
-和 cgroup；Worker 环境会过滤远程仓库凭据并禁用 Git 全局凭据 helper。详见 [自动化目标](docs/autonomy-target.md)。协同多 Worker 属于后续独立开发阶段，
-自动模式只接受裸的直接 Claude 命令名，会固定解析后的操作者拥有的可执行文件，并请求 fail-closed 的 Claude Code Bash sandbox；任意自定义可执行文件和显式可执行路径会在自动模式拒绝。需要固定路径时设置 `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE`。手动/自定义 Worker 的完整 host-level sandbox 仍需由集成方提供。
+和 cgroup；Claude 的完整工具、Agent/Task、插件、MCP、网络和环境会保持可用。详见 [自动化目标](docs/autonomy-target.md)。协同多 Worker 属于后续独立开发阶段，
+自动模式只接受裸的直接 Claude 命令名，会固定解析后的操作者拥有的可执行文件；任意自定义可执行文件和显式可执行路径会在自动模式拒绝。需要固定路径时设置 `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE`。自定义工具和嵌套 Worker 的 remote/main 权限必须由独立 host/仓库边界保护。
 
 ### tmux/PTY 交互模式
 

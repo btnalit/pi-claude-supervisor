@@ -20,7 +20,7 @@
 - `pi-interactive-shell` 如果通过版本、API、许可证和故障测试，应优先复用其 PTY 和人工接管实现。
 - `pi-claude-code`、`pi-harness-delegate` 在完成供应链、API 和故障语义审计前，不作为核心依赖。
 
-**结论：架构方向 GO；先完成固定版本 Spike、生命周期和故障恢复主线。当前自动模式已把直接 Claude 的 fail-closed sandbox、无出站域名、JSONL transport、Git baseline 和分支校验作为启动边界，并拒绝任意自定义可执行文件；手动集成的 host-level 低权限和网络隔离仍是后续加固。另经产品确认，本地开发必须完全无人值守；远程 push 和 main/integration merge 是 Worker 不具备权限的独立边界。详见 [autonomy-target.md](autonomy-target.md)。**
+**结论：架构方向 GO；生命周期、故障恢复和独立验收主线已完成。产品目标是本地开发完全无人值守，因此当前自动模式保留 Claude Code 的完整环境、网络、工具、Agent/Task、插件、MCP 和嵌套 Claude 能力；只保留已知直接 remote push/main-integration 操作的策略拒绝、Git 元数据保护、cgroup 清理和独立验收。`CLAUDECODE` 仅为允许嵌套会话而移除；自定义/嵌套工具如需绝对 remote/main 隔离，必须由独立 host/repository 边界提供。详见 [autonomy-target.md](autonomy-target.md)。**
 
 ## 2. 外部参考源审查结果
 
@@ -222,7 +222,7 @@ MVP 必须满足：
 
 - 单仓库、单 worktree、单 Worker；
 - 本地开发动作按任务授权自动继续、修复或挂起；
-- 不授予 Worker 远程 push 或 main/integration merge 权限；
+- Supervisor 管理的直接 remote push 或 main/integration merge 请求必须拒绝，并由独立边界保护自定义/嵌套能力；
 - 事件可以完整回放；
 - 人工 takeover 后零自动发送；
 - 验收失败绝不进入 `COMPLETE`；
@@ -238,7 +238,7 @@ MVP 必须满足：
 - 依赖 lockfile 和 SBOM；
 - 包来源校验；
 - 手动/自定义集成的最小权限和 host-level sandbox；
-- 手动/自定义集成的网络白名单；自动 Claude 路径已请求无出站域名并在不可用时失败；
+- 手动/自定义集成的网络和 host 权限边界；自动 Claude 路径保留完整网络、工具和 MCP 能力；
 - 更广泛的密钥隔离；
 - 日志脱敏；
 - 成本和时间告警；
@@ -246,9 +246,10 @@ MVP 必须满足：
 - 可随时关闭自动化；
 - 故障回滚、候选挂起和可选通知。
 
-其中手动/自定义集成的 host-level 低权限、sandbox 和网络白名单不阻塞当前生命周期验证；
-自动模式不接受没有 Claude sandbox 边界的自定义 Worker。本地运行权限由任务和调用方授权策略
-控制，远程 push/main merge 仍由独立边界控制。
+其中手动/自定义集成的 host-level 低权限和网络边界不阻塞当前生命周期验证；自动模式
+允许 Agent/Task、插件、MCP 和嵌套 Claude，cgroup 只负责后代清理，已知直接
+remote push/main merge 仍由策略和独立边界控制。嵌套/自定义工具若需要绝对隔离，必须
+由 host/repository 边界提供。
 
 ### 5.4 建议 Go / No-Go 门槛
 

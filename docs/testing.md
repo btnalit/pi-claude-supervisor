@@ -36,8 +36,9 @@ the published TypeScript source directly and there is no second runtime bundle.
   blank turn, idle adoption emits no synthetic completion, adopted pipe
   detachment permits re-adoption, and adopted stop preserves the user's
   session.
-- `worker/environment.test.ts`: unrelated host credentials are excluded unless
-  explicitly supplied.
+- `worker/environment.test.ts`: manual environment inheritance remains minimal, while
+  automatic mode preserves explicit credentials, helpers, settings and custom variables and
+  removes only `CLAUDECODE` so nested Claude can run.
 - `supervisor.test.ts`: the no-output watchdog stops a stalled worker, lifecycle event failures are retried, and output is restored when event persistence fails.
 - `scripts/check-package.mjs`: verifies the Pi manifest, peer dependency policy,
   required files and forbidden secret paths.
@@ -62,8 +63,8 @@ run used Claude Code `2.1.270` and covered real owned tmux turns, pause/resume,
 and restart re-adoption.
 The adapter regression suite also verifies event subscription, parsed
 `permission_request` events, the exact nested `control_response` envelope, and
-that an automatic tmux Worker cannot launch a second Claude executable from a
-Worker-created script.
+that an automatic Worker may launch a nested Claude executable while cgroup
+cleanup still reaps the child.
 The automation spike additionally exercises a real Pi SDK Decision Worker with
 Claude: ordinary completion, harmless Bash permission handling, and an
 `AskUserQuestion` denial-to-text fallback followed by automatic verification.
@@ -143,11 +144,11 @@ The tmux transport is selected with `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`.
 Automatic mode rejects explicit `process-pipe`; use JSONL or the Supervisor-owned
 bridge for bounded decisions and repair. Automatic JSONL and tmux workers also
 require Linux cgroup v2 containment (and the tmux parent-death guardian); startup
-fails closed when it is unavailable. Built-in Claude workers also receive a fail-closed
-sandbox setting (`failIfUnavailable`, `allowUnsandboxedCommands=false`, no outbound
-network domains); verify that startup fails if the sandbox cannot be initialized.
-Automatic startup also requires a full existing Git baseline, non-bare non-protected
-worktree and the bare `claude`/`claude.exe` command name. It resolves and pins an
+fails closed when it is unavailable. Automatic workers preserve Claude Code's normal
+arguments, environment, network access, tools, agents, plugins and MCP configuration;
+there is no injected sandbox or automatic tool allowlist. Automatic startup also requires
+a full existing Git baseline, non-bare non-protected worktree and the bare
+`claude`/`claude.exe` command name. It resolves and pins an
 operator-owned, non-writable executable path (or the path configured by
 `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE`), rejects explicit/custom executable paths, and
 compares the exact startup HEAD again immediately before spawn. Before release, verify:
@@ -169,8 +170,8 @@ response.
 The automated adapter matrix covers external `SIGTERM`, `SIGINT`, `SIGKILL`,
 `SIGSTOP`/`SIGCONT`, SIGTERM refusal/escalation, leader-early-exit descendant
 cleanup, required cgroup bootstrap containment of a pre-attachment detached
-and `setsid()` descendant, automatic nested-Claude detection across the worker
-cgroup, repeated stop, spawn failure, output truncation,
+and `setsid()` descendant, nested Claude/agent descendant allowance with cgroup cleanup,
+repeated stop, spawn failure, output truncation,
 blocked stdin write timeouts, and immediate JSONL results. The Supervisor
 matrix also covers retrying failed lifecycle events, preserving startup event
 order, stopping under persistent timeout-event failure, and restoring output
@@ -266,8 +267,10 @@ Required deterministic and integration coverage:
 - conflicting diffs detected before integration, with no same-worktree writes;
 - independent child acceptance followed by root-task aggregate acceptance and Review;
 - single-child recovery, whole-graph recovery and Pi shutdown during scheduling;
-- no child can grant permissions, send control input to another child or bypass Policy Gate;
-- independent integration in a separate worktree; the Worker has no remote push or main/integration merge authority, and no candidate bypasses that boundary.
+- scheduler-owned children cannot grant permissions or send control input to another scheduled child;
+  Claude-native Agent/Task/MCP descendants remain trusted inside their Worker's cleanup cgroup;
+- independent integration in a separate worktree; known direct remote push/main operations remain
+  policy-denied, while absolute enforcement for trusted nested/custom capabilities belongs to that boundary.
 
 The multi-worker gate should be added only after the minimum-version single-worker
 stability and recovery gates pass. CI should use fake Workers and replay fixtures;

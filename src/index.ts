@@ -768,6 +768,7 @@ function formatSessions(sessions: Map<string, Supervisor>, recoverable: Decision
 }
 
 function selectedWorkerEnvironment(automatic = false): NodeJS.ProcessEnv {
+  if (automatic) return automaticWorkerEnvironment(process.env);
   const result: NodeJS.ProcessEnv = {};
   const names = (process.env.PI_CLAUDE_SUPERVISOR_WORKER_ENV ?? "")
     .split(",")
@@ -776,7 +777,7 @@ function selectedWorkerEnvironment(automatic = false): NodeJS.ProcessEnv {
   for (const name of names) {
     if (process.env[name] !== undefined) result[name] = process.env[name];
   }
-  return automatic ? automaticWorkerEnvironment(result) : result;
+  return result;
 }
 
 async function readTaskSpecFile(path: string, cwd: string): Promise<TaskSpec> {

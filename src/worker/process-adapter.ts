@@ -15,7 +15,6 @@ import type {
 } from "../types.ts";
 import { assertSafeWorkerCommand } from "../policy.ts";
 import { workerEnvironment } from "./environment.ts";
-import { isClaudeProcess, linuxCgroupProcesses, linuxProcessTree, sameProcessIdentity, unexpectedClaudeProcess, unexpectedReviewerProcess, type ProcessTreeEntry } from "./process-tree.ts";
 
 export interface ProcessWorkerAdapterOptions {
   /** Use Claude Code's documented stream-json stdin/stdout framing. */
@@ -80,9 +79,7 @@ interface ProcessRecord {
   inputTail: Promise<void>;
   listeners: Set<WorkerEventListener>;
   permissionResponses: Set<string>;
-  enforceNestedClaude: boolean;
-  expectedClaudeCommand?: string;
-  trustedClaudeProcesses: Map<number, ProcessTreeEntry>;
+  automatic: boolean;
   stopping?: boolean;
   starting: boolean;
   abortRequested: boolean;
@@ -246,9 +243,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       inputTail: Promise.resolve(),
       listeners: new Set(input.eventListener ? [input.eventListener] : []),
       permissionResponses: new Set(),
-      enforceNestedClaude: Boolean(input.automatic),
-      expectedClaudeCommand: input.automatic ? input.command : undefined,
-      trustedClaudeProcesses: new Map(),
+      automatic: Boolean(input.automatic),
       starting: true,
       abortRequested: false,
       startupToken: input.startupToken,
@@ -343,23 +338,6 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
         }
         throw startupError;
       }
-      if (record.enforceNestedClaude) {
-        try {
-          await this.#rememberClaudeProcesses(record);
-        } catch (error) {
-          let cleanupError: unknown;
-          try { await this.stop(handle, "worker containment startup failed"); }
-          catch (stopError) { cleanupError = stopError; }
-          if (cleanupError) {
-            const startupError = error instanceof Error ? error : new Error(String(error));
-            startupError.message = `${startupError.message}; startup cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
-            Object.defineProperty(startupError, "workerHandle", { value: handle, enumerable: false });
-            Object.defineProperty(startupError, "workerCleanupRequired", { value: true, enumerable: false });
-            throw startupError;
-          }
-          throw error;
-        }
-      }
       if (input.task) {
         this.#assertNotAborted(record);
         record.lastInputAt = new Date().toISOString();
@@ -410,7 +388,6 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   async getStatus(handle: WorkerHandle): Promise<WorkerStatus> {
     const record = this.#record(handle);
     const running = record.exitCode === undefined;
-    if (running && record.enforceNestedClaude) await this.#checkNestedClaude(record);
     if (!running && record.groupCleanup) {
       try {
         await record.groupCleanup;
@@ -429,7 +406,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       exitReason: running ? undefined : record.runtimeError ? "failed" : record.stopping ? "stopped" : record.signal ? "crashed" : record.exitCode === 0 ? "completed" : "failed",
       processGroupCleaned: record.groupCleanupComplete,
       cgroupCleaned: record.cgroupPath ? record.groupCleanupComplete : undefined,
-      cgroupRequired: this.#cgroupMode === "required" || record.enforceNestedClaude,
+      cgroupRequired: this.#cgroupMode === "required" || record.automatic,
       cgroupError: record.cgroupError?.message,
       cleanupError: record.cleanupError?.message,
       runtimeError: record.runtimeError?.message,
@@ -711,64 +688,6 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       throw new Error(`worker cgroup controls are unavailable: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
     return path;
-  }
-
-  async #processScope(record: ProcessRecord): Promise<ProcessTreeEntry[]> {
-    const rootPid = record.handle.pid ?? 0;
-    const tree = await linuxProcessTree(rootPid);
-    if (!record.cgroupPath) return tree;
-    const group = await linuxCgroupProcesses(record.cgroupPath);
-    if (record.enforceNestedClaude && !group.some((entry) => entry.pid === rootPid)) {
-      throw new Error("automatic worker is not contained by its required cgroup");
-    }
-    return [...new Map([...tree, ...group].map((entry) => [entry.pid, entry])).values()];
-  }
-
-  async #rememberClaudeProcesses(record: ProcessRecord): Promise<void> {
-    const rootPid = record.handle.pid ?? 0;
-    let entries: ProcessTreeEntry[] = [];
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      try {
-        entries = await this.#processScope(record);
-        if (entries.some((entry) => entry.ppid === rootPid && isClaudeProcess(entry, record.expectedClaudeCommand))) break;
-      } catch (error) {
-        if (attempt === 19) throw error;
-      }
-      await delay(25);
-    }
-    record.trustedClaudeProcesses = new Map(entries.filter((entry) => entry.ppid === rootPid && isClaudeProcess(entry, record.expectedClaudeCommand)).map((entry) => [entry.pid, entry]));
-  }
-
-  async #checkNestedClaude(record: ProcessRecord): Promise<void> {
-    const rootPid = record.handle.pid ?? 0;
-    let entries: ProcessTreeEntry[];
-    try { entries = await this.#processScope(record); }
-    catch (error) {
-      if (process.platform === "linux" && !record.runtimeError) {
-        record.runtimeError = new Error(`nested Claude guard unavailable: ${error instanceof Error ? error.message : String(error)}`);
-        record.stopping = true;
-        try { record.child.kill("SIGTERM"); } catch {}
-        this.#appendOutput(record, { stream: "stderr", text: `${record.runtimeError.message}\n`, at: new Date().toISOString() });
-      }
-      return;
-    }
-    if (record.trustedClaudeProcesses.size === 0) {
-      const directClaude = entries.filter((entry) => entry.ppid === rootPid && isClaudeProcess(entry, record.expectedClaudeCommand));
-      if (directClaude.length > 0) {
-        record.trustedClaudeProcesses = new Map(directClaude.map((entry) => [entry.pid, entry]));
-        return;
-      }
-    }
-    const nestedClaude = unexpectedClaudeProcess(entries, record.trustedClaudeProcesses, record.expectedClaudeCommand);
-    const reviewerCandidate = unexpectedReviewerProcess(entries);
-    const trustedReviewerCandidate = reviewerCandidate && record.trustedClaudeProcesses.get(reviewerCandidate.pid);
-    const nestedReviewer = reviewerCandidate && (!trustedReviewerCandidate || !sameProcessIdentity(trustedReviewerCandidate, reviewerCandidate)) ? reviewerCandidate : undefined;
-    const nested = nestedClaude ?? nestedReviewer;
-    if (!nested || record.runtimeError) return;
-    record.runtimeError = new Error(`${nested === nestedReviewer ? "nested Reviewer" : "nested Claude"} process denied (pid=${nested.pid})`);
-    record.stopping = true;
-    try { record.child.kill("SIGTERM"); } catch {}
-    this.#appendOutput(record, { stream: "stderr", text: `${record.runtimeError.message}\n`, at: new Date().toISOString() });
   }
 
   #record(handle: WorkerHandle): ProcessRecord {

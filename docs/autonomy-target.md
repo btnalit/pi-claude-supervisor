@@ -35,26 +35,27 @@ JSONL Worker or Supervisor-owned tmux bridge, and by default requires a local co
 Automatic Worker supervision uses either the structured JSONL transport or a
 Supervisor-owned tmux bridge. The bridge runs Claude's stream-json protocol inside the live
 PTY, renders a human-readable display, and returns private framed records through the same
-PTY; adopted tmux sessions remain manual-only. The Worker and local automation do **not**
-receive authority or credentials for:
+PTY; adopted tmux sessions remain manual-only. Automatic local work still has no Supervisor API
+for remote push or merging into `main` or another protected integration branch. It also refuses
+known direct Bash forms of those operations, protected Git metadata writes and package publication.
+Starting candidate work directly on a protected integration branch remains refused; automatic
+repositories use a non-protected local branch.
 
-- pushing code to a remote repository;
-- merging into `main` or another protected integration branch;
-- starting automatic candidate work directly on a protected integration branch; repositories with a
-  branch use a non-protected local branch for unattended work;
-- inheriting Git/GitHub/package credential helpers or explicitly selected remote credentials in
-  automatic mode.
+Automatic Claude workers intentionally inherit credentials, helpers, network configuration and
+custom Claude configuration. Agents, background tasks, plugins, MCP servers and nested Claude
+processes are allowed and remain inside the Supervisor-owned process/cgroup cleanup boundary.
+Those custom or nested capabilities are trusted local execution, not a second Supervisor
+permission loop; an absolute remote/main security boundary for them must be provided by the
+repository, host or protected integration service.
 
 A completed local task is a candidate until it passes the independent boundary. That boundary may
 be a later read-only review, CI policy, a maintainer action, or an explicit shutdown/rejection.
-The Worker must not be able to bypass it through a prompt, a local decision, or a model response.
+No local decision or model response may turn a blocked candidate into a published result.
 
-This is the required authority boundary. Automatic mode admits only the bare direct Claude
-command name and pins its operator-owned resolved executable because its fail-closed Claude Code
-sandbox is part of the supported boundary; explicit paths and arbitrary custom executables must
-use manual mode or an independently hardened integration. No additional
-synchronous human-approval boundary should be invented for local editing, local tests, local
-commits, or local repair unless the task owner explicitly configures one.
+Automatic mode still admits only the bare direct Claude command name and pins its operator-owned
+resolved executable. No additional synchronous human-approval boundary should be invented for
+local editing, local tests, local commits or local repair unless the task owner explicitly
+configures one.
 
 ## 3. Unattended decision behavior
 
@@ -110,10 +111,12 @@ again during recovery.
 
 Legacy `humanRequired`, takeover and approval fields remain for compatibility and explicit operator
 control. They are not entered by ordinary uncertainty, and a legacy approval object cannot override
-the deterministic remote push/main merge denial. The existing independent Review and protected
-CI/release paths remain the final external checks. Built-in automatic Claude workers request a fail-closed Claude Code Bash sandbox with no
-outbound domains; automatic command policy and credential filtering remain defense in depth.
-Full host-level sandboxing for custom Worker integrations is separate hardening work.
+the deterministic known-command remote push/main merge denial. The existing independent Review
+and protected CI/release paths remain the final external checks. Automatic Claude workers preserve
+Claude Code's normal environment, network, tool, agent and MCP surface; `CLAUDECODE` is removed
+only to permit intentional nested Claude sessions. The Supervisor-owned cgroup remains a cleanup
+boundary, not a capability allowlist. Full host/repository enforcement for untrusted custom or
+nested integrations remains the independent boundary's responsibility.
 
 ## 7. Explicit non-goals of this target
 

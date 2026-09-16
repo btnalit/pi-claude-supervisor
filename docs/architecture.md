@@ -27,8 +27,9 @@ The extension keeps a registry of independent task sessions. Each session has
 its own Supervisor, watchdog, state machine and Worker handle, while the event
 log is shared and protected by an inter-process lock. Once a task starts, the
 local development loop is intended to run unattended: the Worker may edit, test,
-repair and commit locally. Remote push and merge into `main`/an integration branch
-are outside Worker authority and cross an independent boundary. Concurrent active sessions must use non-overlapping canonical working
+repair and commit locally. Supervisor-managed remote push and merge into `main`/an integration branch
+requests remain outside the local loop and cross an independent boundary; custom/nested tools require
+that boundary to enforce the same rule independently. Concurrent active sessions must use non-overlapping canonical working
 directories/worktrees; same-cwd and parent/child cwd starts are rejected before
 spawn, including concurrent starts, to prevent uncoordinated edits. Pending starts
 are also awaited during Pi shutdown.
@@ -113,18 +114,19 @@ parent-death guardian is unavailable.
 An owned manual worker gets a private tmux server/socket and executes the
 validated Claude command directly in the pane. An owned automatic worker instead
 starts the Supervisor bridge through a cgroup-joining pane bootstrap, so its
-bridge identity is not a manual adoption target. The worker
-environment is supplied to the tmux server through the same least-privilege
-environment builder; credentials are not copied into a file; credential-shaped
-command arguments are rejected.
+bridge identity is not a manual adoption target. The worker environment is
+passed through unchanged (apart from removing `CLAUDECODE` so nested Claude can
+start); credentials are not copied into a file, and credential-shaped command
+arguments are still rejected.
 `load-buffer`, bracketed `paste-buffer` and `send-keys Enter` provide the input
 boundary without interpolating a task into a shell command. C0/C1 terminal
-control bytes are rejected; CRLF is normalized to a newline. In automatic mode,
-the adapter snapshots the trusted direct Claude process and checks both the
-required Linux cgroup and process tree on every poll; a newly executed Claude or
-Reviewer descendant is a runtime policy failure and the owned session is stopped.
-This supplements the lexical Bash/file-tool boundary and is disabled for
-manual/adopted sessions.
+control bytes are rejected; CRLF is normalized to a newline. Automatic agents,
+background tasks, plugins, MCP servers and nested Claude processes stay in the
+same cgroup and are cleaned with the Worker; they are intentionally not rejected
+or polled as a nested-process policy failure. The lexical Bash/file-tool policy
+still handles known direct remote/main operations, while custom descendants are
+trusted and require an independent host/repository boundary for stronger
+protection.
 
 The transport has three deliberately separate observations:
 
@@ -308,13 +310,12 @@ limit, so a normal large test report is not misclassified as a failed command.
 - unauthenticated inbound webhook commands; outbound notifications are optional,
   do not grant permission and do not replace the remote/main independent boundary;
 - treating an unknown Claude interactive question as safe without task evidence or configured authorization;
-- bypassing the configured Claude Code/task permissions;
+- bypassing the known direct remote/main command and Git metadata boundaries;
 - accepting model text as verification;
 - shell command interpolation;
-- a host-level network sandbox for manual integrations. Automatic mode does not admit
-  arbitrary custom executables: its supported Worker is direct Claude, which requests a
-  fail-closed Claude Code Bash sandbox with no outbound domains; command policy and
-  credential filtering remain defense in depth;
+- a host-level network sandbox for automatic or manual integrations. Automatic mode
+  deliberately preserves Claude Code's normal environment, network, tools, agents,
+  plugins and MCP configuration; nested/custom descendants are trusted capabilities;
 - Claude CLI multi-version compatibility in the current stability milestone;
-- full OS sandbox and low-privilege execution for custom Worker integrations in the current
-  lifecycle milestone.
+- full OS sandbox and low-privilege execution for custom or nested Worker integrations in the
+  current lifecycle milestone.

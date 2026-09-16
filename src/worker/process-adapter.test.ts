@@ -15,20 +15,24 @@ test("claude-jsonl arguments normalize controlled equals options and reject dupl
   assert.throws(() => claudeJsonlArgs(["--permission-prompts=none"]), /must be host/u);
 });
 
-test("automatic process scope catches a detached nested Claude in the worker cgroup", { skip: !requiredCgroupTestAvailable }, async () => {
+test("automatic process scope allows nested Claude and cleans all descendants", { skip: !requiredCgroupTestAvailable }, async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-process-nested-test-"));
   const fakeClaude = join(root, "claude");
   const nestedClaude = join(root, "nested", "claude");
+  const nestedPidFile = join(root, "nested.pid");
   await mkdir(join(root, "nested"), { recursive: true });
   await copyFile(process.execPath, nestedClaude);
   await chmod(nestedClaude, 0o700);
   await writeFile(fakeClaude, `#!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
 const nested = ${JSON.stringify(nestedClaude)};
+const nestedPidFile = ${JSON.stringify(nestedPidFile)};
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", data => {
   if (!data.trim()) return;
   const child = spawn(nested, ["-e", "setInterval(() => {}, 10000)"], { detached: true, stdio: "ignore" });
+  if (child.pid) writeFileSync(nestedPidFile, String(child.pid));
   child.unref();
   process.stdout.write(JSON.stringify({ type: "result", subtype: "success", session_id: "nested-test" }) + "\\n");
 });
@@ -36,16 +40,32 @@ process.stdin.on("data", data => {
   await chmod(fakeClaude, 0o700);
   const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl", cgroupMode: "required", terminationGraceMs: 100, killGraceMs: 100 });
   let handle;
+  let nestedPid: number | undefined;
   try {
     handle = await adapter.start({ task: "trigger", cwd: root, command: fakeClaude, args: [], automatic: true });
     let status = await adapter.getStatus(handle);
-    for (let attempt = 0; attempt < 100 && !status.runtimeError; attempt += 1) {
+    for (let attempt = 0; attempt < 100 && status.activeRequests !== 0; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 25));
       status = await adapter.getStatus(handle);
     }
-    assert.match(status.runtimeError ?? "", /nested Claude process denied/u);
+    assert.equal(status.runtimeError, undefined);
+    assert.equal(status.running, true);
+    assert.equal(status.activeRequests, 0);
+    for (let attempt = 0; attempt < 20 && nestedPid === undefined; attempt += 1) {
+      try { nestedPid = Number(await readFile(nestedPidFile, "utf8")); }
+      catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
+    }
+    assert.ok(nestedPid && nestedPid > 0);
   } finally {
     if (handle) await adapter.stop(handle, "nested Claude test cleanup").catch(() => {});
+    if (nestedPid) {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        try { process.kill(nestedPid, 0); }
+        catch { break; }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.throws(() => process.kill(nestedPid!, 0), /ESRCH/u);
+    }
     await rm(root, { recursive: true, force: true });
   }
 });

@@ -17,7 +17,7 @@ import { assertSafeWorkerCommand } from "../policy.ts";
 import { redactSensitive } from "../redaction.ts";
 import { workerEnvironment } from "./environment.ts";
 import { claudeJsonlArgs, cleanupCgroup, currentCgroupPath, preflightCgroupContainment } from "./process-adapter.ts";
-import { isClaudeLauncherProcess, isClaudeProcess, linuxCgroupProcesses, linuxProcessTree, readProcess, sameProcessIdentity, unexpectedClaudeProcess, unexpectedReviewerProcess, type ProcessTreeEntry } from "./process-tree.ts";
+import { isClaudeLauncherProcess, readProcess } from "./process-tree.ts";
 
 export interface TmuxWorkerAdapterOptions {
   /** Directory for launcher and output state. */
@@ -89,8 +89,6 @@ interface TmuxRecord {
   cgroupPath?: string;
   cgroupError?: Error;
   cgroupCleaned?: boolean;
-  expectedClaudeCommand?: string;
-  trustedClaudeProcesses: Map<number, ProcessTreeEntry>;
   runtimeError?: Error;
 }
 
@@ -435,8 +433,6 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       seenResultIds: new Set(),
       seenPermissionRequestIds: new Set(),
       permissionResponses: new Set(),
-      expectedClaudeCommand: structured ? input.command : undefined,
-      trustedClaudeProcesses: new Map(),
       activeRequests: 0,
       turnSequence: 0,
       readyStreak: 0,
@@ -528,7 +524,6 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         record.handle.pid = readyPane.pid;
         await this.#rememberPaneIdentity(record, readyPane.pid);
       }
-      if (record.structured) await this.#rememberClaudeProcesses(record);
       if (sendInitialInput) {
         await this.#send(record, input.task, `${id}:initial`);
       } else if (input.tmuxSession) {
@@ -891,10 +886,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       const outputBeforeInput = record.lastOutputAt;
       await this.#collectOutput(record);
       if (record.inputAt && record.lastOutputAt && Date.parse(record.lastOutputAt) >= record.inputAt && record.lastOutputAt !== outputBeforeInput) record.turnObservedOutput = true;
-      // Inspect the pane before walking its process tree. A normal stop or an
+      // Inspect the pane before capturing its screen. A normal stop or an
       // externally killed pane can remove the bridge between these two reads;
-      // treating that expected exit as a nested-process/containment failure
-      // would turn successful cleanup into a false runtime error.
+      // treating that expected exit as a runtime failure would turn successful
+      // cleanup into a false error.
       const pane = await this.#paneStatus(record);
       record.paneDead = pane.dead;
       record.panePid = pane.pid;
@@ -908,9 +903,6 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         this.#emit(record, { type: "exited", handle: record.handle, exitCode: record.exitCode, signal: record.signal });
         return;
       }
-      // During explicit cleanup the bridge is expected to disappear. Do not
-      // race that teardown with the nested Claude/Reviewer guard.
-      if (record.structured && !record.stopping) await this.#checkNestedClaude(record);
       const screen = await this.#capture(record);
       if (record.structured) {
         if (record.activeRequests === 0 && hasBridgePromptInput(screen)) {
@@ -1412,62 +1404,6 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       cgroupError: record.cgroupError?.message,
       outputTruncated: record.outputTruncated,
     };
-  }
-
-  async #processScope(record: TmuxRecord): Promise<ProcessTreeEntry[]> {
-    const rootPid = record.handle.pid ?? 0;
-    const tree = await linuxProcessTree(rootPid);
-    if (!record.cgroupPath) return tree;
-    const group = await linuxCgroupProcesses(record.cgroupPath);
-    if (!group.some((entry) => entry.pid === rootPid)) throw new Error("automatic tmux bridge is not contained by its required cgroup");
-    return [...new Map([...tree, ...group].map((entry) => [entry.pid, entry])).values()];
-  }
-
-  async #rememberClaudeProcesses(record: TmuxRecord): Promise<void> {
-    const rootPid = record.handle.pid ?? 0;
-    let entries: ProcessTreeEntry[] = [];
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      try {
-        entries = await this.#processScope(record);
-        if (entries.some((entry) => entry.ppid === rootPid && isClaudeProcess(entry, record.expectedClaudeCommand))) break;
-      } catch (error) {
-        if (attempt === 19) throw error;
-      }
-      await delay(25);
-    }
-    record.trustedClaudeProcesses = new Map(entries.filter((entry) => entry.ppid === rootPid && isClaudeProcess(entry, record.expectedClaudeCommand)).map((entry) => [entry.pid, entry]));
-  }
-
-  async #checkNestedClaude(record: TmuxRecord): Promise<void> {
-    const rootPid = record.handle.pid ?? 0;
-    let entries: ProcessTreeEntry[];
-    try { entries = await this.#processScope(record); }
-    catch (error) {
-      if (process.platform === "linux" && !record.runtimeError) {
-        record.runtimeError = new Error(`nested Claude guard unavailable: ${error instanceof Error ? error.message : String(error)}`);
-        this.#appendOutput(record, { stream: "stderr", text: `${record.runtimeError.message}\n`, at: new Date().toISOString() });
-        try { await this.#run(record, ["kill-session", "-t", record.sessionName], undefined, undefined, true); }
-        catch (cleanupError) { record.cleanupError ??= asError(cleanupError); }
-      }
-      return;
-    }
-    if (record.trustedClaudeProcesses.size === 0) {
-      const directClaude = entries.filter((entry) => entry.ppid === rootPid && isClaudeProcess(entry, record.expectedClaudeCommand));
-      if (directClaude.length > 0) {
-        record.trustedClaudeProcesses = new Map(directClaude.map((entry) => [entry.pid, entry]));
-        return;
-      }
-    }
-    const nestedClaude = unexpectedClaudeProcess(entries, record.trustedClaudeProcesses, record.expectedClaudeCommand);
-    const reviewerCandidate = unexpectedReviewerProcess(entries);
-    const trustedReviewerCandidate = reviewerCandidate && record.trustedClaudeProcesses.get(reviewerCandidate.pid);
-    const nestedReviewer = reviewerCandidate && (!trustedReviewerCandidate || !sameProcessIdentity(trustedReviewerCandidate, reviewerCandidate)) ? reviewerCandidate : undefined;
-    const nested = nestedClaude ?? nestedReviewer;
-    if (!nested || record.runtimeError) return;
-    record.runtimeError = new Error(`${nested === nestedReviewer ? "nested Reviewer" : "nested Claude"} process denied (pid=${nested.pid})`);
-    this.#appendOutput(record, { stream: "stderr", text: `${record.runtimeError.message}\n`, at: new Date().toISOString() });
-    try { await this.#run(record, ["kill-session", "-t", record.sessionName], undefined, undefined, true); }
-    catch (error) { record.cleanupError ??= asError(error); }
   }
 
   #record(handle: WorkerHandle): TmuxRecord {

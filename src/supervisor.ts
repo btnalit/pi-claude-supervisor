@@ -267,7 +267,7 @@ export class Supervisor {
       if (this.#automation && !["jsonl", "tmux"].includes(this.#adapter.capabilities().transport)) {
         throw new Error("automatic supervision requires the claude-jsonl or automated tmux transport");
       }
-      const workerEnvironment = this.#automation ? automaticWorkerEnvironment(options.env) : options.env;
+      const workerEnvironment = this.#automation ? automaticWorkerEnvironment(options.env ?? process.env) : options.env;
       if (this.#automation) {
         trustedWorkerCommand = await assertTrustedAutomaticClaudeExecutable(options.command, options.expectedClaudeExecutable);
         workerArgs = automaticClaudeArgs(options.command, options.args);

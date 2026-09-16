@@ -1,21 +1,22 @@
 # Implementation Review
 
 An independent read-only reviewer examined the implementation before the final
-hardening pass. The review found release blockers in automatic startup validation,
-shell-policy lexical handling, malformed custom Reviewer results, credential
-filtering, and stale security documentation. Those findings are addressed by the
-current implementation and regression tests.
+hardening pass. The earlier review found release blockers in automatic startup
+validation, shell-policy lexical handling, malformed custom Reviewer results and
+stale security documentation; those findings remain covered by the current
+implementation and regression tests. Its previous credential-filtering and
+Claude-sandbox assumptions were deliberately superseded by the full-capability
+unattended operating model.
 
-Automatic mode is fail-closed at its supported Worker boundary: it requires a
-validated non-bare Git worktree, an existing full baseline commit, a non-protected
-branch, the Claude JSONL transport, and the bare `claude`/`claude.exe` command name.
-Startup resolves and pins an operator-owned, non-writable executable path (or an
-explicit `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` path), and the final pre-spawn check
-compares the current repository HEAD with the exact startup HEAD. The built-in Claude
-path requests Claude Code's fail-closed Bash sandbox with no outbound domains.
-Arbitrary custom executables and explicit paths are not admitted to automatic mode;
-manual/custom integrations remain responsible for their own host sandbox and network
-boundary.
+Automatic mode still validates a non-bare Git worktree, an existing full baseline
+commit, a non-protected branch, the Claude JSONL/tmux transport and the bare
+`claude`/`claude.exe` command name. Startup resolves and pins an operator-owned,
+non-writable executable path (or an explicit `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE`
+path), and the final pre-spawn check compares the current repository HEAD with the
+exact startup HEAD. Automatic Claude workers retain their normal environment,
+network, tools, agents, plugins and MCP configuration; `CLAUDECODE` is removed only
+to permit nested Claude sessions. Cgroup/process cleanup owns all descendants, but
+custom/nested descendants are trusted rather than denied by a nested-process guard.
 
 ## Findings addressed in this pass
 
@@ -25,9 +26,10 @@ boundary.
 - Automatic startup pins a secure resolved Claude executable identity and rejects
   explicit paths, persists that identity for recovery, and rechecks the exact startup
   HEAD through the built-in adapter's final `preSpawnCheck` immediately before spawn.
-- Worker and verifier processes use a minimal environment; explicit worker
-  variables can be selected with `PI_CLAUDE_SUPERVISOR_WORKER_ENV` or an
-  embedding caller's `WorkerStartInput.env`.
+- Manual Worker and verifier processes retain the baseline environment behavior;
+  automatic Workers pass the full Supervisor environment, including credentials,
+  helpers, custom settings and proxy/network variables, with only `CLAUDECODE`
+  removed so nested Claude can start.
 - Startup failures clean up a worker and do not let event-log failures hide the
   original error.
 - Default wall-clock and no-output watchdogs stop stalled workers.
@@ -50,12 +52,13 @@ sandbox that prevents `.git` writes.
 These are verified limitations and follow-up work after the automatic boundary
 hardening:
 
-- The Claude Code sandbox is a requested runtime boundary and is fail-closed when
-  unavailable; it is not a substitute for a host-level sandbox, lower-privilege
-  account, or container policy for manual integrations.
+- Automatic mode intentionally does not provide a host-level network sandbox or
+  low-privilege account. Known direct remote push/main operations remain policy
+  denied, but nested agents, plugins and MCP servers are trusted capabilities and
+  need an independent repository/host boundary for absolute enforcement.
 - Event contents can contain worker output or user messages; common credential
-  patterns are now redacted and sequence recovery is persisted, but broader
-  structured-secret coverage remains follow-up work.
+  patterns are redacted and sequence recovery is persisted, but broader structured
+  secret coverage remains follow-up work.
 - PTY semantics, permission-event handling, and process-group behavior with the
   target Claude Code versions still require dedicated transport evidence. Basic
   Claude JSONL prompt, multi-turn and session-resume fixtures now pass in the
