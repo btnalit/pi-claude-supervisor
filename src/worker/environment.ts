@@ -1,6 +1,7 @@
 import { constants as fsConstants } from "node:fs";
-import { access, realpath, stat } from "node:fs/promises";
-import { delimiter, dirname, join } from "node:path";
+import { access, readFile, realpath, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { delimiter, dirname, join, resolve } from "node:path";
 
 const inheritedNames = [
   "PATH",
@@ -17,8 +18,8 @@ const inheritedNames = [
 ] as const;
 
 /**
- * Build a least-privilege worker environment. Credentials and arbitrary host
- * variables are not inherited unless the caller explicitly supplies them.
+ * Build the baseline Worker environment. The small inherited set keeps manual
+ * embedding behavior stable; callers may add any explicit variables they need.
  */
 export function workerEnvironment(
   inherited: NodeJS.ProcessEnv = process.env,
@@ -35,109 +36,205 @@ export function workerEnvironment(
 }
 
 /**
- * Restrict explicit variables supplied to an unattended Worker. This is not a
- * network sandbox, but it removes common remote-repository credentials and
- * disables the Git/package-manager credential helpers before command policy
- * gets a chance to inspect a structured Bash request.
+ * Automatic mode intentionally does not filter credentials, network settings,
+ * package-manager configuration or Claude extensions. It inherits the full
+ * explicit environment so Claude Code, MCP servers and nested agents retain
+ * their normal capabilities. CLAUDECODE is removed because Claude Code uses it
+ * to reject a deliberately nested session; process/cgroup cleanup still owns
+ * every descendant of the Worker.
  */
-export function automaticWorkerEnvironment(explicit: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+export function automaticWorkerEnvironment(
+  explicit: NodeJS.ProcessEnv = {},
+  inherited: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = {};
-  for (const [name, value] of Object.entries(explicit)) {
-    if (value !== undefined && isAutomaticAllowedName(name) && (!isRemoteCredentialName(name) || isProviderCredentialName(name))) result[name] = value;
+  for (const [name, value] of Object.entries(inherited)) {
+    if (value !== undefined && name !== "CLAUDECODE") result[name] = value;
   }
-  result.GIT_CONFIG_NOSYSTEM = "1";
-  result.GIT_CONFIG_SYSTEM = process.platform === "win32" ? "NUL" : "/dev/null";
-  result.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
-  result.GIT_CONFIG_COUNT = "3";
-  result.GIT_CONFIG_KEY_0 = "credential.helper";
-  result.GIT_CONFIG_VALUE_0 = "";
-  result.GIT_CONFIG_KEY_1 = "http.proxy";
-  result.GIT_CONFIG_VALUE_1 = "http://127.0.0.1:9";
-  result.GIT_CONFIG_KEY_2 = "https.proxy";
-  result.GIT_CONFIG_VALUE_2 = "http://127.0.0.1:9";
-  result.GIT_TERMINAL_PROMPT = "0";
-  result.GIT_SSH_COMMAND = "false";
-  result.GH_CONFIG_DIR = process.platform === "win32" ? "NUL" : "/dev/null";
-  result.NPM_CONFIG_USERCONFIG = process.platform === "win32" ? "NUL" : "/dev/null";
-  result.npm_config_userconfig = result.NPM_CONFIG_USERCONFIG;
+  for (const [name, value] of Object.entries(explicit)) {
+    if (value !== undefined && name !== "CLAUDECODE") result[name] = value;
+  }
   return result;
 }
 
 /**
- * Ask Claude Code to sandbox Bash and its descendants. The API process keeps
- * its provider connection, while Worker-launched commands get no outbound
- * network and cannot silently fall back to an unsandboxed shell. Automatic mode
- * admits only the direct Claude command name. Startup resolves and pins its
- * operator-owned executable path so a custom path or writable replacement
- * cannot silently omit this boundary.
- */
-const automaticToolAllowlist = new Set([
-  "Bash",
-  "Edit",
-  "Glob",
-  "Grep",
-  "Read",
-  "Write",
-  "NotebookEdit",
-  "AskUserQuestion",
-]);
-
-/**
- * The automatic Worker is the only Claude session allowed to drive the local
- * lifecycle. Keep its tool surface explicit: nested agents/background tasks
- * can start a second reviewer, outlive the Worker, or hide work from the
- * Supervisor's event stream. The safe-mode and strict-MCP flags also prevent
- * project/user customizations from reintroducing that capability.
+ * Validate the executable identity used by automatic mode. Claude's normal
+ * command-line arguments are otherwise left untouched: tool extensions,
+ * agents, background tasks, MCP configuration and network access belong to
+ * Claude Code's full development surface. A safe permission mode is added only
+ * when the caller did not choose one; stream-json transport flags are added by
+ * the adapter. The supervisor policy still blocks known remote push/main
+ * integration and destructive operations.
  */
 export function automaticClaudeArgs(command: string, args: readonly string[] = []): string[] {
   if (!isDirectClaudeName(command)) {
     throw new Error("automatic supervision requires the direct Claude executable command name; custom executable paths need their own host boundary");
   }
-  if (args.some((arg) => arg === "--settings" || arg.startsWith("--settings="))) {
-    throw new Error("automatic Claude supervision controls --settings; remove the caller-provided settings override");
-  }
-  for (const option of ["--allowedTools", "--allowed-tools", "--agent", "--agents", "--plugin-dir", "--plugin-url", "--resume", "-r", "--continue", "-c", "--bg", "--background", "--remote-control", "--tmux", "--worktree", "-w"]) {
-    if (args.some((arg) => arg === option || arg.startsWith(`${option}=`))) {
-      throw new Error(`automatic Claude supervision controls ${option}; remove the caller-provided session or tool-extension override`);
-    }
-  }
   const result = [...args];
-  const tools = requestedAutomaticTools(result);
-  if (tools === undefined) result.push("--tools", [...automaticToolAllowlist].join(","));
-  else if (tools.some((tool) => !automaticToolAllowlist.has(tool))) {
-    throw new Error("automatic Claude supervision permits only the bounded local tool allowlist; nested agents and background reviewers are disabled");
+  if (!result.some((value) => value === "--permission-mode" || value.startsWith("--permission-mode="))) {
+    result.push("--permission-mode", "default");
   }
-  result.push(
-    "--safe-mode",
-    "--strict-mcp-config",
-    "--disallowed-tools",
-    "Task,TaskOutput,Agent,Skill,SendUserMessage",
-    "--settings",
-    JSON.stringify({
-      sandbox: {
-        enabled: true,
-        failIfUnavailable: true,
-        allowUnsandboxedCommands: false,
-        network: { allowedDomains: [] },
-      },
-    }),
-  );
   return result;
 }
 
-function requestedAutomaticTools(args: string[]): string[] | undefined {
-  const index = args.findIndex((arg) => arg === "--tools" || arg.startsWith("--tools="));
-  if (index < 0) return undefined;
-  const values = args[index].startsWith("--tools=")
-    ? [args[index].slice("--tools=".length)]
-    : (() => {
-        const collected: string[] = [];
-        for (let cursor = index + 1; cursor < args.length && !args[cursor]!.startsWith("-"); cursor += 1) collected.push(args[cursor]!);
-        return collected;
-      })();
-  const tools = values.flatMap((value) => value.split(/[\s,]+/u)).map((value) => value.trim()).filter(Boolean);
-  if (tools.includes("default")) throw new Error("automatic Claude supervision requires an explicit tool allowlist; --tools default is not permitted");
-  return tools.map((tool) => tool.replace(/\(.*/u, ""));
+/**
+ * Claude can pre-authorize tools through CLI arguments or settings files. That
+ * would prevent the Supervisor from seeing a Bash permission request before a
+ * command runs, so automatic mode refuses Bash preauthorization while keeping
+ * the Bash tool itself available through the normal host permission path.
+ */
+export async function assertAutomaticClaudePermissionConfiguration(
+  cwd: string,
+  args: readonly string[] = [],
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  assertNoCliBashPreauthorization(args);
+  const cliPermissionMode = explicitPermissionMode(args);
+  assertNoUnsafePermissionMode(args);
+  for (const setting of await automaticClaudeSettings(cwd, args, env)) {
+    if (hasBashPreauthorization(setting.value) || (cliPermissionMode === undefined && hasUnsafeSettingsPermissionMode(setting.value))) {
+      throw new Error(`automatic supervision refuses Claude settings that bypass Supervisor Bash permission events (${setting.label})`);
+    }
+  }
+}
+
+function assertNoCliBashPreauthorization(args: readonly string[]): void {
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index]!;
+    const equalPrefix = value.match(/^--allowed(?:tools|[-_]tools?)=(.*)$/iu)?.[1];
+    if (equalPrefix !== undefined && isBashToolRule(equalPrefix)) {
+      throw new Error("automatic supervision refuses --allowedTools Bash preauthorization; Bash must remain visible to the Supervisor permission policy");
+    }
+    if (!/^--allowed(?:tools|[-_]tools?)$/iu.test(value)) continue;
+    for (let next = index + 1; next < args.length && !args[next]!.startsWith("-"); next += 1) {
+      if (isBashToolRule(args[next]!)) {
+        throw new Error("automatic supervision refuses --allowedTools Bash preauthorization; Bash must remain visible to the Supervisor permission policy");
+      }
+    }
+  }
+}
+
+function explicitPermissionMode(args: readonly string[]): string | undefined {
+  let mode: string | undefined;
+  let seen = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index]!;
+    const inline = value.match(/^--permission-mode=(.*)$/iu)?.[1];
+    if (inline !== undefined) {
+      if (seen) throw new Error("automatic supervision refuses duplicate --permission-mode arguments");
+      if (!inline.trim()) throw new Error("automatic supervision refuses an empty --permission-mode value");
+      seen = true;
+      mode = inline;
+      continue;
+    }
+    if (/^--permission-mode$/iu.test(value)) {
+      if (seen) throw new Error("automatic supervision refuses duplicate --permission-mode arguments");
+      const next = args[index + 1];
+      if (next === undefined || next.startsWith("-")) throw new Error("automatic supervision refuses a missing --permission-mode value");
+      seen = true;
+      mode = next;
+      index += 1;
+    }
+  }
+  return mode;
+}
+
+function assertNoUnsafePermissionMode(args: readonly string[]): void {
+  const mode = explicitPermissionMode(args);
+  if (mode && isUnsafePermissionMode(mode)) {
+    throw new Error(`automatic supervision refuses Claude permission mode ${mode}; the Supervisor must retain the host permission boundary`);
+  }
+}
+
+async function automaticClaudeSettings(cwd: string, args: readonly string[], env: NodeJS.ProcessEnv): Promise<Array<{ value: unknown; label: string }>> {
+  const settings: Array<{ value: unknown; label: string }> = [];
+  for (const { value, label } of explicitSettings(args, cwd)) {
+    if (value !== null && typeof value === "object") {
+      settings.push({ value, label });
+      continue;
+    }
+    if (typeof value !== "string") throw new Error(`automatic supervision could not inspect Claude settings (${label})`);
+    try {
+      settings.push({ value: JSON.parse(value), label });
+    } catch {
+      try {
+        settings.push({ value: JSON.parse(await readFile(value, "utf8")), label });
+      } catch (error) {
+        throw new Error(`automatic supervision could not inspect Claude settings (${label})`, { cause: error });
+      }
+    }
+  }
+
+  const effectiveHome = env.HOME?.trim() ? resolve(env.HOME) : homedir();
+  const configDir = env.CLAUDE_CONFIG_DIR ? resolve(env.CLAUDE_CONFIG_DIR) : join(effectiveHome, ".claude");
+  const paths = new Set<string>([
+    join(configDir, "settings.json"),
+    "/etc/claude-code/managed-settings.json",
+  ]);
+  let directory = resolve(cwd);
+  while (true) {
+    paths.add(join(directory, ".claude", "settings.json"));
+    paths.add(join(directory, ".claude", "settings.local.json"));
+    const parent = dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  for (const path of paths) {
+    try {
+      const value = JSON.parse(await readFile(path, "utf8")) as unknown;
+      settings.push({ value, label: path });
+    } catch (error) {
+      if (error instanceof Error && /ENOENT/u.test(error.message)) continue;
+      throw new Error(`automatic supervision could not inspect Claude settings (${path})`, { cause: error });
+    }
+  }
+  return settings;
+}
+
+function explicitSettings(args: readonly string[], cwd: string): Array<{ value: unknown; label: string }> {
+  const values: Array<{ value: unknown; label: string }> = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    const inline = argument.match(/^--settings=(.*)$/u)?.[1];
+    const value = inline ?? (argument === "--settings" ? args[index + 1] : undefined);
+    if (value === undefined) continue;
+    if (inline === undefined) index += 1;
+    const trimmed = value.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) values.push({ value: JSON.parse(trimmed), label: "--settings JSON" });
+    else values.push({ value: resolve(cwd, trimmed), label: `--settings ${trimmed}` });
+  }
+  return values;
+}
+
+function hasBashPreauthorization(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const settings = value as Record<string, unknown>;
+  if (isBashToolRule(settings.allowedTools)) return true;
+  if (isBashToolRule(settings.permissions && typeof settings.permissions === "object"
+    ? (settings.permissions as Record<string, unknown>).allow
+    : undefined)) return true;
+  return false;
+}
+
+function hasUnsafeSettingsPermissionMode(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const settings = value as Record<string, unknown>;
+  const permissions = settings.permissions && typeof settings.permissions === "object"
+    ? settings.permissions as Record<string, unknown>
+    : undefined;
+  return [settings.permissionMode, permissions?.defaultMode]
+    .some((mode) => typeof mode === "string" && isUnsafePermissionMode(mode));
+}
+
+function isBashToolRule(value: unknown): boolean {
+  const values = Array.isArray(value) ? value : [value];
+  return values.some((item) => typeof item === "string"
+    && item.split(/[\s,]+/u).some((rule) => /^Bash(?:$|\()/iu.test(rule)));
+}
+
+function isUnsafePermissionMode(value: string): boolean {
+  const normalized = value.replace(/[-_]/gu, "").toLowerCase();
+  return normalized === "auto" || normalized === "bypasspermissions" || normalized === "dontask";
 }
 
 /**
@@ -211,38 +308,4 @@ async function assertSecureExecutablePath(path: string): Promise<void> {
       directory = parent;
     }
   }
-}
-
-const automaticEnvironmentAllowlist = new Set([
-  "ANTHROPIC_API_KEY",
-  "ANTHROPIC_AUTH_TOKEN",
-  "ANTHROPIC_BASE_URL",
-  "CLAUDE_CODE_OAUTH_TOKEN",
-  "CLAUDE_CODE_USE_BEDROCK",
-  "CLAUDE_CODE_USE_VERTEX",
-  "CLAUDE_CODE_USE_FOUNDRY",
-  "AWS_PROFILE",
-  "AWS_REGION",
-  "AWS_DEFAULT_REGION",
-  "AWS_SDK_LOAD_CONFIG",
-  "GOOGLE_CLOUD_PROJECT",
-  "GOOGLE_CLOUD_REGION",
-  "CLOUD_ML_REGION",
-  "NO_COLOR",
-  "CI",
-]);
-
-function isAutomaticAllowedName(name: string): boolean {
-  return automaticEnvironmentAllowlist.has(name);
-}
-
-function isProviderCredentialName(name: string): boolean {
-  return name === "ANTHROPIC_API_KEY" || name === "ANTHROPIC_AUTH_TOKEN" || name === "CLAUDE_CODE_OAUTH_TOKEN";
-}
-
-export function isRemoteCredentialName(name: string): boolean {
-  if (isProviderCredentialName(name)) return false;
-  return /^(?:SSH_AUTH_SOCK|GIT_ASKPASS|GIT_SSH_COMMAND|GIT_CREDENTIAL_HELPER|GIT_CONFIG(?:_|$)|GH_CONFIG_DIR|NPM_CONFIG_USERCONFIG|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|AZURE_CLIENT_ID|AZURE_CLIENT_SECRET|AZURE_TENANT_ID|GOOGLE_APPLICATION_CREDENTIALS|KUBECONFIG)$/iu.test(name)
-    || /(?:^|_)(?:GITHUB|GH|GITLAB|BITBUCKET|NPM|NODE_AUTH|CODEARTIFACT|HUGGINGFACE|DOCKER|AWS|AZURE|GOOGLE|CI_JOB)(?:_|$)/iu.test(name)
-    || /(?:^|_)(?:TOKEN|PASSWORD|PASSWD|SECRET|PRIVATE_KEY|ACCESS_KEY|AUTH_TOKEN|API_KEY|CREDENTIALS?)(?:_|$)/iu.test(name);
 }

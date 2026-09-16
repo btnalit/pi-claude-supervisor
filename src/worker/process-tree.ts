@@ -1,4 +1,4 @@
-import { readdir, readFile, readlink } from "node:fs/promises";
+import { readFile, readlink } from "node:fs/promises";
 
 export interface ProcessTreeEntry {
   pid: number;
@@ -10,26 +10,6 @@ export interface ProcessTreeEntry {
   commandLine: string;
   /** Raw argv when read from Linux /proc; test fixtures may omit it. */
   argv?: string[];
-}
-
-export async function linuxCgroupProcesses(cgroupPath: string): Promise<ProcessTreeEntry[]> {
-  if (process.platform !== "linux") return [];
-  const contents = await readFile(`${cgroupPath}/cgroup.procs`, "utf8");
-  const pids = [...new Set(contents.split(/\s+/u).filter(Boolean).map(Number).filter((pid) => Number.isSafeInteger(pid) && pid > 0))];
-  const entries = await Promise.all(pids.map((pid) => readProcess(pid)));
-  if (entries.some((entry) => !entry)) throw new Error("cgroup process identity could not be inspected");
-  return entries as ProcessTreeEntry[];
-}
-
-export async function linuxProcessTree(rootPid: number): Promise<ProcessTreeEntry[]> {
-  if (process.platform !== "linux" || !Number.isInteger(rootPid) || rootPid <= 0) return [];
-  let names: string[];
-  try { names = await readdir("/proc"); }
-  catch (error) { throw new Error(`Linux process inspection is unavailable: ${error instanceof Error ? error.message : String(error)}`, { cause: error }); }
-  const entries = (await Promise.all(names.filter((name) => /^\d+$/u.test(name)).map((name) => readProcess(Number(name))))).filter((entry): entry is ProcessTreeEntry => Boolean(entry));
-  if (!entries.some((entry) => entry.pid === rootPid)) throw new Error(`Linux worker process ${rootPid} could not be inspected`);
-  const byPid = new Map(entries.map((entry) => [entry.pid, entry]));
-  return entries.filter((entry) => entry.pid === rootPid || isDescendant(entry, rootPid, byPid));
 }
 
 export function isClaudeProcess(entry: ProcessTreeEntry, expectedCommand?: string): boolean {
@@ -48,33 +28,6 @@ export function isClaudeLauncherProcess(entry: ProcessTreeEntry): boolean {
     const name = basename(value);
     return name === "claude" || name === "claude.exe";
   });
-}
-
-export function unexpectedReviewerProcess(entries: readonly ProcessTreeEntry[]): ProcessTreeEntry | undefined {
-  const pattern = /(?:^|[\\/_ .-])(?:review(?:er)?|code[-_ ]?review|read[-_ ]?only[-_ ]?review|independent[-_ ]?review|codex|cursor(?:-agent)?|aider|opencode|gemini)(?:$|[\\/_. -])/iu;
-  return entries.find((entry) => {
-    const tokens = entry.commandLine.split(/\s+/u).map((token) => token.replace(/^['"]|['"]$/gu, ""));
-    const candidates: Array<string | undefined> = [entry.argv0, entry.executable, entry.command, tokens[0], tokens[1]];
-    if (tokens[1] === "-c" || tokens[1] === "--command") candidates.push(tokens[2]);
-    if (basename(tokens[0] ?? "") === "env") candidates.push(tokens.find((token) => !token.startsWith("-") && !token.includes("=") && token !== tokens[0]));
-    return candidates.some((value) => typeof value === "string" && pattern.test(value));
-  });
-}
-
-export function sameProcessIdentity(expected: ProcessTreeEntry, current: ProcessTreeEntry): boolean {
-  return expected.pid === current.pid
-    && expected.startTime === current.startTime
-    && expected.executable === current.executable
-    && expected.argv0 === current.argv0;
-}
-
-export function unexpectedClaudeProcess(entries: readonly ProcessTreeEntry[], trusted: ReadonlyMap<number, ProcessTreeEntry>, expectedCommand?: string): ProcessTreeEntry | undefined {
-  for (const entry of entries) {
-    if (!isClaudeProcess(entry, expectedCommand)) continue;
-    const original = trusted.get(entry.pid);
-    if (!original || !sameProcessIdentity(original, entry)) return entry;
-  }
-  return undefined;
 }
 
 export async function readProcess(pid: number): Promise<ProcessTreeEntry | undefined> {
@@ -204,15 +157,4 @@ function nodeScriptIndex(tokens: readonly string[], start: number): number {
     return index;
   }
   return index;
-}
-
-function isDescendant(entry: ProcessTreeEntry, rootPid: number, byPid: ReadonlyMap<number, ProcessTreeEntry>): boolean {
-  let parent = entry.ppid;
-  for (let depth = 0; depth < 64 && parent > 0; depth += 1) {
-    if (parent === rootPid) return true;
-    const ancestor = byPid.get(parent);
-    if (!ancestor || ancestor.ppid === parent) return false;
-    parent = ancestor.ppid;
-  }
-  return false;
 }

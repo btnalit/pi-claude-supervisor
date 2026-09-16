@@ -3,7 +3,7 @@ import { access, chmod, constants, copyFile, mkdir, mkdtemp, readFile, rm, write
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { claudeJsonlArgs, preflightCgroupContainment, ProcessWorkerAdapter } from "./process-adapter.ts";
+import { claudeJsonlArgs, cleanupCgroup, preflightCgroupContainment, ProcessWorkerAdapter } from "./process-adapter.ts";
 
 const requiredCgroupTestAvailable = process.platform === "linux" && await canCreateCgroup();
 
@@ -15,20 +15,24 @@ test("claude-jsonl arguments normalize controlled equals options and reject dupl
   assert.throws(() => claudeJsonlArgs(["--permission-prompts=none"]), /must be host/u);
 });
 
-test("automatic process scope catches a detached nested Claude in the worker cgroup", { skip: !requiredCgroupTestAvailable }, async () => {
+test("automatic process scope allows nested Claude and cleans all descendants", { skip: !requiredCgroupTestAvailable }, async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-process-nested-test-"));
   const fakeClaude = join(root, "claude");
   const nestedClaude = join(root, "nested", "claude");
+  const nestedPidFile = join(root, "nested.pid");
   await mkdir(join(root, "nested"), { recursive: true });
   await copyFile(process.execPath, nestedClaude);
   await chmod(nestedClaude, 0o700);
   await writeFile(fakeClaude, `#!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
 const nested = ${JSON.stringify(nestedClaude)};
+const nestedPidFile = ${JSON.stringify(nestedPidFile)};
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", data => {
   if (!data.trim()) return;
   const child = spawn(nested, ["-e", "setInterval(() => {}, 10000)"], { detached: true, stdio: "ignore" });
+  if (child.pid) writeFileSync(nestedPidFile, String(child.pid));
   child.unref();
   process.stdout.write(JSON.stringify({ type: "result", subtype: "success", session_id: "nested-test" }) + "\\n");
 });
@@ -36,17 +40,150 @@ process.stdin.on("data", data => {
   await chmod(fakeClaude, 0o700);
   const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl", cgroupMode: "required", terminationGraceMs: 100, killGraceMs: 100 });
   let handle;
+  let nestedPid: number | undefined;
   try {
     handle = await adapter.start({ task: "trigger", cwd: root, command: fakeClaude, args: [], automatic: true });
     let status = await adapter.getStatus(handle);
-    for (let attempt = 0; attempt < 100 && !status.runtimeError; attempt += 1) {
+    for (let attempt = 0; attempt < 100 && status.activeRequests !== 0; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 25));
       status = await adapter.getStatus(handle);
     }
-    assert.match(status.runtimeError ?? "", /nested Claude process denied/u);
+    assert.equal(status.runtimeError, undefined);
+    assert.equal(status.running, true);
+    assert.equal(status.activeRequests, 0);
+    for (let attempt = 0; attempt < 20 && nestedPid === undefined; attempt += 1) {
+      try { nestedPid = Number(await readFile(nestedPidFile, "utf8")); }
+      catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
+    }
+    assert.ok(nestedPid && nestedPid > 0);
   } finally {
     if (handle) await adapter.stop(handle, "nested Claude test cleanup").catch(() => {});
+    if (nestedPid) {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        try { process.kill(nestedPid, 0); }
+        catch { break; }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.throws(() => process.kill(nestedPid!, 0), /ESRCH/u);
+    }
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("automatic process adapter inherits capability variables when input env is partial", { skip: !requiredCgroupTestAvailable, concurrency: false }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-process-environment-test-"));
+  const capture = join(root, "environment.json");
+  const fakeClaude = join(root, "claude.mjs");
+  const key = "PI_CLAUDE_SUPERVISOR_PROCESS_TEST_CAPABILITY";
+  const previous = process.env[key];
+  process.env[key] = "inherited-process-capability";
+  await writeFile(fakeClaude, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(capture)}, JSON.stringify({ value: process.env[${JSON.stringify(key)}] }));
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", () => process.stdout.write(JSON.stringify({ type: "result", subtype: "success", session_id: "environment-test" }) + "\\n"));
+`);
+  await chmod(fakeClaude, 0o700);
+  const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl", cgroupMode: "required", terminationGraceMs: 100, killGraceMs: 100 });
+  let handle;
+  try {
+    handle = await adapter.start({ task: "capture", cwd: root, command: fakeClaude, args: [], env: { HOME: root }, automatic: true });
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if ((await adapter.getStatus(handle)).activeRequests === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.deepEqual(JSON.parse(await readFile(capture, "utf8")), { value: "inherited-process-capability" });
+  } finally {
+    if (handle) await adapter.stop(handle, "environment test cleanup").catch(() => {});
+    if (previous === undefined) delete process.env[key];
+    else process.env[key] = previous;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("automatic process cleanup retains an empty cgroup until explicit lease release", { skip: !requiredCgroupTestAvailable }, async () => {
+  const adapter = new ProcessWorkerAdapter({ terminationGraceMs: 50, killGraceMs: 50 });
+  let handle;
+  try {
+    handle = await adapter.start({
+      task: "",
+      cwd: process.cwd(),
+      command: process.execPath,
+      args: ["-e", "setInterval(() => {}, 10000)"],
+      automatic: true,
+      retainCgroupUntilLeaseRelease: true,
+      preSpawnCheck: async (provisional) => {
+        assert.ok(provisional?.cgroupPath);
+        await access(join(provisional.cgroupPath, "cgroup.events"));
+      },
+    });
+    const cgroupPath = handle.cgroupPath;
+    assert.ok(cgroupPath);
+    await adapter.stop(handle, "retained cgroup test");
+    await access(cgroupPath);
+    await cleanupCgroup(cgroupPath, 100, false);
+    await assert.rejects(() => access(cgroupPath), /ENOENT/u);
+  } finally {
+    if (handle) await adapter.stop(handle, "retained cgroup test cleanup").catch(() => {});
+  }
+});
+
+test("automatic startup persists its planned and created cgroup in order", { skip: !requiredCgroupTestAvailable }, async () => {
+  const adapter = new ProcessWorkerAdapter({ terminationGraceMs: 50, killGraceMs: 50 });
+  const phases: string[] = [];
+  let handle;
+  try {
+    handle = await adapter.start({
+      task: "",
+      cwd: process.cwd(),
+      command: process.execPath,
+      args: ["-e", "setTimeout(() => process.exit(0), 50)"],
+      automatic: true,
+      retainCgroupUntilLeaseRelease: true,
+      onWorkerStartup: async (planned) => {
+        phases.push("startup");
+        assert.ok(planned.cgroupPath);
+        await assert.rejects(() => access(planned.cgroupPath!), /ENOENT/u);
+      },
+      onWorkerPrepared: async (prepared) => {
+        phases.push("prepared");
+        assert.ok(prepared.cgroupPath);
+        await access(join(prepared.cgroupPath!, "cgroup.events"));
+      },
+      preSpawnCheck: async () => { phases.push("preSpawn"); },
+    });
+    assert.deepEqual(phases, ["startup", "prepared", "preSpawn"]);
+  } finally {
+    if (handle) await adapter.stop(handle, "startup ordering test cleanup").catch(() => {});
+  }
+});
+
+test("automatic natural exit retains an empty cgroup until lease finalization", { skip: !requiredCgroupTestAvailable }, async () => {
+  const adapter = new ProcessWorkerAdapter({ terminationGraceMs: 50, killGraceMs: 50 });
+  let handle;
+  try {
+    handle = await adapter.start({
+      task: "",
+      cwd: process.cwd(),
+      command: process.execPath,
+      args: ["-e", "setTimeout(() => process.exit(0), 50)"],
+      automatic: true,
+      retainCgroupUntilLeaseRelease: true,
+    });
+    let status = await adapter.getStatus(handle);
+    for (let attempt = 0; attempt < 100 && status.running; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      status = await adapter.getStatus(handle);
+    }
+    assert.equal(status.running, false);
+    assert.equal(status.cgroupCleaned, true);
+    const cgroupPath = handle.cgroupPath;
+    assert.ok(cgroupPath);
+    await access(cgroupPath);
+    await cleanupCgroup(cgroupPath, 100, false);
+    await assert.rejects(() => access(cgroupPath), /ENOENT/u);
+  } finally {
+    if (handle) await adapter.stop(handle, "natural exit retention cleanup").catch(() => {});
   }
 });
 

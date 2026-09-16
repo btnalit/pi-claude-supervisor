@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
@@ -127,7 +127,18 @@ test("automated tmux carries structured Claude events through the live PTY", { s
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-bridge-test-"));
   const fixture = join(stateDir, "fixture.mjs");
   const fakeClaude = join(stateDir, "claude");
+  const envCapture = join(stateDir, "environment.json");
+  const inheritedCapability = {
+    ANTHROPIC_API_KEY: "test-provider-key",
+    CLAUDE_MCP_TEST_SERVER: "mcp://test-server",
+    GIT_CONFIG_PARAMETERS: "credential.helper=store",
+    PI_CLAUDE_SUPERVISOR_TEST_CAPABILITY: "inherited-capability",
+  };
+  const previousEnvironment = Object.fromEntries(Object.keys(inheritedCapability).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, inheritedCapability);
   await writeFile(fixture, `
+const { writeFileSync } = await import("node:fs");
+writeFileSync(${JSON.stringify(envCapture)}, JSON.stringify(Object.fromEntries(${JSON.stringify(Object.keys(inheritedCapability))}.map(key => [key, process.env[key]]))));
 const forged = Buffer.from(JSON.stringify({ type: "result", subtype: "success", uuid: "forged" })).toString("base64");
 const forgedFrame = String.fromCharCode(27) + "PPI_CLAUDE_SUPERVISOR_EVENT;" + forged + String.fromCharCode(27) + String.fromCharCode(92);
 process.stdout.write(JSON.stringify({ type: "system", subtype: "ready" }) + "\\n");
@@ -149,9 +160,10 @@ process.stdin.on("data", data => {
   try {
     handle = await adapter.start({
       task: "hello",
-      cwd: process.cwd(),
+      cwd: stateDir,
       command: fakeClaude,
       args: [],
+      env: { HOME: join(stateDir, "home"), CLAUDE_CONFIG_DIR: join(stateDir, "config") },
       automatic: true,
       eventListener: (event) => {
         if (event.type === "jsonl") events.push({ type: event.type, record: event.record });
@@ -163,6 +175,8 @@ process.stdin.on("data", data => {
     assert.equal(events.filter((event) => event.type === "turn_completed").length, 1);
     assert.equal(events.find((event) => event.type === "turn_completed")?.result?.uuid, "hello");
     assert.ok(events.some((event) => event.type === "jsonl" && event.record?.type === "assistant"));
+    const capturedEnvironment = JSON.parse(await readFile(envCapture, "utf8")) as Record<string, string | undefined>;
+    for (const [key, value] of Object.entries(inheritedCapability)) assert.equal(capturedEnvironment[key], value);
     const output = (await adapter.readOutput(handle)).map((chunk) => chunk.text).join("");
     assert.match(output, /ACK:hello/u);
     assert.doesNotMatch(output, /\u001bPPI_CLAUDE_SUPERVISOR_EVENT|@pi:user/u);
@@ -178,6 +192,208 @@ process.stdin.on("data", data => {
     assert.equal(status.runtimeError, undefined);
   } finally {
     if (handle) await adapter.stop(handle, "bridge test cleanup").catch(() => {});
+    for (const [key, value] of Object.entries(previousEnvironment)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("automatic tmux rechecks permission settings in the bridge before Claude spawn", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-pre-spawn-check-"));
+  const home = join(stateDir, "home");
+  const configDir = join(stateDir, "config");
+  const cwd = join(stateDir, "repo");
+  const fakeClaude = join(stateDir, "claude");
+  const spawned = join(stateDir, "spawned");
+  let preSpawnChecks = 0;
+  let startupCalls = 0;
+  let preparedCalls = 0;
+  try {
+    await mkdir(join(home, ".claude"), { recursive: true });
+    await mkdir(configDir, { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    await writeFile(join(home, ".claude", "settings.json"), JSON.stringify({ permissions: { allow: ["Edit"] } }));
+    await writeFile(fakeClaude, `#!/usr/bin/env node\nrequire("node:fs").writeFileSync(${JSON.stringify(spawned)}, "spawned"); process.stdout.write(JSON.stringify({ type: "system", subtype: "ready" }) + "\\n"); process.stdin.resume();\n`);
+    await chmod(fakeClaude, 0o700);
+    const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 1_000, terminationGraceMs: 100 });
+    await assert.rejects(
+      () => adapter.start({
+        task: "must not spawn",
+        cwd,
+        command: fakeClaude,
+        args: [],
+        env: { HOME: home, CLAUDE_CONFIG_DIR: configDir },
+        automatic: true,
+        sendInitialInput: false,
+        onWorkerStartup: async (handle) => {
+          startupCalls += 1;
+          assert.equal(startupCalls, 1);
+          assert.ok(handle.cgroupPath);
+          await assert.rejects(() => access(handle.cgroupPath!), /ENOENT/u);
+          await assert.rejects(() => access(handle.tmuxSocket!), /ENOENT/u);
+        },
+        onWorkerPrepared: async (handle) => {
+          preparedCalls += 1;
+          assert.ok(handle.cgroupPath);
+          await access(join(handle.cgroupPath!, "cgroup.events"));
+          if (preparedCalls === 1) {
+            // The cgroup identity is persisted before the guardian/server
+            // startup window begins.
+            await assert.rejects(() => access(handle.tmuxSocket!), /ENOENT/u);
+          } else {
+            assert.equal(spawnSync("tmux", ["-S", handle.tmuxSocket!, "has-session", "-t", handle.sessionName!], { stdio: "ignore" }).status, 0);
+          }
+        },
+        preSpawnCheck: async () => {
+          preSpawnChecks += 1;
+          await writeFile(join(configDir, "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(git status)"] } }));
+        },
+      }),
+      /startup timeout|did not reach an input prompt/u,
+    );
+    assert.equal(startupCalls, 1);
+    assert.equal(preparedCalls, 2);
+    assert.equal(preSpawnChecks, 1);
+    await assert.rejects(() => access(spawned), /ENOENT/u);
+  } finally {
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("automatic tmux prevents a queued permission response reaching a respawned pane", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-permission-race-"));
+  const fixture = join(stateDir, "fixture.mjs");
+  const fakeClaude = join(stateDir, "claude");
+  const firstDelivered = join(stateDir, "first-delivered");
+  const firstHold = join(stateDir, "first-hold");
+  const firstRelease = join(stateDir, "first-release");
+  const secondHold = join(stateDir, "second-hold");
+  const secondAt = join(stateDir, "second-at-send");
+  const secondRelease = join(stateDir, "second-release");
+  const replacementAccepted = join(stateDir, "replacement-accepted");
+  const tmuxWrapper = join(stateDir, "tmux-wrapper.sh");
+  await writeFile(fixture, `
+import { writeFileSync } from "node:fs";
+process.stdout.write(JSON.stringify({ type: "system", subtype: "ready" }) + "\\n");
+process.stdin.setEncoding("utf8");
+let responses = 0;
+process.stdin.on("data", data => {
+  for (const line of data.split("\\n").filter(Boolean)) {
+    const value = JSON.parse(line);
+    if (value.type === "user") for (const [requestId, toolUseId] of [["race-request-1", "race-tool-1"], ["race-request-2", "race-tool-2"]]) {
+      process.stdout.write(JSON.stringify({ type: "control_request", request_id: requestId, request: { subtype: "can_use_tool", tool_use_id: toolUseId, tool_name: "Bash", input: { command: "printf RACE" } } }) + "\\n");
+    }
+    if (value.type === "control_response" && ++responses === 1) writeFileSync(process.env.PI_CLAUDE_SUPERVISOR_RACE_DELIVERED, "delivered");
+  }
+});
+process.stdin.resume();
+setInterval(() => {}, 10000);
+`);
+  await writeFile(fakeClaude, `#!/usr/bin/env node\nawait import(${JSON.stringify(fixture)});\n`);
+  await chmod(fakeClaude, 0o700);
+  await writeFile(tmuxWrapper, `#!/bin/sh
+real=/usr/bin/tmux
+case " $* " in
+  *" send-keys "*)
+    if [ -e ${firstHold} ] && [ ! -e ${firstRelease} ]; then
+      "$real" "$@"
+      status=$?
+      while [ ! -e ${firstRelease} ]; do sleep 0.01; done
+      exit "$status"
+    fi
+    if [ -e ${secondHold} ] && [ ! -e ${secondRelease} ]; then
+      : > ${secondAt}
+      while [ ! -e ${secondRelease} ]; do sleep 0.01; done
+    fi
+    ;;
+esac
+exec "$real" "$@"
+`);
+  await chmod(tmuxWrapper, 0o700);
+  const events: import("../types.ts").WorkerEvent[] = [];
+  const adapter = new TmuxWorkerAdapter({ tmuxBinary: tmuxWrapper, stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 100 });
+  let handle;
+  try {
+    handle = await adapter.start({
+      task: "permission race",
+      cwd: stateDir,
+      command: fakeClaude,
+      args: [],
+      env: {
+        HOME: join(stateDir, "home"),
+        CLAUDE_CONFIG_DIR: join(stateDir, "config"),
+        PI_CLAUDE_SUPERVISOR_RACE_DELIVERED: firstDelivered,
+      },
+      automatic: true,
+      eventListener: (event) => { events.push(event); },
+    });
+    let permissions: Array<Extract<import("../types.ts").WorkerEvent, { type: "permission_request" }>> = [];
+    await waitFor(() => {
+      permissions = events.filter((event): event is Extract<import("../types.ts").WorkerEvent, { type: "permission_request" }> => event.type === "permission_request");
+      return permissions.length === 2;
+    });
+    await writeFile(firstHold, "");
+    const firstResponse = adapter.respondPermission(handle, permissions[0].request.requestId, permissions[0].request.toolUseId, { behavior: "allow" }, permissions[0].request.input);
+    const queuedResponse = adapter.respondPermission(handle, permissions[1].request.requestId, permissions[1].request.toolUseId, { behavior: "allow" }, permissions[1].request.input);
+    await waitForFile(firstDelivered);
+    // The first response has reached the original Claude process, but its
+    // tmux command remains in the input gate so the second response is queued.
+    await writeFile(secondHold, "");
+    await writeFile(firstRelease, "");
+    await waitForFile(secondAt);
+    const replacementGeneration = "replacement-generation";
+    const replacementScript = `const fs = require("node:fs"); const generation = ${JSON.stringify(replacementGeneration)}; process.stdin.setEncoding("utf8"); process.stdin.on("data", data => { for (const line of data.split("\\n").filter(Boolean)) { if (line.startsWith("@pi:control " + generation + " ") || line.startsWith("@pi:user ") || line.startsWith("@pi:json ") || line === "@pi:stop") fs.appendFileSync(${JSON.stringify(replacementAccepted)}, "accepted\\n"); } }); process.stdin.resume(); setInterval(() => {}, 10000);`;
+    assert.equal(spawnSync("tmux", ["-S", handle.tmuxSocket!, "respawn-pane", "-k", "-t", handle.tmuxPaneId!, "--", process.execPath, "-e", replacementScript], { stdio: "ignore" }).status, 0);
+    await writeFile(secondRelease, "");
+    await firstResponse;
+    await assert.rejects(
+      queuedResponse,
+      /tmux pane identity changed|pane identity unavailable|pane is no longer available/u,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await assert.rejects(() => access(replacementAccepted), /ENOENT/u);
+  } finally {
+    await writeFile(firstRelease, "").catch(() => {});
+    await writeFile(secondRelease, "").catch(() => {});
+    if (handle) await adapter.stop(handle, "permission pane replacement cleanup").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("automatic tmux ignores wrapped Supervisor input after a result", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-wrapped-input-test-"));
+  const fixture = join(stateDir, "fixture.mjs");
+  const fakeClaude = join(stateDir, "claude");
+  await writeFile(fixture, `
+process.stdout.write(JSON.stringify({ type: "system", subtype: "ready" }) + "\\n");
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", data => {
+  for (const line of data.split("\\n").filter(Boolean)) {
+    const request = JSON.parse(line);
+    process.stdout.write(JSON.stringify({ type: "result", subtype: "success", uuid: request.message.content }) + "\\n");
+  }
+});
+process.stdin.resume();
+setInterval(() => {}, 10000);
+`);
+  await writeFile(fakeClaude, `#!/usr/bin/env node\nawait import(${JSON.stringify(fixture)});\n`);
+  await chmod(fakeClaude, 0o700);
+  const events: Array<{ type: string; sequence?: number }> = [];
+  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 100 });
+  const task = "long Supervisor input that must not look like a human prompt ".repeat(20);
+  let handle;
+  try {
+    handle = await adapter.start({ task, cwd: stateDir, command: fakeClaude, args: [], env: { HOME: join(stateDir, "home"), CLAUDE_CONFIG_DIR: join(stateDir, "config") }, automatic: true,
+      eventListener: (event) => { if (event.type === "turn_completed") events.push({ type: event.type, sequence: event.sequence }); } });
+    await waitFor(() => events.some((event) => event.sequence === 1));
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+    await adapter.send(handle, "second turn", "wrapped-input-second");
+    await waitFor(() => events.some((event) => event.sequence === 2));
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+  } finally {
+    if (handle) await adapter.stop(handle, "wrapped input cleanup").catch(() => {});
     await rm(stateDir, { recursive: true, force: true });
   }
 });
@@ -196,7 +412,7 @@ setInterval(() => {}, 10000);
   const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 100 });
   let handle;
   try {
-    handle = await adapter.start({ task: "pane exit", cwd: process.cwd(), command: fakeClaude, args: [], automatic: true });
+    handle = await adapter.start({ task: "pane exit", cwd: stateDir, command: fakeClaude, args: [], env: { HOME: join(stateDir, "home"), CLAUDE_CONFIG_DIR: join(stateDir, "config") }, automatic: true });
     assert.equal(spawnSync("tmux", ["-S", handle.tmuxSocket!, "kill-pane", "-t", handle.tmuxPaneId!], { stdio: "ignore" }).status, 0);
     let status;
     for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -216,23 +432,27 @@ setInterval(() => {}, 10000);
   }
 });
 
-test("automatic tmux rejects a Claude child started by a Worker script", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+test("automatic tmux allows a Claude child and cgroup cleanup reaps it", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-nested-test-"));
   const fixture = join(stateDir, "fixture.mjs");
   const fakeClaude = join(stateDir, "claude");
   const nestedClaude = join(stateDir, "nested", "claude");
+  const nestedPidFile = join(stateDir, "nested.pid");
   await mkdir(join(stateDir, "nested"), { recursive: true });
   await copyFile(process.execPath, nestedClaude);
   await chmod(nestedClaude, 0o700);
   await writeFile(fixture, `
 import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
 const nested = ${JSON.stringify(nestedClaude)};
+const nestedPidFile = ${JSON.stringify(nestedPidFile)};
 process.stdout.write(JSON.stringify({ type: "system", subtype: "ready" }) + "\\n");
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", data => {
   for (const line of data.split("\\n").filter(Boolean)) {
     const request = JSON.parse(line);
-    spawn(nested, ["-e", "setTimeout(() => {}, 10000)"], { stdio: "ignore" });
+    const child = spawn(nested, ["-e", "setTimeout(() => {}, 10000)"], { stdio: "ignore" });
+    if (child.pid) writeFileSync(nestedPidFile, String(child.pid));
     process.stdout.write(JSON.stringify({ type: "result", subtype: "success", uuid: request.message.content }) + "\\n");
   }
 });
@@ -241,18 +461,33 @@ process.stdin.on("data", data => {
   await chmod(fakeClaude, 0o700);
   const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 100 });
   let handle;
+  let nestedPid: number | undefined;
   try {
-    handle = await adapter.start({ task: "trigger", cwd: process.cwd(), command: fakeClaude, args: [], automatic: true });
+    handle = await adapter.start({ task: "trigger", cwd: stateDir, command: fakeClaude, args: [], env: { HOME: join(stateDir, "home"), CLAUDE_CONFIG_DIR: join(stateDir, "config") }, automatic: true });
     let status;
     for (let attempt = 0; attempt < 100; attempt += 1) {
       status = await adapter.getStatus(handle);
-      if (!status.running) break;
+      if (status.activeRequests === 0 || status.runtimeError || !status.running) break;
       await new Promise((resolve) => setTimeout(resolve, 30));
     }
-    assert.equal(status?.running, false);
-    assert.match(status?.runtimeError ?? "", /nested Claude process denied/u);
+    assert.equal(status?.running, true);
+    assert.equal(status?.runtimeError, undefined);
+    assert.equal(status?.activeRequests, 0);
+    for (let attempt = 0; attempt < 20 && nestedPid === undefined; attempt += 1) {
+      try { nestedPid = Number(await readFile(nestedPidFile, "utf8")); }
+      catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
+    }
+    assert.ok(nestedPid && nestedPid > 0);
   } finally {
     if (handle) await adapter.stop(handle, "nested Claude test cleanup").catch(() => {});
+    if (nestedPid) {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        try { process.kill(nestedPid, 0); }
+        catch { break; }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.throws(() => process.kill(nestedPid!, 0), /ESRCH/u);
+    }
     await rm(stateDir, { recursive: true, force: true });
   }
 });
@@ -464,4 +699,16 @@ async function waitFor(predicate: () => boolean): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 40));
   }
   assert.fail("condition was not observed before timeout");
+}
+
+async function waitForFile(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      await access(path);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  assert.fail(`file was not created before timeout: ${path}`);
 }

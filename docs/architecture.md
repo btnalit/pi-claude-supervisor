@@ -27,8 +27,9 @@ The extension keeps a registry of independent task sessions. Each session has
 its own Supervisor, watchdog, state machine and Worker handle, while the event
 log is shared and protected by an inter-process lock. Once a task starts, the
 local development loop is intended to run unattended: the Worker may edit, test,
-repair and commit locally. Remote push and merge into `main`/an integration branch
-are outside Worker authority and cross an independent boundary. Concurrent active sessions must use non-overlapping canonical working
+repair and commit locally. Supervisor-managed remote push and merge into `main`/an integration branch
+requests remain outside the local loop and cross an independent boundary; custom/nested tools require
+that boundary to enforce the same rule independently. Concurrent active sessions must use non-overlapping canonical working
 directories/worktrees; same-cwd and parent/child cwd starts are rejected before
 spawn, including concurrent starts, to prevent uncoordinated edits. Pending starts
 are also awaited during Pi shutdown.
@@ -83,13 +84,32 @@ fixed-version spike, renders the stream in the pane and carries structured recor
 through private framing on the same PTY; explicit adoption remains manual-only.
 
 A worker exit automatically triggers cleanup, and terminal status waits for
-that cleanup to be confirmed (or reports a cleanup error). On Linux, manual
-workers may use cgroup v2 automatically when the current user cgroup is writable;
+that cleanup to be confirmed (or reports a cleanup error). Automatic Claude
+startup rejects Bash preauthorization in the effective CLI/settings roots,
+including an overridden `HOME`, and adds a safe `default` permission mode when
+no mode was supplied, preserving the Supervisor's permission-event boundary
+without removing the Bash tool. The automatic tmux bridge repeats the settings
+inspection synchronously immediately before its Claude child `spawn`, so a
+mutation after Supervisor preflight fails closed. On Linux,
+manual workers may use cgroup v2 automatically when the current user cgroup is writable;
 the `required` mode performs a preflight and fails before Claude starts if cgroup
 attachment or cleanup is unavailable. Automatic JSONL workers always require the
 same preflight and a guarded cgroup bootstrap; automatic startup fails closed on
 non-Linux hosts or when the boundary cannot be established. Cgroup cleanup kills
-descendants even when they call `setsid()` or create another process group.
+descendants even when they call `setsid()` or create another process group. If
+an automatic parent-death bootstrap performs cleanup after the Supervisor is
+killed, it leaves the now-empty cgroup as takeover evidence; the lease persists
+the generated Worker/cgroup identity and cgroup device/inode, and explicit
+recovery removes the cgroup only after those identities, the dead tmux server,
+and the empty boundary pass. Automatic workers retain their verified empty
+cgroup until the owning cwd lease is finalized, so a normal-exit crash remains
+recoverable; explicit lease release then removes it. Takeover first persists a
+cleanup-pending transaction in the existing lease, then atomically reserves the
+gone private socket; it replaces that same lease record before removing the
+guardian cgroup and clears the transaction only after all cleanup proofs
+complete. A fresh lease reader can reconcile the pending transaction after a
+crash, retaining a replacement lease during the replacement phase, while
+ordinary manual worker cleanup still removes its cgroup.
 
 When cgroup v2 is unavailable, manual mode falls back to detached process-group
 cleanup. That fallback is not recursive: `setsid()` descendants can escape, and
@@ -113,18 +133,19 @@ parent-death guardian is unavailable.
 An owned manual worker gets a private tmux server/socket and executes the
 validated Claude command directly in the pane. An owned automatic worker instead
 starts the Supervisor bridge through a cgroup-joining pane bootstrap, so its
-bridge identity is not a manual adoption target. The worker
-environment is supplied to the tmux server through the same least-privilege
-environment builder; credentials are not copied into a file; credential-shaped
-command arguments are rejected.
+bridge identity is not a manual adoption target. The worker environment is
+passed through unchanged (apart from removing `CLAUDECODE` so nested Claude can
+start); credentials are not copied into a file, and credential-shaped command
+arguments are still rejected.
 `load-buffer`, bracketed `paste-buffer` and `send-keys Enter` provide the input
 boundary without interpolating a task into a shell command. C0/C1 terminal
-control bytes are rejected; CRLF is normalized to a newline. In automatic mode,
-the adapter snapshots the trusted direct Claude process and checks both the
-required Linux cgroup and process tree on every poll; a newly executed Claude or
-Reviewer descendant is a runtime policy failure and the owned session is stopped.
-This supplements the lexical Bash/file-tool boundary and is disabled for
-manual/adopted sessions.
+control bytes are rejected; CRLF is normalized to a newline. Automatic agents,
+background tasks, plugins, MCP servers and nested Claude processes stay in the
+same cgroup and are cleaned with the Worker; they are intentionally not rejected
+or polled as a nested-process policy failure. The lexical Bash/file-tool policy
+still handles known direct remote/main operations, while custom descendants are
+trusted and require an independent host/repository boundary for stronger
+protection.
 
 The transport has three deliberately separate observations:
 
@@ -153,9 +174,13 @@ that immutable pane target; a replacement process is refused. Adopted sessions
 are not owned: stop and Pi shutdown detach rather than kill them. Tmux commands
 and serialized input waits have bounded deadlines so shutdown cannot hang
 forever. Manual sessions started by the adapter survive a Pi disconnect, but recovery
-after restart is explicit re-adoption; automatic sessions are intentionally
-terminated by their parent-death guardian when the Supervisor disappears. The
-extension never claims to attach to an arbitrary non-tmux PTY. Startup cleanup always attempts the
+after restart is explicit re-adoption; automatic sessions are terminated by
+their parent-death guardian when the Supervisor disappears. The guardian leaves
+the verified empty automatic cgroup so `recover --takeover` can confirm the
+private tmux session and Worker identities. Recovery reserves the gone private
+socket, writes the replacement lease, and only then releases the reservation
+and removes that cgroup. The extension never claims to attach to an arbitrary
+non-tmux PTY. Startup cleanup always attempts the
 private tmux server teardown, including after partial session creation, and a
 confirmed `kill-server` is sufficient cleanup evidence. A normal Claude
 `--resume` starts another process from history and is not a live PTY migration.
@@ -191,10 +216,12 @@ only after the adapter confirms the worker and its descendant cleanup. An
 unconfirmed lease left by a crashed Pi is intentionally retained. Ordinary
 recovery refuses it; an operator may use `recover --takeover` only when the old
 owner is dead, the Worker process group is gone, and the lease independently
-reads a real empty cgroup boundary for the old Worker. Missing or unverifiable
-Worker evidence retains the lease and parks the task rather than performing unsafe
-reclamation; later recovery can inspect or clean it without requiring an operator to
-be online.
+reads a real empty cgroup boundary for the old Worker. Automatic tmux takeover
+additionally requires Supervisor ownership and a gone private tmux session, then
+removes the guardian-left-empty cgroup only after all proofs pass. Missing or
+unverifiable Worker evidence retains the lease and parks the task rather than
+performing unsafe reclamation; later recovery can inspect or clean it without
+requiring an operator to be online.
 An explicitly adopted tmux session may hand off an existing lease only after
 its owner identity is no longer live and its canonical cwd, tmux session/socket,
 pane id, pane PID/start time, and pane command all match; ordinary starts
@@ -215,9 +242,18 @@ executable is checked for an operator-owned, non-writable path and then pinned b
 absolute path; `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` can pin the expected identity. The initial repository HEAD is captured, and the repository boundary immediately
 before the Worker adapter starts must report that exact same HEAD (recovery captures
 and compares its current HEAD separately while retaining the persisted baseline).
-The built-in process adapter invokes the same assertion through `preSpawnCheck`
-after cgroup/executable setup and immediately before `spawn`; a failed preflight
-is fail-closed and does not start Claude. Long acceptance commands and Reviewer
+Automatic lease acquisition also persists a no-spawn startup marker. Automatic
+adapters then persist the generated Worker/cgroup identity and clear that marker
+before the actual Worker spawn, closing the startup-registration crash window;
+a stale marker can only be replaced after the old owner is proven dead because
+its adapter has not reached spawn. Adapters persist their generated cgroup/socket
+plan before creating those resources, persist cgroup identity before guardian or
+session setup, and persist tmux-server identity before the final spawn check. Startup
+recovery validates and cleans any planned empty resource it finds instead of
+assuming the marker means no resource exists. The built-in process adapter invokes
+the same assertion through `preSpawnCheck` after cgroup/executable setup and
+immediately before `spawn`; a failed preflight is fail-closed and does not start
+Claude. Long acceptance commands and Reviewer
 sessions share an abort signal with the Supervisor, so operator stop/shutdown
 wins without waiting for a full check timeout. Progress hooks expose starting,
 Worker heartbeat, acceptance, review, repair and candidate/decision phases in the Pi UI.
@@ -308,13 +344,12 @@ limit, so a normal large test report is not misclassified as a failed command.
 - unauthenticated inbound webhook commands; outbound notifications are optional,
   do not grant permission and do not replace the remote/main independent boundary;
 - treating an unknown Claude interactive question as safe without task evidence or configured authorization;
-- bypassing the configured Claude Code/task permissions;
+- bypassing the known direct remote/main command and Git metadata boundaries;
 - accepting model text as verification;
 - shell command interpolation;
-- a host-level network sandbox for manual integrations. Automatic mode does not admit
-  arbitrary custom executables: its supported Worker is direct Claude, which requests a
-  fail-closed Claude Code Bash sandbox with no outbound domains; command policy and
-  credential filtering remain defense in depth;
+- a host-level network sandbox for automatic or manual integrations. Automatic mode
+  deliberately preserves Claude Code's normal environment, network, tools, agents,
+  plugins and MCP configuration; nested/custom descendants are trusted capabilities;
 - Claude CLI multi-version compatibility in the current stability milestone;
-- full OS sandbox and low-privilege execution for custom Worker integrations in the current
-  lifecycle milestone.
+- full OS sandbox and low-privilege execution for custom or nested Worker integrations in the
+  current lifecycle milestone.

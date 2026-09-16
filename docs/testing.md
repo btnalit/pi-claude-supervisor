@@ -36,8 +36,11 @@ the published TypeScript source directly and there is no second runtime bundle.
   blank turn, idle adoption emits no synthetic completion, adopted pipe
   detachment permits re-adoption, and adopted stop preserves the user's
   session.
-- `worker/environment.test.ts`: unrelated host credentials are excluded unless
-  explicitly supplied.
+- `worker/environment.test.ts`: manual environment inheritance remains minimal, while
+  automatic mode merges explicit overrides onto the complete inherited environment,
+  removes only `CLAUDECODE` so nested Claude can run, adds a safe default permission
+  mode when omitted, resolves settings from effective `HOME`/`CLAUDE_CONFIG_DIR`, and
+  rejects Bash preauthorization in CLI/settings configuration.
 - `supervisor.test.ts`: the no-output watchdog stops a stalled worker, lifecycle event failures are retried, and output is restored when event persistence fails.
 - `scripts/check-package.mjs`: verifies the Pi manifest, peer dependency policy,
   required files and forbidden secret paths.
@@ -52,18 +55,22 @@ It must not be added to the normal CI gate because authentication is an owner
 controlled prerequisite.
 
 The transport fixtures validate one prompt, multiple turns, session resume,
-permission allow/deny and SIGTERM/SIGINT behavior. The current release validation
-uses Claude Code 2.1.270 at
-`/home/yancao/.local/share/mise/installs/claude/2.1.270/claude`, including real
-owned tmux turns, pause/resume, and restart re-adoption.
+permission allow/deny and SIGTERM/SIGINT behavior. The compatibility floor for the current release line is Claude Code `2.1.270`.
+The real-Claude spikes resolve the current `claude` executable from `PATH` by
+default, so installer-managed `latest` paths work without naming a versioned
+installation directory; `PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH` is an optional
+explicit override. Versions older than `2.1.270` are rejected, while newer
+versions are accepted and recorded in the spike output. The recorded baseline
+run used Claude Code `2.1.270` and covered real owned tmux turns, pause/resume,
+and restart re-adoption.
 The adapter regression suite also verifies event subscription, parsed
 `permission_request` events, the exact nested `control_response` envelope, and
-that an automatic tmux Worker cannot launch a second Claude executable from a
-Worker-created script.
+that an automatic Worker may launch a nested Claude executable while cgroup
+cleanup still reaps the child.
 The automation spike additionally exercises a real Pi SDK Decision Worker with
 Claude: ordinary completion, harmless Bash permission handling, and an
 `AskUserQuestion` denial-to-text fallback followed by automatic verification.
-A local pinned-CLI run completed all three scenarios with `state=completed`,
+A local baseline-CLI run completed all three scenarios with `state=completed`,
 `verified=true`, and zero human interventions. Provider/model latency can still
 cause a later run to fail closed as a parked/non-publishable candidate after the bounded Decision
 Worker or Reviewer timeout; this is evidence for the manual spike only, not a CI guarantee.
@@ -75,8 +82,21 @@ heartbeat. Recovery is explicit and safe: after an unclean Pi restart,
 `/supervise sessions` shows the task as `recoverable`, and `/supervise recover
 [--takeover] <task-id>` restores the Decision Worker history before starting a new
 Claude Worker. `--takeover` is accepted only when the old Pi owner is dead, the
-Worker process group is gone, and its cgroup is a real readable empty boundary;
-persistent tmux sessions use `adopt-tmux`.
+Worker process group is gone, and its cgroup is a real readable empty boundary.
+Automatic tmux takeover additionally verifies Supervisor ownership, persisted
+Worker/cgroup and tmux-server identities, and that the private tmux session is gone.
+It persists cleanup-pending state before reserving the gone private socket,
+reuses the old lease record for an atomic replacement, then removes the
+guardian-left-empty cgroup and clears the transaction only after cleanup is
+verified; a fresh lease reader reconciles an interrupted transaction while
+retaining a replacement lease during its replacement phase. Automatic lease acquisition records a no-spawn startup marker; the adapter
+persists its generated cgroup/socket plan before resource creation, then records
+cgroup and tmux-server identity in stages before spawn. Startup takeover verifies
+and cleans a planned empty cgroup/session when a crash interrupts that sequence;
+a stale marker can otherwise be reclaimed only after its owner is proven dead.
+Automatic normal-exit cleanup retains an empty cgroup until lease release.
+Persistent manual tmux sessions use `adopt-tmux`. The bridge has a regression test that mutates settings
+between Supervisor preflight and `respawn-pane` and confirms Claude is not spawned.
 Run the permission and signal probes explicitly when validating a CLI release:
 
 ```bash
@@ -86,10 +106,11 @@ npm run spike:signals
 npm run spike:automation
 SPIKE_AUTOMATION_PERMISSION=1 npm run spike:automation
 SPIKE_AUTOMATION_QUESTION=1 npm run spike:automation
-PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH=/home/yancao/.local/share/mise/installs/claude/2.1.270/claude \
 PI_CLAUDE_SUPERVISOR_REAL_CLAUDE=1 npm run spike:tmux
-PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH=/home/yancao/.local/share/mise/installs/claude/2.1.270/claude \
 PI_CLAUDE_SUPERVISOR_REAL_CLAUDE=1 npm run spike:tmux-interactive
+# Optional explicit override; PATH/latest is preferred:
+PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH="$HOME/.local/share/mise/installs/claude/latest/claude" \
+PI_CLAUDE_SUPERVISOR_REAL_CLAUDE=1 npm run spike:tmux
 ```
 
 The tmux spike is gated, authenticated, and excluded from normal CI. It uses
@@ -100,11 +121,12 @@ and identity-bound restart re-adoption. The interactive spike uses a fresh tempo
 cwd to verify Claude's trust prompt, a real Bash permission prompt, an allow-once
 response, and an exact result marker; it also records metadata only.
 
-For each release, pin and record the validated Claude Code version, resolved
-executable path, and model. The spikes reject an unpinned/mismatched executable
-version. For this release the validated version is `2.1.270` with model `opus`;
-the bounded matrix and its fail-closed outliers are recorded in
-[`docs/stability-matrix-2.1.270.md`](stability-matrix-2.1.270.md).
+For each release, record the validated Claude Code version, resolved executable
+path, and model. The spikes resolve `claude` from `PATH` by default and reject
+versions below the compatibility floor `2.1.270`; they do not require an exact
+versioned installation path. The recorded baseline for this release is `2.1.270`
+with model `opus`; the bounded matrix and its fail-closed outliers are recorded
+in [`docs/stability-matrix-2.1.270.md`](stability-matrix-2.1.270.md).
 Record:
 
 1. exact version and resolved executable path;
@@ -137,11 +159,17 @@ The tmux transport is selected with `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`.
 Automatic mode rejects explicit `process-pipe`; use JSONL or the Supervisor-owned
 bridge for bounded decisions and repair. Automatic JSONL and tmux workers also
 require Linux cgroup v2 containment (and the tmux parent-death guardian); startup
-fails closed when it is unavailable. Built-in Claude workers also receive a fail-closed
-sandbox setting (`failIfUnavailable`, `allowUnsandboxedCommands=false`, no outbound
-network domains); verify that startup fails if the sandbox cannot be initialized.
-Automatic startup also requires a full existing Git baseline, non-bare non-protected
-worktree and the bare `claude`/`claude.exe` command name. It resolves and pins an
+fails closed when it is unavailable. Parent-death cleanup leaves an empty cgroup
+for verified takeover, while automatic normal worker cleanup retains an empty
+cgroup until cwd lease release (manual cleanup removes it). Automatic workers
+preserve Claude Code's normal
+arguments, environment, network access, tools, agents, plugins and MCP configuration;
+there is no injected sandbox or automatic tool allowlist. The only automatic CLI
+safety addition is a `default` permission mode when none was supplied; Bash
+preauthorization through `--allowedTools` or loaded settings is rejected so Bash
+requests remain visible to Supervisor policy. Automatic startup also requires
+a full existing Git baseline, non-bare non-protected worktree and the bare
+`claude`/`claude.exe` command name. It resolves and pins an
 operator-owned, non-writable executable path (or the path configured by
 `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE`), rejects explicit/custom executable paths, and
 compares the exact startup HEAD again immediately before spawn. Before release, verify:
@@ -163,13 +191,16 @@ response.
 The automated adapter matrix covers external `SIGTERM`, `SIGINT`, `SIGKILL`,
 `SIGSTOP`/`SIGCONT`, SIGTERM refusal/escalation, leader-early-exit descendant
 cleanup, required cgroup bootstrap containment of a pre-attachment detached
-and `setsid()` descendant, automatic nested-Claude detection across the worker
-cgroup, repeated stop, spawn failure, output truncation,
+and `setsid()` descendant, nested Claude/agent descendant allowance with cgroup cleanup,
+repeated stop, spawn failure, output truncation,
 blocked stdin write timeouts, and immediate JSONL results. The Supervisor
 matrix also covers retrying failed lifecycle events, preserving startup event
 order, stopping under persistent timeout-event failure, and restoring output
 after event-log failure. The Supervisor matrix covers startup rejection,
-externally terminated workers, lifecycle serialization and stop races.
+externally terminated workers, lifecycle serialization and stop races. Cwd lease
+coverage includes successful automatic process and tmux takeover, token-bound
+same-record replacement, provisional pre-spawn identity, retained-cgroup
+release, and reconciliation of a durable pending-cleanup transaction.
 
 Before release, manually test at least: immediate crash, hung process, malformed
 output, duplicate send, send/exit race, Pi `SIGTERM`/`SIGINT` shutdown,
@@ -187,7 +218,7 @@ the managed process group.
 The `v0.5.0` implementation of the acceptance—independent Review—repair—reacceptance
 loop is shipped. The `v0.5.1` real read-only drill reached acceptance and independent
 Review, then correctly produced a non-publishable candidate after two P1 and two P2 findings under the then-current human-gated compatibility path.
-A separate real edit-capable Claude Code `2.1.270` drill then exercised one bounded
+A separate real edit-capable Claude Code `2.1.270` baseline drill then exercised one bounded
 acceptance failure, repair turn, reacceptance and independent Reviewer `pass` in an
 isolated temporary worktree. The current hardening plan and evidence paths are recorded
 in [`docs/automation-hardening-plan.md`](automation-hardening-plan.md). Deterministic
@@ -235,10 +266,12 @@ The adapter/replay matrix must cover:
 - paused watchdog behavior and resume-time no-output rebasing;
 - assistant-message-bounded Reviewer and Decision Worker output parsing.
 
-Real Claude tests remain authenticated manual Spikes and are pinned to
-`2.1.270`; they are not part of normal CI. Normal CI runs deterministic fake
-Worker and replay fixtures. The pinned stability matrix is the compatibility evidence
-for this release line; any future CLI change must rerun ten consecutive ordinary
+Real Claude tests remain authenticated manual Spikes and are not part of normal
+CI. The spikes accept Claude Code `2.1.270` and newer, resolve the current
+executable from `PATH`, and report the actual version/path. Normal CI runs
+deterministic fake Worker and replay fixtures. The `2.1.270` stability matrix is
+the baseline compatibility evidence for this release line; any future CLI change
+must rerun ten consecutive ordinary
 automatic runs and at least five runs each for permission and question handling, with
 no duplicate action, false completion or unreaped Worker.
 
@@ -258,12 +291,15 @@ Required deterministic and integration coverage:
 - conflicting diffs detected before integration, with no same-worktree writes;
 - independent child acceptance followed by root-task aggregate acceptance and Review;
 - single-child recovery, whole-graph recovery and Pi shutdown during scheduling;
-- no child can grant permissions, send control input to another child or bypass Policy Gate;
-- independent integration in a separate worktree; the Worker has no remote push or main/integration merge authority, and no candidate bypasses that boundary.
+- scheduler-owned children cannot grant permissions or send control input to another scheduled child;
+  Claude-native Agent/Task/MCP descendants remain trusted inside their Worker's cleanup cgroup;
+- independent integration in a separate worktree; known direct remote push/main operations remain
+  policy-denied, while absolute enforcement for trusted nested/custom capabilities belongs to that boundary.
 
-The multi-worker gate should be added only after the pinned single-worker stability
-and recovery gates pass. CI should use fake Workers and replay fixtures; authenticated
-Claude multi-worker Spikes remain manual and version-pinned.
+The multi-worker gate should be added only after the minimum-version single-worker
+stability and recovery gates pass. CI should use fake Workers and replay fixtures;
+authenticated Claude multi-worker Spikes remain manual and must meet the same
+`2.1.270` minimum.
 
 ## Live drill and hardening gate
 

@@ -252,9 +252,10 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             throw new Error("An active, starting, or unreaped worker uses an overlapping cwd; use a separate worktree for concurrent sessions");
           }
           const taskId = randomUUID();
-          const lease = await cwdLeaseStore.acquire(cwdKey, taskId, adapter.capabilities().transport, tmuxSession
-            ? { handoff: { sessionName: tmuxSession, tmuxSocket: process.env.PI_CLAUDE_SUPERVISOR_TMUX_SOCKET } }
-            : {});
+          const lease = await cwdLeaseStore.acquire(cwdKey, taskId, adapter.capabilities().transport, {
+            startup: taskAutomation,
+            ...(tmuxSession ? { handoff: { sessionName: tmuxSession, tmuxSocket: process.env.PI_CLAUDE_SUPERVISOR_TMUX_SOCKET } } : {}),
+          });
           cwdLeases.set(taskId, lease);
           if (shuttingDown) {
             await releaseLease(taskId);
@@ -286,6 +287,42 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 env: selectedWorkerEnvironment(taskAutomation),
                 approval,
                 automation: taskAutomation,
+                retainCgroupUntilLeaseRelease: taskAutomation,
+                onWorkerStartup: taskAutomation
+                  ? async (startupHandle) => {
+                      await lease.updateWorker({
+                        transport: adapter.capabilities().transport,
+                        workerId: startupHandle.id,
+                        cgroupPath: startupHandle.cgroupPath,
+                        sessionName: startupHandle.sessionName,
+                        tmuxSocket: startupHandle.tmuxSocket,
+                        ownership: startupHandle.ownership,
+                        retainCgroupUntilLeaseRelease: startupHandle.retainCgroupUntilLeaseRelease,
+                      }, { preserveStartup: true });
+                    }
+                  : undefined,
+                onWorkerPrepared: taskAutomation
+                  ? async (preparedHandle) => {
+                      await lease.updateWorker({
+                        transport: adapter.capabilities().transport,
+                        ...(await workerIdentity(preparedHandle)),
+                        sessionName: preparedHandle.sessionName,
+                        tmuxSocket: preparedHandle.tmuxSocket,
+                        ownership: preparedHandle.ownership,
+                      }, { preserveStartup: true });
+                    }
+                  : undefined,
+                onWorkerPreSpawn: taskAutomation
+                  ? async (preSpawnHandle) => {
+                      await lease.updateWorker({
+                        transport: adapter.capabilities().transport,
+                        ...(await workerIdentity(preSpawnHandle)),
+                        sessionName: preSpawnHandle.sessionName,
+                        tmuxSocket: preSpawnHandle.tmuxSocket,
+                        ownership: preSpawnHandle.ownership,
+                      });
+                    }
+                  : undefined,
                 tmuxSession,
                 tmuxSocket: process.env.PI_CLAUDE_SUPERVISOR_TMUX_SOCKET,
                 tmuxExpectedIdentity: tmuxSession && lease.record.worker ? {
@@ -453,14 +490,15 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           const automaticRecovery = record.spec?.autonomy.unattended !== false;
           if (automaticRecovery && !record.resolvedExecutable) throw new Error("automatic recovery requires a persisted resolved Claude executable identity");
           const approval = record.approval;
-          const lease = await cwdLeaseStore.acquire(cwdKey, record.taskId, adapter.capabilities().transport, takeover
-            ? {
+          const lease = await cwdLeaseStore.acquire(cwdKey, record.taskId, adapter.capabilities().transport, {
+            startup: automaticRecovery,
+            ...(takeover ? {
               takeover: {
                 taskId: record.taskId,
                 ...(staleRecovery ? { beforeReplace: () => decisionStore.reconcileStaleRecovery(record.taskId) } : {}),
               },
-            }
-            : {});
+            } : {}),
+          });
           if (staleRecovery && lease.replacedTaskId !== record.taskId) {
             await lease.release();
             throw new Error(`Stale Decision Worker recovery has no verified old lease to take over: ${record.taskId}`);
@@ -507,6 +545,42 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 env: selectedWorkerEnvironment(automaticRecovery),
                 approval,
                 automation: automaticRecovery,
+                retainCgroupUntilLeaseRelease: automaticRecovery,
+                onWorkerStartup: automaticRecovery
+                  ? async (startupHandle) => {
+                      await lease.updateWorker({
+                        transport: adapter.capabilities().transport,
+                        workerId: startupHandle.id,
+                        cgroupPath: startupHandle.cgroupPath,
+                        sessionName: startupHandle.sessionName,
+                        tmuxSocket: startupHandle.tmuxSocket,
+                        ownership: startupHandle.ownership,
+                        retainCgroupUntilLeaseRelease: startupHandle.retainCgroupUntilLeaseRelease,
+                      }, { preserveStartup: true });
+                    }
+                  : undefined,
+                onWorkerPrepared: automaticRecovery
+                  ? async (preparedHandle) => {
+                      await lease.updateWorker({
+                        transport: adapter.capabilities().transport,
+                        ...(await workerIdentity(preparedHandle)),
+                        sessionName: preparedHandle.sessionName,
+                        tmuxSocket: preparedHandle.tmuxSocket,
+                        ownership: preparedHandle.ownership,
+                      }, { preserveStartup: true });
+                    }
+                  : undefined,
+                onWorkerPreSpawn: automaticRecovery
+                  ? async (preSpawnHandle) => {
+                      await lease.updateWorker({
+                        transport: adapter.capabilities().transport,
+                        ...(await workerIdentity(preSpawnHandle)),
+                        sessionName: preSpawnHandle.sessionName,
+                        tmuxSocket: preSpawnHandle.tmuxSocket,
+                        ownership: preSpawnHandle.ownership,
+                      });
+                    }
+                  : undefined,
                 ...(automaticRecovery && record.resolvedExecutable ? { expectedClaudeExecutable: record.resolvedExecutable } : {}),
                 maxTurns: record.maxTurns,
                 deadlineMs: record.deadlineMs,
@@ -768,6 +842,7 @@ function formatSessions(sessions: Map<string, Supervisor>, recoverable: Decision
 }
 
 function selectedWorkerEnvironment(automatic = false): NodeJS.ProcessEnv {
+  if (automatic) return automaticWorkerEnvironment(process.env);
   const result: NodeJS.ProcessEnv = {};
   const names = (process.env.PI_CLAUDE_SUPERVISOR_WORKER_ENV ?? "")
     .split(",")
@@ -776,7 +851,7 @@ function selectedWorkerEnvironment(automatic = false): NodeJS.ProcessEnv {
   for (const name of names) {
     if (process.env[name] !== undefined) result[name] = process.env[name];
   }
-  return automatic ? automaticWorkerEnvironment(result) : result;
+  return result;
 }
 
 async function readTaskSpecFile(path: string, cwd: string): Promise<TaskSpec> {

@@ -54,15 +54,23 @@ export interface WorkerStartInput {
   sendInitialInput?: boolean;
   /** Automatic mode selects the structured tmux bridge instead of the manual TUI transport. */
   automatic?: boolean;
+  /** Keep an empty automatic cgroup until the owning cwd lease is finalized. */
+  retainCgroupUntilLeaseRelease?: boolean;
+  /** Persist the planned automatic resource identity before adapter setup. */
+  onWorkerStartup?: (provisionalHandle: WorkerHandle) => Promise<void> | void;
+  /** Persist the cgroup identity before creating any external Worker resource. */
+  onWorkerPrepared?: (provisionalHandle: WorkerHandle) => Promise<void> | void;
   /** Cancel startup before a worker is fully returned to the supervisor. */
   abortSignal?: AbortSignal;
   /** Internal token that scopes out-of-band startup cancellation. */
   startupToken?: string;
   /**
-   * Automatic-start repository assertion. Built-in adapters invoke this after
-   * all asynchronous setup and immediately before spawning the Worker.
+   * Automatic-start repository/settings assertion. Built-in adapters invoke
+   * this after asynchronous setup; the tmux bridge repeats its permission
+   * check immediately before spawning the Claude child. The provisional
+   * handle contains the cgroup identity before Worker spawn.
    */
-  preSpawnCheck?: () => Promise<void>;
+  preSpawnCheck?: (provisionalHandle?: WorkerHandle) => Promise<void>;
 }
 
 export interface WorkerHandle {
@@ -76,6 +84,11 @@ export interface WorkerHandle {
   ownership?: "owned" | "adopted";
   /** Verified process-boundary metadata persisted in the cwd lease registry. */
   cgroupPath?: string;
+  cgroupIdentity?: { device: string; inode: string };
+  /** Automatic adapters retain the empty cgroup until the cwd lease is released. */
+  retainCgroupUntilLeaseRelease?: boolean;
+  tmuxServerPid?: number;
+  tmuxServerStartTime?: string;
   tmuxTarget?: string;
   tmuxPaneId?: string;
   paneStartTime?: string;

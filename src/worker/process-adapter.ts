@@ -14,8 +14,7 @@ import type {
   WorkerStatus,
 } from "../types.ts";
 import { assertSafeWorkerCommand } from "../policy.ts";
-import { workerEnvironment } from "./environment.ts";
-import { isClaudeProcess, linuxCgroupProcesses, linuxProcessTree, sameProcessIdentity, unexpectedClaudeProcess, unexpectedReviewerProcess, type ProcessTreeEntry } from "./process-tree.ts";
+import { automaticWorkerEnvironment, workerEnvironment } from "./environment.ts";
 
 export interface ProcessWorkerAdapterOptions {
   /** Use Claude Code's documented stream-json stdin/stdout framing. */
@@ -80,9 +79,7 @@ interface ProcessRecord {
   inputTail: Promise<void>;
   listeners: Set<WorkerEventListener>;
   permissionResponses: Set<string>;
-  enforceNestedClaude: boolean;
-  expectedClaudeCommand?: string;
-  trustedClaudeProcesses: Map<number, ProcessTreeEntry>;
+  automatic: boolean;
   stopping?: boolean;
   starting: boolean;
   abortRequested: boolean;
@@ -151,8 +148,18 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       startedAt: new Date().toISOString(),
       cwd: input.cwd,
     };
-    const workerEnv = workerEnvironment(process.env, input.env);
+    const workerEnv = input.automatic
+      ? automaticWorkerEnvironment(input.env)
+      : workerEnvironment(process.env, input.env);
     await assertExecutable(input.command, workerEnv.PATH);
+    if (input.automatic && process.platform === "linux") {
+      handle.cgroupPath = await this.#plannedCgroupPath(handle.id);
+      if (input.retainCgroupUntilLeaseRelease) handle.retainCgroupUntilLeaseRelease = true;
+      // Persist the generated path before mkdir. A crash after cgroup
+      // creation but before inode registration can then be reconciled by the
+      // lease takeover path instead of being mistaken for a no-resource start.
+      await input.onWorkerStartup?.(handle);
+    }
     const pendingAbortReason = input.startupToken ? this.#pendingStartupAborts.get(input.startupToken) : undefined;
     if (input.startupToken) this.#pendingStartupAborts.delete(input.startupToken);
     if (pendingAbortReason !== undefined) throw new Error(`worker startup aborted: ${pendingAbortReason}`);
@@ -161,13 +168,29 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     if (input.automatic && this.#cgroupMode === "off") throw new Error("automatic supervision requires cgroup containment");
     if ((this.#cgroupMode !== "off" || input.automatic) && process.platform === "linux") {
       try {
-        cgroupPath = await this.#createCgroup(handle.id);
+        cgroupPath = await this.#createCgroup(handle.id, handle.cgroupPath);
         handle.cgroupPath = cgroupPath;
+        if (input.automatic && input.retainCgroupUntilLeaseRelease) handle.retainCgroupUntilLeaseRelease = true;
       } catch (error) {
         cgroupError = error instanceof Error ? error : new Error(String(error));
         if (this.#cgroupMode === "required" || input.automatic) throw new Error(`unable to create a worker cgroup: ${cgroupError.message}`, { cause: cgroupError });
       }
     }
+    if (input.automatic && cgroupPath) {
+      try {
+        await input.onWorkerPrepared?.(handle);
+      } catch (error) {
+        // The durable identity callback did not complete, so there is no
+        // lease-bound evidence with which to retain this startup cgroup.
+        await cleanupCgroup(cgroupPath, this.#killGraceMs, false).catch(() => {});
+        throw error;
+      }
+    }
+    const cleanupStartupCgroup = async () => {
+      if (!cgroupPath) return;
+      if (input.automatic && input.retainCgroupUntilLeaseRelease) await cleanupCgroup(cgroupPath, this.#killGraceMs, true).catch(() => {});
+      else await removeCgroupDirectory(cgroupPath).catch(() => {});
+    };
     const delayedAbortReason = input.startupToken ? this.#pendingStartupAborts.get(input.startupToken) : undefined;
     if (input.startupToken) this.#pendingStartupAborts.delete(input.startupToken);
     if (input.abortSignal?.aborted || delayedAbortReason !== undefined) {
@@ -181,21 +204,21 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     }
     const useGuardedBootstrap = process.platform === "linux" && Boolean(parentStartTime) && Boolean(cgroupPath);
     const launch = useGuardedBootstrap
-      ? guardedBootstrapLaunch(input.command, args, input.cwd, workerEnv, cgroupPath, process.pid, parentStartTime!)
+      ? guardedBootstrapLaunch(input.command, args, input.cwd, workerEnv, cgroupPath, process.pid, parentStartTime!, input.retainCgroupUntilLeaseRelease === true)
       : { command: input.command, args, env: workerEnv };
     try {
       // This is the last asynchronous operation before spawn. Automatic mode
       // uses it for an exact repository HEAD assertion; adapters that add
       // setup work must invoke the hook only after that work is complete.
-      await input.preSpawnCheck?.();
+      await input.preSpawnCheck?.(handle);
     } catch (error) {
-      if (cgroupPath) await removeCgroupDirectory(cgroupPath).catch(() => {});
+      await cleanupStartupCgroup();
       throw error;
     }
     const finalAbortReason = input.startupToken ? this.#pendingStartupAborts.get(input.startupToken) : undefined;
     if (input.startupToken) this.#pendingStartupAborts.delete(input.startupToken);
     if (input.abortSignal?.aborted || finalAbortReason !== undefined) {
-      if (cgroupPath) await removeCgroupDirectory(cgroupPath).catch(() => {});
+      await cleanupStartupCgroup();
       throw new Error(`worker startup aborted${finalAbortReason ? `: ${finalAbortReason}` : " before spawn"}`);
     }
     const guardedLaunch = useGuardedBootstrap;
@@ -209,7 +232,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (error) {
-      if (cgroupPath) await removeCgroupDirectory(cgroupPath).catch(() => {});
+      await cleanupStartupCgroup();
       throw error;
     }
     handle.pid = child.pid;
@@ -246,9 +269,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       inputTail: Promise.resolve(),
       listeners: new Set(input.eventListener ? [input.eventListener] : []),
       permissionResponses: new Set(),
-      enforceNestedClaude: Boolean(input.automatic),
-      expectedClaudeCommand: input.automatic ? input.command : undefined,
-      trustedClaudeProcesses: new Map(),
+      automatic: Boolean(input.automatic),
       starting: true,
       abortRequested: false,
       startupToken: input.startupToken,
@@ -343,23 +364,6 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
         }
         throw startupError;
       }
-      if (record.enforceNestedClaude) {
-        try {
-          await this.#rememberClaudeProcesses(record);
-        } catch (error) {
-          let cleanupError: unknown;
-          try { await this.stop(handle, "worker containment startup failed"); }
-          catch (stopError) { cleanupError = stopError; }
-          if (cleanupError) {
-            const startupError = error instanceof Error ? error : new Error(String(error));
-            startupError.message = `${startupError.message}; startup cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
-            Object.defineProperty(startupError, "workerHandle", { value: handle, enumerable: false });
-            Object.defineProperty(startupError, "workerCleanupRequired", { value: true, enumerable: false });
-            throw startupError;
-          }
-          throw error;
-        }
-      }
       if (input.task) {
         this.#assertNotAborted(record);
         record.lastInputAt = new Date().toISOString();
@@ -410,7 +414,6 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   async getStatus(handle: WorkerHandle): Promise<WorkerStatus> {
     const record = this.#record(handle);
     const running = record.exitCode === undefined;
-    if (running && record.enforceNestedClaude) await this.#checkNestedClaude(record);
     if (!running && record.groupCleanup) {
       try {
         await record.groupCleanup;
@@ -429,7 +432,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       exitReason: running ? undefined : record.runtimeError ? "failed" : record.stopping ? "stopped" : record.signal ? "crashed" : record.exitCode === 0 ? "completed" : "failed",
       processGroupCleaned: record.groupCleanupComplete,
       cgroupCleaned: record.cgroupPath ? record.groupCleanupComplete : undefined,
-      cgroupRequired: this.#cgroupMode === "required" || record.enforceNestedClaude,
+      cgroupRequired: this.#cgroupMode === "required" || record.automatic,
       cgroupError: record.cgroupError?.message,
       cleanupError: record.cleanupError?.message,
       runtimeError: record.runtimeError?.message,
@@ -698,9 +701,13 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     await preflightCgroupContainment(this.#cgroupParentPath);
   }
 
-  async #createCgroup(id: string): Promise<string> {
+  async #plannedCgroupPath(id: string): Promise<string> {
     const parent = this.#cgroupParentPath ?? await currentCgroupPath();
-    const path = `${parent}/pi-claude-supervisor-${id}`;
+    return `${parent}/pi-claude-supervisor-${id}`;
+  }
+
+  async #createCgroup(id: string, plannedPath?: string): Promise<string> {
+    const path = plannedPath ?? await this.#plannedCgroupPath(id);
     await mkdir(path);
     try {
       await access(`${path}/cgroup.procs`, fsConstants.R_OK | fsConstants.W_OK);
@@ -711,64 +718,6 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       throw new Error(`worker cgroup controls are unavailable: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
     return path;
-  }
-
-  async #processScope(record: ProcessRecord): Promise<ProcessTreeEntry[]> {
-    const rootPid = record.handle.pid ?? 0;
-    const tree = await linuxProcessTree(rootPid);
-    if (!record.cgroupPath) return tree;
-    const group = await linuxCgroupProcesses(record.cgroupPath);
-    if (record.enforceNestedClaude && !group.some((entry) => entry.pid === rootPid)) {
-      throw new Error("automatic worker is not contained by its required cgroup");
-    }
-    return [...new Map([...tree, ...group].map((entry) => [entry.pid, entry])).values()];
-  }
-
-  async #rememberClaudeProcesses(record: ProcessRecord): Promise<void> {
-    const rootPid = record.handle.pid ?? 0;
-    let entries: ProcessTreeEntry[] = [];
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      try {
-        entries = await this.#processScope(record);
-        if (entries.some((entry) => entry.ppid === rootPid && isClaudeProcess(entry, record.expectedClaudeCommand))) break;
-      } catch (error) {
-        if (attempt === 19) throw error;
-      }
-      await delay(25);
-    }
-    record.trustedClaudeProcesses = new Map(entries.filter((entry) => entry.ppid === rootPid && isClaudeProcess(entry, record.expectedClaudeCommand)).map((entry) => [entry.pid, entry]));
-  }
-
-  async #checkNestedClaude(record: ProcessRecord): Promise<void> {
-    const rootPid = record.handle.pid ?? 0;
-    let entries: ProcessTreeEntry[];
-    try { entries = await this.#processScope(record); }
-    catch (error) {
-      if (process.platform === "linux" && !record.runtimeError) {
-        record.runtimeError = new Error(`nested Claude guard unavailable: ${error instanceof Error ? error.message : String(error)}`);
-        record.stopping = true;
-        try { record.child.kill("SIGTERM"); } catch {}
-        this.#appendOutput(record, { stream: "stderr", text: `${record.runtimeError.message}\n`, at: new Date().toISOString() });
-      }
-      return;
-    }
-    if (record.trustedClaudeProcesses.size === 0) {
-      const directClaude = entries.filter((entry) => entry.ppid === rootPid && isClaudeProcess(entry, record.expectedClaudeCommand));
-      if (directClaude.length > 0) {
-        record.trustedClaudeProcesses = new Map(directClaude.map((entry) => [entry.pid, entry]));
-        return;
-      }
-    }
-    const nestedClaude = unexpectedClaudeProcess(entries, record.trustedClaudeProcesses, record.expectedClaudeCommand);
-    const reviewerCandidate = unexpectedReviewerProcess(entries);
-    const trustedReviewerCandidate = reviewerCandidate && record.trustedClaudeProcesses.get(reviewerCandidate.pid);
-    const nestedReviewer = reviewerCandidate && (!trustedReviewerCandidate || !sameProcessIdentity(trustedReviewerCandidate, reviewerCandidate)) ? reviewerCandidate : undefined;
-    const nested = nestedClaude ?? nestedReviewer;
-    if (!nested || record.runtimeError) return;
-    record.runtimeError = new Error(`${nested === nestedReviewer ? "nested Reviewer" : "nested Claude"} process denied (pid=${nested.pid})`);
-    record.stopping = true;
-    try { record.child.kill("SIGTERM"); } catch {}
-    this.#appendOutput(record, { stream: "stderr", text: `${record.runtimeError.message}\n`, at: new Date().toISOString() });
   }
 
   #record(handle: WorkerHandle): ProcessRecord {
@@ -793,7 +742,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   async #cleanupProcessGroup(record: ProcessRecord): Promise<void> {
     const errors: Error[] = [];
     if (record.cgroupPath) {
-      try { await cleanupCgroup(record.cgroupPath, this.#killGraceMs); }
+      try { await cleanupCgroup(record.cgroupPath, this.#killGraceMs, Boolean(record.automatic && record.handle.retainCgroupUntilLeaseRelease)); }
       catch (error) { errors.push(error instanceof Error ? error : new Error(String(error))); }
     }
     try { await this.#cleanupProcessGroupOnly(record); }
@@ -841,6 +790,7 @@ const BOOTSTRAP_KEYS = {
   cgroup: "PI_CLAUDE_SUPERVISOR_BOOTSTRAP_CGROUP",
   parentPid: "PI_CLAUDE_SUPERVISOR_BOOTSTRAP_PARENT_PID",
   parentStartTime: "PI_CLAUDE_SUPERVISOR_BOOTSTRAP_PARENT_START",
+  retainCgroup: "PI_CLAUDE_SUPERVISOR_BOOTSTRAP_RETAIN_CGROUP",
 } as const;
 
 /**
@@ -848,7 +798,10 @@ const BOOTSTRAP_KEYS = {
  * Supervisor's PID/start-time identity. A SIGKILL cannot run cleanup in the
  * Supervisor itself, so the detached worker must notice that its owner died
  * and terminate its own descendants. The cgroup path remains an additional
- * descendant boundary when v2 is available.
+ * descendant boundary when v2 is available. Parent-death cleanup leaves an
+ * empty cgroup for explicit lease takeover to verify and reclaim; automatic
+ * worker exit may retain the verified empty directory until its cwd lease is
+ * released.
  */
 const GUARDED_BOOTSTRAP_SCRIPT = `
 const { spawn } = require("node:child_process");
@@ -865,6 +818,7 @@ const readStart = (pid) => {
 };
 const parentPid = Number(decode(${JSON.stringify(BOOTSTRAP_KEYS.parentPid)}));
 const parentStart = decode(${JSON.stringify(BOOTSTRAP_KEYS.parentStartTime)});
+const retainCgroup = decode(${JSON.stringify(BOOTSTRAP_KEYS.retainCgroup)}) === "1";
 const cgroup = decode(${JSON.stringify(BOOTSTRAP_KEYS.cgroup)});
 const parentCgroup = cgroup ? dirname(cgroup) : undefined;
 const parentAlive = () => Boolean(parentPid > 0 && process.ppid === parentPid && (() => {
@@ -884,9 +838,9 @@ const removeCgroup = () => {
 const killGroup = (signal) => {
   try { process.kill(-process.pid, signal); } catch {}
 };
-const finishAfterCgroup = (code, signal) => {
+const finishAfterCgroup = (code, signal, retainCgroup) => {
   const finish = () => {
-    removeCgroup();
+    if (!retainCgroup) removeCgroup();
     if (signal) {
       for (const forwarded of ["SIGTERM", "SIGINT", "SIGQUIT"]) process.removeAllListeners(forwarded);
       try { process.kill(process.pid, signal); } catch {}
@@ -920,7 +874,7 @@ const stopParentlessWorker = () => {
   try { child?.kill("SIGTERM"); } catch {}
   // Move the bootstrap out first so cgroup.kill cannot kill the cleanup code.
   moveOutOfCgroup();
-  setTimeout(() => finishAfterCgroup(143), 250).unref();
+  setTimeout(() => finishAfterCgroup(143, undefined, true), 250).unref();
 };
 try {
   if (cgroup) writeFileSync(cgroup + "/cgroup.procs", String(process.pid) + "\\n");
@@ -934,7 +888,7 @@ try {
 } catch (error) {
   console.error("worker bootstrap failed:", error instanceof Error ? error.message : String(error));
   moveOutOfCgroup();
-  finishAfterCgroup(125);
+  finishAfterCgroup(125, undefined, retainCgroup);
 }
 if (child) {
 process.stderr.write("${BOOTSTRAP_READY_MARKER}\\n");
@@ -948,19 +902,19 @@ child.once("error", (error) => {
   clearInterval(parentWatch);
   console.error("worker bootstrap child failed:", error.message);
   moveOutOfCgroup();
-  finishAfterCgroup(127);
+  finishAfterCgroup(127, undefined, retainCgroup);
 });
 child.once("exit", (code, signal) => {
   if (finished || orphaning) return;
   finished = true;
   clearInterval(parentWatch);
   moveOutOfCgroup();
-  finishAfterCgroup(code ?? 1, signal);
+  finishAfterCgroup(code ?? 1, signal, retainCgroup);
 });
 }
 `;
 
-function guardedBootstrapLaunch(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv, cgroupPath: string | undefined, parentPid: number, parentStartTime: string): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
+function guardedBootstrapLaunch(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv, cgroupPath: string | undefined, parentPid: number, parentStartTime: string, retainCgroup: boolean): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
   const encode = (value: string) => Buffer.from(value, "utf8").toString("base64");
   return {
     command: process.execPath,
@@ -973,6 +927,7 @@ function guardedBootstrapLaunch(command: string, args: string[], cwd: string, en
       [BOOTSTRAP_KEYS.cgroup]: encode(cgroupPath ?? ""),
       [BOOTSTRAP_KEYS.parentPid]: encode(String(parentPid)),
       [BOOTSTRAP_KEYS.parentStartTime]: encode(parentStartTime),
+      [BOOTSTRAP_KEYS.retainCgroup]: encode(retainCgroup ? "1" : "0"),
     },
   };
 }
@@ -1151,7 +1106,7 @@ async function removeCgroupDirectory(path: string): Promise<void> {
   }
 }
 
-export async function cleanupCgroup(path: string, graceMs: number): Promise<void> {
+export async function cleanupCgroup(path: string, graceMs: number, retainDirectory = false): Promise<void> {
   try {
     await stat(path);
   } catch (error) {
@@ -1177,7 +1132,7 @@ export async function cleanupCgroup(path: string, graceMs: number): Promise<void
     try {
       const events = await readFile(`${path}/cgroup.events`, "utf8");
       if (/^populated 0$/mu.test(events)) {
-        await removeCgroupDirectory(path);
+        if (!retainDirectory) await removeCgroupDirectory(path);
         return;
       }
     } catch (error) {
