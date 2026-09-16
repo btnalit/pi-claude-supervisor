@@ -1,6 +1,6 @@
 {
   "name": "pi-claude-supervisor",
-  "version": "0.5.5",
+  "version": "0.6.0",
   "description": "A policy-gated Pi supervisor for observing and verifying Claude Code workers.",
   "license": "MIT",
   "publishConfig": {

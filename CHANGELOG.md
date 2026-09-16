@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.6.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.5.5...v0.6.0) (2026-09-16)
+
+
+### Features
+
+* preserve full automatic Claude capabilities ([#34](https://github.com/btnalit/pi-claude-supervisor/issues/34)) ([f3ef24b](https://github.com/btnalit/pi-claude-supervisor/commit/f3ef24bf4e2bbbce27516a0e36c6000a00222b71))
+
 ## [0.5.5](https://github.com/btnalit/pi-claude-supervisor/compare/v0.5.4...v0.5.5) (2026-09-15)
 
 
