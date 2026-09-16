@@ -7,7 +7,7 @@ import { PiDecisionWorker, type DecisionAction, type DecisionWorkerFactory, type
 import { collectRepositoryEvidence, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryWorkTree, verifyAll, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { redactSensitive } from "./redaction.ts";
-import { assertTrustedAutomaticClaudeExecutable, automaticClaudeArgs, automaticWorkerEnvironment } from "./worker/environment.ts";
+import { assertAutomaticClaudePermissionConfiguration, assertTrustedAutomaticClaudeExecutable, automaticClaudeArgs, automaticWorkerEnvironment } from "./worker/environment.ts";
 import { normalizeReviewReport, type ReviewInput, type TaskReviewer } from "./reviewer.ts";
 import type {
   AcceptanceReport,
@@ -93,6 +93,14 @@ export interface SupervisorStartOptions {
   sendInitialInput?: boolean;
   /** Enable the event-driven Pi Decision Worker. Automatic mode requires claude-jsonl. */
   automation?: boolean;
+  /** Index-owned cwd leases retain the empty automatic cgroup until release. */
+  retainCgroupUntilLeaseRelease?: boolean;
+  /** Persist the planned adapter resource identity before resource creation. */
+  onWorkerStartup?: (handle: WorkerHandle) => Promise<void> | void;
+  /** Persist the cgroup identity before creating external Worker resources. */
+  onWorkerPrepared?: (handle: WorkerHandle) => Promise<void> | void;
+  /** Persist the adapter's final resource identity before Worker spawn. */
+  onWorkerPreSpawn?: (handle: WorkerHandle) => Promise<void> | void;
   /** Persistent Pi session location for the Decision Worker. */
   decisionSessionFile?: string;
   decisionSessionDir?: string;
@@ -267,10 +275,13 @@ export class Supervisor {
       if (this.#automation && !["jsonl", "tmux"].includes(this.#adapter.capabilities().transport)) {
         throw new Error("automatic supervision requires the claude-jsonl or automated tmux transport");
       }
-      const workerEnvironment = this.#automation ? automaticWorkerEnvironment(options.env ?? process.env) : options.env;
+      const workerEnvironment = this.#automation
+        ? automaticWorkerEnvironment(options.env)
+        : options.env;
       if (this.#automation) {
         trustedWorkerCommand = await assertTrustedAutomaticClaudeExecutable(options.command, options.expectedClaudeExecutable);
         workerArgs = automaticClaudeArgs(options.command, options.args);
+        await assertAutomaticClaudePermissionConfiguration(options.cwd, workerArgs, workerEnvironment);
         await this.#appendEvent({ type: "worker_executable_pinned", taskId, data: { command: options.command, resolvedExecutable: trustedWorkerCommand } });
       }
       await this.#adapter.preflight?.({
@@ -330,13 +341,18 @@ export class Supervisor {
         tmuxExpectedIdentity: options.tmuxExpectedIdentity,
         sendInitialInput: options.sendInitialInput,
         automatic: this.#automation,
+        retainCgroupUntilLeaseRelease: this.#automation && options.retainCgroupUntilLeaseRelease === true,
         eventListener: (event) => this.#receiveWorkerEvent(event),
         env: workerEnvironment,
         abortSignal: startAbortController.signal,
         startupToken: this.#startToken,
+        onWorkerStartup: this.#automation ? options.onWorkerStartup : undefined,
+        onWorkerPrepared: this.#automation ? options.onWorkerPrepared : undefined,
         preSpawnCheck: this.#automation
-          ? async () => {
+          ? async (provisionalHandle) => {
+              if (provisionalHandle) await options.onWorkerPreSpawn?.(provisionalHandle);
               await automaticRepositoryBoundary(options.cwd, this.#task!.baseCommit, this.#task!.baseBranch, startAbortController.signal, startupHead);
+              await assertAutomaticClaudePermissionConfiguration(options.cwd, workerArgs ?? [], workerEnvironment);
               this.#assertStartNotAborted(startAbortController.signal);
             }
           : undefined,

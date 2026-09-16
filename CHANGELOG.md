@@ -59,6 +59,10 @@ All notable changes to this project will be documented here.
 - Keep protected CI checks on the exact checked-out commit while giving automatic-mode fixtures a local validation branch and an owned deterministic Claude executable.
 - Add a Supervisor-owned automatic tmux bridge that renders Claude stream-json in a live PTY and carries structured records through private framing instead of an independent event sidecar; adopted sessions remain manual-only.
 - Add parent-identity tmux guardians, guarded Linux bootstrap readiness/cleanup, explicit nested-Agent/background-reviewer denial, and tolerant Reviewer prose/fence/repeated-JSON parsing with separate display-truncation markers.
+- Preserve the complete Supervisor environment when automatic callers provide partial overrides, while still removing only `CLAUDECODE`.
+- Keep direct Claude Bash permission events observable by adding a safe default mode and rejecting Bash preauthorization in CLI/settings configuration.
+- Permit verified automatic tmux recovery after the guardian removes the session, with dead-owner/process/cgroup/session proofs before reclaiming the cwd lease; bind recovery to persisted Worker/cgroup identities, persist phased cleanup-pending state before reservation, replace the same lease record atomically, and repeat the effective-settings permission check immediately before the tmux bridge spawns Claude.
+- Retain verified empty automatic cgroups until cwd lease release, persist a no-spawn startup marker and provisional identity before Worker spawn, bind lock release/reclamation to directory identity and owner tokens, and pin the automatic tmux bridge cwd.
 
 ### Release readiness
 

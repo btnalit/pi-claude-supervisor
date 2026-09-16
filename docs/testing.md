@@ -37,8 +37,10 @@ the published TypeScript source directly and there is no second runtime bundle.
   detachment permits re-adoption, and adopted stop preserves the user's
   session.
 - `worker/environment.test.ts`: manual environment inheritance remains minimal, while
-  automatic mode preserves explicit credentials, helpers, settings and custom variables and
-  removes only `CLAUDECODE` so nested Claude can run.
+  automatic mode merges explicit overrides onto the complete inherited environment,
+  removes only `CLAUDECODE` so nested Claude can run, adds a safe default permission
+  mode when omitted, resolves settings from effective `HOME`/`CLAUDE_CONFIG_DIR`, and
+  rejects Bash preauthorization in CLI/settings configuration.
 - `supervisor.test.ts`: the no-output watchdog stops a stalled worker, lifecycle event failures are retried, and output is restored when event persistence fails.
 - `scripts/check-package.mjs`: verifies the Pi manifest, peer dependency policy,
   required files and forbidden secret paths.
@@ -80,8 +82,21 @@ heartbeat. Recovery is explicit and safe: after an unclean Pi restart,
 `/supervise sessions` shows the task as `recoverable`, and `/supervise recover
 [--takeover] <task-id>` restores the Decision Worker history before starting a new
 Claude Worker. `--takeover` is accepted only when the old Pi owner is dead, the
-Worker process group is gone, and its cgroup is a real readable empty boundary;
-persistent tmux sessions use `adopt-tmux`.
+Worker process group is gone, and its cgroup is a real readable empty boundary.
+Automatic tmux takeover additionally verifies Supervisor ownership, persisted
+Worker/cgroup and tmux-server identities, and that the private tmux session is gone.
+It persists cleanup-pending state before reserving the gone private socket,
+reuses the old lease record for an atomic replacement, then removes the
+guardian-left-empty cgroup and clears the transaction only after cleanup is
+verified; a fresh lease reader reconciles an interrupted transaction while
+retaining a replacement lease during its replacement phase. Automatic lease acquisition records a no-spawn startup marker; the adapter
+persists its generated cgroup/socket plan before resource creation, then records
+cgroup and tmux-server identity in stages before spawn. Startup takeover verifies
+and cleans a planned empty cgroup/session when a crash interrupts that sequence;
+a stale marker can otherwise be reclaimed only after its owner is proven dead.
+Automatic normal-exit cleanup retains an empty cgroup until lease release.
+Persistent manual tmux sessions use `adopt-tmux`. The bridge has a regression test that mutates settings
+between Supervisor preflight and `respawn-pane` and confirms Claude is not spawned.
 Run the permission and signal probes explicitly when validating a CLI release:
 
 ```bash
@@ -144,9 +159,15 @@ The tmux transport is selected with `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux`.
 Automatic mode rejects explicit `process-pipe`; use JSONL or the Supervisor-owned
 bridge for bounded decisions and repair. Automatic JSONL and tmux workers also
 require Linux cgroup v2 containment (and the tmux parent-death guardian); startup
-fails closed when it is unavailable. Automatic workers preserve Claude Code's normal
+fails closed when it is unavailable. Parent-death cleanup leaves an empty cgroup
+for verified takeover, while automatic normal worker cleanup retains an empty
+cgroup until cwd lease release (manual cleanup removes it). Automatic workers
+preserve Claude Code's normal
 arguments, environment, network access, tools, agents, plugins and MCP configuration;
-there is no injected sandbox or automatic tool allowlist. Automatic startup also requires
+there is no injected sandbox or automatic tool allowlist. The only automatic CLI
+safety addition is a `default` permission mode when none was supplied; Bash
+preauthorization through `--allowedTools` or loaded settings is rejected so Bash
+requests remain visible to Supervisor policy. Automatic startup also requires
 a full existing Git baseline, non-bare non-protected worktree and the bare
 `claude`/`claude.exe` command name. It resolves and pins an
 operator-owned, non-writable executable path (or the path configured by
@@ -176,7 +197,10 @@ blocked stdin write timeouts, and immediate JSONL results. The Supervisor
 matrix also covers retrying failed lifecycle events, preserving startup event
 order, stopping under persistent timeout-event failure, and restoring output
 after event-log failure. The Supervisor matrix covers startup rejection,
-externally terminated workers, lifecycle serialization and stop races.
+externally terminated workers, lifecycle serialization and stop races. Cwd lease
+coverage includes successful automatic process and tmux takeover, token-bound
+same-record replacement, provisional pre-spawn identity, retained-cgroup
+release, and reconciliation of a durable pending-cleanup transaction.
 
 Before release, manually test at least: immediate crash, hung process, malformed
 output, duplicate send, send/exit race, Pi `SIGTERM`/`SIGINT` shutdown,

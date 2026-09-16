@@ -1,11 +1,32 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, rmdir, symlink, utimes, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { CwdLeaseStore, pathsOverlap } from "./cwd-lease.ts";
+import { CwdLeaseStore, pathsOverlap, workerIdentity } from "./cwd-lease.ts";
+import { currentCgroupPath } from "./worker/process-adapter.ts";
 
- test("cwd leases serialize overlapping acquisition across store instances", async () => {
+ test("cwd lease stale-lock reclamation is token and inode bound", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-lock-"));
+  const leaseDir = join(root, "leases");
+  const cwd = join(root, "repo");
+  const lockPath = join(leaseDir, ".lock");
+  const ownerPath = join(lockPath, "owner.json");
+  await mkdir(cwd);
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(ownerPath, JSON.stringify({ pid: 999999991, startTime: "1", token: "stale-lock-token" }));
+  const stale = new Date(Date.now() - 10_000);
+  await utimes(ownerPath, stale, stale);
+  const store = new CwdLeaseStore(leaseDir);
+  const handle = await store.acquire(cwd, "10101010-1010-4010-8010-101010101010", "process-pipe");
+  assert.equal((await readdir(leaseDir)).some((name) => name.includes(".reap-")), false);
+  await handle.release();
+  await rm(root, { recursive: true, force: true });
+});
+
+test("cwd leases serialize overlapping acquisition across store instances", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-"));
   const leaseDir = join(root, "leases");
   const cwd = join(root, "repo");
@@ -81,6 +102,490 @@ test("cwd lease takeover requires an explicit dead-owner and dead-worker proof",
   );
   await noCgroup.release();
   await rm(root, { recursive: true, force: true });
+});
+
+test("automatic process takeover replaces a lease and then removes its cgroup", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("Linux cgroup v2 is required");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "p-"));
+  const leaseDir = join(root, "leases");
+  const cwd = join(root, "repo");
+  let cgroupPath: string | undefined;
+  try {
+    await mkdir(cwd);
+    const parent = await currentCgroupPath();
+    const workerId = randomUUID();
+    cgroupPath = join(parent, `pi-claude-supervisor-${workerId}`);
+    try {
+      await mkdir(cgroupPath);
+    } catch {
+      t.skip("the current cgroup does not allow test children");
+      return;
+    }
+    const store = new CwdLeaseStore(leaseDir);
+    const old = await store.acquire(cwd, "77777777-7777-4777-8777-777777777777", "jsonl");
+    await old.updateWorker({ transport: "jsonl", ...(await workerIdentity({ id: workerId, pid: 999999998, cgroupPath })), pid: 999999998, startTime: "1" });
+    const oldPath = join(leaseDir, `${old.record.leaseId}.json`);
+    const oldRecord = JSON.parse(await readFile(oldPath, "utf8")) as Record<string, unknown>;
+    oldRecord.ownerPid = 999999999;
+    oldRecord.ownerStartTime = "1";
+    await writeFile(oldPath, `${JSON.stringify(oldRecord)}\n`);
+
+    const recovered = await store.acquire(cwd, "88888888-8888-4888-8888-888888888888", "jsonl", { takeover: { taskId: old.record.taskId } });
+    assert.equal(recovered.replacedTaskId, old.record.taskId);
+    assert.equal(recovered.record.taskId, "88888888-8888-4888-8888-888888888888");
+    assert.equal((await readdir(leaseDir)).filter((name) => name.endsWith(".json")).length, 1);
+    await assert.rejects(() => access(cgroupPath!), /ENOENT/u);
+    await assert.rejects(() => old.release(), /identity changed/u);
+    await recovered.release();
+  } finally {
+    if (cgroupPath) await rmdir(cgroupPath).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a durable pre-spawn lease can be replaced before cgroup creation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-startup-"));
+  const leaseDir = join(root, "leases");
+  const cwd = join(root, "repo");
+  try {
+    await mkdir(cwd);
+    const store = new CwdLeaseStore(leaseDir);
+    const old = await store.acquire(cwd, "99999999-9999-4999-8999-999999999999", "jsonl", { startup: true });
+    const leasePath = join(leaseDir, `${old.record.leaseId}.json`);
+    const record = JSON.parse(await readFile(leasePath, "utf8")) as Record<string, unknown>;
+    record.ownerPid = 999999999;
+    record.ownerStartTime = "1";
+    await writeFile(leasePath, `${JSON.stringify(record)}\n`);
+
+    const recovered = await store.acquire(cwd, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "jsonl", {
+      startup: true,
+      takeover: { taskId: old.record.taskId },
+    });
+    assert.equal(recovered.replacedTaskId, old.record.taskId);
+    assert.equal(recovered.record.pendingStartup?.transport, "jsonl");
+    await recovered.release();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("automatic provisional lease identity supports takeover before Worker PID registration", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("Linux cgroup v2 is required");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-provisional-"));
+  const leaseDir = join(root, "leases");
+  const cwd = join(root, "repo");
+  let cgroupPath: string | undefined;
+  try {
+    await mkdir(cwd);
+    const parent = await currentCgroupPath();
+    const workerId = randomUUID();
+    cgroupPath = join(parent, `pi-claude-supervisor-${workerId}`);
+    try { await mkdir(cgroupPath); }
+    catch { t.skip("the current cgroup does not allow test children"); return; }
+    const store = new CwdLeaseStore(leaseDir);
+    const old = await store.acquire(cwd, "99999999-9999-4999-8999-999999999999", "jsonl");
+    const identity = await workerIdentity({ id: workerId, cgroupPath, retainCgroupUntilLeaseRelease: true });
+    await old.updateWorker({ transport: "jsonl", ...identity, retainCgroupUntilLeaseRelease: true });
+    const leasePath = join(leaseDir, `${old.record.leaseId}.json`);
+    const record = JSON.parse(await readFile(leasePath, "utf8")) as Record<string, unknown>;
+    record.ownerPid = 999999999;
+    record.ownerStartTime = "1";
+    await writeFile(leasePath, `${JSON.stringify(record)}\n`);
+
+    const recovered = await store.acquire(cwd, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "jsonl", { takeover: { taskId: old.record.taskId } });
+    assert.equal(recovered.replacedTaskId, old.record.taskId);
+    assert.equal(recovered.record.taskId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    await assert.rejects(() => access(cgroupPath!), /ENOENT/u);
+    await recovered.release();
+  } finally {
+    if (cgroupPath) await rmdir(cgroupPath).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("startup takeover reconciles a cgroup created after its provisional plan", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("Linux cgroup identity is required");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-startup-resource-"));
+  const leaseDir = join(root, "leases");
+  const cwd = join(root, "repo");
+  const workerId = randomUUID();
+  const cgroupPath = `${await currentCgroupPath()}/pi-claude-supervisor-${workerId}`;
+  await mkdir(cwd);
+  const store = new CwdLeaseStore(leaseDir);
+  const old = await store.acquire(cwd, "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "jsonl", { startup: true });
+  await old.updateWorker({
+    transport: "jsonl",
+    workerId,
+    cgroupPath,
+    ownership: "owned",
+    retainCgroupUntilLeaseRelease: true,
+  }, { preserveStartup: true });
+  await mkdir(cgroupPath);
+  const oldPath = join(leaseDir, `${old.record.leaseId}.json`);
+  const oldRecord = JSON.parse(await readFile(oldPath, "utf8")) as Record<string, unknown>;
+  oldRecord.ownerPid = 999999995;
+  oldRecord.ownerStartTime = "1";
+  await writeFile(oldPath, `${JSON.stringify(oldRecord)}\n`);
+  try {
+    const recovered = await store.acquire(cwd, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "jsonl", {
+      startup: true,
+      takeover: { taskId: old.record.taskId },
+    });
+    assert.equal(recovered.record.pendingStartup?.transport, "jsonl");
+    await assert.rejects(() => access(cgroupPath), /ENOENT/u);
+    await recovered.release();
+  } finally {
+    await rmdir(cgroupPath).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("automatic tmux startup takeover reconciles a planned cgroup before server identity", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("Linux cgroup identity is required");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-tmux-startup-resource-"));
+  const leaseDir = join(root, "leases");
+  const cwd = join(root, "repo");
+  const workerId = randomUUID();
+  const cgroupPath = `${await currentCgroupPath()}/pi-claude-supervisor-tmux-${workerId}`;
+  const sessionName = `pi-supervisor-${workerId}`;
+  const tmuxSocket = `/tmp/pi-cs-${workerId}.sock`;
+  await mkdir(cwd);
+  const store = new CwdLeaseStore(leaseDir);
+  const old = await store.acquire(cwd, "12121212-1212-4121-8121-121212121212", "tmux", { startup: true });
+  await old.updateWorker({
+    transport: "tmux",
+    workerId,
+    cgroupPath,
+    sessionName,
+    tmuxSocket,
+    ownership: "owned",
+    retainCgroupUntilLeaseRelease: true,
+  }, { preserveStartup: true });
+  await mkdir(cgroupPath);
+  const oldPath = join(leaseDir, `${old.record.leaseId}.json`);
+  const oldRecord = JSON.parse(await readFile(oldPath, "utf8")) as Record<string, unknown>;
+  oldRecord.ownerPid = 999999990;
+  oldRecord.ownerStartTime = "1";
+  await writeFile(oldPath, `${JSON.stringify(oldRecord)}\n`);
+  try {
+    const recovered = await store.acquire(cwd, "13131313-1313-4131-8131-131313131313", "tmux", {
+      startup: true,
+      takeover: { taskId: old.record.taskId },
+    });
+    assert.equal(recovered.record.pendingStartup?.transport, "tmux");
+    await assert.rejects(() => access(cgroupPath), /ENOENT/u);
+    await assert.rejects(() => access(tmuxSocket), /ENOENT/u);
+    await recovered.release();
+  } finally {
+    await rmdir(cgroupPath).catch(() => {});
+    await rmdir(tmuxSocket).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("tmux handoff refuses an unreconciled pending cleanup transaction", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-handoff-pending-"));
+  const leaseDir = join(root, "leases");
+  const cwd = join(root, "repo");
+  await mkdir(cwd);
+  const store = new CwdLeaseStore(leaseDir);
+  const workerId = randomUUID();
+  const sessionName = `pi-supervisor-${workerId}`;
+  const tmuxSocket = `/tmp/pi-cs-${workerId}.sock`;
+  const old = await store.acquire(cwd, "ffffffff-ffff-4fff-8fff-ffffffffffff", "tmux");
+  await old.updateWorker({ transport: "tmux", workerId, pid: 999999994, startTime: "1", sessionName, tmuxSocket, ownership: "owned", tmuxTarget: sessionName });
+  const oldPath = join(leaseDir, `${old.record.leaseId}.json`);
+  const oldRecord = JSON.parse(await readFile(oldPath, "utf8")) as Record<string, unknown>;
+  oldRecord.ownerPid = 999999993;
+  oldRecord.ownerStartTime = "1";
+  oldRecord.pendingCleanup = {
+    phase: "prepared",
+    transport: "tmux",
+    workerId,
+    cgroupPath: `/sys/fs/cgroup/pi-claude-supervisor-tmux-${workerId}`,
+    cgroupIdentity: { device: "1", inode: "1" },
+    sessionName,
+    tmuxSocket,
+    tmuxServerPid: 999999992,
+    tmuxServerStartTime: "1",
+  };
+  await writeFile(oldPath, `${JSON.stringify(oldRecord)}\n`);
+  await mkdir(tmuxSocket);
+  try {
+    await assert.rejects(
+      () => store.acquire(cwd, "abababab-abab-4aba-8aba-abababababab", "tmux", { handoff: { sessionName, tmuxSocket } }),
+      /working-directory lease is held/u,
+    );
+    // A marker whose inode was not durably recorded is never guessed to be
+    // owned by the pending transaction.
+    await access(tmuxSocket);
+  } finally {
+    await old.release().catch(() => {});
+    await rmdir(tmuxSocket).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("releasing an automatic lease removes its retained empty cgroup", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("Linux cgroup v2 is required");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-retained-"));
+  const leaseDir = join(root, "leases");
+  const cwd = join(root, "repo");
+  let cgroupPath: string | undefined;
+  try {
+    await mkdir(cwd);
+    const parent = await currentCgroupPath();
+    const workerId = randomUUID();
+    cgroupPath = join(parent, `pi-claude-supervisor-${workerId}`);
+    try { await mkdir(cgroupPath); }
+    catch { t.skip("the current cgroup does not allow test children"); return; }
+    const store = new CwdLeaseStore(leaseDir);
+    const lease = await store.acquire(cwd, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "jsonl");
+    const identity = await workerIdentity({ id: workerId, cgroupPath, retainCgroupUntilLeaseRelease: true });
+    await lease.updateWorker({ transport: "jsonl", ...identity, retainCgroupUntilLeaseRelease: true });
+    await lease.release();
+    await assert.rejects(() => access(cgroupPath!), /ENOENT/u);
+  } finally {
+    if (cgroupPath) await rmdir(cgroupPath).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("replacement-phase pending cleanup retains the replacement lease", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("Linux cgroup v2 is required");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-replacement-"));
+  const leaseDir = join(root, "leases");
+  const cwd = join(root, "repo");
+  let cgroupPath: string | undefined;
+  try {
+    await mkdir(cwd);
+    const parent = await currentCgroupPath();
+    const workerId = randomUUID();
+    cgroupPath = join(parent, `pi-claude-supervisor-${workerId}`);
+    try { await mkdir(cgroupPath); }
+    catch { t.skip("the current cgroup does not allow test children"); return; }
+    const store = new CwdLeaseStore(leaseDir);
+    const old = await store.acquire(cwd, "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "jsonl");
+    const identity = await workerIdentity({ id: workerId, cgroupPath });
+    await old.updateWorker({ transport: "jsonl", ...identity });
+    const leasePath = join(leaseDir, `${old.record.leaseId}.json`);
+    const record = JSON.parse(await readFile(leasePath, "utf8")) as Record<string, any>;
+    record.taskId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    record.pendingCleanup = {
+      phase: "replacement",
+      transport: "jsonl",
+      workerId,
+      cgroupPath,
+      cgroupIdentity: identity.cgroupIdentity,
+    };
+    await writeFile(leasePath, `${JSON.stringify(record)}\n`);
+
+    const leases = await store.list();
+    assert.equal(leases.length, 1);
+    assert.equal(leases[0]!.taskId, "dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+    assert.equal(leases[0]!.pendingCleanup, undefined);
+    await assert.rejects(() => access(cgroupPath!), /ENOENT/u);
+  } finally {
+    if (cgroupPath) await rmdir(cgroupPath).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("pending takeover cleanup is reconciled before lease discovery", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("Linux cgroup v2 is required");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-pending-"));
+  const leaseDir = join(root, "leases");
+  const cwd = join(root, "repo");
+  let cgroupPath: string | undefined;
+  try {
+    await mkdir(cwd);
+    const parent = await currentCgroupPath();
+    const workerId = randomUUID();
+    cgroupPath = join(parent, `pi-claude-supervisor-${workerId}`);
+    try {
+      await mkdir(cgroupPath);
+    } catch {
+      t.skip("the current cgroup does not allow test children");
+      return;
+    }
+    const store = new CwdLeaseStore(leaseDir);
+    const old = await store.acquire(cwd, "99999999-9999-4999-8999-999999999999", "jsonl");
+    const identity = await workerIdentity({ id: workerId, pid: 999999998, cgroupPath });
+    await old.updateWorker({ transport: "jsonl", ...identity, pid: 999999998, startTime: "1" });
+    const leasePath = join(leaseDir, `${old.record.leaseId}.json`);
+    const record = JSON.parse(await readFile(leasePath, "utf8")) as Record<string, unknown>;
+    record.pendingCleanup = {
+      phase: "prepared",
+      transport: "jsonl",
+      workerId,
+      cgroupPath,
+      cgroupIdentity: identity.cgroupIdentity,
+    };
+    await writeFile(leasePath, `${JSON.stringify(record)}\n`);
+
+    assert.deepEqual(await store.list(), []);
+    await assert.rejects(() => access(cgroupPath!), /ENOENT/u);
+  } finally {
+    if (cgroupPath) await rmdir(cgroupPath).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("automatic tmux takeover reclaims a guardian-cleaned lease", async (t) => {
+  if (process.platform !== "linux" || spawnSync("tmux", ["-V"], { stdio: "ignore" }).status !== 0) {
+    t.skip("Linux tmux is required");
+    return;
+  }
+  const root = await mkdtemp(join(tmpdir(), "p-"));
+  const leaseDir = join(root, "leases");
+  const cwd = join(root, "repo");
+  let cgroupPath: string | undefined;
+  try {
+    await mkdir(cwd);
+    const parent = await currentCgroupPath();
+    const workerId = randomUUID();
+    cgroupPath = join(parent, `pi-claude-supervisor-tmux-${workerId}`);
+    try {
+      await mkdir(cgroupPath);
+    } catch {
+      t.skip("the current cgroup does not allow test children");
+      return;
+    }
+    const store = new CwdLeaseStore(leaseDir);
+    const old = await store.acquire(cwd, "77777777-7777-4777-8777-777777777777", "tmux");
+    const identity = await workerIdentity({ id: workerId, pid: 999999998, cgroupPath });
+    await old.updateWorker({
+      transport: "tmux",
+      ...identity,
+      pid: 999999998,
+      startTime: "1",
+      sessionName: `pi-supervisor-${workerId}`,
+      tmuxSocket: join(root, `pi-cs-${workerId}.sock`),
+      tmuxServerPid: 999999997,
+      tmuxServerStartTime: "1",
+      ownership: "adopted",
+    });
+    const oldPath = join(leaseDir, `${old.record.leaseId}.json`);
+    const markOwnerDead = async () => {
+      const record = JSON.parse(await readFile(oldPath, "utf8")) as Record<string, unknown>;
+      record.ownerPid = 999999999;
+      record.ownerStartTime = "1";
+      await writeFile(oldPath, `${JSON.stringify(record)}\n`);
+    };
+    await markOwnerDead();
+
+    await assert.rejects(
+      () => store.acquire(cwd, "88888888-8888-4888-8888-888888888888", "tmux", { takeover: { taskId: old.record.taskId } }),
+      /working-directory lease is held/u,
+    );
+    await old.updateWorker({
+      transport: "tmux",
+      ...identity,
+      pid: 999999998,
+      startTime: "1",
+      sessionName: `pi-supervisor-${workerId}`,
+      tmuxSocket: join(root, `pi-cs-${workerId}.sock`),
+      tmuxServerPid: 999999997,
+      tmuxServerStartTime: "1",
+      ownership: "owned",
+    });
+    await markOwnerDead();
+
+    const tamperedRecord = JSON.parse(await readFile(oldPath, "utf8")) as { worker?: { cgroupIdentity?: { inode: string } } };
+    tamperedRecord.worker!.cgroupIdentity!.inode = "0";
+    await writeFile(oldPath, `${JSON.stringify(tamperedRecord)}\n`);
+    await assert.rejects(
+      () => store.acquire(cwd, "88888888-8888-4888-8888-888888888888", "tmux", { takeover: { taskId: old.record.taskId } }),
+      /working-directory lease is held/u,
+    );
+    await old.updateWorker({
+      transport: "tmux",
+      ...identity,
+      pid: 999999998,
+      startTime: "1",
+      sessionName: `pi-supervisor-${workerId}`,
+      tmuxSocket: join(root, `pi-cs-${workerId}.sock`),
+      tmuxServerPid: 999999997,
+      tmuxServerStartTime: "1",
+      ownership: "owned",
+    });
+    await markOwnerDead();
+
+    const replacementDir = join(root, "replacement");
+    await mkdir(replacementDir);
+    const replacementSocket = join(replacementDir, `pi-cs-${workerId}.sock`);
+    assert.equal(spawnSync("tmux", ["-S", replacementSocket, "new-session", "-d", "-s", "replacement", "sleep", "20"], { stdio: "ignore" }).status, 0);
+    try {
+      await old.updateWorker({
+        transport: "tmux",
+        ...identity,
+        pid: 999999998,
+        startTime: "1",
+        sessionName: `pi-supervisor-${workerId}`,
+        tmuxSocket: replacementSocket,
+        tmuxServerPid: 999999997,
+        tmuxServerStartTime: "1",
+        ownership: "owned",
+      });
+      await assert.rejects(
+        () => store.acquire(cwd, "88888888-8888-4888-8888-888888888888", "tmux", { takeover: { taskId: old.record.taskId } }),
+        /working-directory lease is held/u,
+      );
+    } finally {
+      spawnSync("tmux", ["-S", replacementSocket, "kill-server"], { stdio: "ignore" });
+    }
+    await old.updateWorker({
+      transport: "tmux",
+      ...identity,
+      pid: 999999998,
+      startTime: "1",
+      sessionName: `pi-supervisor-${workerId}`,
+      tmuxSocket: join(root, `pi-cs-${workerId}.sock`),
+      tmuxServerPid: 999999997,
+      tmuxServerStartTime: "1",
+      ownership: "owned",
+    });
+    await markOwnerDead();
+
+    const recovered = await store.acquire(cwd, "88888888-8888-4888-8888-888888888888", "tmux", {
+      takeover: {
+        taskId: old.record.taskId,
+        beforeReplace: async () => {
+          // The reservation must survive the proof-to-replacement window;
+          // tmux must not be able to replace it as a stale socket path.
+          assert.notEqual(spawnSync("tmux", ["-S", join(root, `pi-cs-${workerId}.sock`), "new-session", "-d", "-s", "replacement", "sleep", "20"], { stdio: "ignore" }).status, 0);
+        },
+      },
+    });
+    assert.equal(recovered.replacedTaskId, old.record.taskId);
+    await assert.rejects(() => access(cgroupPath!), /ENOENT/u);
+    await assert.rejects(() => access(join(root, `pi-cs-${workerId}.sock`)), /ENOENT/u);
+    await recovered.release();
+  } finally {
+    if (cgroupPath) await rmdir(cgroupPath).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("cwd leases canonicalize symlink aliases and support identity-bound tmux handoff", async () => {
