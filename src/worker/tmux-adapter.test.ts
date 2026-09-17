@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
 import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS } from "./tmux-adapter.ts";
 import { preflightCgroupContainment } from "./process-adapter.ts";
+import type { HookEventSource, HookRelayReply, HookRelayRequest } from "../hooks/types.ts";
+import type { WorkerEvent } from "../types.ts";
 
 const tmuxAvailable = process.platform === "linux" && spawnSync("tmux", ["-V"], { stdio: "ignore" }).status === 0;
 const automaticTmuxAvailable = tmuxAvailable && await (async () => {
@@ -698,6 +700,306 @@ test("adopting a tmux session never kills the user's session on stop", { skip: !
     await rm(stateDir, { recursive: true, force: true });
   }
 });
+
+test("interactive owned session subscribes hooks, accepts the trust dialog and becomes ready", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const stateDir = await realpath(await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-interactive-ready-")));
+  const fakeClaude = join(stateDir, "claude");
+  const pidFile = join(stateDir, "claude.pid");
+  const hookSettingsPath = join(stateDir, "hook-settings.json");
+  await writeFile(hookSettingsPath, "{}");
+  await writeFile(fakeClaude, `#!/usr/bin/env node
+const { writeFileSync } = require("node:fs");
+writeFileSync(process.env.PI_TEST_PIDFILE, String(process.pid));
+process.stdout.write("Quick safety check\\n\\u276f No, exit\\n  Yes, I trust this folder\\n");
+let buffer = "";
+let accepted = false;
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  if (!accepted && buffer.includes("\\x1b[B") && /[\\r\\n]/.test(buffer)) {
+    accepted = true;
+    process.stdout.write("\\n>\\n");
+  }
+});
+process.stdin.resume();
+setInterval(() => {}, 10000);
+`);
+  await chmod(fakeClaude, 0o700);
+  const hookSource = createFakeHookSource();
+  const events: WorkerEvent[] = [];
+  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+  let handle;
+  try {
+    const startPromise = adapter.start({
+      task: "hello interactive",
+      cwd: stateDir,
+      command: fakeClaude,
+      args: [],
+      env: { HOME: join(stateDir, "home"), CLAUDE_CONFIG_DIR: join(stateDir, "config"), PI_TEST_PIDFILE: pidFile },
+      automatic: true,
+      interactive: true,
+      hookSource,
+      hookSettingsPath,
+      sendInitialInput: false,
+      eventListener: (event) => { events.push(event); },
+    });
+    const fakePid = Number(await waitForFileContent(pidFile));
+    await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "SessionStart", session_id: "session-1", cwd: stateDir, transcript_path: join(stateDir, "transcript.jsonl") },
+    });
+    handle = await startPromise;
+    assert.equal(handle.ownership, "owned");
+    const output = (await adapter.readOutput(handle)).map((chunk) => chunk.text).join("");
+    assert.match(output, /accepted the workspace trust dialog/u);
+  } finally {
+    if (handle) await adapter.stop(handle, "interactive ready test cleanup").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("Stop hook completes the turn", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const fixture = await startInteractiveOwnedFixture();
+  const { adapter, handle, hookSource, events, stateDir, fakePid } = fixture;
+  try {
+    await adapter.send(handle, "do x", "test-do-x");
+    await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "UserPromptSubmit", session_id: "session-1", cwd: stateDir, prompt: "do x" },
+    });
+    assert.equal(events.some((event) => event.type === "human_input"), false);
+    await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "Stop", session_id: "session-1", cwd: stateDir, last_assistant_message: "done", stop_hook_active: false },
+    });
+    const completion = events.find((event): event is Extract<WorkerEvent, { type: "turn_completed" }> => event.type === "turn_completed");
+    assert.ok(completion);
+    assert.equal((completion.result as { result?: string }).result, "done");
+    assert.equal((completion.result as { subtype?: string }).subtype, "stop");
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+  } finally {
+    await adapter.stop(handle, "stop hook test cleanup").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("a human prompt is reported", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const fixture = await startInteractiveOwnedFixture();
+  const { adapter, handle, hookSource, events, stateDir, fakePid } = fixture;
+  try {
+    await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "UserPromptSubmit", session_id: "session-1", cwd: stateDir, prompt: "hello from human" },
+    });
+    const humanEvent = events.find((event): event is Extract<WorkerEvent, { type: "human_input" }> => event.type === "human_input");
+    assert.ok(humanEvent);
+    assert.equal(humanEvent.text, "hello from human");
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 1);
+    await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "Stop", session_id: "session-1", cwd: stateDir, last_assistant_message: "ack" },
+    });
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+  } finally {
+    await adapter.stop(handle, "human prompt test cleanup").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("PreToolUse waits for respondPermission and maps defer/deny/allow", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const fixture = await startInteractiveOwnedFixture();
+  const { adapter, handle, hookSource, events, stateDir, fakePid } = fixture;
+  try {
+    const firstReplyPromise = hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "PreToolUse", session_id: "session-1", cwd: stateDir, tool_name: "Bash", tool_input: { command: "echo hi" }, tool_use_id: "tool-1" },
+    });
+    await waitFor(() => events.some((event) => event.type === "permission_request" && event.request.requestId === "tool-1"));
+    const firstRequest = events.find((event): event is Extract<WorkerEvent, { type: "permission_request" }> => event.type === "permission_request" && event.request.requestId === "tool-1")!;
+    assert.equal(firstRequest.request.phase, "pre");
+    assert.equal(firstRequest.request.toolUseId, "tool-1");
+    await adapter.respondPermission(handle, firstRequest.request.requestId, firstRequest.request.toolUseId, { behavior: "allow", defer: true });
+    assert.deepEqual(await firstReplyPromise, {});
+
+    const secondReplyPromise = hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "PreToolUse", session_id: "session-1", cwd: stateDir, tool_name: "Bash", tool_input: { command: "rm -rf /" }, tool_use_id: "tool-2" },
+    });
+    await waitFor(() => events.some((event) => event.type === "permission_request" && event.request.requestId === "tool-2"));
+    const secondRequest = events.find((event): event is Extract<WorkerEvent, { type: "permission_request" }> => event.type === "permission_request" && event.request.requestId === "tool-2")!;
+    await adapter.respondPermission(handle, secondRequest.request.requestId, secondRequest.request.toolUseId, { behavior: "deny", message: "not allowed" });
+    assert.deepEqual(await secondReplyPromise, { permissionDecision: "deny", permissionDecisionReason: "not allowed" });
+  } finally {
+    await adapter.stop(handle, "pre tool use test cleanup").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("PermissionRequest maps to phase prompt with a derived requestId", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const fixture = await startInteractiveOwnedFixture();
+  const { adapter, handle, hookSource, events, stateDir, fakePid } = fixture;
+  try {
+    const replyPromise = hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "PermissionRequest", session_id: "session-1", cwd: stateDir, tool_name: "Bash", tool_input: { command: "echo hi" } },
+    });
+    await waitFor(() => events.some((event) => event.type === "permission_request"));
+    const request = events.find((event): event is Extract<WorkerEvent, { type: "permission_request" }> => event.type === "permission_request")!;
+    assert.equal(request.request.phase, "prompt");
+    assert.match(request.request.requestId, /^prompt:[0-9a-f]{16}$/u);
+    await adapter.respondPermission(handle, request.request.requestId, request.request.toolUseId, { behavior: "allow" });
+    const reply = await replyPromise;
+    assert.equal(reply?.permissionDecision, "allow");
+    assert.equal(reply?.permissionDecisionReason, undefined);
+
+    // The same tool+input reuses the deterministic digest id; a repeat
+    // occurrence must supersede the prior answer rather than dedupe away and
+    // hang the relay (see the collision this id scheme creates across turns).
+    const secondReplyPromise = hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "PermissionRequest", session_id: "session-1", cwd: stateDir, tool_name: "Bash", tool_input: { command: "echo hi" } },
+    });
+    await waitFor(() => events.filter((event) => event.type === "permission_request").length === 2);
+    const secondRequest = events.filter((event): event is Extract<WorkerEvent, { type: "permission_request" }> => event.type === "permission_request")[1]!;
+    assert.equal(secondRequest.request.requestId, request.request.requestId);
+    await adapter.respondPermission(handle, secondRequest.request.requestId, secondRequest.request.toolUseId, { behavior: "allow" });
+    const secondReply = await secondReplyPromise;
+    assert.equal(secondReply?.permissionDecision, "allow");
+  } finally {
+    await adapter.stop(handle, "permission request test cleanup").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("requests that do not bind to the pane are ignored", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const fixture = await startInteractiveOwnedFixture();
+  const { adapter, handle, events, stateDir, hookSource } = fixture;
+  try {
+    const reply = await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: 999_999,
+      ppid: 999_999,
+      tmuxPane: "%999999",
+      event: { hook_event_name: "UserPromptSubmit", session_id: "session-1", cwd: stateDir, prompt: "should be ignored" },
+    });
+    assert.deepEqual(reply, {});
+    assert.equal(events.some((event) => event.type === "human_input"), false);
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+  } finally {
+    await adapter.stop(handle, "ignored binding test cleanup").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("interactive mode never emits turn_completed from screen scraping", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const fixture = await startInteractiveOwnedFixture();
+  const { adapter, handle, events, stateDir } = fixture;
+  try {
+    await adapter.send(handle, "no hook reply for this turn", "test-no-hook-reply");
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    assert.equal(events.some((event) => event.type === "turn_completed"), false);
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 1);
+  } finally {
+    await adapter.stop(handle, "no screen scrape completion test cleanup").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+/** A fake HookEventSource that routes synthetic requests directly to whatever subscribed for a cwd. */
+function createFakeHookSource(): HookEventSource & { dispatch: (cwd: string, request: HookRelayRequest) => Promise<HookRelayReply | undefined> } {
+  const subscriptions = new Map<string, (request: HookRelayRequest) => Promise<HookRelayReply | undefined>>();
+  return {
+    subscribe: async (cwd, handler) => {
+      subscriptions.set(cwd, handler);
+      return async () => { subscriptions.delete(cwd); };
+    },
+    dispatch: async (cwd, request) => {
+      const handler = subscriptions.get(cwd);
+      if (!handler) throw new Error(`no hook subscription for cwd: ${cwd}`);
+      return handler(request);
+    },
+  };
+}
+
+async function waitForFileContent(path: string): Promise<string> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      const content = (await readFile(path, "utf8")).trim();
+      if (content) return content;
+    } catch {
+      // Retry until the fake worker has written its identity.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail(`file content was not observed before timeout: ${path}`);
+}
+
+/** Owned interactive fixture already past the trust dialog and bound via a SessionStart hook. */
+async function startInteractiveOwnedFixture(): Promise<{
+  stateDir: string;
+  adapter: TmuxWorkerAdapter;
+  handle: Awaited<ReturnType<TmuxWorkerAdapter["start"]>>;
+  hookSource: ReturnType<typeof createFakeHookSource>;
+  events: WorkerEvent[];
+  fakePid: number;
+}> {
+  const stateDir = await realpath(await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-interactive-")));
+  const fakeClaude = join(stateDir, "claude");
+  const pidFile = join(stateDir, "claude.pid");
+  const hookSettingsPath = join(stateDir, "hook-settings.json");
+  await writeFile(hookSettingsPath, "{}");
+  await writeFile(fakeClaude, `#!/usr/bin/env node
+const { writeFileSync } = require("node:fs");
+writeFileSync(process.env.PI_TEST_PIDFILE, String(process.pid));
+process.stdout.write("\\n>\\n");
+process.stdin.resume();
+setInterval(() => {}, 10000);
+`);
+  await chmod(fakeClaude, 0o700);
+  const hookSource = createFakeHookSource();
+  const events: WorkerEvent[] = [];
+  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+  const startPromise = adapter.start({
+    task: "interactive fixture task",
+    cwd: stateDir,
+    command: fakeClaude,
+    args: [],
+    env: { HOME: join(stateDir, "home"), CLAUDE_CONFIG_DIR: join(stateDir, "config"), PI_TEST_PIDFILE: pidFile },
+    automatic: true,
+    interactive: true,
+    hookSource,
+    hookSettingsPath,
+    sendInitialInput: false,
+    eventListener: (event) => { events.push(event); },
+  });
+  const fakePid = Number(await waitForFileContent(pidFile));
+  await hookSource.dispatch(stateDir, {
+    version: 1,
+    pid: fakePid + 1,
+    ppid: fakePid,
+    event: { hook_event_name: "SessionStart", session_id: "session-1", cwd: stateDir },
+  });
+  const handle = await startPromise;
+  return { stateDir, adapter, handle, hookSource, events, fakePid };
+}
 
 async function waitFor(predicate: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
