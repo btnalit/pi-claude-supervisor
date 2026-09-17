@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { CwdLeaseStore, pathsOverlap, workerIdentity } from "./cwd-lease.ts";
+import { CwdLeaseStore, pathsOverlap, removeEmptyChildCgroups, workerIdentity } from "./cwd-lease.ts";
 import { currentCgroupPath } from "./worker/process-adapter.ts";
 
  test("cwd lease stale-lock reclamation is token and inode bound", async () => {
@@ -626,7 +626,7 @@ test("cwd leases canonicalize symlink aliases and support identity-bound tmux ha
   await rm(root, { recursive: true, force: true });
 });
 
-test("cwd lease registry fails closed when a leased cwd disappears", async () => {
+test("a lease whose cwd disappeared blocks only that path", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-"));
   const leaseDir = join(root, "leases");
   const oldCwd = join(root, "old");
@@ -636,7 +636,16 @@ test("cwd lease registry fails closed when a leased cwd disappears", async () =>
   const store = new CwdLeaseStore(leaseDir);
   const old = await store.acquire(oldCwd, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "process-pipe");
   await rm(oldCwd, { recursive: true, force: true });
-  await assert.rejects(() => store.acquire(newCwd, "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "process-pipe"), /ENOENT/u);
+  // A vanished lease directory must not throw and block every unrelated cwd.
+  const unrelated = await store.acquire(newCwd, "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "process-pipe");
+  await unrelated.release();
+  // The same path is still fail-closed: the raw recorded cwd still matches
+  // once the directory exists again for canonicalization.
+  await mkdir(oldCwd);
+  await assert.rejects(
+    () => store.acquire(oldCwd, "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "process-pipe"),
+    /working-directory lease is held/u,
+  );
   await old.release().catch(() => {});
   await rm(root, { recursive: true, force: true });
 });
@@ -659,4 +668,54 @@ test("cwd overlap treats parents and descendants as conflicting", () => {
   assert.equal(pathsOverlap("/work/repo", "/work/repo"), true);
   assert.equal(pathsOverlap("/work/repo", "/work/repo/nested"), true);
   assert.equal(pathsOverlap("/work/repo", "/work/repository"), false);
+});
+
+test("a corrupt lease record is quarantined and does not block other cwds", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-quarantine-"));
+  const leaseDir = join(root, "leases");
+  const cwd = join(root, "repo");
+  await mkdir(leaseDir, { recursive: true });
+  await mkdir(cwd);
+  await writeFile(join(leaseDir, "broken.json"), '{"taskId":');
+  const store = new CwdLeaseStore(leaseDir);
+  const handle = await store.acquire(cwd, "40000000-0000-4000-8000-000000000001", "process-pipe");
+  const quarantined = await store.quarantined();
+  assert.equal(quarantined.length, 1);
+  assert.match(quarantined[0]!, /^broken\.json\./u);
+  await assert.rejects(() => access(join(leaseDir, "broken.json")), /ENOENT/u);
+  await handle.release();
+  await rm(root, { recursive: true, force: true });
+});
+
+test("a non-regular lease entry is skipped", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-nonregular-"));
+  const leaseDir = join(root, "leases");
+  const cwd = join(root, "repo");
+  await mkdir(leaseDir, { recursive: true });
+  await mkdir(cwd);
+  await mkdir(join(leaseDir, "weird.json"));
+  const store = new CwdLeaseStore(leaseDir);
+  const handle = await store.acquire(cwd, "50000000-0000-4000-8000-000000000001", "process-pipe");
+  await access(join(leaseDir, "weird.json"));
+  await handle.release();
+  await rm(root, { recursive: true, force: true });
+});
+
+test("removeEmptyChildCgroups removes nested empty directories bottom-up", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-cgroup-children-"));
+  await mkdir(join(root, "a", "b", "c"), { recursive: true });
+  await mkdir(join(root, "d"));
+  const removed = await removeEmptyChildCgroups(root, async () => false);
+  assert.equal(removed, true);
+  assert.deepEqual(await readdir(root), []);
+  await rm(root, { recursive: true, force: true });
+
+  const root2 = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-cgroup-children-"));
+  await mkdir(join(root2, "a", "b", "c"), { recursive: true });
+  await mkdir(join(root2, "d"));
+  const blocked = join(root2, "a", "b");
+  const removed2 = await removeEmptyChildCgroups(root2, async (candidate) => candidate === blocked);
+  assert.equal(removed2, false);
+  await access(blocked);
+  await rm(root2, { recursive: true, force: true });
 });

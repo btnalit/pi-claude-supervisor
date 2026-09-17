@@ -276,6 +276,16 @@ export class CwdLeaseStore {
     return this.#withLock(() => this.#readAll());
   }
 
+  /** Sorted quarantined lease file names, for operator inspection/cleanup. */
+  async quarantined(): Promise<string[]> {
+    try {
+      return (await readdir(this.#quarantineDirectory())).sort();
+    } catch (error) {
+      if (error instanceof Error && /ENOENT/u.test(error.message)) return [];
+      throw error;
+    }
+  }
+
   #handle(initial: CwdLeaseRecord, replacedTaskId?: string): CwdLeaseHandle {
     let current = { ...initial, worker: initial.worker ? { ...initial.worker } : undefined };
     let released = false;
@@ -326,44 +336,99 @@ export class CwdLeaseStore {
     const leases: CwdLeaseRecord[] = [];
     for (const name of names.filter((item) => item.endsWith(".json"))) {
       const leasePath = join(this.#directory, name);
-      const leaseInfo = await lstat(leasePath);
-      if (!leaseInfo.isFile()) throw new Error(`cwd lease entry is not a regular file: ${redactText(leasePath)}`);
-      const value = JSON.parse(await readFile(leasePath, "utf8")) as Partial<CwdLeaseRecord>;
-      let lease = normalizeLease(value);
-      if (lease.pendingCleanup) {
-        // A takeover transaction is not usable until the old cgroup/session
-        // and any socket marker have been independently confirmed clean.
-        const cgroupCleanedBefore = lease.pendingCleanup.cgroupCleaned === true;
-        let cleanupComplete = await cleanupPendingLease(lease.pendingCleanup);
-        // Reconciliation may have removed the cgroup successfully but failed
-        // on a later marker operation. Persist that stage before returning a
-        // still-pending record, so the next reader can continue fail-closed.
-        if (!cgroupCleanedBefore && lease.pendingCleanup.cgroupCleaned === true) {
-          await this.#write({ ...lease, updatedAt: new Date().toISOString() });
-          // The first pass deliberately stops before socket-marker removal;
-          // the cleanup stage must be durable before that second proof.
-          cleanupComplete = await cleanupPendingLease(lease.pendingCleanup);
+      let lease: CwdLeaseRecord;
+      try {
+        const leaseInfo = await lstat(leasePath);
+        if (!leaseInfo.isFile()) {
+          // A directory or symlink is never renamed or followed as part of
+          // quarantine; just skip it in place and let an operator inspect it.
+          console.error(`pi-claude-supervisor skipped a non-regular cwd lease entry: ${redactText(name)}`);
+          continue;
         }
-        if (cleanupComplete) {
-          if (lease.pendingCleanup.phase === "replacement") {
-            // The replacement is the live lease after recovery. Clear only
-            // its transaction marker; do not delete the cwd reservation.
-            delete lease.pendingCleanup;
-            await this.#write(lease);
-          } else {
-            // The old record was still in the preparation phase, so no new
-            // Worker lease exists to retain after cleanup.
-            await rm(leasePath, { force: true });
-            continue;
+        const value = JSON.parse(await readFile(leasePath, "utf8")) as Partial<CwdLeaseRecord>;
+        lease = normalizeLease(value);
+      } catch (error) {
+        if (isTransientIoError(error)) throw error;
+        // One unreadable or incompatible record (disk full, truncated write,
+        // a schema this build no longer accepts) must not block every other
+        // cwd lease in the registry. Quarantine it out of the directory this
+        // scan reads instead, and keep going.
+        await this.#quarantine(name, leasePath, error);
+        continue;
+      }
+      if (lease.pendingCleanup) {
+        try {
+          // A takeover transaction is not usable until the old cgroup/session
+          // and any socket marker have been independently confirmed clean.
+          const cgroupCleanedBefore = lease.pendingCleanup.cgroupCleaned === true;
+          let cleanupComplete = await cleanupPendingLease(lease.pendingCleanup);
+          // Reconciliation may have removed the cgroup successfully but failed
+          // on a later marker operation. Persist that stage before returning a
+          // still-pending record, so the next reader can continue fail-closed.
+          if (!cgroupCleanedBefore && lease.pendingCleanup.cgroupCleaned === true) {
+            await this.#write({ ...lease, updatedAt: new Date().toISOString() });
+            // The first pass deliberately stops before socket-marker removal;
+            // the cleanup stage must be durable before that second proof.
+            cleanupComplete = await cleanupPendingLease(lease.pendingCleanup);
           }
+          if (cleanupComplete) {
+            if (lease.pendingCleanup.phase === "replacement") {
+              // The replacement is the live lease after recovery. Clear only
+              // its transaction marker; do not delete the cwd reservation.
+              delete lease.pendingCleanup;
+              await this.#write(lease);
+            } else {
+              // The old record was still in the preparation phase, so no new
+              // Worker lease exists to retain after cleanup.
+              await rm(leasePath, { force: true });
+              continue;
+            }
+          }
+        } catch (error) {
+          if (isTransientIoError(error)) throw error;
+          // A reconciliation failure is not proof the record itself is
+          // corrupt, and quarantining it would discard a durable
+          // pendingCleanup transaction a later read could still finish. Skip
+          // it for this read only and leave the file in place.
+          console.error(`pi-claude-supervisor skipped a cwd lease record with a failed pendingCleanup reconciliation: ${redactText(name)}: ${errorMessage(error)}`);
+          continue;
         }
       }
-      // A missing or replaced cwd invalidates the registry evidence. Do not
-      // silently drop that record and allow a second worker to start.
-      lease.cwd = await realpath(lease.cwd);
+      // A missing cwd is registry evidence that this lease's directory is
+      // gone, but it must not be treated the same as an unreadable record:
+      // silently dropping the lease would let a second worker start against
+      // the same path. Callers only ever compare `existing.cwd` against a
+      // freshly canonicalized candidate cwd, so keeping the raw (already
+      // `resolve`d by normalizeLease) path here still fails closed for that
+      // same/overlapping path without blocking every unrelated cwd lookup
+      // just because one lease's directory happened to disappear.
+      try {
+        lease.cwd = await realpath(lease.cwd);
+      } catch {
+        lease.cwd = resolve(lease.cwd);
+      }
       leases.push(lease);
     }
     return leases;
+  }
+
+  async #quarantine(name: string, leasePath: string, error: unknown): Promise<void> {
+    const message = errorMessage(error);
+    const quarantineDir = this.#quarantineDirectory();
+    try {
+      await mkdir(quarantineDir, { recursive: true, mode: 0o700 });
+      await rename(leasePath, join(quarantineDir, `${name}.${Date.now()}`));
+    } catch {
+      // If the rename itself fails, leave the file in place and skip it for
+      // this read; the next read will retry rather than lose it silently.
+      console.error(`pi-claude-supervisor could not quarantine an unreadable cwd lease record: ${redactText(name)}: ${message}`);
+      return;
+    }
+    console.error(`pi-claude-supervisor quarantined an unreadable cwd lease record: ${redactText(name)}: ${message}`);
+  }
+
+  #quarantineDirectory(): string {
+    return join(this.#directory, "quarantine");
   }
 
   async #write(lease: CwdLeaseRecord): Promise<void> {
@@ -879,11 +944,46 @@ async function cgroupIdentityMatches(path: string, expected: { device: string; i
   }
 }
 
+/**
+ * systemd/claude can create nested cgroups under a Worker's own cgroup, so an
+ * empty parent (`populated 0`) can still contain an empty child directory
+ * that plain `rmdir` leaves behind with ENOTEMPTY. Remove bottom-up so the
+ * parent is only ever asked to `rmdir` once every descendant is gone.
+ * `hasProcesses` is injectable because `cgroupHasProcesses` refuses to
+ * inspect any path outside `/sys/fs/cgroup`, which this function's own
+ * (already `/sys/fs/cgroup`-scoped) recursion does not need to re-derive.
+ */
+export async function removeEmptyChildCgroups(path: string, hasProcesses: (candidate: string) => Promise<boolean> = cgroupHasProcesses): Promise<boolean> {
+  let entries;
+  try {
+    entries = await readdir(path, { withFileTypes: true });
+  } catch {
+    // A directory that has already been removed out from under us (e.g. by a
+    // concurrent guardian teardown) is not proof it is safe to remove; every
+    // neighboring check in this file (cgroupIdentityMatches, cgroupHasProcesses,
+    // the final rmdir) also fails closed on an unexpected fs error.
+    return false;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    const child = join(path, entry.name);
+    if (!await removeEmptyChildCgroups(child, hasProcesses)) return false;
+    if (await hasProcesses(child)) return false;
+    try {
+      await rmdir(child);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
 async function removeEmptyCgroup(path: string, expected: { device: string; inode: string }): Promise<boolean> {
   // Re-check both the persisted directory identity and emptiness immediately
   // before removal. The initial checks only authorize attempting takeover;
   // they must not be reused after the pre-replacement hook has run.
   if (!await cgroupIdentityMatches(path, expected) || await cgroupHasProcesses(path)) return false;
+  if (!await removeEmptyChildCgroups(resolve(path))) return false;
   try {
     await rmdir(resolve(path));
     return true;
@@ -1129,6 +1229,20 @@ function normalizeLease(value: Partial<CwdLeaseRecord>): CwdLeaseRecord {
 
 function redactText(value: string): string {
   return String(redactSensitive(value));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * A transient condition (resource exhaustion, a concurrent lock) is not
+ * evidence a lease record is corrupt. Rethrow it instead of quarantining or
+ * skipping the record on its account.
+ */
+function isTransientIoError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EAGAIN" || code === "EBUSY";
 }
 
 function delay(ms: number): Promise<void> {
