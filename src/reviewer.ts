@@ -1,4 +1,4 @@
-import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { isDeepStrictEqual } from "node:util";
 import { extractJsonObjects } from "./json-extract.ts";
 import { redactSensitive } from "./redaction.ts";
@@ -41,10 +41,12 @@ export interface PiReadOnlyReviewerOptions {
 
 export class PiReadOnlyReviewer implements TaskReviewer {
   readonly #timeoutMs: number;
+  readonly #model: PiModel | undefined;
 
   constructor(options: PiReadOnlyReviewerOptions = {}) {
     // #timeoutMs is a TOTAL deadline across both attempts, not a per-attempt budget.
     this.#timeoutMs = options.timeoutMs ?? 600_000;
+    this.#model = options.model;
   }
 
   async review(input: ReviewInput): Promise<ReviewReport> {
@@ -63,13 +65,19 @@ export class PiReadOnlyReviewer implements TaskReviewer {
       throw error;
     }
     const remaining = deadline - Date.now();
-    if (remaining <= 0) return invalidReview(`Reviewer model request failed: ${first.message}`, input.round, new Date().toISOString());
+    if (remaining <= 0) {
+      const report = invalidReview(`Reviewer model request failed: ${first.message}`, input.round, new Date().toISOString());
+      if (first.usage) report.usage = first.usage;
+      return report;
+    }
     const second = await this.#attempt(input, remaining);
     if (second.kind === "report") return second.report;
-    return invalidReview(`Reviewer model request failed: ${second.message}`, input.round, new Date().toISOString());
+    const report = invalidReview(`Reviewer model request failed: ${second.message}`, input.round, new Date().toISOString());
+    if (second.usage) report.usage = second.usage;
+    return report;
   }
 
-  async #attempt(input: ReviewInput, timeoutMs: number): Promise<{ kind: "report"; report: ReviewReport } | { kind: "providerError"; message: string }> {
+  async #attempt(input: ReviewInput, timeoutMs: number): Promise<{ kind: "report"; report: ReviewReport } | { kind: "providerError"; message: string; usage?: NonNullable<ReviewReport["usage"]> }> {
     const resourceLoader = new DefaultResourceLoader({
       cwd: input.cwd,
       agentDir: getAgentDir(),
@@ -86,6 +94,7 @@ export class PiReadOnlyReviewer implements TaskReviewer {
       sessionManager: SessionManager.inMemory(input.cwd),
       thinkingLevel: "low",
       tools: ["read", "grep", "find", "ls"],
+      model: this.#model,
     });
     let current = "";
     let finalMessage = "";
@@ -95,7 +104,7 @@ export class PiReadOnlyReviewer implements TaskReviewer {
     let stopReason: string | undefined;
     let errorMessage: string | undefined;
     const unsubscribe = session.subscribe((value) => {
-      const record = value as unknown as { type?: string; message?: { role?: string; content?: unknown; stopReason?: string; errorMessage?: string }; assistantMessageEvent?: { type?: string; delta?: string } };
+      const record = value as unknown as { type?: string; message?: { role?: string; content?: unknown; stopReason?: string; errorMessage?: string; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; cost?: { total: number } } }; assistantMessageEvent?: { type?: string; delta?: string } };
       const role = record.message?.role;
       if (record.type === "message_start" && role === "assistant") {
         current = "";
@@ -121,8 +130,25 @@ export class PiReadOnlyReviewer implements TaskReviewer {
         current = "";
         currentTooLarge = false;
         capturingAssistant = false;
+        // The Reviewer's single prompt() call may drive several model calls
+        // (tool use loops); report every assistant message's usage, not just
+        // the last one.
+        const usage = record.message?.usage;
+        if (usage && input.onUsage) {
+          input.onUsage({
+            role: "reviewer",
+            input: usage.input,
+            output: usage.output,
+            cacheRead: usage.cacheRead,
+            cacheWrite: usage.cacheWrite,
+            totalTokens: usage.totalTokens,
+            costUsd: usage.cost?.total,
+            contextTokens: session.getContextUsage?.()?.tokens ?? null,
+          });
+        }
       }
     });
+    let sessionStats: ReturnType<AgentSession["getSessionStats"]>["tokens"] | undefined;
     try {
       await withTimeout(session.prompt(reviewPrompt(input)), timeoutMs, "independent Reviewer", input.signal);
     } catch (error) {
@@ -130,6 +156,7 @@ export class PiReadOnlyReviewer implements TaskReviewer {
       throw error;
     } finally {
       unsubscribe();
+      sessionStats = session.getSessionStats().tokens;
       session.dispose();
     }
     if (stopReason === "aborted") {
@@ -137,10 +164,11 @@ export class PiReadOnlyReviewer implements TaskReviewer {
       error.name = "AbortError";
       throw error;
     }
-    if (stopReason === "error") return { kind: "providerError", message: errorMessage ?? "unknown provider error" };
+    if (stopReason === "error") return { kind: "providerError", message: errorMessage ?? "unknown provider error", usage: sessionStats ? usageFromSessionStats(sessionStats) : undefined };
     const report = finalTooLarge
       ? invalidReview(`Reviewer response exceeded ${MAX_REVIEW_RESPONSE_BYTES} bytes`, input.round, new Date().toISOString())
       : parseReview(finalMessage || current, input.round);
+    if (sessionStats) report.usage = usageFromSessionStats(sessionStats);
     return { kind: "report", report };
   }
 }
@@ -267,6 +295,11 @@ function parseFinding(value: unknown, index: number): ReviewFinding {
     ...(line !== undefined ? { line } : {}),
     ...(typeof source.acceptanceRef === "string" ? { acceptanceRef: boundText(source.acceptanceRef, 200) } : {}),
   };
+}
+
+/** Maps the aggregate session token counters onto the `ReviewReport.usage` shape. */
+export function usageFromSessionStats(tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }): NonNullable<ReviewReport["usage"]> {
+  return { input: tokens.input, output: tokens.output, cacheRead: tokens.cacheRead, cacheWrite: tokens.cacheWrite, totalTokens: tokens.total };
 }
 
 function invalidReview(reason: string, round: number, checkedAt: string): ReviewReport {
