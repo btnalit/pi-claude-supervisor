@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import type { SupervisorEvent } from "./events.ts";
-import type { WorkerAdapter, WorkerEvent, WorkerHandle, WorkerOutputChunk, WorkerStartInput, WorkerStatus } from "./types.ts";
+import type { PiUsageSample, WorkerAdapter, WorkerEvent, WorkerHandle, WorkerOutputChunk, WorkerStartInput, WorkerStatus } from "./types.ts";
 import type { DecisionWorkerFactory } from "./decision-worker.ts";
 import { Supervisor } from "./supervisor.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
@@ -1558,6 +1558,14 @@ test("a committed task branch with a dirty worktree requests repair", async () =
     assert.ok(events.events.some((event) => event.type === "repair_requested"));
     assert.equal(sends, 1);
     assert.equal(supervisor.state, "running");
+    // An automatic repair round transitions verifying -> running immediately
+    // before sending the repair instruction; #sendInternal must not treat that
+    // as an ordinary turn boundary and emit a spurious worker_waiting between
+    // the repair request and the message actually being sent (F20).
+    const repairedIndex = events.events.findIndex((event) => event.type === "repair_requested");
+    const sentIndex = events.events.findIndex((event) => event.type === "worker_message_sent");
+    assert.ok(repairedIndex >= 0 && sentIndex > repairedIndex);
+    assert.ok(!events.events.slice(repairedIndex, sentIndex + 1).some((event) => event.type === "worker_waiting"));
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -1735,4 +1743,321 @@ test("deny_permission on a policy-allowed command uses the Decision Worker's rea
   await onAction?.({ action: "deny_permission", requestId: "req-1", toolUseId: "tool-1", reason: "not needed for this task" }, permissionEvent);
   assert.equal(respondedDecision?.behavior, "deny");
   assert.equal(respondedDecision?.message, "denied by supervisor: not needed for this task");
+});
+
+test("hybrid permission authority answers routine requests from policy", async () => {
+  const handle: WorkerHandle = { id: "hybrid-permission-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  const running = true;
+  let capturedListener: WorkerStartInput["eventListener"];
+  const responded: Array<{ requestId: string; behavior: string; message?: string }> = [];
+  const notified: WorkerEvent[] = [];
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async (input) => { capturedListener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+    respondPermission: async (_handle, requestId, _toolUseId, decision) => { responded.push({ requestId, ...decision }); },
+  };
+  const events = new FlakyEventLog("never-fail");
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "hybrid permission fixture",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: (event) => { notified.push(event); }, close: async () => {} }),
+  });
+  const routineEvent: WorkerEvent = {
+    type: "permission_request",
+    handle,
+    request: { requestId: "req-routine", toolUseId: "tool-routine", toolName: "Bash", input: { command: "ls -la" }, raw: {} },
+  };
+  capturedListener?.(routineEvent);
+  await supervisor.poll();
+  assert.equal(responded.length, 1);
+  assert.equal(responded[0]?.behavior, "allow");
+  assert.equal(notified.length, 0);
+  const decision = events.events.find((event) => event.type === "permission_decision");
+  assert.equal(decision?.data?.actor, "policy");
+
+  const nonRoutineEvent: WorkerEvent = {
+    type: "permission_request",
+    handle,
+    request: { requestId: "req-curl", toolUseId: "tool-curl", toolName: "Bash", input: { command: "curl https://x" }, raw: {} },
+  };
+  capturedListener?.(nonRoutineEvent);
+  await supervisor.poll();
+  assert.equal(responded.length, 1);
+  assert.equal(notified.length, 1);
+  assert.equal(notified[0], nonRoutineEvent);
+});
+
+test("policy permission authority never consults the Decision Worker", async () => {
+  const handle: WorkerHandle = { id: "policy-only-permission-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  const running = true;
+  let capturedListener: WorkerStartInput["eventListener"];
+  const responded: Array<{ requestId: string; behavior: string; message?: string }> = [];
+  const notified: WorkerEvent[] = [];
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async (input) => { capturedListener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+    respondPermission: async (_handle, requestId, _toolUseId, decision) => { responded.push({ requestId, ...decision }); },
+  };
+  const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "policy-only permission fixture",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, permissionAuthority: "policy" } },
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: (event) => { notified.push(event); }, close: async () => {} }),
+  });
+  capturedListener?.({
+    type: "permission_request",
+    handle,
+    request: { requestId: "req-curl", toolUseId: "tool-curl", toolName: "Bash", input: { command: "curl https://x" }, raw: {} },
+  });
+  await supervisor.poll();
+  assert.equal(responded[0]?.behavior, "allow");
+  assert.equal(notified.length, 0);
+
+  capturedListener?.({
+    type: "permission_request",
+    handle,
+    request: { requestId: "req-push", toolUseId: "tool-push", toolName: "Bash", input: { command: "git push origin main" }, raw: {} },
+  });
+  await supervisor.poll();
+  assert.equal(responded[1]?.behavior, "deny");
+  assert.match(String(responded[1]?.message ?? ""), /denied by supervisor policy/u);
+  assert.equal(notified.length, 0);
+});
+
+test("decision-worker permission authority forwards everything", async () => {
+  const handle: WorkerHandle = { id: "decision-worker-only-permission-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  const running = true;
+  let capturedListener: WorkerStartInput["eventListener"];
+  const responded: Array<{ requestId: string; behavior: string; message?: string }> = [];
+  const notified: WorkerEvent[] = [];
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async (input) => { capturedListener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+    respondPermission: async (_handle, requestId, _toolUseId, decision) => { responded.push({ requestId, ...decision }); },
+  };
+  const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "decision-worker-only permission fixture",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, permissionAuthority: "decision-worker" } },
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: (event) => { notified.push(event); }, close: async () => {} }),
+  });
+  capturedListener?.({
+    type: "permission_request",
+    handle,
+    request: { requestId: "req-ls", toolUseId: "tool-ls", toolName: "Bash", input: { command: "ls" }, raw: {} },
+  });
+  await supervisor.poll();
+  assert.equal(responded.length, 0);
+  assert.equal(notified.length, 1);
+});
+
+test("worker usage is recorded and the cost budget parks the candidate", async () => {
+  const handle: WorkerHandle = { id: "usage-budget-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  let running = true;
+  let capturedListener: WorkerStartInput["eventListener"];
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async (input) => { capturedListener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const events = new FlakyEventLog("never-fail");
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "usage budget fixture",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, maxWorkerCostUsd: 1 } },
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+  });
+  capturedListener?.({
+    type: "turn_completed",
+    handle,
+    result: { total_cost_usd: 0.4, usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, num_turns: 3 },
+    sequence: 1,
+  });
+  await supervisor.poll();
+  assert.ok(events.events.some((event) => event.type === "worker_usage"));
+  assert.equal(supervisor.usage.workerCostUsd, 0.4);
+
+  capturedListener?.({
+    type: "turn_completed",
+    handle,
+    result: { total_cost_usd: 1.2, usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, num_turns: 4 },
+    sequence: 2,
+  });
+  await supervisor.poll();
+  const parked = events.events.find((event) => event.type === "candidate_parked");
+  assert.ok(parked);
+  assert.match(String(parked?.data?.reason ?? ""), /budget/u);
+  assert.equal(supervisor.state, "blocked");
+});
+
+test("Claude's own budget stop parks with a clear reason", async () => {
+  const handle: WorkerHandle = { id: "claude-budget-stop-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  let running = true;
+  let capturedListener: WorkerStartInput["eventListener"];
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async (input) => { capturedListener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const events = new FlakyEventLog("never-fail");
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "claude budget stop fixture",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+  });
+  capturedListener?.({
+    type: "turn_completed",
+    handle,
+    result: { subtype: "error_max_budget_usd", is_error: true, total_cost_usd: 5 },
+    sequence: 1,
+  });
+  await supervisor.poll();
+  const parked = events.events.find((event) => event.type === "candidate_parked");
+  assert.ok(parked);
+  assert.match(String(parked?.data?.reason ?? ""), /max-budget-usd/u);
+});
+
+test("Pi usage samples accumulate", async () => {
+  const handle: WorkerHandle = { id: "pi-usage-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  let running = true;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const events = new FlakyEventLog("never-fail");
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+  let capturedOnUsage: ((sample: PiUsageSample) => void) | undefined;
+  await supervisor.start({
+    task: "pi usage fixture",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: (options) => { capturedOnUsage = options.onUsage; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+  });
+  capturedOnUsage?.({ role: "decision", input: 100, output: 20, cacheRead: 0, cacheWrite: 0, totalTokens: 120, costUsd: 0.01 });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(supervisor.usage.decision.calls, 1);
+  assert.ok(events.events.some((event) => event.type === "pi_usage"));
+});
+
+test("a Reviewer report's usage is recorded when it never called onUsage", async () => {
+  const handle: WorkerHandle = { id: "review-usage-fallback-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
+  let running = true;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, undefined, {
+    reviewer: {
+      // This fake never calls ReviewInput.onUsage; the Supervisor must fall
+      // back to the raw (pre-normalization) report's own `usage` field.
+      review: async () => ({
+        verdict: "pass" as const,
+        summary: "verified",
+        findings: [],
+        round: 0,
+        checkedAt: new Date().toISOString(),
+        usage: { input: 500, output: 100, cacheRead: 0, cacheWrite: 0, totalTokens: 600, costUsd: 0.02 },
+      }),
+    },
+  });
+  await supervisor.start({
+    task: "reviewer usage fallback fixture",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+  });
+  await supervisor.poll();
+  const result = await supervisor.verify();
+  assert.equal(result.ok, true);
+  assert.equal(supervisor.usage.reviewer.calls, 1);
+  assert.equal(supervisor.usage.reviewer.input, 500);
 });

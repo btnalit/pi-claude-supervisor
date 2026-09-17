@@ -2,15 +2,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { EventLog, type SupervisorEvent } from "./events.ts";
 import { SupervisorStateMachine } from "./state.ts";
-import { evaluatePermission } from "./policy.ts";
+import { evaluatePermission, isRoutinePermission } from "./policy.ts";
 import { PiDecisionWorker, type DecisionAction, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
 import { collectRepositoryEvidence, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryWorkTree, verifyAll, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { redactSensitive } from "./redaction.ts";
-import { assertAutomaticClaudePermissionConfiguration, assertTrustedAutomaticClaudeExecutable, automaticClaudeArgs, automaticWorkerEnvironment } from "./worker/environment.ts";
+import { assertAutomaticClaudePermissionConfiguration, assertTrustedAutomaticClaudeExecutable, automaticClaudeArgs, automaticWorkerEnvironment, type AutomaticClaudeArgOptions } from "./worker/environment.ts";
 import { normalizeReviewReport, type ReviewInput, type TaskReviewer } from "./reviewer.ts";
 import type {
   AcceptanceReport,
+  PiUsageSample,
   ReviewReport,
   TaskContext,
   TaskSpec,
@@ -57,6 +58,10 @@ export interface SupervisorProgress {
   turn: number;
   repairRound: number;
   heartbeat: boolean;
+  /** Cumulative Claude Worker API cost for this task. */
+  costUsd: number;
+  /** Cumulative Decision Worker + Reviewer token usage for this task. */
+  piTokens: number;
 }
 
 export interface DecisionSessionClosedInfo {
@@ -118,6 +123,8 @@ export interface SupervisorStartOptions {
   baseCommit?: string;
   /** Internal recovery identity: the executable resolved by the original start. */
   expectedClaudeExecutable?: string;
+  /** Automatic-mode Claude CLI knobs (--model, --autocompact, --max-budget-usd, --mcp-config). */
+  workerArgOptions?: AutomaticClaudeArgOptions;
   /** Non-protected local branch before automatic work begins. */
   baseBranch?: string;
   /** Internal recovery values; elapsed wall time remains cumulative. */
@@ -150,6 +157,7 @@ export interface HumanInterventionNotice {
 export interface CandidateNotice extends HumanInterventionNotice {
   status: "ready" | "blocked" | "failed";
   deliverable: boolean;
+  usage?: SupervisorTokenUsage;
 }
 
 export class Supervisor {
@@ -183,6 +191,8 @@ export class Supervisor {
   #onCandidate?: (notice: CandidateNotice) => Promise<void> | void;
   #handledEvents = new Set<string>();
   #deferredWorkerEvents = new Map<string, WorkerEvent>();
+  /** Turn events whose usage was already accounted; a deferred replay must not double-count tokens. */
+  #usageRecordedEvents = new Set<string>();
   #pendingPermissions = new Map<string, WorkerPermissionRequest>();
   #humanRequired = false;
   #humanGate: "permission" | "other" | undefined;
@@ -199,6 +209,15 @@ export class Supervisor {
   #released = false;
   #releasing = false;
   #terminalNoticeSent = false;
+  #progressHeartbeatMs = 60_000;
+  #decisionModel?: PiModel;
+  #decisionCompactionTokens?: number;
+  #repairSendInProgress = false;
+  #usage: SupervisorTokenUsage = emptyUsage();
+  /** Cumulative Worker cost observed from Worker sessions prior to the current one. */
+  #workerCostBaseline = 0;
+  /** Cumulative cost reported by the most recent Worker `result` record. */
+  #lastWorkerResultCost = 0;
 
   constructor(adapter: WorkerAdapter, events = new EventLog(), hooks: { onCandidate?: (notice: CandidateNotice) => Promise<void> | void; onHumanRequired?: (notice: HumanInterventionNotice) => Promise<void> | void; reviewer?: TaskReviewer; reviewTimeoutMs?: number; progressHeartbeatMs?: number; decisionModel?: PiModel; decisionCompactionTokens?: number } = {}) {
     this.#adapter = adapter;
@@ -206,6 +225,9 @@ export class Supervisor {
     this.#onCandidate = hooks.onCandidate;
     this.#reviewer = hooks.reviewer;
     this.#reviewTimeoutMs = hooks.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
+    this.#progressHeartbeatMs = hooks.progressHeartbeatMs ?? 60_000;
+    this.#decisionModel = hooks.decisionModel;
+    this.#decisionCompactionTokens = hooks.decisionCompactionTokens;
   }
 
   get state() { return this.#machine.state; }
@@ -217,6 +239,16 @@ export class Supervisor {
   get candidateParked() { return this.#candidateParked; }
   /** True after the persistent worker was detached from this Supervisor. */
   get released() { return this.#released; }
+  /** Structural copy of the Worker + Pi-side token/cost accounting for this task. */
+  get usage(): SupervisorTokenUsage {
+    return {
+      workerCostUsd: this.#usage.workerCostUsd,
+      workerTurns: this.#usage.workerTurns,
+      workerTokens: { ...this.#usage.workerTokens },
+      decision: { ...this.#usage.decision },
+      reviewer: { ...this.#usage.reviewer },
+    };
+  }
 
   async start(options: SupervisorStartOptions): Promise<WorkerHandle> {
     return this.#exclusive(() => this.#startInternal(options));
@@ -240,12 +272,17 @@ export class Supervisor {
     this.#onProgress = options.onProgress;
     this.#handledEvents.clear();
     this.#deferredWorkerEvents.clear();
+    this.#usageRecordedEvents.clear();
     this.#pendingPermissions.clear();
     this.#humanRequired = false;
     this.#candidateParked = false;
     this.#released = false;
     this.#releasing = false;
     this.#terminalNoticeSent = false;
+    this.#usage = emptyUsage();
+    this.#workerCostBaseline = 0;
+    this.#lastWorkerResultCost = 0;
+    this.#repairSendInProgress = false;
     this.#task = { taskId, task: spec.goal, cwd: options.cwd, maxTurns: options.maxTurns ?? 100, startedAt: options.startedAt ?? new Date().toISOString(), ...(options.baseCommit ? { baseCommit: options.baseCommit } : {}), ...(options.baseBranch ? { baseBranch: options.baseBranch } : {}), spec, repairRound: options.initialRepairRound ?? 0, ...(options.initialFindingSignature ? { lastFindingSignature: options.initialFindingSignature } : {}) };
     this.#repairRound = options.initialRepairRound ?? 0;
     this.#lastFindingSignature = options.initialFindingSignature;
@@ -302,7 +339,11 @@ export class Supervisor {
         : options.env;
       if (this.#automation) {
         trustedWorkerCommand = await assertTrustedAutomaticClaudeExecutable(options.command, options.expectedClaudeExecutable);
-        workerArgs = automaticClaudeArgs(options.command, options.args);
+        workerArgs = automaticClaudeArgs(options.command, options.args, {
+          ...options.workerArgOptions,
+          // Claude's own cap is the first line of defence; the Supervisor's cumulative check is the second.
+          ...(options.workerArgOptions?.maxBudgetUsd === undefined && spec.autonomy.maxWorkerCostUsd !== undefined ? { maxBudgetUsd: spec.autonomy.maxWorkerCostUsd } : {}),
+        });
         await assertAutomaticClaudePermissionConfiguration(options.cwd, workerArgs, workerEnvironment);
         await this.#appendEvent({ type: "worker_executable_pinned", taskId, data: { command: options.command, resolvedExecutable: trustedWorkerCommand } });
       }
@@ -321,6 +362,9 @@ export class Supervisor {
           context: { taskId, task: spec.goal, cwd: options.cwd, state: this.#machine.state, turn: this.#turn, maxTurns: this.#task.maxTurns, repairRound: this.#repairRound, spec },
           sessionFile: options.decisionSessionFile,
           sessionDir: options.decisionSessionDir ? join(options.decisionSessionDir, taskId) : undefined,
+          model: this.#decisionModel,
+          compactionTokens: this.#decisionCompactionTokens,
+          onUsage: (sample) => this.#recordPiUsage(sample),
           ...(options.onDecisionSessionReady ? {
             onSessionReady: async (info: { sessionFile: string; sessionId: string; restored: boolean }) => {
               return options.onDecisionSessionReady?.({
@@ -495,17 +539,27 @@ export class Supervisor {
   }
 
   async #processWorkerEvent(event: WorkerEvent): Promise<void> {
-    const taskId = this.#task?.taskId;
+    const task = this.#task;
+    const taskId = task?.taskId;
     const handle = this.#handle;
-    if (!taskId || !handle || event.handle.id !== handle.id) return;
+    if (!task || !taskId || !handle || event.handle.id !== handle.id) return;
     const key = workerEventKey(event);
     if (this.#handledEvents.has(key)) return;
     try {
+      let skipDecisionNotify = false;
       if (event.type === "turn_completed") { this.#lastWorkerResult = event.result; this.#lastTurnCompleted = event; }
       // Do not call #pollInternal from within a deferred retry: it would
       // recurse back into #retryDeferredWorkerEvents through #pollInternal's
       // callers and reprocess this same event twice.
       if (event.type === "turn_completed" || event.type === "exited") await this.#pollInternal();
+      if (event.type === "turn_completed" && !this.#usageRecordedEvents.has(key)) {
+        this.#usageRecordedEvents.add(key);
+        const budgetReason = this.#recordWorkerUsage(event.result);
+        if (this.#automation && budgetReason) {
+          skipDecisionNotify = true;
+          await this.#parkCandidate(budgetReason, event);
+        }
+      }
       if (event.type === "permission_request") {
         this.#pendingPermissions.set(event.request.requestId, event.request);
         await this.#appendEvent({
@@ -514,8 +568,29 @@ export class Supervisor {
           workerId: handle.id,
           data: { requestId: event.request.requestId, toolUseId: event.request.toolUseId, toolName: event.request.toolName, input: event.request.input },
         });
+        if (this.#automation && !this.#humanRequired) {
+          const authority = task.spec.autonomy.permissionAuthority;
+          const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd);
+          const answerLocally = authority === "policy"
+            || (authority === "hybrid" && (policy.decision === "deny" || isRoutinePermission(event.request.toolName, event.request.input, task.cwd)));
+          if (answerLocally && this.#adapter.respondPermission) {
+            const behavior: "allow" | "deny" = policy.decision === "deny" ? "deny" : "allow";
+            await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, {
+              behavior,
+              message: behavior === "deny" ? `${policy.reason}; denied by supervisor policy` : undefined,
+            }, behavior === "allow" ? event.request.input : undefined);
+            this.#pendingPermissions.delete(event.request.requestId);
+            await this.#appendEvent({
+              type: "permission_decision",
+              taskId,
+              workerId: handle.id,
+              data: { requestId: event.request.requestId, toolName: event.request.toolName, behavior, policy: policy.decision, actor: "policy" },
+            });
+            skipDecisionNotify = true;
+          }
+        }
       }
-      if (this.#decision && (event.type === "permission_request" || event.type === "turn_completed" || event.type === "exited")) {
+      if (this.#decision && !skipDecisionNotify && (event.type === "permission_request" || event.type === "turn_completed" || event.type === "exited")) {
         this.#decision.updateContext({ state: this.#machine.state, turn: this.#turn, repairRound: this.#repairRound });
         this.#decision.notify(event);
       }
@@ -555,7 +630,7 @@ export class Supervisor {
       console.error(`pi-claude-supervisor candidate audit failed: ${safeMessage(auditError)}`);
     });
     this.#terminalNoticeSent = true;
-    void Promise.resolve(this.#onCandidate?.({ taskId: task.taskId, cwd: task.cwd, task: task.task, reason, status: "failed", deliverable: false })).catch(() => {});
+    void Promise.resolve(this.#onCandidate?.({ taskId: task.taskId, cwd: task.cwd, task: task.task, reason, status: "failed", deliverable: false, usage: this.usage })).catch(() => {});
   }
 
   /**
@@ -591,6 +666,7 @@ export class Supervisor {
       reason,
       status: "failed",
       deliverable: false,
+      usage: this.usage,
       ...(permission ? { permission } : {}),
     })).catch(() => {});
   }
@@ -649,7 +725,7 @@ export class Supervisor {
           message: behavior === "deny" ? (policy.decision === "deny" ? `${policy.reason}; denied by supervisor policy` : `denied by supervisor: ${action.reason}`) : undefined,
         }, behavior === "allow" ? event.request.input : undefined);
         this.#pendingPermissions.delete(event.request.requestId);
-        await this.#appendEvent({ type: "permission_decision", taskId: task.taskId, workerId: handle.id, data: { requestId: event.request.requestId, toolName: event.request.toolName, behavior, policy: policy.decision } });
+        await this.#appendEvent({ type: "permission_decision", taskId: task.taskId, workerId: handle.id, data: { requestId: event.request.requestId, toolName: event.request.toolName, behavior, policy: policy.decision, actor: "decision-worker" } });
         return;
       }
       if (action.action === "continue" || action.action === "redirect" || action.action === "answer") {
@@ -745,6 +821,7 @@ export class Supervisor {
       permission,
       status: cleanupError ? "failed" : "blocked",
       deliverable: false,
+      usage: this.usage,
     };
     await this.#appendEvent({
       type: "candidate_parked",
@@ -815,7 +892,7 @@ export class Supervisor {
         ? "worker has an active JSONL request; poll until its result before sending the next turn"
         : "worker has an active turn; wait until its interactive prompt or structured result is ready before sending another turn");
     }
-    if (status.activeRequests === 0 && this.#machine.state === "running") {
+    if (status.activeRequests === 0 && this.#machine.state === "running" && !this.#repairSendInProgress) {
       this.#machine.transition("waiting");
       await this.#appendEvent({ type: "worker_waiting", taskId, workerId: handle.id });
     }
@@ -1135,6 +1212,7 @@ export class Supervisor {
       await this.#appendEvent({ type: "review_started", taskId: this.#task.taskId, workerId: this.#handle?.id, data: { round: this.#repairRound } });
       this.#reportProgress("review", "collecting repository evidence and running independent Reviewer", true);
       let review: ReviewReport;
+      let reviewUsageReceived = false;
       try {
         const evidence = repositoryEvidence ?? redactRepositoryEvidence(await collectRepositoryEvidence(this.#task.cwd, { signal: verificationAbortController.signal, baseRef: this.#task.baseCommit }));
         const rawReview = await withTimeout(this.#reviewer.review({
@@ -1147,8 +1225,13 @@ export class Supervisor {
           workerResult: this.#lastWorkerResult ? redactSensitive(this.#lastWorkerResult) as Record<string, unknown> : undefined,
           round: this.#repairRound,
           signal: verificationAbortController.signal,
+          onUsage: (sample) => { reviewUsageReceived = true; this.#recordPiUsage(sample); },
         } satisfies ReviewInput), this.#reviewTimeoutMs + 30_000, "independent Reviewer", verificationAbortController.signal);
         review = normalizeReviewReport(rawReview, this.#repairRound);
+        // normalizeReviewReport re-parses the Reviewer's JSON text and does not
+        // carry `usage` through, so the fallback must read it from the raw,
+        // pre-normalization report.
+        if (!reviewUsageReceived && rawReview.usage) this.#recordPiUsage({ role: "reviewer", ...rawReview.usage });
       } catch (error) {
         if (error instanceof Error && error.name === "TimeoutError") verificationAbortController.abort(error.message);
         review = { verdict: "human" as const, summary: `independent Reviewer failed: ${safeMessage(error)}`, findings: [], round: this.#repairRound, checkedAt: new Date().toISOString() };
@@ -1253,6 +1336,7 @@ export class Supervisor {
     await this.#appendEvent({ type: "repair_requested", taskId: task.taskId, workerId: handle.id, data: { round: this.#repairRound, reason, instruction } });
     this.#reportProgress("repair", `sending repair round ${this.#repairRound}`, true);
     if (this.#machine.state === "verifying") this.#machine.transition("running");
+    this.#repairSendInProgress = true;
     try {
       await this.#sendInternal(instruction);
       return true;
@@ -1260,6 +1344,8 @@ export class Supervisor {
       if (this.#machine.state === "running") this.#machine.transition("verifying");
       await this.#appendEvent({ type: "candidate_blocked", taskId: task.taskId, workerId: handle.id, data: { reason: `automatic repair could not be sent: ${safeMessage(error)}` } });
       return false;
+    } finally {
+      this.#repairSendInProgress = false;
     }
   }
 
@@ -1325,6 +1411,7 @@ export class Supervisor {
         reason: verificationSucceeded ? "candidate is ready" : candidateReason,
         status: verificationSucceeded ? "ready" : "blocked",
         deliverable: verificationSucceeded,
+        usage: this.usage,
       };
       this.#terminalNoticeSent = true;
       void Promise.resolve(this.#onCandidate?.(notice)).catch(() => {});
@@ -1453,11 +1540,85 @@ export class Supervisor {
     if (timeoutEventError) throw timeoutEventError;
   }
 
+  /**
+   * Best-effort accounting for a Worker `result` stream-json record; `total_cost_usd`
+   * is cumulative for the Worker's own process session, so a value smaller than the
+   * last one observed means a new Worker process started counting from zero, and
+   * the prior session's total is folded into `#workerCostBaseline` before tracking
+   * continues. Returns a park reason when the cost budget is exhausted, else undefined.
+   */
+  #recordWorkerUsage(result: Record<string, unknown>): string | undefined {
+    const totalCostUsd = typeof result.total_cost_usd === "number" && Number.isFinite(result.total_cost_usd) ? result.total_cost_usd : undefined;
+    const rawUsage = result.usage && typeof result.usage === "object" ? result.usage as Record<string, unknown> : undefined;
+    const numTurns = typeof result.num_turns === "number" && Number.isFinite(result.num_turns) ? result.num_turns : undefined;
+    const durationMs = typeof result.duration_ms === "number" && Number.isFinite(result.duration_ms) ? result.duration_ms : undefined;
+    const subtype = typeof result.subtype === "string" ? result.subtype : undefined;
+    const isError = result.is_error === true;
+
+    let delta = 0;
+    if (totalCostUsd !== undefined) {
+      if (totalCostUsd < this.#lastWorkerResultCost) this.#workerCostBaseline += this.#lastWorkerResultCost;
+      this.#lastWorkerResultCost = totalCostUsd;
+      const cumulative = this.#workerCostBaseline + totalCostUsd;
+      delta = Math.max(0, cumulative - this.#usage.workerCostUsd);
+      this.#usage.workerCostUsd = cumulative;
+    }
+    const tokens = {
+      input: numericField(rawUsage?.input_tokens),
+      output: numericField(rawUsage?.output_tokens),
+      cacheRead: numericField(rawUsage?.cache_read_input_tokens),
+      cacheWrite: numericField(rawUsage?.cache_creation_input_tokens),
+    };
+    this.#usage.workerTokens.input += tokens.input;
+    this.#usage.workerTokens.output += tokens.output;
+    this.#usage.workerTokens.cacheRead += tokens.cacheRead;
+    this.#usage.workerTokens.cacheWrite += tokens.cacheWrite;
+    this.#usage.workerTurns += 1;
+
+    this.#appendEvent({
+      type: "worker_usage",
+      taskId: this.#task?.taskId,
+      workerId: this.#handle?.id,
+      data: {
+        costUsd: delta,
+        cumulativeCostUsd: this.#usage.workerCostUsd,
+        tokens,
+        ...(numTurns !== undefined ? { numTurns } : {}),
+        ...(durationMs !== undefined ? { durationMs } : {}),
+        ...(subtype !== undefined ? { subtype } : {}),
+      },
+    }).catch((error) => {
+      console.error(`pi-claude-supervisor worker usage audit failed: ${safeMessage(error)}`);
+    });
+
+    if (subtype === "error_max_budget_usd" && isError) {
+      return `Claude Code stopped the session at its --max-budget-usd cap ($${this.#usage.workerCostUsd.toFixed(2)})`;
+    }
+    const limit = this.#task?.spec.autonomy.maxWorkerCostUsd;
+    if (limit !== undefined && this.#usage.workerCostUsd > limit) {
+      return `worker cost budget exhausted: $${this.#usage.workerCostUsd.toFixed(2)} of $${limit}`;
+    }
+    return undefined;
+  }
+
+  #recordPiUsage(sample: PiUsageSample): void {
+    const bucket = sample.role === "reviewer" ? this.#usage.reviewer : this.#usage.decision;
+    bucket.calls += 1;
+    bucket.input += sample.input;
+    bucket.output += sample.output;
+    bucket.cacheRead += sample.cacheRead;
+    bucket.cacheWrite += sample.cacheWrite;
+    if (typeof sample.costUsd === "number" && Number.isFinite(sample.costUsd)) bucket.costUsd += sample.costUsd;
+    this.#appendEvent({ type: "pi_usage", taskId: this.#task?.taskId, data: { ...sample } }).catch((error) => {
+      console.error(`pi-claude-supervisor pi usage audit failed: ${safeMessage(error)}`);
+    });
+  }
+
   #reportProgress(phase: SupervisorProgressPhase, message: string, force = false): void {
     const task = this.#task;
     if (!task || !this.#onProgress) return;
     const now = Date.now();
-    if (!force && this.#progressPhase === phase && now - this.#lastProgressAt < 15_000) return;
+    if (!force && this.#progressPhase === phase && now - this.#lastProgressAt < this.#progressHeartbeatMs) return;
     const info: SupervisorProgress = {
       taskId: task.taskId,
       phase,
@@ -1466,6 +1627,9 @@ export class Supervisor {
       turn: this.#turn,
       repairRound: this.#repairRound,
       heartbeat: !force && this.#progressPhase === phase,
+      costUsd: this.#usage.workerCostUsd,
+      piTokens: this.#usage.decision.input + this.#usage.decision.output + this.#usage.decision.cacheRead + this.#usage.decision.cacheWrite
+        + this.#usage.reviewer.input + this.#usage.reviewer.output + this.#usage.reviewer.cacheRead + this.#usage.reviewer.cacheWrite,
     };
     this.#progressPhase = phase;
     this.#lastProgressAt = now;
@@ -1690,4 +1854,18 @@ function redactRepositoryEvidence(evidence: RepositoryEvidence): RepositoryEvide
 
 function safeMessage(error: unknown): string {
   return String(redactSensitive(error instanceof Error ? error.message : String(error)));
+}
+
+function numericField(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function emptyUsage(): SupervisorTokenUsage {
+  return {
+    workerCostUsd: 0,
+    workerTurns: 0,
+    workerTokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    decision: { calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 },
+    reviewer: { calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 },
+  };
 }
