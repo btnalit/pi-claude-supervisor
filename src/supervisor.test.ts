@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import type { SupervisorEvent } from "./events.ts";
-import type { WorkerAdapter, WorkerHandle, WorkerOutputChunk, WorkerStartInput, WorkerStatus } from "./types.ts";
+import type { WorkerAdapter, WorkerEvent, WorkerHandle, WorkerOutputChunk, WorkerStartInput, WorkerStatus } from "./types.ts";
 import type { DecisionWorkerFactory } from "./decision-worker.ts";
 import { Supervisor } from "./supervisor.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
@@ -1416,4 +1416,276 @@ test("stop still transitions when a pending event keeps failing", async () => {
   assert.equal(supervisor.state, "waiting");
   await assert.rejects(() => supervisor.stop("test complete"));
   assert.equal(supervisor.state, "stopped");
+});
+
+test("watchdog-classified exit starts verification in automation mode", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-watchdog-verify-"));
+  try {
+    await initializeGitRepository(cwd, "worker/watchdog-verify");
+    const handle: WorkerHandle = { id: "watchdog-verify-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    let reviews = 0;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async () => handle,
+      getStatus: async () => ({ handle, running, activeRequests: 0, exitReason: running ? undefined : "completed", processGroupCleaned: !running }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const supervisor = new Supervisor(adapter, undefined, {
+      reviewer: { review: async () => { reviews += 1; return { verdict: "pass" as const, summary: "verified", findings: [], round: 0, checkedAt: new Date().toISOString() }; } },
+    });
+    // No "exited" event is ever delivered by this adapter; only the watchdog's
+    // own getStatus poll can notice the Worker died and classify+verify it.
+    await supervisor.start({
+      task: "watchdog classifies and verifies",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 60_000,
+      spec: { ...automaticSpec(), acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    });
+    running = false;
+    let attempt = 0;
+    while (reviews === 0 && attempt < 60) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      attempt += 1;
+    }
+    assert.equal(reviews, 1);
+    assert.equal(supervisor.state, "completed");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a committed task branch with a dirty worktree requests repair", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-dirty-worktree-"));
+  try {
+    await initializeGitRepository(cwd, "worker/dirty-worktree");
+    const handle: WorkerHandle = { id: "dirty-worktree-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    let sends = 0;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async () => handle,
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+      readOutput: async () => [],
+      send: async () => { sends += 1; },
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "dirty worktree candidate",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: { autonomy: { unattended: true, requireLocalCommit: true, maxDecisionRetries: 1 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    });
+    // A commit already exists on the task branch, but the worktree still has
+    // an uncommitted change on top of it: the committed candidate and the
+    // reviewed worktree diff would disagree.
+    await writeFile(join(cwd, "candidate.txt"), "candidate\n");
+    await execFileAsync("git", ["add", "candidate.txt"], { cwd });
+    await execFileAsync("git", ["commit", "-qm", "candidate commit"], { cwd });
+    await writeFile(join(cwd, "dirty.txt"), "dirty\n");
+    await supervisor.poll();
+    const result = await supervisor.verify();
+    assert.equal(result.ok, true);
+    const required = events.events.find((event) => event.type === "local_commit_required");
+    assert.match(String(required?.data?.reason ?? ""), /uncommitted/u);
+    assert.ok(events.events.some((event) => event.type === "repair_requested"));
+    assert.equal(sends, 1);
+    assert.equal(supervisor.state, "running");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("truncated repository evidence requests a repair before parking", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-truncated-evidence-"));
+  try {
+    await initializeGitRepository(cwd, "worker/truncated-evidence");
+    const handle: WorkerHandle = { id: "truncated-evidence-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    let sends = 0;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async () => handle,
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+      readOutput: async () => [],
+      send: async () => { sends += 1; },
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "truncated evidence candidate",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: { ...automaticSpec(), acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    });
+    // A >1 MiB tracked change makes the collected diff exceed the Reviewer
+    // evidence limit; the candidate should get a chance to shrink it before
+    // any candidate is parked.
+    await writeFile(join(cwd, "base.txt"), "a".repeat(1024 * 1024 + 500_000));
+    await supervisor.poll();
+    const result = await supervisor.verify();
+    assert.equal(result.ok, true);
+    const repaired = events.events.find((event) => event.type === "repair_requested");
+    assert.match(String(repaired?.data?.reason ?? ""), /review limits/u);
+    assert.equal(sends, 1);
+    assert.equal(supervisor.state, "running");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("resume-auto replays the last completed turn", async () => {
+  const handle: WorkerHandle = { id: "resume-replay-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  const running = true;
+  let capturedListener: WorkerStartInput["eventListener"];
+  let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+  const replays: WorkerEvent[] = [];
+  const events = new FlakyEventLog("never-fail");
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async (input) => { capturedListener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "resume auto replay",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: (options) => {
+      onAction = options.onAction;
+      return {
+        start: async () => {},
+        updateContext: () => {},
+        notify: () => {},
+        replay: (event) => { replays.push(event); },
+        close: async () => {},
+      };
+    },
+  });
+  const turnEvent: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 1 };
+  capturedListener?.(turnEvent);
+  // poll() is serialized behind the async event processing #receiveWorkerEvent
+  // queued above, so by the time it resolves "waiting" has already landed.
+  await supervisor.poll();
+  assert.equal(supervisor.state, "waiting");
+  await supervisor.takeover();
+  assert.equal(supervisor.humanRequired, true);
+  await onAction?.({ action: "continue", message: "should not be sent", reason: "r" }, turnEvent);
+  assert.ok(events.events.some((event) => event.type === "decision_deferred"));
+  assert.ok(!events.events.some((event) => event.type === "worker_message_sent"));
+  await supervisor.resumeAutomation();
+  assert.equal(replays.length, 1);
+  assert.equal(replays[0], turnEvent);
+  // The replayed action must not have been deduped by the earlier, deferred
+  // delivery: #applyDecision returned before recording its actionKey.
+  await onAction?.({ action: "continue", message: "should not be sent", reason: "r" }, turnEvent);
+  assert.ok(events.events.some((event) => event.type === "worker_message_sent"));
+});
+
+test("failed send does not consume a turn", async () => {
+  const handle: WorkerHandle = { id: "failed-send-worker", startedAt: new Date().toISOString(), cwd: "/tmp" };
+  let running = true;
+  let sendAttempts = 0;
+  const events = new FlakyEventLog("never-fail");
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "process-pipe", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {
+      sendAttempts += 1;
+      if (sendAttempts === 1) throw new Error("transient send failure");
+    },
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1]);
+  await supervisor.start({ task: "failed send fixture", cwd: "/tmp", command: "fixture", deadlineMs: 0, noOutputTimeoutMs: 0 });
+  await assert.rejects(() => supervisor.send("first attempt"), /transient send failure/u);
+  await supervisor.send("second attempt");
+  const sent = events.events.filter((event) => event.type === "worker_message_sent");
+  assert.equal(sent.length, 1);
+  assert.ok(String(sent[0]?.idempotencyKey).endsWith(":turn:1"));
+});
+
+test("deny_permission on a policy-allowed command uses the Decision Worker's reason", async () => {
+  const handle: WorkerHandle = { id: "deny-message-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  const running = true;
+  let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+  let respondedDecision: { behavior: string; message?: string } | undefined;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+    respondPermission: async (_handle, _requestId, _toolUseId, decision) => { respondedDecision = decision; },
+  };
+  const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "deny message fixture",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: (options) => { onAction = options.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+  });
+  const permissionEvent: WorkerEvent = {
+    type: "permission_request",
+    handle,
+    request: { requestId: "req-1", toolUseId: "tool-1", toolName: "Read", input: { file_path: "x" }, raw: {} },
+  };
+  await onAction?.({ action: "deny_permission", requestId: "req-1", toolUseId: "tool-1", reason: "not needed for this task" }, permissionEvent);
+  assert.equal(respondedDecision?.behavior, "deny");
+  assert.equal(respondedDecision?.message, "denied by supervisor: not needed for this task");
 });
