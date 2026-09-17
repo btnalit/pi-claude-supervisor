@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, lstat, mkdir, open, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, open, readdir, readFile, realpath, rm, stat, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, isAbsolute, join } from "node:path";
 import type {
@@ -20,7 +20,7 @@ import { assertSafeWorkerCommand } from "../policy.ts";
 import { redactSensitive } from "../redaction.ts";
 import { automaticWorkerEnvironment, workerEnvironment } from "./environment.ts";
 import { claudeJsonlArgs, cleanupCgroup, currentCgroupPath, preflightCgroupContainment } from "./process-adapter.ts";
-import { isClaudeLauncherProcess, readProcess } from "./process-tree.ts";
+import { isClaudeLauncherProcess, readProcess, type ProcessTreeEntry } from "./process-tree.ts";
 import { nodeScriptCommand } from "./runtime.ts";
 
 export interface TmuxWorkerAdapterOptions {
@@ -85,6 +85,15 @@ interface TmuxRecord {
   panePid?: number;
   paneStartTime?: string;
   paneCommand?: string;
+  /**
+   * The actual Claude Code process pid/start time, for hook binding only. An
+   * adopted launcher-wrapped pane (`panePid` is the launcher, Claude is its
+   * child) pins this to the Claude child; otherwise it mirrors `panePid`.
+   * `tmuxExpectedIdentity`/pause/resume/replacement-detection keep using
+   * `panePid`, which is the pane's actual occupant.
+   */
+  claudePid?: number;
+  claudeStartTime?: string;
   replacementPaneStartTime?: string;
   replacementPaneCommand?: string;
   paneDead?: boolean;
@@ -514,8 +523,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     this.#cgroupMode = options.cgroupMode ?? "auto";
   }
 
-  async preflight(input: Pick<WorkerStartInput, "cwd" | "command" | "args" | "env" | "approval" | "automatic">): Promise<void> {
-    const args = input.automatic ? claudeJsonlArgs(input.args) : (input.args ?? []);
+  async preflight(input: Pick<WorkerStartInput, "cwd" | "command" | "args" | "env" | "approval" | "automatic" | "interactive">): Promise<void> {
+    // Interactive mode drives the real Claude TUI with ordinary interactive
+    // args; only the structured stream-json bridge needs claudeJsonlArgs.
+    const args = input.automatic && !input.interactive ? claudeJsonlArgs(input.args) : (input.args ?? []);
     assertSafeWorkerCommand(input.command, args, input.approval);
     await assertDirectory(input.cwd);
     if (process.platform !== "linux") throw new Error("tmux supervision currently requires Linux process identity and cleanup support");
@@ -1258,7 +1269,15 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         let paneCwd: string | undefined;
         try { paneCwd = (await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_current_path}"])).stdout.trim(); }
         catch { paneCwd = undefined; }
-        if (paneCwd === cwd) {
+        // A symlinked cwd still shows the dialog for the resolved path tmux
+        // reports; compare real paths, falling back to the raw string when
+        // either side cannot be resolved.
+        let matchesCwd = paneCwd === cwd;
+        if (paneCwd !== undefined && !matchesCwd) {
+          try { matchesCwd = (await realpath(paneCwd)) === (await realpath(cwd)); }
+          catch { /* keep the raw comparison result */ }
+        }
+        if (matchesCwd) {
           await this.#run(record, ["send-keys", "-t", record.target, "Down"]);
           await this.#run(record, ["send-keys", "-t", record.target, "Enter"]);
           trustDialogHandled = true;
@@ -1304,15 +1323,77 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     const argsText = processArgs.stdout.trim();
     const commandLine = `${command} ${argsText}`.trim();
     const paneProcess = await readProcess(pane.pid);
-    if (!argsText || !paneProcess || !isClaudeLauncherProcess(paneProcess)) {
+    if (!argsText || !paneProcess) {
       throw new Error(`tmux pane is not a Claude Code executable: ${redactSensitiveText(commandLine || "unknown")}`);
+    }
+    let claudePid = pane.pid;
+    let claudeStartTime = paneProcess.startTime;
+    if (!isClaudeLauncherProcess(paneProcess)) {
+      // A recovered owned interactive session runs the launcher in the pane
+      // (`node -e TMUX_INTERACTIVE_LAUNCHER_SCRIPT`), whose only child is the
+      // real Claude process; the launcher's own argv never looks like Claude.
+      const claudeChild = await this.#findClaudeChild(pane.pid);
+      if (!claudeChild) throw new Error(`tmux pane is not a Claude Code executable: ${redactSensitiveText(commandLine || "unknown")}`);
+      claudePid = claudeChild.pid;
+      claudeStartTime = claudeChild.startTime;
     }
     assertSafeWorkerCommand(command, [argsText], approval);
     await this.#rememberPaneIdentity(record, pane.pid);
     record.panePid = pane.pid;
+    // Pinned separately from `panePid` (the pane's own occupant, which
+    // pause/resume/replacement-detection and tmuxExpectedIdentity all key
+    // off) so a launcher-wrapped adoption binds hook requests to the actual
+    // Claude pid rather than the launcher.
+    record.claudePid = claudePid;
+    record.claudeStartTime = claudeStartTime;
     if (expected?.startTime && record.paneStartTime !== expected.startTime) throw new Error("tmux pane process start time changed; refusing identity-unverified handoff");
     if (expected?.paneStartTime && record.paneStartTime !== expected.paneStartTime) throw new Error("tmux pane identity changed; refusing identity-unverified handoff");
     if (expected?.paneCommand && record.paneCommand !== expected.paneCommand) throw new Error("tmux pane command changed; refusing identity-unverified handoff");
+  }
+
+  /**
+   * Direct children of `panePid` whose executable identity looks like Claude
+   * Code (`isClaudeLauncherProcess`, the same predicate used for the pane's
+   * own process above). Recovery accepts the pane only when exactly one
+   * matches; zero or several is refused as an unverified handoff.
+   */
+  async #findClaudeChild(panePid: number): Promise<ProcessTreeEntry | undefined> {
+    const childPids = await this.#directChildPids(panePid);
+    const children: ProcessTreeEntry[] = [];
+    for (const pid of childPids) {
+      const entry = await readProcess(pid);
+      if (entry) children.push(entry);
+    }
+    const claudeChildren = children.filter((entry) => isClaudeLauncherProcess(entry));
+    return claudeChildren.length === 1 ? claudeChildren[0] : undefined;
+  }
+
+  async #directChildPids(pid: number): Promise<number[]> {
+    try {
+      const raw = await readFile(`/proc/${pid}/task/${pid}/children`, "utf8");
+      return raw.trim().split(/\s+/u).filter(Boolean).map(Number).filter((value) => Number.isSafeInteger(value) && value > 0);
+    } catch {
+      // Some kernels/containers do not expose /proc/<pid>/task/<pid>/children;
+      // fall back to scanning /proc for entries whose ppid matches, the way
+      // process-adapter.ts's processGroupHasLiveMember walks /proc.
+    }
+    const children: number[] = [];
+    let names: string[];
+    try { names = await readdir("/proc"); }
+    catch { return children; }
+    for (const name of names) {
+      if (!/^\d+$/u.test(name)) continue;
+      try {
+        const statText = await readFile(`/proc/${name}/stat`, "utf8");
+        const closeParen = statText.lastIndexOf(")");
+        if (closeParen < 0) continue;
+        const fields = statText.slice(closeParen + 2).trim().split(/\s+/u);
+        if (Number(fields[1]) === pid) children.push(Number(name));
+      } catch {
+        // A process can disappear between /proc enumeration and stat read.
+      }
+    }
+    return children;
   }
 
   async #pinTarget(record: TmuxRecord): Promise<void> {
@@ -1789,7 +1870,11 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
 
   async #bindsToRecord(record: TmuxRecord, request: HookRelayRequest): Promise<boolean> {
     if (record.handle.tmuxPaneId && request.tmuxPane && request.tmuxPane === record.handle.tmuxPaneId) return true;
-    if (record.panePid !== undefined) return this.#ppidDescendsFrom(request.ppid, record.panePid);
+    // claudePid (pinned by #assertExistingSession recovery) is the verified
+    // Claude process itself; panePid is the pane's occupant, which may be a
+    // launcher one or more hops above Claude in the hook relay's ppid chain.
+    const anchor = record.claudePid ?? record.panePid;
+    if (anchor !== undefined) return this.#ppidDescendsFrom(request.ppid, anchor);
     // The pane identity is not established yet (owned startup window); a cwd
     // has at most one subscribed Supervisor session at a time, so accept.
     return true;

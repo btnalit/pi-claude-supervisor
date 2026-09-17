@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
@@ -24,6 +24,28 @@ test("embedded tmux-adapter scripts are syntactically valid JavaScript", () => {
 test("automatic tmux preflight rejects disabled cgroup containment", { skip: process.platform !== "linux" || !tmuxAvailable }, async () => {
   const adapter = new TmuxWorkerAdapter({ cgroupMode: "off" });
   await assert.rejects(() => adapter.preflight({ cwd: process.cwd(), command: process.execPath, args: [], automatic: true }), /cgroup containment/u);
+});
+
+test("interactive preflight skips claude-jsonl stream-json arg validation", { skip: !automaticTmuxAvailable }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-interactive-preflight-"));
+  const adapter = new TmuxWorkerAdapter({ stateDir });
+  try {
+    // "--model sonnet" is an ordinary interactive TUI arg; interactive mode
+    // must preflight it as-is instead of injecting/validating stream-json flags.
+    await adapter.preflight({ cwd: process.cwd(), command: process.execPath, args: ["--model", "sonnet"], automatic: true, interactive: true });
+    // Same args, interactive: false, still resolve (claudeJsonlArgs tolerates them).
+    await adapter.preflight({ cwd: process.cwd(), command: process.execPath, args: ["--model", "sonnet"], automatic: true, interactive: false });
+    // An arg claudeJsonlArgs actively rejects proves the structured path still
+    // validates while interactive bypasses it entirely.
+    const conflictingArgs = ["--input-format", "text"];
+    await adapter.preflight({ cwd: process.cwd(), command: process.execPath, args: conflictingArgs, automatic: true, interactive: true });
+    await assert.rejects(
+      () => adapter.preflight({ cwd: process.cwd(), command: process.execPath, args: conflictingArgs, automatic: true, interactive: false }),
+      /--input-format must be stream-json in claude-jsonl mode/u,
+    );
+  } finally {
+    await rm(stateDir, { recursive: true, force: true });
+  }
 });
 
 test("tmux adapter owns a private PTY, completes turns, and preserves output", { skip: !tmuxAvailable, concurrency: false }, async () => {
@@ -127,6 +149,101 @@ test("owned tmux guardian kills the session after an unexpected Supervisor death
     assert.fail(`guardian did not remove ${identity.session}`);
   } finally {
     if (!child.killed) child.kill("SIGKILL");
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("release stops the owned interactive guardian, so a released session survives Supervisor exit", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-interactive-guardian-release-"));
+  const fakeClaude = join(stateDir, "claude");
+  const pidFile = join(stateDir, "claude.pid");
+  const hookSettingsPath = join(stateDir, "hook-settings.json");
+  await writeFile(hookSettingsPath, "{}");
+  await writeFile(fakeClaude, `#!/usr/bin/env node
+const { writeFileSync } = require("node:fs");
+writeFileSync(process.env.PI_TEST_PIDFILE, String(process.pid));
+process.stdout.write("\\n>\\n");
+process.stdin.resume();
+setInterval(() => {}, 10000);
+`);
+  await chmod(fakeClaude, 0o700);
+  const driverScript = join(stateDir, "driver.mjs");
+  const adapterUrl = new URL("./tmux-adapter.ts", import.meta.url).href;
+  await writeFile(driverScript, `
+import { TmuxWorkerAdapter } from ${JSON.stringify(adapterUrl)};
+import { readFileSync } from "node:fs";
+const stateDir = process.env.STATE_DIR;
+const pidFile = process.env.PID_FILE;
+const hookSettingsPath = process.env.HOOK_SETTINGS;
+const fakeClaude = process.env.FAKE_CLAUDE;
+let handler;
+const hookSource = {
+  subscribe: async (cwd, h) => { handler = h; return async () => { handler = undefined; }; },
+};
+const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000 });
+const startPromise = adapter.start({
+  task: "guardian release test",
+  cwd: stateDir,
+  command: fakeClaude,
+  args: [],
+  env: { HOME: stateDir + "/home", CLAUDE_CONFIG_DIR: stateDir + "/config", PI_TEST_PIDFILE: pidFile },
+  automatic: true,
+  interactive: true,
+  hookSource,
+  hookSettingsPath,
+  sendInitialInput: false,
+});
+let fakePid;
+for (let attempt = 0; attempt < 200; attempt += 1) {
+  try {
+    const content = readFileSync(pidFile, "utf8").trim();
+    if (content) { fakePid = Number(content); break; }
+  } catch {}
+  await new Promise((resolve) => setTimeout(resolve, 20));
+}
+for (let attempt = 0; attempt < 200 && !handler; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+await handler({ version: 1, pid: fakePid + 1, ppid: fakePid, event: { hook_event_name: "SessionStart", session_id: "session-1", cwd: stateDir } });
+const handle = await startPromise;
+// Simulate a normal completion: Supervisor releases the session (leaving it
+// open for the user) before the process later exits.
+await adapter.release(handle, "simulate normal completion before Supervisor exit");
+process.stdout.write(JSON.stringify({ socket: handle.tmuxSocket, session: handle.sessionName }) + "\\n");
+setInterval(() => {}, 10_000);
+`);
+  const child = spawn(process.execPath, ["--experimental-strip-types", driverScript], {
+    env: { ...process.env, STATE_DIR: stateDir, PID_FILE: pidFile, HOOK_SETTINGS: hookSettingsPath, FAKE_CLAUDE: fakeClaude },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  const ready = new Promise<{ socket: string; session: string }>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`driver did not become ready: ${stderr}`)), 10_000);
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+      const line = stdout.split("\n").find(Boolean);
+      if (!line) return;
+      clearTimeout(timer);
+      try { resolve(JSON.parse(line) as { socket: string; session: string }); }
+      catch (error) { reject(error); }
+    });
+    child.once("error", reject);
+  });
+  child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+  let identity: { socket: string; session: string } | undefined;
+  try {
+    identity = await ready;
+    assert.equal(spawnSync("tmux", ["-S", identity.socket, "has-session", "-t", identity.session], { stdio: "ignore" }).status, 0);
+    child.kill("SIGKILL");
+    await new Promise<void>((resolve) => child.once("close", () => resolve()));
+    // A still-armed guardian polls every 100ms and would remove the session
+    // shortly after the parent dies; give it several chances to (wrongly) fire.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(spawnSync("tmux", ["-S", identity.socket, "has-session", "-t", identity.session], { stdio: "ignore" }).status, 0);
+  } finally {
+    if (!child.killed) child.kill("SIGKILL");
+    if (identity) spawnSync("tmux", ["-S", identity.socket, "kill-server"], { stdio: "ignore" });
     await rm(stateDir, { recursive: true, force: true });
   }
 });
@@ -760,6 +877,128 @@ setInterval(() => {}, 10000);
   }
 });
 
+test("interactive owned session accepts the trust dialog when cwd is a symlink", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const rootDir = await realpath(await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-interactive-symlink-")));
+  const realCwd = join(rootDir, "real-cwd");
+  await mkdir(realCwd, { recursive: true });
+  const symlinkCwd = join(rootDir, "symlink-cwd");
+  await symlink(realCwd, symlinkCwd);
+  const stateDir = join(rootDir, "state");
+  await mkdir(stateDir, { recursive: true });
+  const fakeClaude = join(stateDir, "claude");
+  const pidFile = join(stateDir, "claude.pid");
+  const hookSettingsPath = join(stateDir, "hook-settings.json");
+  await writeFile(hookSettingsPath, "{}");
+  await writeFile(fakeClaude, `#!/usr/bin/env node
+const { writeFileSync } = require("node:fs");
+writeFileSync(process.env.PI_TEST_PIDFILE, String(process.pid));
+process.stdout.write("Quick safety check\\n\\u276f No, exit\\n  Yes, I trust this folder\\n");
+let buffer = "";
+let accepted = false;
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  if (!accepted && buffer.includes("\\x1b[B") && /[\\r\\n]/.test(buffer)) {
+    accepted = true;
+    process.stdout.write("\\n>\\n");
+  }
+});
+process.stdin.resume();
+setInterval(() => {}, 10000);
+`);
+  await chmod(fakeClaude, 0o700);
+  const hookSource = createFakeHookSource();
+  const events: WorkerEvent[] = [];
+  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+  let handle;
+  try {
+    // tmux reports #{pane_current_path} resolved (the real directory); the
+    // adapter is started with the symlink path, so the raw string comparison
+    // used to accept the trust dialog would never match without realpath.
+    const startPromise = adapter.start({
+      task: "hello interactive symlink",
+      cwd: symlinkCwd,
+      command: fakeClaude,
+      args: [],
+      env: { HOME: join(stateDir, "home"), CLAUDE_CONFIG_DIR: join(stateDir, "config"), PI_TEST_PIDFILE: pidFile },
+      automatic: true,
+      interactive: true,
+      hookSource,
+      hookSettingsPath,
+      sendInitialInput: false,
+      eventListener: (event) => { events.push(event); },
+    });
+    const fakePid = Number(await waitForFileContent(pidFile));
+    await hookSource.dispatch(symlinkCwd, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "SessionStart", session_id: "session-1", cwd: symlinkCwd, transcript_path: join(stateDir, "transcript.jsonl") },
+    });
+    handle = await startPromise;
+    assert.equal(handle.ownership, "owned");
+    const output = (await adapter.readOutput(handle)).map((chunk) => chunk.text).join("");
+    assert.match(output, /accepted the workspace trust dialog/u);
+  } finally {
+    if (handle) await adapter.stop(handle, "interactive symlink cwd test cleanup").catch(() => {});
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test("a launcher-wrapped owned interactive session can be re-adopted after restart", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const fixture = await startInteractiveOwnedFixture();
+  const { adapter, handle, stateDir, fakePid } = fixture;
+  let readoptedAdapter: TmuxWorkerAdapter | undefined;
+  let readopted: Awaited<ReturnType<TmuxWorkerAdapter["start"]>> | undefined;
+  try {
+    // The owned pane runs `node -e TMUX_INTERACTIVE_LAUNCHER_SCRIPT`, not
+    // Claude directly; Claude (the fake worker script) is its spawnSync
+    // child. Recovery must scan for that child instead of rejecting the
+    // launcher as "not a Claude Code executable".
+    await adapter.release(handle, "simulate Pi restart");
+    readoptedAdapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+    const readoptedHookSource = createFakeHookSource();
+    readopted = await readoptedAdapter.start({
+      task: "must not replay after recovery",
+      cwd: stateDir,
+      command: "claude",
+      tmuxSession: handle.sessionName,
+      tmuxSocket: handle.tmuxSocket,
+      tmuxExpectedIdentity: {
+        pid: handle.pid,
+        startTime: handle.paneStartTime,
+        tmuxTarget: handle.tmuxTarget,
+        tmuxPaneId: handle.tmuxPaneId,
+        paneStartTime: handle.paneStartTime,
+        paneCommand: handle.paneCommand,
+      },
+      automatic: true,
+      interactive: true,
+      hookSource: readoptedHookSource,
+      sendInitialInput: false,
+    });
+    assert.equal(readopted.ownership, "adopted");
+    // #bindsToRecord must resolve hook requests via the real Claude child
+    // pid (fakePid), not the launcher pid still occupying the pane.
+    const events: WorkerEvent[] = [];
+    readoptedAdapter.subscribe(readopted, (event) => { events.push(event); });
+    const reply = await readoptedHookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "UserPromptSubmit", session_id: "session-2", cwd: stateDir, prompt: "hello after recovery" },
+    });
+    assert.deepEqual(reply, {});
+    const humanEvent = events.find((event): event is Extract<WorkerEvent, { type: "human_input" }> => event.type === "human_input");
+    assert.ok(humanEvent);
+    assert.equal(humanEvent.text, "hello after recovery");
+  } finally {
+    if (readoptedAdapter && readopted) await readoptedAdapter.stop(readopted, "recovery test cleanup").catch(() => {});
+    if (handle.tmuxSocket && handle.sessionName) spawnSync("tmux", ["-S", handle.tmuxSocket, "kill-session", "-t", handle.sessionName], { stdio: "ignore" });
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("Stop hook completes the turn", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
   const fixture = await startInteractiveOwnedFixture();
   const { adapter, handle, hookSource, events, stateDir, fakePid } = fixture;
@@ -919,6 +1158,63 @@ test("interactive mode never emits turn_completed from screen scraping", { skip:
     assert.equal((await adapter.getStatus(handle)).activeRequests, 1);
   } finally {
     await adapter.stop(handle, "no screen scrape completion test cleanup").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("adopting an interactive tmux session subscribes hooks, completes a Stop turn, and stop() only releases it", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-adopt-interactive-"));
+  const socketPath = join(stateDir, "tmux.sock");
+  const sessionName = `pi-adopt-interactive-${process.pid}-${Date.now()}`;
+  const claudeScript = join(stateDir, "claude");
+  await writeFile(claudeScript, `#!/usr/bin/env node
+process.stdout.write("\\u276f \\n");
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { process.stdout.write(chunk); });
+process.stdin.resume();
+setInterval(() => {}, 10000);
+`);
+  await chmod(claudeScript, 0o700);
+  const created = spawnSync("tmux", ["-S", socketPath, "new-session", "-d", "-s", sessionName, "-c", stateDir, claudeScript], { encoding: "utf8" });
+  assert.equal(created.status, 0, created.stderr);
+  const hookSource = createFakeHookSource();
+  const events: WorkerEvent[] = [];
+  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+  let handle;
+  try {
+    handle = await adapter.start({
+      task: "observe interactive adoption",
+      cwd: stateDir,
+      command: "claude",
+      tmuxSession: sessionName,
+      tmuxSocket: socketPath,
+      automatic: true,
+      interactive: true,
+      hookSource,
+      sendInitialInput: false,
+      eventListener: (event) => { events.push(event); },
+    });
+    assert.equal(handle.ownership, "adopted");
+    assert.match(handle.tmuxPaneId ?? "", /^%[0-9]+$/u);
+    // A dispatch that resolves (rather than throwing "no hook subscription
+    // for cwd") proves the adapter subscribed the hook source for the pane's cwd.
+    const reply = await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: 111_111,
+      ppid: 222_222,
+      tmuxPane: handle.tmuxPaneId,
+      event: { hook_event_name: "Stop", session_id: "session-1", cwd: stateDir, last_assistant_message: "adopted turn done" },
+    });
+    assert.deepEqual(reply, {});
+    const completion = events.find((event): event is Extract<WorkerEvent, { type: "turn_completed" }> => event.type === "turn_completed");
+    assert.ok(completion);
+    assert.equal((completion.result as { result?: string }).result, "adopted turn done");
+    await adapter.stop(handle, "adopted interactive detach only");
+    const status = await adapter.getStatus(handle);
+    assert.equal(status.running, true);
+    assert.equal(spawnSync("tmux", ["-S", socketPath, "has-session", "-t", sessionName], { stdio: "ignore" }).status, 0);
+  } finally {
+    spawnSync("tmux", ["-S", socketPath, "kill-server"], { stdio: "ignore" });
     await rm(stateDir, { recursive: true, force: true });
   }
 });
