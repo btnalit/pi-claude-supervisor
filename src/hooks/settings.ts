@@ -10,6 +10,7 @@ const HOOK_EVENT_NAMES: readonly ClaudeHookEventName[] = [
   "PreToolUse",
   "PermissionRequest",
   "Stop",
+  "StopFailure",
   "Notification",
 ];
 

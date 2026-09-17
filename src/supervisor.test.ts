@@ -2487,7 +2487,7 @@ test("human_input pauses automation, is withheld from the Decision Worker's next
   const notified: WorkerEvent[] = [];
   const replays: WorkerEvent[] = [];
   const events = new FlakyEventLog("never-fail");
-  const humanNotices: Array<{ reason: string }> = [];
+  const humanNotices: Array<{ reason: string; source?: string }> = [];
   const adapter: WorkerAdapter = {
     capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true }),
     start: async (input) => { capturedListener = input.eventListener; return handle; },
@@ -2538,6 +2538,12 @@ test("human_input pauses automation, is withheld from the Decision Worker's next
   await supervisor.poll();
   assert.deepEqual(permissionReplies.at(-1), { requestId: "p1", decision: { behavior: "allow", defer: true } });
   assert.equal(notified.length, 0);
+  // Likewise a question: the human at the keyboard answers it in the TUI.
+  capturedListener?.({ type: "permission_request", handle, request: { requestId: "q1", toolUseId: "t2", toolName: "AskUserQuestion", input: { questions: [] }, raw: {}, phase: "pre" } });
+  await supervisor.poll();
+  assert.deepEqual(permissionReplies.at(-1), { requestId: "q1", decision: { behavior: "allow", defer: true } });
+  assert.equal(notified.length, 0);
+  assert.equal(humanNotices[0]?.source, "worker_prompt");
 
   const turnEvent: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 1 };
   capturedListener?.(turnEvent);

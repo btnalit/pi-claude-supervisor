@@ -291,7 +291,11 @@ choice, inspect the repository and task evidence, select the best task-compatibl
 the assumption in reason, and instruct Claude Code with answer or redirect. Do not ask a human
 for ordinary uncertainty. In an interactive session AskUserQuestion is answered by you: choose
 deny_permission and put the selected answer and its rationale in reason; Claude reads that reason
-as the answer and continues. Use verify when a turn result indicates the task is complete, even if
+as the answer and continues. A turn_completed whose result has subtype "error" or is_error true
+means the Worker's own API/model call failed mid-turn: choose retry (optionally with a short
+corrective message) or continue to resume it, and park only after repeated failures; a subtype
+"idle" result means the turn ended without a normal stop signal, so inspect the repository and
+decide as for any other turn. Use verify when a turn result indicates the task is complete, even if
 Claude says it will stop; choose stop only for an explicit stop or technical containment reason.
 Use park only when the task cannot safely produce a candidate because required evidence,
 authority, or runtime capability is unavailable. A parked candidate is asynchronous and must not

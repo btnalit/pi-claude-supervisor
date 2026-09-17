@@ -170,6 +170,8 @@ export interface HumanInterventionNotice {
   permission?: { requestId: string; toolUseId: string; toolName: string; input: unknown };
   /** Shell command to attach to the tmux session this notice concerns, when it refers to one. */
   attach?: string;
+  /** `worker_prompt`: the human is already at the keyboard; only an in-UI hint is useful, not an outbound alert. */
+  source?: "worker_prompt" | "ask_human";
 }
 
 export interface CandidateNotice extends HumanInterventionNotice {
@@ -642,6 +644,12 @@ export class Supervisor {
           // Claude's own permission mode (or the human) decides.
           if (event.request.toolName === "AskUserQuestion" && !this.#humanRequired) {
             // Fall through to the Decision Worker notification below.
+          } else if (event.request.toolName === "AskUserQuestion" && this.#adapter.respondPermission) {
+            // A human is driving: let the TUI show them the question instead of
+            // answering it with a policy denial nobody asked for.
+            await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, { behavior: "allow", defer: true });
+            this.#pendingPermissions.delete(event.request.requestId);
+            skipDecisionNotify = true;
           } else {
             const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd);
             if (policy.decision === "deny") {
@@ -707,6 +715,7 @@ export class Supervisor {
             cwd: task.cwd,
             task: task.task,
             reason: "human typed into the supervised session; automation paused",
+            source: "worker_prompt",
             ...(this.#attachHint(handle) ? { attach: this.#attachHint(handle) } : {}),
           })).catch(() => {});
         }

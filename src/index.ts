@@ -122,7 +122,9 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   });
   const onHumanRequired = (ctx: ExtensionContext) => async (notice: HumanInterventionNotice): Promise<void> => {
     if (ctx.hasUI) notify(ctx, `Human required: ${notice.reason}${notice.question ? ` — ${notice.question}` : ""}${notice.attach ? ` (${notice.attach})` : ""}`, "warning");
-    if (humanWebhook.enabled) {
+    // The person who just typed into the session does not need a WeCom alert
+    // telling them so; outbound notices are for decisions nobody is present for.
+    if (humanWebhook.enabled && notice.source !== "worker_prompt") {
       try { await humanWebhook.notify(notice); }
       catch (error) { console.error(`pi-claude-supervisor human intervention webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`); }
     }

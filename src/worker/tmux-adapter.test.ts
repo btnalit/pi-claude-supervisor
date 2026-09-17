@@ -1054,6 +1054,50 @@ test("a launcher-wrapped owned interactive session can be re-adopted after resta
   }
 });
 
+test("StopFailure and an idle_prompt without a Stop both close the turn", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const fixture = await startInteractiveOwnedFixture();
+  const { adapter, handle, hookSource, events, stateDir, fakePid } = fixture;
+  try {
+    await adapter.send(handle, "do y", "test-do-y");
+    await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "StopFailure", session_id: "session-1", cwd: stateDir, error: { type: "rate_limit_error", message: "overloaded" } },
+    });
+    const failed = events.find((event): event is Extract<WorkerEvent, { type: "turn_completed" }> => event.type === "turn_completed");
+    assert.ok(failed);
+    assert.equal((failed.result as { subtype?: string }).subtype, "error");
+    assert.equal((failed.result as { is_error?: boolean }).is_error, true);
+    assert.match(String((failed.result as { result?: string }).result), /rate_limit_error.*overloaded/u);
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+
+    await adapter.send(handle, "do z", "test-do-z");
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 1);
+    await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "Notification", session_id: "session-1", cwd: stateDir, notification_type: "idle_prompt", message: "waiting" },
+    });
+    const completions = events.filter((event) => event.type === "turn_completed");
+    assert.equal(completions.length, 2);
+    assert.equal(((completions[1] as Extract<WorkerEvent, { type: "turn_completed" }>).result as { subtype?: string }).subtype, "idle");
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+    // An idle notification while nothing is in flight is not a turn.
+    await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "Notification", session_id: "session-1", cwd: stateDir, notification_type: "idle_prompt", message: "waiting" },
+    });
+    assert.equal(events.filter((event) => event.type === "turn_completed").length, 2);
+  } finally {
+    await adapter.stop(handle, "stop failure test cleanup").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("Stop hook completes the turn", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
   const fixture = await startInteractiveOwnedFixture();
   const { adapter, handle, hookSource, events, stateDir, fakePid } = fixture;

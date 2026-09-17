@@ -259,7 +259,10 @@ export PI_CLAUDE_SUPERVISOR_MODE=auto
 /supervise adopt-tmux <tmux-session> <task>
 ```
 
-Pi intervenes when Claude stops a turn (`Stop`), when Claude is about to show
+Pi intervenes when Claude stops a turn (`Stop`; an API/model failure mid-turn
+arrives as `StopFailure` and is treated as an errored turn the Decision Worker
+can retry, and a minute of idle prompt with no stop signal closes the turn as a
+safety net), when Claude is about to show
 you a real permission prompt (only then — every ordinary tool call is
 otherwise left to your own Claude Code permission mode), when Claude asks
 `AskUserQuestion` (the Decision Worker picks an answer and Claude continues
