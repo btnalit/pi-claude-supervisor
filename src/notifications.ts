@@ -9,6 +9,8 @@ export interface HumanWebhookOptions {
   timeoutMs?: number;
   maxAttempts?: number;
   retryDelaysMs?: number[];
+  /** Total wall-clock budget for retries; a delay that would cross it fails fast with the last error. */
+  retryDeadlineMs?: number;
 }
 
 /** Optional outbound candidate delivery. It never grants permission or controls the Worker. */
@@ -19,6 +21,7 @@ export class HumanWebhookNotifier {
   readonly #timeoutMs: number;
   readonly #maxAttempts: number;
   readonly #retryDelaysMs: number[];
+  readonly #retryDeadlineMs: number;
 
   constructor(options: HumanWebhookOptions = {}) {
     this.#url = options.url;
@@ -27,6 +30,7 @@ export class HumanWebhookNotifier {
     this.#timeoutMs = options.timeoutMs ?? 10_000;
     this.#maxAttempts = options.maxAttempts ?? 3;
     this.#retryDelaysMs = options.retryDelaysMs ?? [500, 2_000];
+    this.#retryDeadlineMs = options.retryDeadlineMs ?? 30_000;
   }
 
   get enabled(): boolean { return Boolean(this.#url); }
@@ -46,6 +50,8 @@ export class HumanWebhookNotifier {
   async #send(body: string): Promise<void> {
     const headers: Record<string, string> = { "content-type": "application/json", "user-agent": "pi-claude-supervisor/0.1" };
     if (this.#secret) headers["x-pi-supervisor-signature"] = `sha256=${createHmac("sha256", this.#secret).update(body).digest("hex")}`;
+    const startedAt = Date.now();
+    let lastError: unknown;
     for (let attempt = 1; ; attempt += 1) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
@@ -54,6 +60,7 @@ export class HumanWebhookNotifier {
         response = await fetch(this.#url!, { method: "POST", headers, body, signal: controller.signal });
       } catch (error) {
         if (attempt >= this.#maxAttempts) throw error;
+        lastError = error;
       } finally {
         clearTimeout(timer);
       }
@@ -62,8 +69,11 @@ export class HumanWebhookNotifier {
         if (!isRetryableStatus(response.status) || attempt >= this.#maxAttempts) {
           throw new Error(`candidate webhook returned HTTP ${response.status}`);
         }
+        lastError = new Error(`candidate webhook returned HTTP ${response.status}`);
       }
-      await sleep(this.#retryDelaysMs[attempt - 1] ?? this.#retryDelaysMs.at(-1) ?? 0);
+      const nextDelay = this.#retryDelaysMs[attempt - 1] ?? this.#retryDelaysMs.at(-1) ?? 0;
+      if (Date.now() - startedAt + nextDelay > this.#retryDeadlineMs) throw lastError;
+      await sleep(nextDelay);
     }
   }
 }

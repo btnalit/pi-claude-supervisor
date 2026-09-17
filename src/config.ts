@@ -64,6 +64,48 @@ export function eventLogMaxBytes(env: NodeJS.ProcessEnv = process.env): number {
   return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_EVENT_LOG_MAX_BYTES, 64 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024);
 }
 
+export function workerModel(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return readTrimmedString(env.PI_CLAUDE_SUPERVISOR_WORKER_MODEL);
+}
+
+/** The 200_000 default applies only in automatic mode; "0" is an explicit opt-out that omits --autocompact. */
+export function workerAutocompactTokens(env: NodeJS.ProcessEnv = process.env): number {
+  return readBoundedIntegerWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS, 200_000, 100_000, 1_000_000);
+}
+
+export function workerMcpConfigPath(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return readTrimmedString(env.PI_CLAUDE_SUPERVISOR_WORKER_MCP_CONFIG);
+}
+
+export function decisionModel(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return readTrimmedString(env.PI_CLAUDE_SUPERVISOR_DECISION_MODEL);
+}
+
+export function reviewerModel(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return readTrimmedString(env.PI_CLAUDE_SUPERVISOR_REVIEWER_MODEL);
+}
+
+/** "0" is an explicit opt-out that disables Decision Worker session compaction. */
+export function decisionCompactionTokens(env: NodeJS.ProcessEnv = process.env): number {
+  return readBoundedIntegerWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS, 60_000, 10_000, 500_000);
+}
+
+export function progressHeartbeatMs(env: NodeJS.ProcessEnv = process.env): number {
+  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_PROGRESS_HEARTBEAT_MS, 60_000, 5_000, 3_600_000);
+}
+
+export function decisionSessionRetentionDays(env: NodeJS.ProcessEnv = process.env): number {
+  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_DECISION_SESSION_RETENTION_DAYS, 30, 0, 3650);
+}
+
+export function evidenceMaxBytes(env: NodeJS.ProcessEnv = process.env): number {
+  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES, 1024 * 1024, 64 * 1024, 64 * 1024 * 1024);
+}
+
+export function evidenceMaxUntrackedFiles(env: NodeJS.ProcessEnv = process.env): number {
+  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES, 512, 16, 10_000);
+}
+
 export function loadSupervisorEnvironment(): string | undefined {
   const path = process.env.PI_CLAUDE_SUPERVISOR_ENV_FILE ?? join(homedir(), ".config", "pi-claude-supervisor", "env");
   if (!existsSync(path)) return undefined;
@@ -95,6 +137,17 @@ function readBoundedInteger(value: string | undefined, fallback: number, minimum
   if (value === undefined) return fallback;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+}
+
+/** Like readBoundedInteger, but the literal "0" is always honored as an opt-out below the normal minimum. */
+function readBoundedIntegerWithZeroOptOut(value: string | undefined, fallback: number, minimum: number, maximum: number): number {
+  if (value !== undefined && value.trim() === "0") return 0;
+  return readBoundedInteger(value, fallback, minimum, maximum);
+}
+
+function readTrimmedString(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 function readPermissionAuthority(value: string | undefined): PermissionAuthority {

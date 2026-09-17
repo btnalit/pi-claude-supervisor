@@ -4,14 +4,27 @@ import { lstat, open, readlink, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { AcceptanceCheck, AcceptanceCheckResult, AcceptanceReport, VerificationResult } from "./types.ts";
+import { evidenceMaxBytes, evidenceMaxUntrackedFiles } from "./config.ts";
 import { assertSafeWorkerCommand } from "./policy.ts";
 import { workerEnvironment } from "./worker/environment.ts";
 
 const execFileAsync = promisify(execFile);
-const MAX_OUTPUT_BYTES = 1024 * 1024;
-const MAX_EXEC_BUFFER_BYTES = 8 * 1024 * 1024;
 const MAX_UNTRACKED_FILE_BYTES = 256 * 1024;
-const MAX_UNTRACKED_FILES = 512;
+
+/** The bounded evidence/output size; configurable via PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES. */
+function maxOutputBytes(): number {
+  return evidenceMaxBytes();
+}
+
+/** The maximum number of untracked files to include as evidence; configurable via PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES. */
+function maxUntrackedFiles(): number {
+  return evidenceMaxUntrackedFiles();
+}
+
+/** child_process maxBuffer stays a comfortable multiple of the configured evidence bound. */
+function maxExecBufferBytes(): number {
+  return Math.max(8 * 1024 * 1024, 8 * evidenceMaxBytes());
+}
 
 function throwIfAborted(signal?: AbortSignal): void {
   if (!signal?.aborted) return;
@@ -200,7 +213,7 @@ async function runCheck(cwd: string, check: AcceptanceCheck, signal?: AbortSigna
     const result = await execFileAsync(check.command, check.args, {
       cwd,
       timeout: check.timeoutMs,
-      maxBuffer: MAX_EXEC_BUFFER_BYTES,
+      maxBuffer: maxExecBufferBytes(),
       signal,
       env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
     });
@@ -244,15 +257,18 @@ async function readGitEvidence(cwd: string, args: string[], signal?: AbortSignal
     const result = await execFileAsync("git", args, {
       cwd,
       timeout: 30_000,
-      maxBuffer: MAX_EXEC_BUFFER_BYTES,
+      maxBuffer: maxExecBufferBytes(),
       signal,
       env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
     });
     const bounded = boundEvidence(`${result.stdout}${result.stderr}`);
     return { ...bounded, text: bounded.text || "(none)" };
   } catch (error) {
-    const failure = error as { stdout?: string; stderr?: string; message?: string };
+    const failure = error as { code?: number | string; stdout?: string; stderr?: string; message?: string };
     const bounded = boundEvidence(`${failure.stdout ?? ""}${failure.stderr ?? ""}${failure.message ?? "git evidence unavailable"}`);
+    // Oversized output is a bounding problem, not an unsafe/incomplete command: let the
+    // Supervisor's truncated-evidence repair path handle it instead of a hard park.
+    if (failure.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return { ...bounded, complete: false, truncated: true };
     return { ...bounded, complete: false };
   }
 }
@@ -270,7 +286,7 @@ async function collectUntrackedEvidence(cwd: string, signal?: AbortSignal): Prom
     const result = await execFileAsync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
       cwd,
       timeout: 30_000,
-      maxBuffer: MAX_OUTPUT_BYTES,
+      maxBuffer: maxOutputBytes(),
       signal,
       env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
     });
@@ -282,10 +298,11 @@ async function collectUntrackedEvidence(cwd: string, signal?: AbortSignal): Prom
   }
   const paths = output.split("\0").filter(Boolean);
   if (paths.length === 0) return { text: "(none)", complete: true, truncated: false };
-  let complete = paths.length <= MAX_UNTRACKED_FILES;
+  const untrackedLimit = maxUntrackedFiles();
+  let complete = paths.length <= untrackedLimit;
   let truncated = false;
   const sections: string[] = [];
-  for (const path of paths.slice(0, MAX_UNTRACKED_FILES)) {
+  for (const path of paths.slice(0, untrackedLimit)) {
     const fullPath = resolve(root, path);
     const relativePath = relative(root, fullPath);
     if (isAbsolute(relativePath) || relativePath === ".." || relativePath.startsWith(`..${"/"}`) || relativePath.startsWith(`..${"\\"}`)) {
@@ -336,9 +353,9 @@ async function collectUntrackedEvidence(cwd: string, signal?: AbortSignal): Prom
       await handle?.close().catch(() => {});
     }
   }
-  if (paths.length > MAX_UNTRACKED_FILES) {
+  if (paths.length > untrackedLimit) {
     truncated = true;
-    sections.push(`[TRUNCATED: ${paths.length - MAX_UNTRACKED_FILES} untracked paths omitted]`);
+    sections.push(`[TRUNCATED: ${paths.length - untrackedLimit} untracked paths omitted]`);
   }
   const bounded = boundEvidence(sections.join("\n"));
   return { ...bounded, complete: complete && bounded.complete, truncated: truncated || bounded.truncated };
@@ -371,16 +388,16 @@ function formatCheckResult(result: AcceptanceCheckResult): string {
 
 function boundEvidence(value: string): EvidencePart {
   const encoded = Buffer.from(value, "utf8");
-  if (encoded.byteLength <= MAX_OUTPUT_BYTES) return { text: value, complete: true, truncated: false };
+  if (encoded.byteLength <= maxOutputBytes()) return { text: value, complete: true, truncated: false };
   const marker = Buffer.from("\n[TRUNCATED]", "utf8");
-  const suffix = encoded.subarray(-Math.max(0, MAX_OUTPUT_BYTES - marker.byteLength));
+  const suffix = encoded.subarray(-Math.max(0, maxOutputBytes() - marker.byteLength));
   return { text: `${suffix.toString("utf8")}${marker.toString("utf8")}`, complete: false, truncated: true };
 }
 
 function boundOutput(value: string): string {
   const encoded = Buffer.from(value, "utf8");
-  if (encoded.byteLength <= MAX_OUTPUT_BYTES) return value;
+  if (encoded.byteLength <= maxOutputBytes()) return value;
   const marker = Buffer.from("\n[TRUNCATED]", "utf8");
-  const suffix = encoded.subarray(-Math.max(0, MAX_OUTPUT_BYTES - marker.byteLength));
+  const suffix = encoded.subarray(-Math.max(0, maxOutputBytes() - marker.byteLength));
   return `${suffix.toString("utf8")}${marker.toString("utf8")}`;
 }

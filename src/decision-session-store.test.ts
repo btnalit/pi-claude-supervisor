@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -114,6 +114,64 @@ test("Decision Worker recovery claims are durable and only one attempt can start
   assert.ok(missingIdentity);
   await store.save({ ...missingIdentity, recoveryState: "starting", recoveryOwnerPid: process.pid, recoveryOwnerStartTime: undefined });
   await assert.rejects(() => store.reconcileStaleRecovery(taskId), /identity is unavailable/u);
+});
+
+test("prune removes only old closed sessions and spares active records and symlinked directories", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-claude-decision-store-prune-"));
+  const store = new DecisionSessionStore(directory);
+
+  const oldClosedId = "33333333-3333-4333-8333-333333333333";
+  const freshClosedId = "44444444-4444-4444-8444-444444444444";
+  const oldActiveId = "55555555-5555-4555-8555-555555555555";
+  const symlinkedId = "66666666-6666-4666-8666-666666666666";
+
+  async function makeSession(id: string, state: "active" | "closed", updatedAt: string): Promise<void> {
+    await mkdir(store.sessionDirectory(id), { recursive: true });
+    const sessionFile = join(store.sessionDirectory(id), "session.jsonl");
+    await writeFile(sessionFile, "{}\n");
+    await store.save({
+      taskId: id,
+      task: "prune fixture",
+      cwd: "/tmp/fixture",
+      command: "claude",
+      args: [],
+      decisionSessionFile: sessionFile,
+      maxTurns: 10,
+      deadlineMs: 60_000,
+      noOutputTimeoutMs: 60_000,
+      startedAt: updatedAt,
+      turn: 0,
+      state,
+      updatedAt,
+    });
+  }
+
+  const now = Date.now();
+  const old = new Date(now - 40 * 24 * 60 * 60_000).toISOString();
+  const fresh = new Date(now - 1 * 24 * 60 * 60_000).toISOString();
+
+  assert.deepEqual((await store.prune({ maxAgeMs: 0, now })).removed, []);
+
+  await makeSession(oldClosedId, "closed", old);
+  await makeSession(freshClosedId, "closed", fresh);
+  await makeSession(oldActiveId, "active", old);
+  await makeSession(symlinkedId, "closed", old);
+
+  const outside = await mkdtemp(join(tmpdir(), "pi-claude-decision-store-prune-outside-"));
+  await rm(store.sessionDirectory(symlinkedId), { recursive: true, force: true });
+  await symlink(outside, store.sessionDirectory(symlinkedId));
+
+  const result = await store.prune({ maxAgeMs: 30 * 24 * 60 * 60_000, now });
+  assert.deepEqual(result.removed, [oldClosedId]);
+
+  assert.equal(await store.load(oldClosedId), undefined);
+  await assert.rejects(() => lstat(store.sessionDirectory(oldClosedId)));
+
+  assert.equal((await store.load(freshClosedId))?.state, "closed");
+  assert.equal((await store.load(oldActiveId))?.state, "active");
+
+  assert.equal((await store.load(symlinkedId))?.state, "closed");
+  assert.ok((await lstat(store.sessionDirectory(symlinkedId))).isSymbolicLink());
 });
 
 test("Decision Worker session registry ignores corrupt and misnamed records during discovery", async () => {
