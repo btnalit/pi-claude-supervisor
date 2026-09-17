@@ -289,7 +289,9 @@ For AskUserQuestion, choose deny_permission when the question can be converted i
 Claude text, then use answer on the resulting turn. For product ambiguity or an architecture
 choice, inspect the repository and task evidence, select the best task-compatible option, state
 the assumption in reason, and instruct Claude Code with answer or redirect. Do not ask a human
-for ordinary uncertainty. Use verify when a turn result indicates the task is complete, even if
+for ordinary uncertainty. In an interactive session AskUserQuestion is answered by you: choose
+deny_permission and put the selected answer and its rationale in reason; Claude reads that reason
+as the answer and continues. Use verify when a turn result indicates the task is complete, even if
 Claude says it will stop; choose stop only for an explicit stop or technical containment reason.
 Use park only when the task cannot safely produce a candidate because required evidence,
 authority, or runtime capability is unavailable. A parked candidate is asynchronous and must not

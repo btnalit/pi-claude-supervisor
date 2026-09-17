@@ -213,6 +213,7 @@ test("adopted tmux detach retains a live lease and reaps it after the session di
     mode: process.env.PI_CLAUDE_SUPERVISOR_MODE,
     automation: process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION,
     tmuxSocket: process.env.PI_CLAUDE_SUPERVISOR_TMUX_SOCKET,
+    tmuxMode: process.env.PI_CLAUDE_SUPERVISOR_TMUX_MODE,
   };
   process.env.PI_CLAUDE_SUPERVISOR_WORKER = `${fakeClaude} -e ${JSON.stringify(fixture)}`;
   process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
@@ -222,6 +223,10 @@ test("adopted tmux detach retains a live lease and reaps it after the session di
   process.env.PI_CLAUDE_SUPERVISOR_MODE = "auto";
   process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "1";
   process.env.PI_CLAUDE_SUPERVISOR_TMUX_SOCKET = seeded.tmuxSocket!;
+  // This test exercises the pre-existing structured tmux bridge, not the
+  // hook-driven interactive TUI (which would require install-hooks); see the
+  // dedicated interactive adopt-tmux tests below.
+  process.env.PI_CLAUDE_SUPERVISOR_TMUX_MODE = "bridge";
   const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
   const messages: string[] = [];
   const context: TestContext = { cwd, hasUI: true, ui: { confirm: async () => false, notify: (message) => messages.push(message) } };
@@ -266,6 +271,7 @@ test("adopted tmux detach retains a live lease and reaps it after the session di
       mode: "PI_CLAUDE_SUPERVISOR_MODE",
       automation: "PI_CLAUDE_SUPERVISOR_AUTOMATION",
       tmuxSocket: "PI_CLAUDE_SUPERVISOR_TMUX_SOCKET",
+      tmuxMode: "PI_CLAUDE_SUPERVISOR_TMUX_MODE",
     } as const;
     for (const [key, value] of Object.entries(previous) as Array<[keyof typeof envKeys, string | undefined]>) {
       const envKey = envKeys[key];
@@ -585,6 +591,112 @@ test("index recover does not leak a cwd reservation when the Decision Worker mod
     await rm(cwd, { recursive: true, force: true });
     await rm(stateDir, { recursive: true, force: true });
     await rm(leaseDir, { recursive: true, force: true });
+  }
+});
+
+test("install-hooks writes the relay hook and is idempotent; uninstall-hooks removes it", { concurrency: false }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-hooks-state-"));
+  const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-hooks-leases-"));
+  const configDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-hooks-config-"));
+  const previous = {
+    stateDir: process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR,
+    leaseDir: process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR,
+    transport: process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT,
+    configDir: process.env.CLAUDE_CONFIG_DIR,
+  };
+  process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
+  process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
+  process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "process-pipe";
+  process.env.CLAUDE_CONFIG_DIR = configDir;
+  const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
+  const messages: string[] = [];
+  const context: TestContext = { cwd: process.cwd(), hasUI: true, ui: { confirm: async () => false, notify: (message) => messages.push(message) } };
+  let shutdownHandler: (() => Promise<void>) | undefined;
+  try {
+    const fakePi = {
+      registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) { registrations.commands.push({ name, definition }); },
+      on(name: string, handler: () => Promise<void>) { registrations.events.push({ name, handler }); },
+    };
+    extension(fakePi as never);
+    const command = registrations.commands.find(({ name }) => name === "supervise")?.definition;
+    shutdownHandler = registrations.events.find(({ name }) => name === "session_shutdown")?.handler;
+    assert.ok(command);
+
+    await command.handler("install-hooks", context);
+    assert.match(messages.at(-1) ?? "", /install-hooks: updated/u);
+    const settingsPath = join(configDir, "settings.json");
+    const settings = JSON.parse(await readFile(settingsPath, "utf8")) as { hooks?: Record<string, unknown> };
+    assert.ok(settings.hooks?.PreToolUse);
+    assert.ok(settings.hooks?.Stop);
+
+    await command.handler("install-hooks", context);
+    assert.match(messages.at(-1) ?? "", /install-hooks: already up to date/u);
+
+    await command.handler("uninstall-hooks", context);
+    assert.match(messages.at(-1) ?? "", /uninstall-hooks: updated/u);
+    const uninstalled = JSON.parse(await readFile(settingsPath, "utf8")) as { hooks?: Record<string, unknown> };
+    assert.equal(uninstalled.hooks?.PreToolUse, undefined);
+  } finally {
+    if (shutdownHandler) await shutdownHandler().catch(() => {});
+    if (previous.stateDir === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR; else process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = previous.stateDir;
+    if (previous.leaseDir === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR; else process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = previous.leaseDir;
+    if (previous.transport === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT; else process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = previous.transport;
+    if (previous.configDir === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = previous.configDir;
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(leaseDir, { recursive: true, force: true });
+    await rm(configDir, { recursive: true, force: true });
+  }
+});
+
+test("adopt-tmux in interactive mode requires install-hooks first, checked before any tmux interaction", { concurrency: false }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-hooks-state2-"));
+  const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-hooks-leases2-"));
+  const configDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-hooks-config2-"));
+  const previous = {
+    stateDir: process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR,
+    leaseDir: process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR,
+    transport: process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT,
+    mode: process.env.PI_CLAUDE_SUPERVISOR_MODE,
+    automation: process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION,
+    configDir: process.env.CLAUDE_CONFIG_DIR,
+  };
+  process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
+  process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
+  process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "tmux";
+  process.env.PI_CLAUDE_SUPERVISOR_MODE = "auto";
+  process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "1";
+  // No settings.json under this empty configDir: install-hooks was never run.
+  process.env.CLAUDE_CONFIG_DIR = configDir;
+  const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
+  const messages: string[] = [];
+  const context: TestContext = { cwd: process.cwd(), hasUI: true, ui: { confirm: async () => false, notify: (message) => messages.push(message) } };
+  let shutdownHandler: (() => Promise<void>) | undefined;
+  try {
+    const fakePi = {
+      registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) { registrations.commands.push({ name, definition }); },
+      on(name: string, handler: () => Promise<void>) { registrations.events.push({ name, handler }); },
+    };
+    extension(fakePi as never);
+    const command = registrations.commands.find(({ name }) => name === "supervise")?.definition;
+    shutdownHandler = registrations.events.find(({ name }) => name === "session_shutdown")?.handler;
+    assert.ok(command);
+
+    // A non-existent tmux session name proves the check runs before any tmux
+    // interaction: if it reached tmux first, it would fail with a tmux error,
+    // not the install-hooks hint.
+    await command.handler("adopt-tmux definitely-not-a-real-session some task", context);
+    assert.match(messages.at(-1) ?? "", /run \/supervise install-hooks first/u);
+  } finally {
+    if (shutdownHandler) await shutdownHandler().catch(() => {});
+    if (previous.stateDir === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR; else process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = previous.stateDir;
+    if (previous.leaseDir === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR; else process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = previous.leaseDir;
+    if (previous.transport === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT; else process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = previous.transport;
+    if (previous.mode === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_MODE; else process.env.PI_CLAUDE_SUPERVISOR_MODE = previous.mode;
+    if (previous.automation === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION; else process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = previous.automation;
+    if (previous.configDir === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = previous.configDir;
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(leaseDir, { recursive: true, force: true });
+    await rm(configDir, { recursive: true, force: true });
   }
 });
 

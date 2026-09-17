@@ -69,6 +69,26 @@ test("wecom human webhook sanitizes task and question text", async () => {
   assert.match(body, /\[REDACTED\]/u);
 });
 
+test("attach hint renders in both the generic and WeCom notice formats", async () => {
+  const originalFetch = globalThis.fetch;
+  const withAttach: HumanInterventionNotice = { ...notice, attach: "tmux -S /tmp/pi-cs-test.sock attach -t pi-supervisor-1" };
+  let genericBody = "";
+  let wecomBody = "";
+  globalThis.fetch = (async (_input, init) => {
+    const body = String(init?.body ?? "");
+    if (body.includes("msgtype")) wecomBody = body; else genericBody = body;
+    return new Response("ok", { status: 200 });
+  }) as typeof fetch;
+  try {
+    await new HumanWebhookNotifier({ url: "https://example.test/hook" }).notify(withAttach);
+    await new HumanWebhookNotifier({ url: "https://example.test/hook", format: "wecom" }).notify(withAttach);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.match(genericBody, /"attach":"tmux -S \/tmp\/pi-cs-test\.sock attach -t pi-supervisor-1"/u);
+  assert.match(wecomBody, /接入: tmux -S \/tmp\/pi-cs-test\.sock attach -t pi-supervisor-1/u);
+});
+
 test("webhook retries a transient 503 and succeeds once the server recovers", async () => {
   let requests = 0;
   const server = http.createServer((_req, res) => {
