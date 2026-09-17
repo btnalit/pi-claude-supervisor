@@ -130,6 +130,8 @@ interface ShellToken {
   value: string;
   operator: boolean;
   dynamic: boolean;
+  /** A quoted heredoc body: literal text whose meaning depends on the command that consumes it. */
+  data?: boolean;
 }
 
 const protectedBranches = new Set(["main", "master", "trunk", "integration", "develop"]);
@@ -141,10 +143,21 @@ const protectedBranches = new Set(["main", "master", "trunk", "integration", "de
 const DYNAMIC_SENSITIVE_COMMANDS = new Set([
   "git", "gh", "glab", "hub", "npm", "pnpm", "yarn", "npx", "curl", "wget", "ssh", "scp", "rsync", "sftp", "claude",
   "eval", "exec", "source", "sh", "bash", "zsh", "dash", "ksh", "fish", "xargs", "env", "sudo", "su", "doas",
-  "timeout", "time", "nice", "nohup", "command", "builtin", "watch", "dd", "mkfs", "shred",
+  "timeout", "time", "nice", "nohup", "command", "builtin", "watch", "setsid", "strace", "ltrace", "stdbuf", "flock",
+  "unshare", "nsenter", "chroot", "script", "parallel", "expect", "ionice", "chrt", "taskset", "crontab", "at", "batch",
+  "systemd-run", "dd", "mkfs", "shred",
 ]);
+/** `find` runs its `-exec`/`-ok` argv and so joins the sensitive set when one is present. */
+const FIND_EXEC_ACTIONS = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
+/** Commands that only store or display their input; a quoted heredoc fed to one never executes. */
+const DATA_SINK_COMMANDS = new Set([
+  "cat", "tee", "head", "tail", "grep", "rg", "wc", "sort", "uniq", "cut", "tr", "diff", "less", "more", "base64",
+  "md5sum", "sha1sum", "sha256sum", "jq", "column", "fold", "paste", "comm", "cmp", "od", "hexdump", "xxd", "nl", "tac", "rev",
+  "echo", "printf",
+]);
+const SHELL_NAMES = new Set(["sh", "bash", "dash", "zsh", "fish", "ksh"]);
 /** Shell words after which the next word is again in command position. */
-const COMMAND_POSITION_KEYWORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "!", "time", "exec", "command", "builtin", "nohup", "sudo", "doas"]);
+const COMMAND_POSITION_KEYWORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "!", "(", "{", "time", "exec", "command", "builtin", "nohup", "sudo", "doas"]);
 /** Rewriting a protected ref's identity directly; `checkout`/`switch`/`restore`/`worktree` are read-only uses of a branch name and are not included. */
 const protectedBranchRewriteOperations = new Set(["reset", "update-ref", "symbolic-ref"]);
 /** `branch` only rewrites or deletes a protected branch when combined with one of these flags. */
@@ -201,7 +214,8 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   // the boundary: a repository, package, network or remote-shell command, or an
   // interpreter that would execute the expanded text. Dynamic text in an
   // ordinary local command (`for f in …; echo "$f"`) is Claude's own business.
-  const dynamicSensitive = lower.some((value) => DYNAMIC_SENSITIVE_COMMANDS.has(value.split(/[\\/]/u).at(-1) ?? value));
+  const dynamicSensitive = lower.some((value) => DYNAMIC_SENSITIVE_COMMANDS.has(value.split(/[\\/]/u).at(-1) ?? value))
+    || (lower.some((value) => (value.split(/[\\/]/u).at(-1) ?? value) === "find") && lower.some((value) => FIND_EXEC_ACTIONS.has(value)));
   if (hasDynamicArgument && (hasGit || hasGhRemote || hasPackagePublication || dynamicSensitive || hasDynamicCommandName(tokens))) {
     return { decision: "deny", reason: "a repository, package, network or shell command with a dynamic argument cannot be capability-checked" };
   }
@@ -248,7 +262,7 @@ function hasDynamicCommandName(tokens: readonly ShellToken[]): boolean {
     // `VAR=value cmd` keeps the following word in command position; the value itself is data.
     if (/^[A-Za-z_][A-Za-z0-9_]*=/u.test(token.value)) continue;
     if (token.dynamic) return true;
-    const word = token.value.toLowerCase();
+    const word = token.value.toLowerCase().replace(/^\(+/u, "") || "(";
     if (word === "." || word === "source") return true;
     if (COMMAND_POSITION_KEYWORDS.has(word)) continue;
     commandPosition = false;
@@ -258,10 +272,9 @@ function hasDynamicCommandName(tokens: readonly ShellToken[]): boolean {
 
 function nestedShellCommands(lower: readonly string[], values: readonly string[]): string[] {
   const nested: string[] = [];
-  const shellNames = new Set(["sh", "bash", "dash", "zsh", "fish", "ksh"]);
   for (let index = 0; index < lower.length; index += 1) {
     const executable = lower[index]!.split(/[\\/]/u).at(-1);
-    if (executable && shellNames.has(executable)) {
+    if (executable && SHELL_NAMES.has(executable)) {
       for (let option = index + 1; option < lower.length; option += 1) {
         // `-c`, `--command`, or a combined short option such as `-lc` / `-ec`.
         if (lower[option] === "--command" || /^-[a-z]*c[a-z]*$/u.test(lower[option]!)) {
@@ -287,7 +300,14 @@ function evaluateCommandInternal(command: string, depth: number): PolicyResult {
   return evaluateTokens(lexical.tokens, depth);
 }
 
-function evaluateTokens(tokens: readonly ShellToken[], depth: number): PolicyResult {
+function evaluateTokens(rawTokens: readonly ShellToken[], depth: number): PolicyResult {
+  const { tokens, embedded } = resolveDataTokens(rawTokens);
+  if (depth < 4) {
+    for (const body of embedded) {
+      const nestedResult = evaluateCommandInternal(body, depth + 1);
+      if (nestedResult.decision === "deny") return nestedResult;
+    }
+  }
   const canonical = tokens.map((token) => token.value).join(" ").trim();
   if (!canonical) return { decision: "deny", reason: "empty command" };
   const boundary = evaluateRepositoryBoundary(tokens, canonical, depth);
@@ -315,11 +335,70 @@ function evaluateTokens(tokens: readonly ShellToken[], depth: number): PolicyRes
 }
 
 /**
+ * A quoted heredoc body means whatever its consumer makes of it. Fed to a shell
+ * (`bash <<'EOF'`, `cat <<'EOF' | sh`, `eval "$(cat <<'EOF' …)"`) it is a
+ * command and is evaluated as one; fed to a pure data sink (`cat > file`,
+ * `git commit -m`) it is text the boundary never needs to see; fed to anything
+ * else it stays in the command as literal words for the pattern checks.
+ */
+function resolveDataTokens(tokens: readonly ShellToken[]): { tokens: ShellToken[]; embedded: string[] } {
+  if (!tokens.some((token) => token.data)) return { tokens: [...tokens], embedded: [] };
+  const segments: { tokens: ShellToken[]; joiner?: string }[] = [{ tokens: [] }];
+  for (const token of tokens) {
+    if (token.operator && SEGMENT_SPLIT_OPERATORS.has(token.value)) {
+      segments.at(-1)!.joiner = token.value;
+      segments.push({ tokens: [] });
+      continue;
+    }
+    segments.at(-1)!.tokens.push(token);
+  }
+  const commandOf = (segment: readonly ShellToken[]): { name: string; words: string[] } | undefined => {
+    let afterRedirect = false;
+    let name: string | undefined;
+    const words: string[] = [];
+    for (const token of segment) {
+      if (token.operator) { afterRedirect = [">", ">>", "<", "<<", "<<<"].includes(token.value); continue; }
+      const skip = afterRedirect;
+      afterRedirect = false;
+      if (skip || token.data) continue;
+      const word = token.value.toLowerCase();
+      if (name === undefined) {
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/u.test(token.value) || COMMAND_POSITION_KEYWORDS.has(word)) continue;
+        name = word.replace(/^\(+/u, "").split(/[\\/]/u).at(-1) ?? word;
+      }
+      words.push(word);
+    }
+    return name === undefined ? undefined : { name, words };
+  };
+  const resolved: ShellToken[] = [];
+  const embedded: string[] = [];
+  segments.forEach((segment, index) => {
+    const bodies = segment.tokens.filter((token) => token.data);
+    if (bodies.length === 0) {
+      resolved.push(...segment.tokens, ...(segment.joiner ? [{ value: segment.joiner, operator: true, dynamic: false }] : []));
+      return;
+    }
+    const consumers: { name: string; words: string[] }[] = [];
+    for (let cursor = index; cursor < segments.length; cursor += 1) {
+      const command = commandOf(segments[cursor]!.tokens);
+      if (command) consumers.push(command);
+      if (segments[cursor]!.joiner !== "|") break;
+    }
+    const shellConsumer = consumers.some((consumer) => SHELL_NAMES.has(consumer.name) || consumer.name === "eval" || consumer.name === "source" || consumer.name === ".");
+    const sinkOnly = consumers.length > 0 && consumers.every((consumer) => DATA_SINK_COMMANDS.has(consumer.name) || (consumer.name === "git" && consumer.words.includes("commit")));
+    if (shellConsumer) embedded.push(...bodies.map((token) => token.value));
+    const kept = shellConsumer || sinkOnly ? segment.tokens.filter((token) => !token.data) : segment.tokens.map((token) => ({ ...token, data: false }));
+    resolved.push(...kept, ...(segment.joiner ? [{ value: segment.joiner, operator: true, dynamic: false }] : []));
+  });
+  return { tokens: resolved, embedded };
+}
+
+/**
  * `$(cat <<'EOF' … EOF\n)` inside double quotes: Claude Code's commit-message
  * idiom. With a quoted delimiter nothing in the body expands or runs, so the
  * whole substitution is literal data.
  */
-const LITERAL_CAT_HEREDOC = /^\$\(\s*cat\s+<<-?\s*(['"])([^'"\s]+)\1[ \t]*\n(?:[\s\S]*?\n)?[ \t]*\2[ \t]*\n?\s*\)/u;
+const LITERAL_CAT_HEREDOC = /^\$\(\s*cat\s+<<-?\s*(['"])([^'"\s]+)\1[ \t]*\n(?:([\s\S]*?)\n)?[ \t]*\2[ \t]*\n?\s*\)/u;
 
 function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
   const tokens: ShellToken[] = [];
@@ -327,6 +406,7 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
   let dynamic = false;
   let started = false;
   let tokenQuoted = false;
+  let tokenData = false;
   let quote: "single" | "double" | undefined;
   // Heredocs: the word after `<<` names the delimiter; the body starts on the
   // next line and ends at a line equal to it. A quoted delimiter makes the body
@@ -335,18 +415,19 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
   const pendingHeredocs: { delimiter: string; quoted: boolean; stripTabs: boolean }[] = [];
   const flush = (): void => {
     if (!started) return;
-    // A bare `[`, `[[`, `]` or `]]` is the test builtin's syntax, not a glob.
-    if (/^[[\]]+$/u.test(value)) dynamic = false;
+    // A bare `[`, `[[`, `]`, `]]`, `{` or `}` is shell syntax, not an expansion.
+    if (/^[[\]{}]+$/u.test(value)) dynamic = false;
     if (expectDelimiter) {
       pendingHeredocs.push({ delimiter: value, quoted: tokenQuoted, stripTabs: expectDelimiter.stripTabs });
       expectDelimiter = undefined;
       dynamic = false;
     }
-    tokens.push({ value, operator: false, dynamic });
+    tokens.push({ value, operator: false, dynamic, ...(tokenData ? { data: true } : {}) });
     value = "";
     dynamic = false;
     started = false;
     tokenQuoted = false;
+    tokenData = false;
   };
   const pushOperator = (operator: string): void => {
     flush();
@@ -365,9 +446,10 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
         if ((heredoc.stripTabs ? line.replace(/^\t+/u, "") : line) === heredoc.delimiter) { terminated = true; break; }
         bodyLines.push(line);
       }
-      if (heredoc.quoted) continue;
       const body = bodyLines.join("\n");
-      tokens.push({ value: body, operator: false, dynamic: /[$`]/u.test(body) });
+      // A quoted delimiter suppresses expansion: the body is data for its
+      // consumer. An unquoted one expands, so the body is an ordinary argument.
+      tokens.push(heredoc.quoted ? { value: body, operator: false, dynamic: false, data: true } : { value: body, operator: false, dynamic: /[$`]/u.test(body) });
       if (!terminated) break;
     }
     return Math.min(position, input.length);
@@ -387,7 +469,7 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
       else if (character === "\\" && next !== undefined && /[\\"$`]/u.test(next)) { value += next; index += 1; }
       else if (character === "$") {
         const literal = LITERAL_CAT_HEREDOC.exec(input.slice(index));
-        if (literal) { index += literal[0].length - 1; }
+        if (literal) { value += literal[3] ?? ""; tokenData = true; index += literal[0].length - 1; }
         else { value += character; dynamic = true; }
       }
       else { value += character; if (character === "`") dynamic = true; }
@@ -402,11 +484,20 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
       started = true;
       continue;
     }
-    if (character === "\n" && (pendingHeredocs.length > 0 || expectDelimiter)) {
+    // A comment runs to the end of the line.
+    if (character === "#" && !started) {
+      const lineEnd = input.indexOf("\n", index);
+      index = (lineEnd === -1 ? input.length : lineEnd) - 1;
+      continue;
+    }
+    // A newline ends the statement. Any pending heredoc bodies belong to the
+    // statement just lexed, so they are emitted before the separator.
+    if (character === "\n") {
       flush();
       expectDelimiter = undefined;
-      pushOperator(";");
-      index = consumeHeredocs(index) - 1;
+      if (pendingHeredocs.length > 0) index = consumeHeredocs(index) - 1;
+      const last = tokens.at(-1);
+      if (last && !(last.operator && SEGMENT_SPLIT_OPERATORS.has(last.value))) pushOperator(";");
       continue;
     }
     if (/\s/u.test(character)) { flush(); continue; }

@@ -172,10 +172,12 @@ stream-json` 的方式运行 Claude,完全没有终端界面;一旦设置
   分支、其他远程 CLI 变更、`.git` 元数据写入,以及对受保护分支的破坏性改写
   (`reset`、`update-ref`、`symbolic-ref`,或带删除/移动/强制标志的 `branch`)。
   策略看不透的 shell 参数(`$VAR`、`$(…)`、通配符)只在可能触及这条边界的命令上
-  被拒绝——git、gh、npm/pnpm/yarn、curl/wget/ssh、嵌套的 `claude`,以及 `eval`、
-  `sh -c`、`xargs` 之类的解释器;带引号分隔符的 heredoc 正文视为数据。
-  除此之外的一切(`for f in …; do echo "$f"`、`rm -rf ./dist`、写入 Claude
-  自己的 scratchpad)都按配置的策略处理。
+  被尽力拦截——git、gh、npm/pnpm/yarn、curl/wget/ssh、嵌套的 `claude`,以及
+  `eval`、`sh -c`、`xargs`、`find -exec` 之类的解释器/执行器。带引号分隔符的
+  heredoc 正文按其消费者判断:交给 shell 就是命令,交给 `cat > file` 或
+  `git commit -m` 就是数据。除此之外的一切(`for f in …; do echo "$f"`、
+  `rm -rf ./dist`、写入 Claude 自己的 scratchpad)都按配置的策略处理——由
+  Claude 自己的权限模式决定,和你亲自运行 Claude 时一样。
 - `autonomy.permissionAuthority`(`policy` | `hybrid` 默认 |
   `decision-worker`)决定谁来回答权限请求——headless 模式下是每一个请求,交互式
   tmux 模式下只是那些 Claude 本来会弹窗问你的请求:`hybrid` 会让策略独自回答
