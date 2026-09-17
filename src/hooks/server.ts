@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
 import { chmod, lstat, mkdir, readdir, readlink, realpath, rename, rm, symlink, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import type { ClaudeHookEvent, ClaudeHookEventName, HookEventSource, HookRelayReply, HookRelayRequest } from "./types.ts";
 
 const MAX_LINE_BYTES = 1024 * 1024;
@@ -23,6 +24,21 @@ export function hookSocketDirectory(stateDir: string): string {
   return join(resolve(stateDir), "hooks");
 }
 
+/** Linux limits a unix socket path to 108 bytes (`sun_path`); leave headroom for the pid suffix. */
+const MAX_SOCKET_PATH_BYTES = 100;
+
+/**
+ * Where the listening socket itself lives. The state directory can be
+ * arbitrarily deep (`~/.pi/agent/claude-supervisor/hooks/by-cwd/<sha256>` is
+ * already past the limit), so the socket goes to a short per-user runtime
+ * directory and the `by-cwd` symlinks in the state directory point at it.
+ */
+export function hookSocketRuntimeDirectory(env: NodeJS.ProcessEnv = process.env): string {
+  const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+  const runtime = env.XDG_RUNTIME_DIR?.trim();
+  return runtime ? join(runtime, "pi-claude-supervisor") : join(tmpdir(), `pi-claude-supervisor-${uid}`);
+}
+
 /**
  * One socket per Pi process, with a per-cwd symlink under `by-cwd/` so a
  * relay only needs the event's cwd to find its Supervisor. See
@@ -35,7 +51,10 @@ export class HookServer implements HookEventSource {
   #server: Server | undefined;
   #socketPath: string | undefined;
 
-  constructor(options: { directory: string }) {
+  readonly #socketDirectory: string;
+
+  constructor(options: { directory: string; socketDirectory?: string }) {
+    this.#socketDirectory = options.socketDirectory ?? hookSocketRuntimeDirectory();
     this.#directory = resolve(options.directory);
   }
 
@@ -51,7 +70,13 @@ export class HookServer implements HookEventSource {
     if (this.#server) throw new Error("hook server is already listening");
     await mkdir(this.#directory, { recursive: true, mode: 0o700 });
     await chmod(this.#directory, 0o700);
-    const socketPath = join(this.#directory, `${process.pid}.sock`);
+    await mkdir(this.#socketDirectory, { recursive: true, mode: 0o700 });
+    const socketDirectoryInfo = await lstat(this.#socketDirectory);
+    if (!socketDirectoryInfo.isDirectory() || socketDirectoryInfo.isSymbolicLink()) throw new Error(`hook socket directory is not a real directory: ${this.#socketDirectory}`);
+    if (typeof process.getuid === "function" && socketDirectoryInfo.uid !== process.getuid()) throw new Error(`hook socket directory is owned by another user: ${this.#socketDirectory}`);
+    await chmod(this.#socketDirectory, 0o700);
+    const socketPath = join(this.#socketDirectory, `${process.pid}.sock`);
+    if (Buffer.byteLength(socketPath, "utf8") > MAX_SOCKET_PATH_BYTES) throw new Error(`hook socket path exceeds the unix socket limit: ${socketPath}`);
     await removeStaleSocket(socketPath);
     const server = createServer((socket) => this.#handleConnection(socket));
     server.on("error", (error) => {

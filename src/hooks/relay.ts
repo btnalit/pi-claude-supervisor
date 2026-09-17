@@ -99,8 +99,15 @@ export const HOOK_RELAY_SCRIPT = `
     event: event,
   }) + "\\n";
 
+  // The by-cwd entry is a symlink from the (possibly deep) state directory to
+  // the real socket in a short runtime directory; connect to the resolved
+  // target, since connect(2) needs the path itself to fit in sun_path.
+  var connectPath = socketPath;
+  try { connectPath = fs.realpathSync(socketPath); } catch (e) { /* connect through the symlink */ }
+  if (Buffer.byteLength(connectPath, "utf8") > 104) return;
+
   var net = require("net");
-  var socket = net.createConnection(socketPath);
+  var socket = net.createConnection(connectPath);
   var finished = false;
   var timer;
 
