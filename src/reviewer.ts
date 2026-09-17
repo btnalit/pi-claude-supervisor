@@ -1,5 +1,6 @@
 import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
 import { isDeepStrictEqual } from "node:util";
+import { extractJsonObjects } from "./json-extract.ts";
 import { redactSensitive } from "./redaction.ts";
 import type { AcceptanceReport, ReviewFinding, ReviewReport, TaskSpec } from "./types.ts";
 import type { RepositoryEvidence } from "./verifier.ts";
@@ -37,13 +38,28 @@ export class PiReadOnlyReviewer implements TaskReviewer {
   readonly #timeoutMs: number;
 
   constructor(options: PiReadOnlyReviewerOptions = {}) {
-    this.#timeoutMs = options.timeoutMs ?? 120_000;
+    // #timeoutMs is a TOTAL deadline across both attempts, not a per-attempt budget.
+    this.#timeoutMs = options.timeoutMs ?? 600_000;
   }
 
   async review(input: ReviewInput): Promise<ReviewReport> {
     if (input.evidence.complete === false || input.evidence.truncated === true) {
       return invalidReview("repository evidence is incomplete or truncated", input.round, new Date().toISOString());
     }
+    const deadline = Date.now() + this.#timeoutMs;
+    const first = await this.#attempt(input, Math.max(1, deadline - Date.now()));
+    if (first.kind === "report") return first.report;
+    // A raw provider error (429/529, auth, network) gets one retry with a
+    // fresh session after a short cooldown, budget permitting.
+    if (deadline - Date.now() >= 5_000) await new Promise<void>((resolveWait) => setTimeout(resolveWait, 2_000));
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return invalidReview(`Reviewer model request failed: ${first.message}`, input.round, new Date().toISOString());
+    const second = await this.#attempt(input, remaining);
+    if (second.kind === "report") return second.report;
+    return invalidReview(`Reviewer model request failed: ${second.message}`, input.round, new Date().toISOString());
+  }
+
+  async #attempt(input: ReviewInput, timeoutMs: number): Promise<{ kind: "report"; report: ReviewReport } | { kind: "providerError"; message: string }> {
     const resourceLoader = new DefaultResourceLoader({
       cwd: input.cwd,
       agentDir: getAgentDir(),
@@ -66,8 +82,10 @@ export class PiReadOnlyReviewer implements TaskReviewer {
     let capturingAssistant = false;
     let currentTooLarge = false;
     let finalTooLarge = false;
+    let stopReason: string | undefined;
+    let errorMessage: string | undefined;
     const unsubscribe = session.subscribe((value) => {
-      const record = value as unknown as { type?: string; message?: { role?: string; content?: unknown }; assistantMessageEvent?: { type?: string; delta?: string } };
+      const record = value as unknown as { type?: string; message?: { role?: string; content?: unknown; stopReason?: string; errorMessage?: string }; assistantMessageEvent?: { type?: string; delta?: string } };
       const role = record.message?.role;
       if (record.type === "message_start" && role === "assistant") {
         current = "";
@@ -88,13 +106,15 @@ export class PiReadOnlyReviewer implements TaskReviewer {
       if (record.type === "message_end" && role === "assistant") {
         finalMessage = current || textFromMessage(record.message?.content);
         finalTooLarge = currentTooLarge;
+        stopReason = record.message?.stopReason;
+        errorMessage = record.message?.errorMessage;
         current = "";
         currentTooLarge = false;
         capturingAssistant = false;
       }
     });
     try {
-      await withTimeout(session.prompt(reviewPrompt(input)), this.#timeoutMs, "independent Reviewer", input.signal);
+      await withTimeout(session.prompt(reviewPrompt(input)), timeoutMs, "independent Reviewer", input.signal);
     } catch (error) {
       await session.abort().catch(() => {});
       throw error;
@@ -102,9 +122,16 @@ export class PiReadOnlyReviewer implements TaskReviewer {
       unsubscribe();
       session.dispose();
     }
-    return finalTooLarge
+    if (stopReason === "aborted") {
+      const error = new Error("independent Reviewer was aborted");
+      error.name = "AbortError";
+      throw error;
+    }
+    if (stopReason === "error") return { kind: "providerError", message: errorMessage ?? "unknown provider error" };
+    const report = finalTooLarge
       ? invalidReview(`Reviewer response exceeded ${MAX_REVIEW_RESPONSE_BYTES} bytes`, input.round, new Date().toISOString())
       : parseReview(finalMessage || current, input.round);
+    return { kind: "report", report };
   }
 }
 
@@ -208,56 +235,6 @@ export function parseReview(text: string, round: number): ReviewReport {
   } catch (error) {
     return invalidReview(`invalid Reviewer output: ${error instanceof Error ? error.message : String(error)}`, round, checkedAt);
   }
-}
-
-/**
- * Claude occasionally wraps its answer in a fence, a sentence, or repeats
- * the same JSON object. Extract one bounded object while rejecting conflicting
- * objects: prose is harmless, but ambiguity must remain non-publishable.
- */
-function extractJsonObjects(text: string): unknown[] {
-  const objects: unknown[] = [];
-  let offset = 0;
-  while (offset < text.length) {
-    const start = text.indexOf("{", offset);
-    if (start < 0) break;
-    const end = balancedObjectEnd(text, start);
-    if (end < 0) {
-      offset = start + 1;
-      continue;
-    }
-    const candidate = text.slice(start, end + 1);
-    try {
-      const value = JSON.parse(candidate) as unknown;
-      if (value && typeof value === "object" && !Array.isArray(value)) objects.push(value);
-      offset = end + 1;
-    } catch {
-      offset = start + 1;
-    }
-  }
-  return objects;
-}
-
-function balancedObjectEnd(text: string, start: number): number {
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let index = start; index < text.length; index += 1) {
-    const character = text[index];
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (character === "\\") escaped = true;
-      else if (character === '"') inString = false;
-      continue;
-    }
-    if (character === '"') {
-      inString = true;
-      continue;
-    }
-    if (character === "{") depth += 1;
-    else if (character === "}" && --depth === 0) return index;
-  }
-  return -1;
 }
 
 function parseFinding(value: unknown, index: number): ReviewFinding {

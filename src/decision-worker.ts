@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { lstat, open, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
+import { isDeepStrictEqual } from "node:util";
 import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
+import { extractJsonObjects } from "./json-extract.ts";
 import type { TaskSpec, WorkerEvent } from "./types.ts";
 import { redactSensitive } from "./redaction.ts";
 
@@ -30,6 +32,8 @@ export interface DecisionWorkerLike {
   start(): Promise<void>;
   updateContext(patch: Partial<DecisionContext>): void;
   notify(event: WorkerEvent): void;
+  /** Re-deliver an event already seen (e.g. after a Supervisor recovery) bypassing dedupe. */
+  replay?(event: WorkerEvent): void;
   close(): Promise<void>;
 }
 
@@ -42,11 +46,15 @@ export interface DecisionWorkerOptions {
   onStartupFailure?: (error: unknown) => Promise<void> | void;
   /** Bound each Decision Worker model request so failure handling cannot wait forever. */
   timeoutMs?: number;
+  /** Base backoff for retrying a failed Decision Worker request; doubles per attempt, capped at 30s. */
+  retryBackoffMs?: number;
   /** Existing Pi session JSONL to restore after a Supervisor/Pi restart. */
   sessionFile?: string;
   /** Directory for newly created Pi session JSONL files. */
   sessionDir?: string;
   onSessionReady?: (info: { sessionFile: string; sessionId: string; restored: boolean }) => Promise<void> | void;
+  /** Test seam: inject a fake Pi session instead of the real createAgentSession. */
+  sessionFactory?: (options: Parameters<typeof createAgentSession>[0]) => Promise<{ session: AgentSession }>;
 }
 
 /**
@@ -64,11 +72,13 @@ export class PiDecisionWorker implements DecisionWorkerLike {
   #sessionFile?: string;
   #context: DecisionContext;
   readonly #timeoutMs: number;
+  readonly #retryBackoffMs: number;
 
   constructor(options: DecisionWorkerOptions) {
     this.#options = options;
     this.#context = { ...options.context };
     this.#timeoutMs = options.timeoutMs ?? 120_000;
+    this.#retryBackoffMs = options.retryBackoffMs ?? 500;
   }
 
   async start(): Promise<void> {
@@ -94,7 +104,8 @@ export class PiDecisionWorker implements DecisionWorkerLike {
         ? SessionManager.create(this.#options.context.cwd, this.#options.sessionDir)
         : SessionManager.inMemory(this.#options.context.cwd);
     const sessionManager = redactingSessionManager(rawSessionManager);
-    const { session } = await createAgentSession({
+    const sessionFactory = this.#options.sessionFactory ?? createAgentSession;
+    const { session } = await sessionFactory({
       cwd: this.#options.context.cwd,
       resourceLoader,
       sessionManager,
@@ -109,9 +120,8 @@ export class PiDecisionWorker implements DecisionWorkerLike {
     }
     if (!restored) {
       try {
-        await withTimeout(session.prompt(decisionInstructions(this.#context)), this.#timeoutMs, "Decision Worker startup");
+        await promptForText(session, decisionInstructions(this.#context), this.#timeoutMs, "Decision Worker startup", MAX_DECISION_RESPONSE_BYTES);
       } catch (error) {
-        await session.abort().catch(() => {});
         try { await this.#options.onStartupFailure?.(error); } catch { /* preserve the original startup failure */ }
         throw error;
       }
@@ -140,22 +150,45 @@ export class PiDecisionWorker implements DecisionWorkerLike {
     });
   }
 
+  /** Re-deliver an event that was already seen, bypassing the dedupe set. */
+  replay(event: WorkerEvent): void {
+    this.#seenEvents.delete(eventKey(event));
+    this.notify(event);
+  }
+
   async #processEvent(event: WorkerEvent): Promise<void> {
     if (!this.#session || this.#closed) return;
     const maxRetries = this.#context.spec?.autonomy.maxDecisionRetries ?? 2;
     let attempt = 0;
+    // undefined selects the primary decision question; a bounded re-prompt
+    // (below) switches this to a corrective follow-up on the same session.
+    let prompt: string | undefined;
+    let repromptAttempted = false;
     while (true) {
       let text: string;
       try {
-        text = await askDecision(this.#session, event, this.#context, this.#timeoutMs);
+        text = prompt === undefined
+          ? await askDecision(this.#session, event, this.#context, this.#timeoutMs)
+          : await promptForText(this.#session, prompt, this.#timeoutMs, "Decision Worker request", MAX_DECISION_RESPONSE_BYTES);
       } catch (error) {
-        if (attempt >= maxRetries || this.#closed) throw error;
+        if (this.#closed) return;
+        if (error instanceof Error && error.name === "AbortError") throw error;
+        if (attempt >= maxRetries) throw error;
         attempt += 1;
-        await new Promise<void>((resolve) => setTimeout(resolve, Math.min(1_000, 100 * attempt)));
+        await new Promise<void>((resolveWait) => setTimeout(resolveWait, Math.min(30_000, this.#retryBackoffMs * 2 ** attempt)));
         if (!this.#session || this.#closed) return;
         continue;
       }
+      if (this.#closed) return;
       const action = parseDecision(text, event);
+      // A single bounded re-prompt: give the model one more chance to return a
+      // valid single JSON action before parking. A second parse failure keeps
+      // the park; a provider error on the re-prompt still retries above.
+      if (!repromptAttempted && isReparseableDecision(action)) {
+        repromptAttempted = true;
+        prompt = `Your previous reply was not a single valid JSON action (${action.reason}). Return exactly one JSON object now and nothing else.`;
+        continue;
+      }
       // An action handler may stop or close the session. Do not replay an
       // already-decoded action if the handler itself fails.
       await this.#options.onAction(action, event);
@@ -213,17 +246,32 @@ for ordinary uncertainty. Use verify when a turn result indicates the task is co
 Claude says it will stop; choose stop only for an explicit stop or technical containment reason.
 Use park only when the task cannot safely produce a candidate because required evidence,
 authority, or runtime capability is unavailable. A parked candidate is asynchronous and must not
-wait for a human to be online.`;
+wait for a human to be online. Use noop only for an exited event that needs no action; a
+completed turn or a permission request always requires a concrete action.`;
 }
 
 async function askDecision(session: AgentSession, event: WorkerEvent, context: DecisionContext, timeoutMs: number): Promise<string> {
+  const prompt = `UNTRUSTED SUPERVISOR EVENT:\n${boundedJson(event)}\n\nCURRENT CONTEXT:\n${boundedJson(context)}\n\nChoose one action now.`;
+  return promptForText(session, prompt, timeoutMs, "Decision Worker request", MAX_DECISION_RESPONSE_BYTES);
+}
+
+/**
+ * Send a prompt and capture the assistant's final text. `session.prompt()`
+ * resolves normally even when the model/API call failed or was aborted, so the
+ * captured `message_end` stopReason/errorMessage are checked after it resolves:
+ * an aborted turn raises an AbortError, a provider error raises a
+ * DecisionWorkerApiError, and neither is treated as a normal empty reply.
+ */
+async function promptForText(session: AgentSession, prompt: string, timeoutMs: number, label: string, maxBytes: number): Promise<string> {
   let current = "";
   let finalMessage = "";
   let capturingAssistant = false;
   let currentTooLarge = false;
   let finalTooLarge = false;
+  let stopReason: string | undefined;
+  let errorMessage: string | undefined;
   const unsubscribe = session.subscribe((value) => {
-    const record = value as unknown as { type?: string; message?: { role?: string; content?: unknown }; assistantMessageEvent?: { type?: string; delta?: string } };
+    const record = value as unknown as { type?: string; message?: { role?: string; content?: unknown; stopReason?: string; errorMessage?: string }; assistantMessageEvent?: { type?: string; delta?: string } };
     const role = record.message?.role;
     if (record.type === "message_start" && role === "assistant") {
       current = "";
@@ -234,7 +282,7 @@ async function askDecision(session: AgentSession, event: WorkerEvent, context: D
     if (record.type === "message_update" && record.assistantMessageEvent?.type === "text_delta" && (capturingAssistant || role === "assistant" || role === undefined)) {
       capturingAssistant = true;
       const delta = record.assistantMessageEvent.delta ?? "";
-      if (Buffer.byteLength(current, "utf8") + Buffer.byteLength(delta, "utf8") > MAX_DECISION_RESPONSE_BYTES) {
+      if (Buffer.byteLength(current, "utf8") + Buffer.byteLength(delta, "utf8") > maxBytes) {
         currentTooLarge = true;
         return;
       }
@@ -244,6 +292,8 @@ async function askDecision(session: AgentSession, event: WorkerEvent, context: D
     if (record.type === "message_end" && role === "assistant") {
       finalMessage = current || textFromMessage(record.message?.content);
       finalTooLarge = currentTooLarge;
+      stopReason = record.message?.stopReason;
+      errorMessage = record.message?.errorMessage;
       current = "";
       currentTooLarge = false;
       capturingAssistant = false;
@@ -251,7 +301,7 @@ async function askDecision(session: AgentSession, event: WorkerEvent, context: D
   });
   try {
     try {
-      await withTimeout(session.prompt(`UNTRUSTED SUPERVISOR EVENT:\n${boundedJson(event)}\n\nCURRENT CONTEXT:\n${boundedJson(context)}\n\nChoose one action now.`), timeoutMs, "Decision Worker request");
+      await withTimeout(session.prompt(prompt), timeoutMs, label);
     } catch (error) {
       await session.abort().catch(() => {});
       throw error;
@@ -259,8 +309,19 @@ async function askDecision(session: AgentSession, event: WorkerEvent, context: D
   } finally {
     unsubscribe();
   }
-  if (finalTooLarge) return "";
-  return finalMessage || current;
+  if (stopReason === "aborted") {
+    await session.abort().catch(() => {});
+    const error = new Error(`${label} was aborted`);
+    error.name = "AbortError";
+    throw error;
+  }
+  if (stopReason === "error") {
+    await session.abort().catch(() => {});
+    const error = new Error(`${label} model request failed: ${errorMessage ?? "unknown provider error"}`);
+    error.name = "DecisionWorkerApiError";
+    throw error;
+  }
+  return finalTooLarge ? "" : finalMessage || current;
 }
 
 function textFromMessage(content: unknown): string {
@@ -272,11 +333,27 @@ function textFromMessage(content: unknown): string {
     .join("");
 }
 
+/**
+ * A park action produced only because the reply failed to decode is worth one
+ * bounded re-prompt; a park chosen deliberately by the model is not.
+ */
+function isReparseableDecision(action: DecisionAction): boolean {
+  if (action.action !== "park") return false;
+  return action.reason.startsWith("Decision Worker returned no JSON action")
+    || action.reason.startsWith("Decision Worker returned conflicting")
+    || action.reason.startsWith("invalid Decision Worker action");
+}
+
 function parseDecision(text: string, event: WorkerEvent): DecisionAction {
-  const candidate = text.trim();
-  if (!candidate) return { action: "park", reason: "Decision Worker returned no JSON action" };
+  const objects = extractJsonObjects(text);
+  const distinct: unknown[] = [];
+  for (const value of objects) {
+    if (!distinct.some((seen) => isDeepStrictEqual(seen, value))) distinct.push(value);
+  }
+  if (distinct.length === 0) return { action: "park", reason: "Decision Worker returned no JSON action" };
+  if (distinct.length > 1) return { action: "park", reason: "Decision Worker returned conflicting JSON actions" };
   try {
-    const value = JSON.parse(candidate) as Record<string, unknown>;
+    const value = distinct[0] as Record<string, unknown>;
     const action = value.action;
     if (typeof action !== "string") throw new Error("missing action");
     const allowed = new Set(["continue", "redirect", "answer", "allow_permission", "deny_permission", "verify", "retry", "stop", "park", "ask_human", "noop"]);
