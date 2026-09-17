@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, lstat, mkdir, open, readdir, readFile, realpath, rm, stat, truncate, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, open, readdir, readFile, realpath, rm, rmdir, stat, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, isAbsolute, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join } from "node:path";
 import type {
   PermissionDecision,
   WorkerAdapter,
@@ -79,6 +79,13 @@ interface TmuxRecord {
   abortListener?: () => void;
   released: boolean;
   cleanupComplete: boolean;
+  /**
+   * Set once an owned interactive `release()` has migrated every process out
+   * of the Worker cgroup and handed the tmux session back to the operator.
+   * The pane process is intentionally still alive; `detached` is the signal
+   * that the Supervisor owes no further cleanup and the cwd lease may go.
+   */
+  detached?: boolean;
   sessionCreated?: boolean;
   serverKilled?: boolean;
   cleanupError?: Error;
@@ -973,6 +980,13 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     if (!record.structured) {
       try { await this.#stopGuardian(record); }
       catch (error) { record.cleanupError ??= asError(error); }
+      if (record.interactive && record.owned) {
+        // Hand the processes back to the operator instead of killing them:
+        // migrate every process out of the Worker cgroup so the cwd lease's
+        // process-boundary requirement is satisfied while the pane keeps running.
+        try { await this.#detachCgroup(record); }
+        catch (error) { record.cleanupError ??= asError(error); }
+      }
     }
     await this.#unsubscribeHooks(record);
     record.listeners.clear();
@@ -996,7 +1010,15 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   async killProcessGroup(handle: WorkerHandle, _reason: string): Promise<void> {
     const record = this.#record(handle);
     if (!record.owned) throw new Error("cannot kill an adopted tmux session without explicit ownership");
+    // A released/detached record already reports cleanupComplete=true (the
+    // Supervisor's own obligations are done), but the tmux session and pane
+    // process are intentionally still alive; force #cleanup to actually run
+    // rather than short-circuiting on that flag. #cleanup already tolerates a
+    // missing (already-migrated-out) cgroup, falling back to tmux
+    // kill-session plus the pane process-tree kill below it.
+    record.cleanupComplete = false;
     await this.#cleanup(record, true);
+    if (record.cleanupComplete) record.detached = false;
   }
 
   async resumeSession(_sessionId: string): Promise<WorkerHandle> {
@@ -1467,6 +1489,61 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     const path = plannedPath ?? await this.#plannedCgroupPath(id);
     await mkdir(path);
     return path;
+  }
+
+  /**
+   * Hand every process in the Worker cgroup back to its parent cgroup rather
+   * than killing them, mirroring the guarded bootstrap script's own
+   * self-migration (`moveOutOfCgroup` in process-adapter.ts): a process is
+   * migrated into a cgroup by writing its pid to the destination's
+   * `cgroup.procs`, which requires write access to both the source and
+   * destination `cgroup.procs` files. The Supervisor created both cgroups, so
+   * it can do this directly instead of asking a process inside the cgroup to
+   * move itself. Removes the now-empty Worker cgroup unless the cwd lease
+   * still needs to verify and reclaim it itself.
+   */
+  async #detachCgroup(record: TmuxRecord): Promise<void> {
+    const cgroupPath = record.cgroupPath;
+    if (!cgroupPath) {
+      record.detached = true;
+      return;
+    }
+    const parentCgroup = dirname(cgroupPath);
+    const deadline = Date.now() + 2_000;
+    for (;;) {
+      let procsText: string;
+      try {
+        procsText = await readFile(`${cgroupPath}/cgroup.procs`, "utf8");
+      } catch (error) {
+        if (isMissingFile(error)) { record.detached = true; return; }
+        throw error;
+      }
+      for (const pid of procsText.split(/\s+/u).filter(Boolean)) {
+        try { await writeFile(`${parentCgroup}/cgroup.procs`, `${pid}\n`); }
+        catch {
+          // A pid can exit, or already have been migrated, between listing
+          // and migration; the populated-0 poll below is the authoritative check.
+        }
+      }
+      let eventsText: string;
+      try {
+        eventsText = await readFile(`${cgroupPath}/cgroup.events`, "utf8");
+      } catch (error) {
+        if (isMissingFile(error)) { record.detached = true; return; }
+        throw error;
+      }
+      if (/^populated 0$/mu.test(eventsText)) break;
+      if (Date.now() >= deadline) throw new Error(`worker cgroup ${cgroupPath} did not empty before detach deadline`);
+      await delay(25);
+    }
+    if (!record.handle.retainCgroupUntilLeaseRelease) {
+      try { await rmdir(cgroupPath); }
+      catch {
+        // Leave it for a later explicit cleanup; a verified-empty cgroup
+        // directory left behind is harmless.
+      }
+    }
+    record.detached = true;
   }
 
   async #startGuardian(record: TmuxRecord, socketPath: string): Promise<void> {
@@ -1990,13 +2067,17 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       lastInputAt: record.lastInputAt,
       activeRequests: record.activeRequests,
       exitReason: running ? undefined : record.runtimeError ? "failed" : record.stopping ? "stopped" : record.exitCode === 0 ? "completed" : "failed",
-      processGroupCleaned: record.cleanupComplete,
+      // A detached record's processes are intentionally still alive; do not
+      // claim the process-group boundary was cleaned. `detached` is the
+      // signal callers must check instead.
+      processGroupCleaned: record.detached ? false : record.cleanupComplete,
       cleanupError: record.cleanupError?.message,
       runtimeError: record.runtimeError?.message,
       cgroupCleaned: record.cgroupPath ? record.cgroupCleaned : undefined,
       cgroupRequired: record.cgroupPath ? true : undefined,
       cgroupError: record.cgroupError?.message,
       outputTruncated: record.outputTruncated,
+      detached: record.detached,
     };
   }
 

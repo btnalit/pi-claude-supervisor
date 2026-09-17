@@ -284,6 +284,18 @@ stop <task-id>` closes it explicitly. Set
 close-on-completion behavior. A blocked or failed candidate still stops the
 Worker as usual.
 
+**Handing the session back.** When an owned session is kept open, Pi hands it
+back cleanly rather than merely disconnecting: before reporting the candidate
+ready, it moves every process out of the Supervisor's private cgroup into its
+parent (instead of killing them) and stops the guardian process; the cwd
+lease is then released on the next sweep. The tmux server and pane are left
+alone, so the session survives a Pi restart with nothing left owing it.
+`/supervise stop <task-id>` still closes it immediately while Pi is running.
+After a Pi restart it is an ordinary tmux session with no Supervisor attached
+— `tmux -S <socket> attach -t <session>` reaches it directly, and `/supervise
+adopt-tmux` can babysit it again exactly as it would any other externally
+created session.
+
 **WeCom/outbound notices.** Both the candidate notice and a "needs you" notice
 (a parked candidate that asked a question, or a human-takeover notice) include
 an `attach` field with the literal `tmux -S <socket> attach -t <session>`
