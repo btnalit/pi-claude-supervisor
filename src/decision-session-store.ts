@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { redactSensitive } from "./redaction.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import type { TaskSpec } from "./types.ts";
@@ -89,6 +89,43 @@ export class DecisionSessionStore {
       const record = await this.#loadUnlocked(taskId);
       if (!record) return;
       await this.#saveUnlocked({ ...record, state: "closed", updatedAt: new Date().toISOString() });
+    });
+  }
+
+  /**
+   * Remove closed records (and their session directories) whose last update is
+   * older than maxAgeMs. Active records are never touched. A record whose
+   * directory cannot be safely identified as its own task directory (moved,
+   * missing, or replaced by a symlink) is left in place and logged, not removed.
+   */
+  async prune(options: { maxAgeMs: number; now?: number }): Promise<{ removed: string[] }> {
+    if (options.maxAgeMs <= 0) return { removed: [] };
+    const now = options.now ?? Date.now();
+    return this.#withLock(async () => {
+      const removed: string[] = [];
+      for (const record of await this.list()) {
+        if (record.state !== "closed") continue;
+        const updatedAtMs = Date.parse(record.updatedAt);
+        if (!Number.isFinite(updatedAtMs) || now - updatedAtMs < options.maxAgeMs) continue;
+        try {
+          const directory = resolve(dirname(record.decisionSessionFile));
+          if (directory !== this.sessionDirectory(record.taskId)) {
+            throw new Error("session directory does not match its task id");
+          }
+          const relativeToStore = relative(this.#directory, directory);
+          if (isAbsolute(relativeToStore) || relativeToStore === ".." || relativeToStore.startsWith(`..${sep}`)) {
+            throw new Error("session directory escaped the store directory");
+          }
+          const info = await lstat(directory);
+          if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("session directory is not a real directory");
+          await rm(directory, { recursive: true, force: true });
+          await rm(this.#recordPath(record.taskId), { force: true });
+          removed.push(record.taskId);
+        } catch (error) {
+          console.error(`pi-claude-supervisor could not prune Decision Worker session ${record.taskId}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      return { removed };
     });
   }
 

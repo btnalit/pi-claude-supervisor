@@ -87,6 +87,32 @@ test("webhook retries a transient 503 and succeeds once the server recovers", as
   }
 });
 
+test("webhook stops retrying once the total retry deadline would be exceeded", async () => {
+  let requests = 0;
+  const server = http.createServer((_req, res) => {
+    requests += 1;
+    res.writeHead(503);
+    res.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("test server failed to bind");
+  try {
+    await assert.rejects(
+      () => new HumanWebhookNotifier({
+        url: `http://127.0.0.1:${address.port}/hook`,
+        maxAttempts: 3,
+        retryDelaysMs: [50, 50],
+        retryDeadlineMs: 10,
+      }).notify(notice),
+      /HTTP 503/u,
+    );
+    assert.equal(requests, 1);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
 test("webhook does not retry a non-retryable status", async () => {
   let requests = 0;
   const server = http.createServer((_req, res) => {

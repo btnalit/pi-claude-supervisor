@@ -152,6 +152,32 @@ test("repository evidence omits untracked hard-link aliases", async () => {
   }
 });
 
+test("repository evidence marks a maxBuffer overflow as truncated instead of an outright failure", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-evidence-maxbuffer-"));
+  const originalMaxBytes = process.env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES;
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd });
+    await execFileAsync("git", ["config", "user.email", "test@example.invalid"], { cwd });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd });
+    await writeFile(join(cwd, "tracked.txt"), "base\n");
+    await execFileAsync("git", ["add", "tracked.txt"], { cwd });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd });
+    await writeFile(join(cwd, "tracked.txt"), "x".repeat(2_000_000));
+
+    // A tiny evidence bound (64 KiB, the configured minimum) keeps the exec maxBuffer
+    // (8x that) well under the ~2 MiB diff this rewrite produces, forcing execFile to
+    // throw ERR_CHILD_PROCESS_STDIO_MAXBUFFER instead of returning full output.
+    process.env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES = String(64 * 1024);
+    const evidence = await collectRepositoryEvidence(cwd);
+    assert.equal(evidence.complete, false);
+    assert.equal(evidence.truncated, true);
+  } finally {
+    if (originalMaxBytes === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES;
+    else process.env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES = originalMaxBytes;
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("verifyAll records timeout evidence and bounds check output", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-acceptance-"));
   try {

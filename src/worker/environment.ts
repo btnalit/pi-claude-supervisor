@@ -1,4 +1,4 @@
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, existsSync, statSync } from "node:fs";
 import { access, readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
@@ -77,7 +77,7 @@ export interface AutomaticClaudeArgOptions {
   mcpConfigPath?: string;
 }
 
-export function automaticClaudeArgs(command: string, args: readonly string[] = [], _options: AutomaticClaudeArgOptions = {}): string[] {
+export function automaticClaudeArgs(command: string, args: readonly string[] = [], options: AutomaticClaudeArgOptions = {}): string[] {
   if (!isDirectClaudeName(command)) {
     throw new Error("automatic supervision requires the direct Claude executable command name; custom executable paths need their own host boundary");
   }
@@ -85,7 +85,35 @@ export function automaticClaudeArgs(command: string, args: readonly string[] = [
   if (!result.some((value) => value === "--permission-mode" || value.startsWith("--permission-mode="))) {
     result.push("--permission-mode", "default");
   }
+  if (options.model && !hasFlag(result, "--model")) {
+    result.push("--model", options.model);
+  }
+  if (options.autocompactTokens !== undefined && options.autocompactTokens !== 0) {
+    if (!Number.isSafeInteger(options.autocompactTokens) || options.autocompactTokens < 100_000 || options.autocompactTokens > 1_000_000) {
+      throw new Error("automatic supervision requires --autocompact between 100000 and 1000000 tokens");
+    }
+    if (!hasFlag(result, "--autocompact")) result.push("--autocompact", String(options.autocompactTokens));
+  }
+  if (options.maxBudgetUsd !== undefined && Number.isFinite(options.maxBudgetUsd) && options.maxBudgetUsd > 0 && !hasFlag(result, "--max-budget-usd")) {
+    result.push("--max-budget-usd", String(options.maxBudgetUsd));
+  }
+  if (options.mcpConfigPath) {
+    const resolvedPath = resolve(options.mcpConfigPath);
+    if (!existsSync(resolvedPath) || !statSync(resolvedPath).isFile()) {
+      throw new Error(`automatic supervision requires an existing --mcp-config file: ${resolvedPath}`);
+    }
+    if (!hasFlag(result, "--mcp-config")) {
+      if (!result.includes("--strict-mcp-config")) result.push("--strict-mcp-config");
+      result.push("--mcp-config", resolvedPath);
+    }
+  }
   return result;
+}
+
+/** True when args already sets `name` as `--flag value` or `--flag=value`. */
+function hasFlag(args: readonly string[], name: string): boolean {
+  const equalsPrefix = `${name}=`;
+  return args.some((value) => value === name || value.startsWith(equalsPrefix));
 }
 
 /**

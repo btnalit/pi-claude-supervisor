@@ -64,6 +64,68 @@ test("automatic Claude args preserve the full Claude Code argument surface", () 
   assert.throws(() => automaticClaudeArgs("fixture", ["--settings", "{}"]), /direct Claude executable/u);
 });
 
+test("automatic Claude args append model, autocompact and max-budget flags from options", () => {
+  const result = automaticClaudeArgs("claude", [], { model: "claude-sonnet-4-5", autocompactTokens: 250_000, maxBudgetUsd: 5 });
+  assert.deepEqual(result, ["--permission-mode", "default", "--model", "claude-sonnet-4-5", "--autocompact", "250000", "--max-budget-usd", "5"]);
+});
+
+test("automatic Claude args omit autocompact and max-budget when unset or zero", () => {
+  assert.deepEqual(automaticClaudeArgs("claude", [], {}), ["--permission-mode", "default"]);
+  assert.deepEqual(automaticClaudeArgs("claude", [], { autocompactTokens: 0, maxBudgetUsd: 0 }), ["--permission-mode", "default"]);
+});
+
+test("automatic Claude args let a user-supplied --model win over options.model", () => {
+  assert.deepEqual(automaticClaudeArgs("claude", ["--model", "x"], { model: "y" }), ["--model", "x", "--permission-mode", "default"]);
+  assert.deepEqual(automaticClaudeArgs("claude", ["--model=x"], { model: "y" }), ["--model=x", "--permission-mode", "default"]);
+});
+
+test("automatic Claude args reject an autocompact token count outside the safe window", () => {
+  assert.throws(() => automaticClaudeArgs("claude", [], { autocompactTokens: 50_000 }), /--autocompact between 100000 and 1000000/u);
+  assert.throws(() => automaticClaudeArgs("claude", [], { autocompactTokens: 1_500_000 }), /--autocompact between 100000 and 1000000/u);
+  assert.throws(() => automaticClaudeArgs("claude", [], { autocompactTokens: 150_000.5 }), /--autocompact between 100000 and 1000000/u);
+});
+
+test("automatic Claude args require an existing regular file for --mcp-config", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-mcp-config-"));
+  try {
+    const configPath = join(root, "mcp.json");
+    await writeFile(configPath, "{}");
+    const result = automaticClaudeArgs("claude", [], { mcpConfigPath: configPath });
+    assert.deepEqual(result, ["--permission-mode", "default", "--strict-mcp-config", "--mcp-config", configPath]);
+    assert.throws(() => automaticClaudeArgs("claude", [], { mcpConfigPath: join(root, "missing.json") }), /existing --mcp-config file/u);
+    const directoryPath = join(root, "not-a-file");
+    await mkdir(directoryPath);
+    assert.throws(() => automaticClaudeArgs("claude", [], { mcpConfigPath: directoryPath }), /existing --mcp-config file/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a fully configured argv still passes the automatic-mode permission checks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-full-argv-"));
+  const configDir = join(root, "config");
+  const cwd = join(root, "repo");
+  try {
+    await mkdir(configDir, { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    const configPath = join(root, "mcp.json");
+    await writeFile(configPath, "{}");
+    const args = automaticClaudeArgs("claude", [], {
+      model: "claude-sonnet-4-5",
+      autocompactTokens: 250_000,
+      maxBudgetUsd: 5,
+      mcpConfigPath: configPath,
+    });
+    // assertAutomaticClaudePermissionConfiguration runs assertNoCliBashPreauthorization internally;
+    // a rejection here would mean one of the newly appended flags looks like Bash preauthorization.
+    // CLAUDE_CONFIG_DIR is pinned to an empty fixture directory so this does not depend on the
+    // real developer machine's ~/.claude/settings.json.
+    await assert.doesNotReject(() => assertAutomaticClaudePermissionConfiguration(cwd, args, { CLAUDE_CONFIG_DIR: configDir }));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("automatic Claude permission configuration rejects Bash preauthorization", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-permission-config-"));
   const configDir = join(root, "config");
