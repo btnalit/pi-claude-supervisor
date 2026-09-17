@@ -18,3 +18,13 @@ test("still redacts short-key inline secret assignments and quoted secret litera
   assert.equal(redactSensitive("token=abcdefgh12345678"), "token=[REDACTED]");
   assert.equal(redactSensitive('password: "hunter2hunter2"'), "password: [REDACTED]");
 });
+
+test("dotted secrets are redacted whole rather than leaking their tail", () => {
+  assert.equal(redactSensitive("token=abcdefgh.ijklmnop1"), "token=[REDACTED]");
+  assert.equal(redactSensitive("secret: sk_live_abcdefgh.suffixdata"), "secret: [REDACTED]");
+  assert.equal(redactSensitive("token=dp.st.dev.abcdefghijklmnop"), "token=[REDACTED]");
+  assert.equal(redactSensitive("token=abc.def-12345678"), "token=[REDACTED]");
+  assert.doesNotMatch(String(redactSensitive("token=abcdefgh.ijklmnop1")), /ijklmnop/u);
+  assert.equal(redactSensitive("password=hunterhunter"), "password=[REDACTED]");
+  assert.equal(redactSensitive("token=ABCDEFGH"), "token=[REDACTED]");
+});

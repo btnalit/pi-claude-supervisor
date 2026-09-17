@@ -246,8 +246,8 @@ for ordinary uncertainty. Use verify when a turn result indicates the task is co
 Claude says it will stop; choose stop only for an explicit stop or technical containment reason.
 Use park only when the task cannot safely produce a candidate because required evidence,
 authority, or runtime capability is unavailable. A parked candidate is asynchronous and must not
-wait for a human to be online. Use noop only for an exited event that needs no action; a
-completed turn or a permission request always requires a concrete action.`;
+wait for a human to be online. For an exited event choose verify, park or stop; a noop on an exited event is treated as
+verify. A completed turn or a permission request always requires a concrete action.`;
 }
 
 async function askDecision(session: AgentSession, event: WorkerEvent, context: DecisionContext, timeoutMs: number): Promise<string> {

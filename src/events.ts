@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { appendFile, chmod, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { redactSensitive } from "./redaction.ts";
@@ -17,7 +18,7 @@ const STALE_LOCK_MS = 5_000;
 const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
 const DEFAULT_KEEP_ROTATED = 5;
 const TAIL_WINDOW_BYTES = 256 * 1024;
-const ROTATED_STAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/u;
+const ROTATED_STAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[0-9a-f]{8}$/u;
 
 export class EventLog {
   #seq = 0;
@@ -235,7 +236,9 @@ export class EventLog {
       return;
     }
     if (size < this.#maxBytes) return;
-    const stamp = new Date().toISOString().replace(/[:.]/gu, "-");
+    // Two rotations within one millisecond must not clobber each other via
+    // rename(2), so the timestamp carries a random suffix as well.
+    const stamp = `${new Date().toISOString().replace(/[:.]/gu, "-")}-${randomBytes(4).toString("hex")}`;
     await rename(this.#path, `${this.#path}.${stamp}`);
     await this.#pruneRotated();
   }

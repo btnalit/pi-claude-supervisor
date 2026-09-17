@@ -663,7 +663,12 @@ export class Supervisor {
       if (action.action === "noop") {
         if (event.type === "turn_completed" || event.type === "permission_request") {
           await this.#parkCandidate(`Decision Worker returned noop for ${event.type}; a concrete action is required`, event);
+          return;
         }
+        // A clean exit already moved the task to verifying and cleared the
+        // watchdog, so a noop here has nothing left to drive verification.
+        // Treat it as "proceed" rather than stranding the candidate silently.
+        if (event.type === "exited" && this.#machine.state === "verifying" && !this.#verificationAbortController) await this.#verifyInternal();
         return;
       }
       if (action.action === "park" || action.action === "ask_human") {
