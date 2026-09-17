@@ -93,6 +93,8 @@ export PI_CLAUDE_SUPERVISOR_WORKER=claude
 /supervise resume
 /supervise stop human requested stop
 /supervise verify
+/supervise install-hooks
+/supervise uninstall-hooks
 ```
 
 `--spec` accepts a JSON file; checks are always executed with argv (never through
@@ -224,9 +226,96 @@ configuration and proxy settings. Keep the Supervisor's own environment appropri
 the task; `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` pins executable identity but is otherwise
 not used to select the Claude binary.
 
-### tmux/PTY transport
+### Interactive tmux mode (hooks)
 
-For an interactive Claude Code window, opt in to the tmux transport:
+`PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux` now defaults to running the real,
+unmodified Claude Code TUI in the tmux pane — the same interface you would see
+running `claude` yourself — instead of the structured stream-json bridge
+described below. You can attach to the printed `attach=...` command at any
+time and watch, or type into the session yourself; Pi reports its events
+through Claude Code's own hooks rather than scraping the screen.
+
+One-time setup, once per machine/user:
+
+```text
+/supervise install-hooks
+```
+
+This registers a small relay command for all seven Claude Code hook events in
+`~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`); `/supervise
+uninstall-hooks` removes only that entry. An owned `/supervise start` does not
+need this step — it passes its own `--settings` file — but `/supervise
+adopt-tmux` runs inside your normal Claude Code configuration and requires it.
+
+```bash
+export PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux
+export PI_CLAUDE_SUPERVISOR_MODE=auto
+# Opt back into the older stream-json-in-a-pane transport instead:
+# export PI_CLAUDE_SUPERVISOR_TMUX_MODE=bridge
+```
+
+```text
+/supervise start <task>
+/supervise adopt-tmux <tmux-session> <task>
+```
+
+Pi intervenes when Claude stops a turn (`Stop`), when Claude is about to show
+you a real permission prompt (only then — every ordinary tool call is
+otherwise left to your own Claude Code permission mode), when Claude asks
+`AskUserQuestion` (the Decision Worker picks an answer and Claude continues
+with it as ordinary text, exactly as in headless automatic mode), and when the
+session exits. Before that prompt, a `PreToolUse` veto point only ever denies
+a known direct remote push/merge/PR or other destructive/protected-branch
+operation (or forwards an `AskUserQuestion`); it never second-guesses a normal
+edit, read or local command — those reach your own permission mode with no
+decision from Pi at all.
+
+**Human coexistence.** If you type into the attached session, automation
+pauses (`human_takeover`, visible as a warning) until you run `/supervise
+resume-auto <task-id>`; the turn that completed while you were driving is
+replayed to the Decision Worker at that point, so nothing already finished is
+lost.
+
+**Completion keeps the session open.** Unlike other transports, a completed
+task by default disconnects Pi from the session instead of closing it, so you
+can keep working in the same window or review what Claude did; `/supervise
+stop <task-id>` closes it explicitly. Set
+`PI_CLAUDE_SUPERVISOR_CLOSE_WORKER_ON_COMPLETION=1` to restore the old
+close-on-completion behavior. A blocked or failed candidate still stops the
+Worker as usual.
+
+**WeCom/outbound notices.** Both the candidate notice and a "needs you" notice
+(a parked candidate that asked a question, or a human-takeover notice) include
+an `attach` field with the literal `tmux -S <socket> attach -t <session>`
+command when the notice concerns a tmux session.
+
+**Cost accounting limits.** The TUI's `Stop` hook has no `total_cost_usd` or
+token `usage` (that only comes from Claude's own `result` stream-json record,
+which the TUI does not emit), so cost tracking in interactive mode only counts
+turns, not dollars; `--max-budget-usd` is also unavailable (Claude Code only
+enforces it under `-p`) and is not passed to an interactive launch. Set
+`autonomy.maxWorkerCostUsd` expecting it to have no effect in interactive
+mode, or use bridge/jsonl mode when a hard cost cap matters.
+
+**Trust dialog.** The very first time Claude Code runs in a given directory it
+may show its own one-time "do you trust this folder" dialog before any hook
+fires; approve it once (attach and press Enter) the same way you would for an
+unsupervised `claude` session.
+
+**Recovery.** `/supervise recover` does not persist whether the original task
+was interactive; it derives that from the current
+`PI_CLAUDE_SUPERVISOR_TRANSPORT`/`PI_CLAUDE_SUPERVISOR_TMUX_MODE` configuration
+at recovery time, so do not change either between starting a task and
+recovering it.
+
+### tmux/PTY transport (bridge mode)
+
+This section describes the pre-existing automatic tmux transport: a
+structured stream-json bridge running inside the pane instead of the real
+TUI. It applies only to automatic (`PI_CLAUDE_SUPERVISOR_MODE=auto`) tmux
+sessions, and only when explicitly selected with
+`PI_CLAUDE_SUPERVISOR_TMUX_MODE=bridge`; manual (non-`auto`) tmux sessions
+always run Claude directly in the pane and are unaffected by this setting.
 
 ```bash
 export PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux

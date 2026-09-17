@@ -9,6 +9,8 @@ import { normalizeTaskSpec } from "./acceptance.ts";
 import { redactSensitive } from "./redaction.ts";
 import { assertAutomaticClaudePermissionConfiguration, assertTrustedAutomaticClaudeExecutable, automaticClaudeArgs, automaticWorkerEnvironment, type AutomaticClaudeArgOptions } from "./worker/environment.ts";
 import { normalizeReviewReport, type ReviewInput, type TaskReviewer } from "./reviewer.ts";
+import { attachCommand } from "./worker/tmux-adapter.ts";
+import type { HookEventSource } from "./hooks/types.ts";
 import type {
   AcceptanceReport,
   PiUsageSample,
@@ -108,6 +110,18 @@ export interface SupervisorStartOptions {
   sendInitialInput?: boolean;
   /** Enable the event-driven Pi Decision Worker. Automatic mode requires claude-jsonl. */
   automation?: boolean;
+  /**
+   * Hook-driven interactive Claude TUI supervision instead of the stream-json
+   * bridge. Requires `hookSource`; `hookSettingsPath` is additionally required
+   * for an owned (non-adopted) launch. See docs/architecture.md.
+   */
+  interactive?: boolean;
+  /** Hook event routing for an interactive task (owned or adopted). */
+  hookSource?: HookEventSource;
+  /** Hook settings file an owned interactive launch passes as `--settings`. */
+  hookSettingsPath?: string;
+  /** Keep the persistent interactive session open after a completed task instead of stopping it. */
+  keepWorkerOnCompletion?: boolean;
   /** Index-owned cwd leases retain the empty automatic cgroup until release. */
   retainCgroupUntilLeaseRelease?: boolean;
   /** Persist the planned adapter resource identity before resource creation. */
@@ -154,6 +168,8 @@ export interface HumanInterventionNotice {
   reason: string;
   question?: string;
   permission?: { requestId: string; toolUseId: string; toolName: string; input: unknown };
+  /** Shell command to attach to the tmux session this notice concerns, when it refers to one. */
+  attach?: string;
 }
 
 export interface CandidateNotice extends HumanInterventionNotice {
@@ -197,6 +213,9 @@ export class Supervisor {
   #automation = false;
   #decision?: DecisionWorkerLike;
   #onCandidate?: (notice: CandidateNotice) => Promise<void> | void;
+  #onHumanRequired?: (notice: HumanInterventionNotice) => Promise<void> | void;
+  /** Interactive tasks may keep their persistent session open after completion instead of stopping it. */
+  #keepWorkerOnCompletion = false;
   #handledEvents = new Set<string>();
   #deferredWorkerEvents = new Map<string, WorkerEvent>();
   /** Turn events whose usage was already accounted; a deferred replay must not double-count tokens. */
@@ -231,6 +250,7 @@ export class Supervisor {
     this.#adapter = adapter;
     this.#events = events;
     this.#onCandidate = hooks.onCandidate;
+    this.#onHumanRequired = hooks.onHumanRequired;
     this.#reviewer = hooks.reviewer;
     this.#reviewTimeoutMs = hooks.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
     this.#progressHeartbeatMs = hooks.progressHeartbeatMs ?? 60_000;
@@ -288,6 +308,7 @@ export class Supervisor {
     this.#released = false;
     this.#releasing = false;
     this.#terminalNoticeSent = false;
+    this.#keepWorkerOnCompletion = Boolean(options.interactive) && options.keepWorkerOnCompletion === true;
     this.#usage = emptyUsage();
     // A recovered task continues its budget from the cost its earlier Worker
     // processes already reported; a Claude result record only counts its own process.
@@ -356,15 +377,27 @@ export class Supervisor {
         : options.env;
       if (this.#automation) {
         trustedWorkerCommand = await assertTrustedAutomaticClaudeExecutable(options.command, options.expectedClaudeExecutable);
+        const hadExplicitPermissionMode = (options.args ?? []).some((value) => value === "--permission-mode" || value.startsWith("--permission-mode="));
         workerArgs = automaticClaudeArgs(options.command, options.args, {
           ...options.workerArgOptions,
           // Claude's own cap is the first line of defence; the Supervisor's cumulative check is the second.
           // On recovery Claude's own cap reflects what is left of the task budget, not the whole of it.
-          ...(options.workerArgOptions?.maxBudgetUsd === undefined && spec.autonomy.maxWorkerCostUsd !== undefined
+          // --max-budget-usd only takes effect under -p; interactive mode strips it below and relies solely
+          // on the Supervisor's own cumulative check (#recordWorkerUsage).
+          ...(!options.interactive && options.workerArgOptions?.maxBudgetUsd === undefined && spec.autonomy.maxWorkerCostUsd !== undefined
             ? { maxBudgetUsd: Math.max(0.01, spec.autonomy.maxWorkerCostUsd - this.#usage.workerCostUsd) }
             : {}),
         });
-        await assertAutomaticClaudePermissionConfiguration(options.cwd, workerArgs, workerEnvironment);
+        if (options.interactive) {
+          // The hook relay's PreToolUse veto is the enforced boundary for an
+          // interactive session and holds under any permission mode Claude ends
+          // up using, so the CLI-level --permission-mode injection and the
+          // settings-file assertion below (which assume that boundary) are
+          // unnecessary and would only fight the user's own TUI preferences.
+          workerArgs = stripInteractiveUnsupportedArgs(workerArgs, hadExplicitPermissionMode);
+        } else {
+          await assertAutomaticClaudePermissionConfiguration(options.cwd, workerArgs, workerEnvironment);
+        }
         await this.#appendEvent({ type: "worker_executable_pinned", taskId, data: { command: options.command, resolvedExecutable: trustedWorkerCommand } });
       }
       await this.#adapter.preflight?.({
@@ -374,6 +407,7 @@ export class Supervisor {
         env: workerEnvironment,
         approval: options.approval,
         automatic: this.#automation,
+        interactive: this.#automation ? options.interactive : undefined,
       });
       this.#assertStartNotAborted(startAbortController.signal);
       if (this.#automation) {
@@ -428,6 +462,9 @@ export class Supervisor {
         tmuxExpectedIdentity: options.tmuxExpectedIdentity,
         sendInitialInput: options.sendInitialInput,
         automatic: this.#automation,
+        interactive: this.#automation ? options.interactive : undefined,
+        hookSource: options.hookSource,
+        hookSettingsPath: options.hookSettingsPath,
         retainCgroupUntilLeaseRelease: this.#automation && options.retainCgroupUntilLeaseRelease === true,
         eventListener: (event) => this.#receiveWorkerEvent(event),
         env: workerEnvironment,
@@ -440,7 +477,7 @@ export class Supervisor {
               if (provisionalHandle) await options.onWorkerPreSpawn?.(provisionalHandle);
               const boundary = await automaticRepositoryBoundary(options.cwd, this.#task!.baseCommit, startAbortController.signal, startupHead);
               await this.#trackBranchChange(boundary.branch);
-              await assertAutomaticClaudePermissionConfiguration(options.cwd, workerArgs ?? [], workerEnvironment);
+              if (!options.interactive) await assertAutomaticClaudePermissionConfiguration(options.cwd, workerArgs ?? [], workerEnvironment);
               this.#assertStartNotAborted(startAbortController.signal);
             }
           : undefined,
@@ -589,9 +626,53 @@ export class Supervisor {
           type: "permission_requested",
           taskId,
           workerId: handle.id,
-          data: { requestId: event.request.requestId, toolUseId: event.request.toolUseId, toolName: event.request.toolName, input: event.request.input },
+          data: { requestId: event.request.requestId, toolUseId: event.request.toolUseId, toolName: event.request.toolName, input: event.request.input, ...(event.request.phase ? { phase: event.request.phase } : {}) },
         });
-        if (this.#automation && !this.#humanRequired) {
+        if (this.#automation && event.request.phase === "pre") {
+          // The PreToolUse veto point of an interactive session: AskUserQuestion
+          // is forwarded to the Decision Worker, which answers it (see
+          // #applyDecision) — evaluatePermission always denies that tool (it
+          // exists to convert the question into ordinary text for the
+          // prompt-phase/hybrid path below), so it must be checked first, not
+          // routed through the generic policy-deny branch. A human at the
+          // keyboard driving Claude's own prompts does not bypass the policy
+          // boundary, so AskUserQuestion falls back to a policy answer while a
+          // human takeover is active (no Decision Worker to answer it). Every
+          // other tool call gets a policy deny or no decision at all, so
+          // Claude's own permission mode (or the human) decides.
+          if (event.request.toolName === "AskUserQuestion" && !this.#humanRequired) {
+            // Fall through to the Decision Worker notification below.
+          } else {
+            const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd);
+            if (policy.decision === "deny") {
+              if (this.#adapter.respondPermission) {
+                await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, {
+                  behavior: "deny",
+                  message: `${policy.reason}; denied by supervisor policy`,
+                });
+                this.#pendingPermissions.delete(event.request.requestId);
+                await this.#appendEvent({
+                  type: "permission_decision",
+                  taskId,
+                  workerId: handle.id,
+                  data: { requestId: event.request.requestId, toolName: event.request.toolName, behavior: "deny", policy: policy.decision, actor: "policy", phase: "pre" },
+                });
+              }
+              skipDecisionNotify = true;
+            } else if (this.#adapter.respondPermission) {
+              await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, { behavior: "allow", defer: true });
+              this.#pendingPermissions.delete(event.request.requestId);
+              skipDecisionNotify = true;
+            }
+          }
+        } else if (this.#automation && this.#humanRequired && event.request.phase === "prompt" && this.#adapter.respondPermission) {
+          // A human is driving the interactive session: Claude's own permission
+          // prompt is theirs to answer at the keyboard. Holding the hook open
+          // for /supervise approve would freeze the TUI for minutes instead.
+          await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, { behavior: "allow", defer: true });
+          this.#pendingPermissions.delete(event.request.requestId);
+          skipDecisionNotify = true;
+        } else if (this.#automation && !this.#humanRequired) {
           const authority = task.spec.autonomy.permissionAuthority;
           const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd);
           const answerLocally = authority === "policy"
@@ -613,7 +694,28 @@ export class Supervisor {
           }
         }
       }
-      if (this.#decision && !skipDecisionNotify && (event.type === "permission_request" || event.type === "turn_completed" || event.type === "exited")) {
+      if (event.type === "human_input") {
+        await this.#appendEvent({ type: "human_input", taskId, workerId: handle.id, data: { text: event.text.slice(0, 512) } });
+        if (!this.#humanRequired) {
+          this.#humanRequired = true;
+          this.#humanGate = "other";
+          await this.#appendEvent({ type: "human_takeover", taskId, workerId: handle.id, data: { source: "worker_prompt" } });
+          this.#reportProgress("human", "a human is driving the interactive Worker; automation paused until resume-auto", true);
+          void Promise.resolve(this.#onHumanRequired?.({
+            taskId,
+            workerId: handle.id,
+            cwd: task.cwd,
+            task: task.task,
+            reason: "human typed into the supervised session; automation paused",
+            ...(this.#attachHint(handle) ? { attach: this.#attachHint(handle) } : {}),
+          })).catch(() => {});
+        }
+      }
+      // While a human drives the interactive session, the Decision Worker must
+      // not be asked to act on a completed turn; #lastTurnCompleted is still
+      // recorded above so resumeAutomation can replay it once automation resumes.
+      const suppressTurnCompletedForHuman = this.#humanRequired && event.type === "turn_completed";
+      if (this.#decision && !skipDecisionNotify && !suppressTurnCompletedForHuman && (event.type === "permission_request" || event.type === "turn_completed" || event.type === "exited")) {
         this.#decision.updateContext({ state: this.#machine.state, turn: this.#turn, repairRound: this.#repairRound });
         this.#decision.notify(event);
       }
@@ -691,7 +793,14 @@ export class Supervisor {
       deliverable: false,
       usage: this.usage,
       ...(permission ? { permission } : {}),
+      ...(this.#attachHint(handle) ? { attach: this.#attachHint(handle) } : {}),
     })).catch(() => {});
+  }
+
+  /** Attach hint for a tmux-backed handle; undefined for any other transport. */
+  #attachHint(handle?: WorkerHandle): string | undefined {
+    const target = handle ?? this.#handle;
+    return target?.sessionName ? attachCommand(target) : undefined;
   }
 
   async #decisionFailure(event: WorkerEvent, error: unknown): Promise<void> {
@@ -741,14 +850,45 @@ export class Supervisor {
           await this.#parkCandidate(`Permission response is unavailable for ${event.type}`, event);
           return;
         }
+        // evaluatePermission always denies AskUserQuestion (it exists to
+        // convert the question into ordinary text for the prompt-phase/hybrid
+        // policy path), so an explicit deny_permission answer for it must be
+        // checked before the generic policy-deny reason, or the Decision
+        // Worker's chosen answer would never reach Claude.
+        const isAskUserQuestionAnswer = event.request.toolName === "AskUserQuestion" && action.action === "deny_permission";
         const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd);
         const behavior = policy.decision === "deny" ? "deny" : action.action === "allow_permission" ? "allow" : "deny";
-        await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, {
-          behavior,
-          message: behavior === "deny" ? (policy.decision === "deny" ? `${policy.reason}; denied by supervisor policy` : `denied by supervisor: ${action.reason}`) : undefined,
-        }, behavior === "allow" ? event.request.input : undefined);
+        const message = behavior !== "deny"
+          ? undefined
+          : isAskUserQuestionAnswer
+            // Claude reads a permission deny's message as the answer: put the
+            // Decision Worker's chosen option and rationale there.
+            ? `Supervisor answer: ${action.reason}`
+            : policy.decision === "deny"
+              ? `${policy.reason}; denied by supervisor policy`
+              : `denied by supervisor: ${action.reason}`;
+        await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, { behavior, message }, behavior === "allow" ? event.request.input : undefined);
         this.#pendingPermissions.delete(event.request.requestId);
         await this.#appendEvent({ type: "permission_decision", taskId: task.taskId, workerId: handle.id, data: { requestId: event.request.requestId, toolName: event.request.toolName, behavior, policy: policy.decision, actor: "decision-worker" } });
+        return;
+      }
+      if ((action.action === "continue" || action.action === "redirect" || action.action === "answer")
+        && event.type === "permission_request" && event.request.toolName === "AskUserQuestion") {
+        // A pending AskUserQuestion tool call blocks the turn; #sendInternal
+        // would race or fail against it. Treat the chosen answer as a
+        // permission deny whose message carries the answer back to Claude.
+        if (!this.#adapter.respondPermission) {
+          await this.#parkCandidate(`Permission response is unavailable for ${event.type}`, event);
+          return;
+        }
+        // evaluatePermission always denies AskUserQuestion by design (see the
+        // pre-phase comment above); the answer chosen here always reaches
+        // Claude through the deny message, not a generic policy reason.
+        const behavior = "deny" as const;
+        const message = `Supervisor answer: ${action.message}`;
+        await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, { behavior, message });
+        this.#pendingPermissions.delete(event.request.requestId);
+        await this.#appendEvent({ type: "permission_decision", taskId: task.taskId, workerId: handle.id, data: { requestId: event.request.requestId, toolName: event.request.toolName, behavior, policy: "deny", actor: "decision-worker" } });
         return;
       }
       if (action.action === "continue" || action.action === "redirect" || action.action === "answer") {
@@ -860,6 +1000,7 @@ export class Supervisor {
       deliverable: false,
       usage: this.usage,
       ...(this.#lastObservedBranch ? { branch: this.#lastObservedBranch, protectedBranch: isProtectedBranch(this.#lastObservedBranch) } : {}),
+      ...(this.#attachHint(handle) ? { attach: this.#attachHint(handle) } : {}),
     };
     await this.#appendEvent({
       type: "candidate_parked",
@@ -869,6 +1010,18 @@ export class Supervisor {
     });
     this.#terminalNoticeSent = true;
     void Promise.resolve(this.#onCandidate?.(notice)).catch(() => {});
+    if (question) {
+      void Promise.resolve(this.#onHumanRequired?.({
+        taskId: task.taskId,
+        workerId: handle?.id,
+        cwd: task.cwd,
+        task: task.task,
+        reason,
+        question,
+        permission,
+        ...(this.#attachHint(handle) ? { attach: this.#attachHint(handle) } : {}),
+      })).catch(() => {});
+    }
     if (cleanupError) throw cleanupError;
   }
 
@@ -1083,7 +1236,16 @@ export class Supervisor {
     }
     if (this.#machine.state === "completed") {
       if (this.#handle) {
-        await this.#adapter.stop(this.#handle, reason);
+        if (this.#released && this.#handle.ownership === "owned") {
+          // The handle was released, not stopped, when the task completed
+          // with a kept-open interactive session (#finalizeVerification); the
+          // adapter's own stop() would just re-release an already-released
+          // record. Kill the process group directly so an explicit stop
+          // actually closes the session.
+          await this.#adapter.killProcessGroup(this.#handle, reason);
+        } else {
+          await this.#adapter.stop(this.#handle, reason);
+        }
         await this.#drainOutputAfterStop(this.#handle);
       }
       return;
@@ -1404,19 +1566,37 @@ export class Supervisor {
     const stopRequested = this.#stopRequested !== undefined;
     const stopCloseReason = this.#stopCloseReason ?? "human_stop";
     if (outcome === "blocked") this.#candidateParked = true;
+    // A completed interactive task may keep its persistent session open for
+    // the operator instead of tearing it down; a stop requested mid-verify or
+    // a blocked/failed outcome always falls back to today's stop behavior.
+    const keepOpen = !stopRequested && outcome === "completed" && result.ok
+      && this.#keepWorkerOnCompletion && Boolean(this.#adapter.release) && Boolean(this.#handle);
     let cleanupError: unknown;
+    let releasedInteractive = false;
     if (this.#handle) {
-      try {
-        await this.#adapter.stop(this.#handle, stopRequested ? this.#stopRequested! : result.ok ? "verification passed" : "verification failed");
-        await this.#drainOutputAfterStop(this.#handle);
-        const cleanup = await this.#adapter.getStatus(this.#handle);
-        if (cleanup.cleanupError) throw new Error(`worker cleanup failed after verification: ${cleanup.cleanupError}`);
-        if (cleanup.cgroupError && cleanup.cgroupRequired !== false) throw new Error(`worker cgroup cleanup failed after verification: ${cleanup.cgroupError}`);
-        if (this.#handle.ownership === "owned" && (cleanup.running || cleanup.processGroupCleaned !== true)) {
-          throw new Error("owned worker cleanup was not confirmed after verification");
+      if (keepOpen) {
+        try {
+          // Match the generic release() path: no output drain. The session
+          // stays alive and its transcript keeps growing after detach.
+          await this.#adapter.release!(this.#handle, "task completed; interactive session kept open");
+          this.#released = true;
+          releasedInteractive = true;
+        } catch (error) {
+          cleanupError = error;
         }
-      } catch (error) {
-        cleanupError = error;
+      } else {
+        try {
+          await this.#adapter.stop(this.#handle, stopRequested ? this.#stopRequested! : result.ok ? "verification passed" : "verification failed");
+          await this.#drainOutputAfterStop(this.#handle);
+          const cleanup = await this.#adapter.getStatus(this.#handle);
+          if (cleanup.cleanupError) throw new Error(`worker cleanup failed after verification: ${cleanup.cleanupError}`);
+          if (cleanup.cgroupError && cleanup.cgroupRequired !== false) throw new Error(`worker cgroup cleanup failed after verification: ${cleanup.cgroupError}`);
+          if (this.#handle.ownership === "owned" && (cleanup.running || cleanup.processGroupCleaned !== true)) {
+            throw new Error("owned worker cleanup was not confirmed after verification");
+          }
+        } catch (error) {
+          cleanupError = error;
+        }
       }
     }
     const verificationSucceeded = !stopRequested && outcome === "completed" && result.ok && !cleanupError;
@@ -1438,7 +1618,17 @@ export class Supervisor {
         eventError = eventError ? new AggregateError([eventError, error], "verification lifecycle audit failed") : error;
       }
     }
-    const cleanupConfirmed = !cleanupError && await this.#isCleanupConfirmed(this.#handle);
+    if (releasedInteractive) {
+      try {
+        await this.#appendEvent({ type: "worker_released", taskId: this.#task?.taskId, workerId: this.#handle?.id, data: { reason: "task completed; interactive session kept open" } });
+      } catch (error) {
+        eventError = eventError ? new AggregateError([eventError, error], "verification lifecycle audit failed") : error;
+      }
+    }
+    // The process was released, not stopped, so #isCleanupConfirmed's "the
+    // process died" checks do not apply; the release call above already
+    // confirmed the disconnect succeeded.
+    const cleanupConfirmed = releasedInteractive ? true : (!cleanupError && await this.#isCleanupConfirmed(this.#handle));
     await this.#decision?.close().catch(() => {});
     this.#decision = undefined;
     this.#stopRequested = undefined;
@@ -1458,11 +1648,12 @@ export class Supervisor {
         workerId: this.#handle?.id,
         cwd: task?.cwd ?? "",
         task: task?.task ?? "",
-        reason: verificationSucceeded ? "candidate is ready" : candidateReason,
+        reason: verificationSucceeded ? (releasedInteractive ? "candidate is ready; the interactive session stays open (/supervise stop closes it)" : "candidate is ready") : candidateReason,
         status: verificationSucceeded ? "ready" : "blocked",
         deliverable: verificationSucceeded,
         usage: this.usage,
         ...(this.#lastObservedBranch ? { branch: this.#lastObservedBranch, protectedBranch: isProtectedBranch(this.#lastObservedBranch) } : {}),
+        ...(this.#attachHint() ? { attach: this.#attachHint() } : {}),
       };
       this.#terminalNoticeSent = true;
       void Promise.resolve(this.#onCandidate?.(notice)).catch(() => {});
@@ -1804,6 +1995,39 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
     if (timer) clearTimeout(timer);
     if (signal && onAbort) signal.removeEventListener("abort", onAbort);
   }
+}
+
+/**
+ * Interactive (hook-driven TUI) mode does not use `automaticClaudeArgs`'s
+ * `--permission-mode default` boundary (the hook relay's PreToolUse veto
+ * enforces the boundary instead) or `--max-budget-usd` (it only takes effect
+ * under `-p`). `automaticClaudeArgs` is not owned by this module, so its
+ * injected flags are removed here rather than adding an opt-out to it.
+ */
+function stripInteractiveUnsupportedArgs(args: readonly string[], hadExplicitPermissionMode: boolean): string[] {
+  let result = [...args];
+  if (!hadExplicitPermissionMode) result = removeFlagPair(result, "--permission-mode", "default");
+  result = removeFlagWithValue(result, "--max-budget-usd");
+  return result;
+}
+
+/** Removes the first occurrence of `flag` followed immediately by `value`, as a pair. */
+function removeFlagPair(args: readonly string[], flag: string, value: string): string[] {
+  const index = args.findIndex((entry, position) => entry === flag && args[position + 1] === value);
+  if (index === -1) return [...args];
+  return [...args.slice(0, index), ...args.slice(index + 2)];
+}
+
+/** Removes every occurrence of `flag value` and `flag=value` from args. */
+function removeFlagWithValue(args: readonly string[], flag: string): string[] {
+  const result: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index]!;
+    if (value === flag) { index += 1; continue; }
+    if (value.startsWith(`${flag}=`)) continue;
+    result.push(value);
+  }
+  return result;
 }
 
 function isProtectedBranch(branch: string): boolean {

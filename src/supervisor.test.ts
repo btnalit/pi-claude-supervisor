@@ -2279,3 +2279,320 @@ test("a Reviewer report's usage is recorded when it never called onUsage", async
   assert.equal(supervisor.usage.reviewer.calls, 1);
   assert.equal(supervisor.usage.reviewer.input, 500);
 });
+
+test("interactive pre-phase permission: policy deny is answered without the Decision Worker", async () => {
+  const handle: WorkerHandle = { id: "pre-deny-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  const running = true;
+  const responded: Array<{ requestId: string; behavior: string; message?: string; defer?: boolean }> = [];
+  const notified: WorkerEvent[] = [];
+  let capturedListener: WorkerStartInput["eventListener"];
+  let capturedInput: WorkerStartInput | undefined;
+  const fakeHookSource: import("./hooks/types.ts").HookEventSource = { subscribe: async () => async () => {} };
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true }),
+    start: async (input) => { capturedListener = input.eventListener; capturedInput = input; return handle; },
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => {},
+    release: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+    respondPermission: async (_handle, requestId, _toolUseId, decision) => { responded.push({ requestId, ...decision }); },
+  };
+  const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "interactive pre-deny fixture",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    interactive: true,
+    hookSource: fakeHookSource,
+    hookSettingsPath: "/tmp/pi-cs-fixture-settings.json",
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: (event) => { notified.push(event); }, close: async () => {} }),
+  });
+  assert.equal(capturedInput?.interactive, true);
+  assert.equal(capturedInput?.hookSource, fakeHookSource);
+  assert.equal(capturedInput?.hookSettingsPath, "/tmp/pi-cs-fixture-settings.json");
+  capturedListener?.({
+    type: "permission_request",
+    handle,
+    request: { requestId: "req-push", toolUseId: "tool-push", toolName: "Bash", input: { command: "git push origin main" }, raw: {}, phase: "pre" },
+  });
+  await supervisor.poll();
+  assert.equal(responded.length, 1);
+  assert.equal(responded[0]?.behavior, "deny");
+  assert.match(String(responded[0]?.message ?? ""), /denied by supervisor policy/u);
+  assert.equal(notified.length, 0);
+});
+
+test("interactive pre-phase permission: a routine tool call defers to Claude's own permission mode", async () => {
+  const handle: WorkerHandle = { id: "pre-defer-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  const running = true;
+  const responded: Array<{ requestId: string; behavior: string; message?: string; defer?: boolean }> = [];
+  const notified: WorkerEvent[] = [];
+  let capturedListener: WorkerStartInput["eventListener"];
+  const events = new FlakyEventLog("never-fail");
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true }),
+    start: async (input) => { capturedListener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => {},
+    release: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+    respondPermission: async (_handle, requestId, _toolUseId, decision) => { responded.push({ requestId, ...decision }); },
+  };
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "interactive pre-defer fixture",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    interactive: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: (event) => { notified.push(event); }, close: async () => {} }),
+  });
+  capturedListener?.({
+    type: "permission_request",
+    handle,
+    request: { requestId: "req-ls", toolUseId: "tool-ls", toolName: "Bash", input: { command: "ls -la" }, raw: {}, phase: "pre" },
+  });
+  await supervisor.poll();
+  assert.equal(responded.length, 1);
+  assert.equal(responded[0]?.behavior, "allow");
+  assert.equal(responded[0]?.defer, true);
+  assert.equal(notified.length, 0);
+  assert.ok(!events.events.some((event) => event.type === "permission_decision"));
+});
+
+test("interactive pre-phase AskUserQuestion is forwarded to the Decision Worker and answered as a permission deny", async () => {
+  const handle: WorkerHandle = { id: "pre-askuserquestion-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  const running = true;
+  const responded: Array<{ requestId: string; behavior: string; message?: string; defer?: boolean }> = [];
+  const notified: WorkerEvent[] = [];
+  let capturedListener: WorkerStartInput["eventListener"];
+  let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true }),
+    start: async (input) => { capturedListener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => {},
+    release: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+    respondPermission: async (_handle, requestId, _toolUseId, decision) => { responded.push({ requestId, ...decision }); },
+  };
+  const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "interactive AskUserQuestion fixture",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    interactive: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: (options) => {
+      onAction = options.onAction;
+      return { start: async () => {}, updateContext: () => {}, notify: (event) => { notified.push(event); }, close: async () => {} };
+    },
+  });
+  const questionEvent: WorkerEvent = {
+    type: "permission_request",
+    handle,
+    request: { requestId: "req-ask", toolUseId: "tool-ask", toolName: "AskUserQuestion", input: { question: "Which option?" }, raw: {}, phase: "pre" },
+  };
+  capturedListener?.(questionEvent);
+  await supervisor.poll();
+  assert.equal(notified.length, 1);
+  assert.equal(notified[0], questionEvent);
+  assert.equal(responded.length, 0);
+  await onAction?.({ action: "deny_permission", requestId: "req-ask", toolUseId: "tool-ask", reason: "Option B because it matches the existing pattern" }, questionEvent);
+  assert.equal(responded.length, 1);
+  assert.equal(responded[0]?.behavior, "deny");
+  assert.match(String(responded[0]?.message ?? ""), /^Supervisor answer: Option B because/u);
+});
+
+test("interactive prompt-phase permission keeps today's hybrid policy/decision-worker behavior", async () => {
+  const handle: WorkerHandle = { id: "prompt-phase-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  const running = true;
+  let capturedListener: WorkerStartInput["eventListener"];
+  const responded: Array<{ requestId: string; behavior: string; message?: string }> = [];
+  const notified: WorkerEvent[] = [];
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true }),
+    start: async (input) => { capturedListener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => {},
+    release: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+    respondPermission: async (_handle, requestId, _toolUseId, decision) => { responded.push({ requestId, ...decision }); },
+  };
+  const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "interactive prompt-phase fixture",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    interactive: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: (event) => { notified.push(event); }, close: async () => {} }),
+  });
+  capturedListener?.({
+    type: "permission_request",
+    handle,
+    request: { requestId: "req-routine", toolUseId: "tool-routine", toolName: "Bash", input: { command: "ls -la" }, raw: {}, phase: "prompt" },
+  });
+  await supervisor.poll();
+  assert.equal(responded[0]?.behavior, "allow");
+  assert.equal(notified.length, 0);
+
+  capturedListener?.({
+    type: "permission_request",
+    handle,
+    request: { requestId: "req-curl", toolUseId: "tool-curl", toolName: "Bash", input: { command: "curl https://x" }, raw: {}, phase: "prompt" },
+  });
+  await supervisor.poll();
+  assert.equal(responded.length, 1);
+  assert.equal(notified.length, 1);
+});
+
+test("human_input pauses automation, is withheld from the Decision Worker's next turn, and replays after resume-auto", async () => {
+  const handle: WorkerHandle = { id: "human-input-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  const running = true;
+  let capturedListener: WorkerStartInput["eventListener"];
+  const notified: WorkerEvent[] = [];
+  const replays: WorkerEvent[] = [];
+  const events = new FlakyEventLog("never-fail");
+  const humanNotices: Array<{ reason: string }> = [];
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true }),
+    start: async (input) => { capturedListener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => {},
+    release: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+    respondPermission: async (_handle, requestId, _toolUseId, decision) => { permissionReplies.push({ requestId, decision }); },
+  };
+  const permissionReplies: Array<{ requestId: string; decision: { behavior: string; defer?: boolean } }> = [];
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+    reviewer: automaticReviewer(),
+    onHumanRequired: (notice) => { humanNotices.push(notice); },
+  });
+  await supervisor.start({
+    task: "human input fixture",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    interactive: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: () => ({
+      start: async () => {},
+      updateContext: () => {},
+      notify: (event) => { notified.push(event); },
+      replay: (event) => { replays.push(event); },
+      close: async () => {},
+    }),
+  });
+  capturedListener?.({ type: "human_input", handle, text: "hello from a human" });
+  await supervisor.poll();
+  assert.equal(supervisor.humanRequired, true);
+  assert.ok(events.events.some((event) => event.type === "human_takeover" && (event.data as { source?: string } | undefined)?.source === "worker_prompt"));
+  assert.ok(events.events.some((event) => event.type === "human_input"));
+  assert.equal(humanNotices.length, 1);
+
+  // While the human drives, Claude's own permission prompt is theirs to answer:
+  // a prompt-phase request is deferred immediately instead of pending for
+  // /supervise approve and freezing the TUI.
+  capturedListener?.({ type: "permission_request", handle, request: { requestId: "p1", toolUseId: "t1", toolName: "Bash", input: { command: "npm test" }, raw: {}, phase: "prompt" } });
+  await supervisor.poll();
+  assert.deepEqual(permissionReplies.at(-1), { requestId: "p1", decision: { behavior: "allow", defer: true } });
+  assert.equal(notified.length, 0);
+
+  const turnEvent: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 1 };
+  capturedListener?.(turnEvent);
+  await supervisor.poll();
+  assert.equal(notified.length, 0);
+
+  await supervisor.resumeAutomation();
+  assert.equal(replays.length, 1);
+  assert.equal(replays[0], turnEvent);
+});
+
+test("a completed interactive task with keepWorkerOnCompletion releases instead of stopping the Worker", async () => {
+  const handle: WorkerHandle = { id: "keep-open-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
+  let stopCalls = 0;
+  let releaseCalls = 0;
+  let killProcessGroupCalls = 0;
+  let released = false;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true, repairableSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running: !released, activeRequests: 0, processGroupCleaned: released }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { stopCalls += 1; },
+    release: async () => { releaseCalls += 1; released = true; },
+    killProcessGroup: async () => { killProcessGroupCalls += 1; },
+    resumeSession: async () => handle,
+  };
+  let candidateNotice: { reason: string } | undefined;
+  const supervisor = new Supervisor(adapter, undefined, { onCandidate: (notice) => { candidateNotice = notice; } });
+  await supervisor.start({
+    task: "keep open fixture",
+    cwd: "/tmp",
+    command: "fixture",
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    interactive: true,
+    keepWorkerOnCompletion: true,
+  });
+  await supervisor.poll();
+  const result = await supervisor.verify({ command: process.execPath, args: ["-e", "process.exit(0)"] });
+  assert.equal(result.ok, true);
+  assert.equal(supervisor.state, "completed");
+  assert.equal(releaseCalls, 1);
+  assert.equal(stopCalls, 0);
+  assert.equal(supervisor.released, true);
+  assert.match(candidateNotice?.reason ?? "", /interactive session stays open/u);
+
+  // An explicit stop on the kept-open session must actually close it: the
+  // adapter's own stop() would just re-release an already-released record
+  // (see #stopInternal's "completed" branch), so this goes through
+  // killProcessGroup instead.
+  await supervisor.stop("operator requested close");
+  assert.equal(killProcessGroupCalls, 1);
+  assert.equal(stopCalls, 0);
+});

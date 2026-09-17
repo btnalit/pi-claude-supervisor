@@ -87,6 +87,8 @@ export PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_FORMAT=generic
 /supervise approve <task-id> allow|deny [request-id]
 /supervise takeover <task-id>
 /supervise resume-auto <task-id>
+/supervise install-hooks
+/supervise uninstall-hooks
 ```
 
 `--spec` 接受 JSON 文件；验收命令始终使用 argv 执行，不经过 shell。例如：
@@ -145,7 +147,79 @@ Worker 启动前捕获 git baseline，要求完整的 baseline-relative tracked/
 和 cgroup；Claude 的完整工具、Agent/Task、插件、MCP、网络和环境会保持可用。自动模式会在未指定时加入安全的 `default` permission mode，并拒绝 Bash 预授权；Bash 仍通过 Supervisor 可见的 permission request 使用。详见 [自动化目标](docs/autonomy-target.md)。协同多 Worker 属于后续独立开发阶段，
 自动模式只接受裸的直接 Claude 命令名，会固定解析后的操作者拥有的可执行文件；任意自定义可执行文件和显式可执行路径会在自动模式拒绝。需要固定路径时设置 `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE`。自定义工具和嵌套 Worker 的 remote/main 权限必须由独立 host/仓库边界保护。
 
-### tmux/PTY 交互模式
+### 交互式 tmux 模式（hooks）
+
+`PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux` 现在默认在 tmux pane 中运行真实、未经修改的
+Claude Code TUI——就是你自己运行 `claude` 时看到的那个界面——而不是下文描述的结构化
+stream-json bridge。你可以随时 attach 到打印出的 `attach=...` 命令上观察，或者亲自输入；
+Pi 通过 Claude Code 自身的 hooks 上报事件，而不是抓取屏幕文字。
+
+一次性设置，每台机器/每个用户只需执行一次：
+
+```text
+/supervise install-hooks
+```
+
+这会在 `~/.claude/settings.json`（或 `$CLAUDE_CONFIG_DIR/settings.json`）中为全部
+七个 Claude Code hook 事件注册一个小型 relay 命令；`/supervise uninstall-hooks` 只会
+移除这一条目。owned 的 `/supervise start` 不需要这一步——它会传入自己的 `--settings`
+文件——但 `/supervise adopt-tmux` 运行在你自己的 Claude Code 配置中，因此需要它。
+
+```bash
+export PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux
+export PI_CLAUDE_SUPERVISOR_MODE=auto
+# 改为使用旧版 stream-json-in-a-pane transport：
+# export PI_CLAUDE_SUPERVISOR_TMUX_MODE=bridge
+```
+
+```text
+/supervise start <task>
+/supervise adopt-tmux <tmux-session> <task>
+```
+
+Pi 会在 Claude 结束一轮对话时（`Stop`）、Claude 即将向你展示真实权限提示时（仅此时——
+其余每一次普通工具调用都交给你自己的 Claude Code 权限模式处理）、Claude 询问
+`AskUserQuestion` 时（Decision Worker 会选择一个答案，Claude 以普通文本形式继续，
+与无人值守自动模式中完全一致），以及 session 退出时介入。在展示提示之前的
+`PreToolUse` 否决点只会拒绝已知的直接远程 push/merge/PR 或其他破坏性/受保护分支操作
+（或转发一个 `AskUserQuestion`）；它从不干预普通的编辑、读取或本地命令——那些请求会
+直接进入你自己的权限模式，Pi 完全不做决策。
+
+**人机协同。** 如果你在已 attach 的 session 中输入内容，自动化会暂停
+（`human_takeover`，以警告形式呈现），直到你执行 `/supervise resume-auto <task-id>`；
+你接管期间完成的那一轮会在此时重放给 Decision Worker，因此不会丢失已经完成的工作。
+
+**完成后保持会话开启。** 与其他 transport 不同，任务完成后默认只是让 Pi 与该会话断开，
+而不是关闭它，方便你在同一窗口中继续工作或查看 Claude 做了什么；`/supervise stop
+<task-id>` 可以显式关闭它。设置 `PI_CLAUDE_SUPERVISOR_CLOSE_WORKER_ON_COMPLETION=1`
+可恢复旧的“完成即关闭”行为。被阻塞或失败的候选仍会像以往一样停止 Worker。
+
+**企业微信/出站通知。** 候选通知和“需要你”通知（被阻塞并提出问题的候选，或人工接管通知）
+都会在涉及 tmux session 时附带一个 `attach` 字段，内容是可直接执行的
+`tmux -S <socket> attach -t <session>` 命令。
+
+**成本核算的限制。** TUI 的 `Stop` hook 没有 `total_cost_usd` 或 token `usage`
+（这些字段只出现在 Claude 自己的 `result` stream-json 记录中，而 TUI 不会产生这种记录），
+因此交互模式下的成本统计只计算轮次，不计算费用；`--max-budget-usd` 同样不可用
+（Claude Code 只在 `-p` 模式下强制执行它），也不会传给交互式启动。如果设置了
+`autonomy.maxWorkerCostUsd`，请预期它在交互模式下不起作用；需要硬性成本上限时请使用
+bridge/jsonl 模式。
+
+**信任对话框。** Claude Code 第一次在某个目录中运行时，可能会先弹出它自己的一次性
+“是否信任该文件夹”对话框，然后 hook 才会开始生效；像对待未受监督的 `claude` session
+一样 attach 并按一次 Enter 确认即可。
+
+**恢复。** `/supervise recover` 不会持久化原始任务是否为交互式；它在恢复时根据当前的
+`PI_CLAUDE_SUPERVISOR_TRANSPORT`/`PI_CLAUDE_SUPERVISOR_TMUX_MODE` 配置来判断，因此在
+启动任务和恢复任务之间请不要改变这两个配置。
+
+### tmux/PTY 交互模式（bridge 模式）
+
+本节描述的是此前就存在的自动 tmux transport：在 pane 内运行结构化的
+stream-json bridge，而不是真实 TUI。它只适用于自动模式
+（`PI_CLAUDE_SUPERVISOR_MODE=auto`）的 tmux session，且只有显式设置
+`PI_CLAUDE_SUPERVISOR_TMUX_MODE=bridge` 时才会启用；手动（非 `auto`）tmux
+session 始终直接在 pane 中运行 Claude，不受此设置影响。
 
 如果希望在可见的 Claude Code 终端中工作，可显式启用 tmux transport：
 

@@ -1,19 +1,20 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { accessSync, chmodSync, constants as fsConstants, lstatSync, mkdirSync } from "node:fs";
-import { readFile, realpath } from "node:fs/promises";
+import { chmod, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { EventLog } from "./events.ts";
 import { redactSensitive } from "./redaction.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
 import { automaticWorkerEnvironment } from "./worker/environment.ts";
 import { TmuxWorkerAdapter, attachCommand } from "./worker/tmux-adapter.ts";
-import { Supervisor, type DecisionSessionClosedInfo, type SupervisorProgress, type SupervisorTokenUsage } from "./supervisor.ts";
+import { Supervisor, type DecisionSessionClosedInfo, type HumanInterventionNotice, type SupervisorProgress, type SupervisorTokenUsage } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
 import {
   autonomyDefaults,
+  closeWorkerOnCompletion,
   decisionCompactionTokens,
   decisionModel,
   decisionSessionRetentionDays,
@@ -22,6 +23,7 @@ import {
   progressHeartbeatMs,
   reviewerModel,
   reviewTimeoutMs,
+  tmuxMode,
   workerAutocompactTokens,
   workerMcpConfigPath,
   workerModel,
@@ -32,7 +34,51 @@ import { normalizeTaskSpec } from "./acceptance.ts";
 import { PiReadOnlyReviewer } from "./reviewer.ts";
 import { resolvePiModel } from "./pi-model.ts";
 import type { PiModel } from "./decision-worker.ts";
+import { HookServer, hookSocketDirectory } from "./hooks/server.ts";
+import { installUserHooks, uninstallUserHooks } from "./hooks/install.ts";
+import { writeHookSettingsFile } from "./hooks/settings.ts";
+import { HOOK_RELAY_SCRIPT, hookRelayCommand } from "./hooks/relay.ts";
 import type { TaskSpec, WorkerHandle } from "./types.ts";
+
+/** Substring that marks a hook command entry as ours; kept in sync with src/hooks/install.ts's RELAY_MARKER. */
+const RELAY_HOOK_MARKER = "/hooks/relay.js";
+
+function claudeUserSettingsPath(): string {
+  return join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"), "settings.json");
+}
+
+/** `src/hooks/install.ts` does not export its relay-script writer; this mirrors it for an owned launch's static relay path. */
+async function writeRelayScript(path: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, HOOK_RELAY_SCRIPT, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  await rename(temporary, path);
+  await chmod(path, 0o600);
+}
+
+/** True when the user's Claude Code settings already register our relay for at least one hook event. */
+async function userHooksInstalled(settingsPath: string): Promise<boolean> {
+  let raw: string;
+  try {
+    raw = await readFile(settingsPath, "utf8");
+  } catch {
+    return false;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  const hooks = parsed && typeof parsed === "object" ? (parsed as { hooks?: unknown }).hooks : undefined;
+  if (!hooks || typeof hooks !== "object") return false;
+  return Object.values(hooks as Record<string, unknown>).some((groups) =>
+    Array.isArray(groups) && groups.some((group) =>
+      group && typeof group === "object" && Array.isArray((group as { hooks?: unknown }).hooks)
+      && (group as { hooks: unknown[] }).hooks.some((entry) =>
+        entry && typeof entry === "object" && typeof (entry as { command?: unknown }).command === "string"
+        && (entry as { command: string }).command.includes(RELAY_HOOK_MARKER))));
+}
 
 /**
  * Pi Claude Supervisor.
@@ -73,6 +119,29 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     format: process.env.PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_FORMAT === "wecom" ? "wecom" : "generic",
     secret: process.env.PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_SECRET,
   });
+  const onHumanRequired = (ctx: ExtensionContext) => async (notice: HumanInterventionNotice): Promise<void> => {
+    if (ctx.hasUI) notify(ctx, `Human required: ${notice.reason}${notice.question ? ` — ${notice.question}` : ""}${notice.attach ? ` (${notice.attach})` : ""}`, "warning");
+    if (humanWebhook.enabled) {
+      try { await humanWebhook.notify(notice); }
+      catch (error) { console.error(`pi-claude-supervisor human intervention webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`); }
+    }
+  };
+  // Hook-driven interactive tmux supervision: the real Claude TUI reports its
+  // events (Stop, permission prompts, AskUserQuestion, human input) through
+  // Claude Code hooks relayed over a unix socket. See docs/architecture.md.
+  const interactiveHooksEnabled = transport === "tmux" && tmuxMode() === "interactive";
+  const hookServer = interactiveHooksEnabled ? new HookServer({ directory: hookSocketDirectory(stateDir) }) : undefined;
+  const relayPath = join(hookSocketDirectory(stateDir), "relay.js");
+  let hookServerReady: Promise<void> | undefined;
+  if (hookServer) {
+    hookServerReady = (async () => {
+      await writeRelayScript(relayPath);
+      await hookServer.listen();
+    })();
+    hookServerReady.catch((error) => {
+      console.error(`pi-claude-supervisor hook server startup failed: ${redactText(error instanceof Error ? error.message : String(error))}`);
+    });
+  }
   const leaseDir = process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR ?? join(homedir(), ".pi", "agent", "claude-supervisor", "cwd-leases");
   assertRuntimeDirectory(stateDir, "state");
   assertRuntimeDirectory(leaseDir, "lease");
@@ -141,6 +210,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   };
   const activeSessions = () => [...sessions.entries()].filter(([, session]) =>
     ["starting", "running", "waiting", "paused"].includes(session.state));
+  const tmuxModeLabel = (): string | undefined => (adapter.capabilities().transport === "tmux" ? tmuxMode() : undefined);
   const releaseLease = async (taskId: string): Promise<boolean> => {
     const lease = cwdLeases.get(taskId);
     if (!lease) return false;
@@ -159,6 +229,9 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     cleanupRequiredTasks.delete(taskId);
     unconfirmedSweepAttempts.delete(taskId);
     if (activeTaskId === taskId) activeTaskId = undefined;
+    if (interactiveHooksEnabled) {
+      void rm(join(hookSocketDirectory(stateDir), `settings-${taskId}.json`), { force: true }).catch(() => {});
+    }
   };
   const releaseSettledReservations = async (): Promise<void> => {
     for (const [taskId, session] of sessions) {
@@ -289,12 +362,18 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           const fileSpec = specPath ? await readTaskSpecFile(specPath, ctx.cwd) : undefined;
           const spec = fileSpec ?? { autonomy: autonomyDefaults() };
           const goal = fileSpec?.goal ?? task;
-          // Adopted sessions are explicit manual compatibility controls. They
+          // Adopted sessions are explicit manual compatibility controls; they
           // never enter the automatic Reviewer/decision loop, even when the
-          // extension is globally configured for unattended starts.
-          const taskAutomation = operation !== "adopt-tmux" && automation && spec.autonomy.unattended;
+          // extension is globally configured for unattended starts — except
+          // in interactive tmux mode, where an adopted session reports its
+          // own events through hooks exactly like an owned one.
+          const taskAutomation = (operation !== "adopt-tmux" || tmuxMode() === "interactive") && automation && spec.autonomy.unattended;
+          const interactive = taskAutomation && adapter.capabilities().transport === "tmux" && tmuxMode() === "interactive";
           if (!goal) throw new Error(operation === "adopt-tmux" ? "Usage: /supervise adopt-tmux [--spec <file>] <tmux-session> <task>" : "Usage: /supervise start [--spec <file>] <task>");
           if (operation === "adopt-tmux" && adapter.capabilities().transport !== "tmux") throw new Error("/supervise adopt-tmux requires PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux");
+          if (operation === "adopt-tmux" && interactive && !await userHooksInstalled(claudeUserSettingsPath())) {
+            throw new Error("run /supervise install-hooks first so the adopted session can report its events");
+          }
           const [command, ...workerArgs] = parseCommand(process.env.PI_CLAUDE_SUPERVISOR_WORKER ?? "claude");
           if (!command) throw new Error("PI_CLAUDE_SUPERVISOR_WORKER must contain an executable");
           const policy = evaluateCommand(command, workerArgs);
@@ -336,11 +415,18 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 catch (error) { console.error(`pi-claude-supervisor candidate webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`); }
               }
             },
+            onHumanRequired: onHumanRequired(ctx),
           });
           pendingStartSessions.add(session);
           let startupCleanupCompleted = false;
+          const hookSettingsPath = interactive && !tmuxSession ? join(hookSocketDirectory(stateDir), `settings-${taskId}.json`) : undefined;
           const startOperation = (async () => {
             try {
+              if (interactive) {
+                if (!hookServer || !hookServerReady) throw new Error("interactive tmux supervision requires PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux");
+                await hookServerReady;
+                if (hookSettingsPath) await writeHookSettingsFile(hookSettingsPath, hookRelayCommand(relayPath));
+              }
               const handle = await session.start({
                 taskId,
                 onProgress: progress(ctx),
@@ -352,6 +438,10 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 env: selectedWorkerEnvironment(taskAutomation),
                 approval,
                 automation: taskAutomation,
+                interactive,
+                hookSource: interactive ? hookServer : undefined,
+                hookSettingsPath,
+                keepWorkerOnCompletion: interactive ? !closeWorkerOnCompletion() : undefined,
                 retainCgroupUntilLeaseRelease: taskAutomation,
                 workerArgOptions: taskAutomation
                   ? { model: workerModel(), autocompactTokens: workerAutocompactTokens(), mcpConfigPath: workerMcpConfigPath() }
@@ -557,6 +647,11 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           if (policy.decision === "deny") throw new Error(`Worker command denied: ${policy.reason}`);
           const automaticRecovery = record.spec?.autonomy.unattended !== false;
           if (automaticRecovery && !record.resolvedExecutable) throw new Error("automatic recovery requires a persisted resolved Claude executable identity");
+          // The decision-session record does not persist whether the original
+          // task was interactive; the current transport/mode configuration is
+          // used instead, so it must not change between start and recovery.
+          const recoveryInteractive = automaticRecovery && adapter.capabilities().transport === "tmux" && tmuxMode() === "interactive";
+          const recoveryHookSettingsPath = recoveryInteractive ? join(hookSocketDirectory(stateDir), `settings-${record.taskId}.json`) : undefined;
           // Resolve models before any lease/recovery state is mutated below, so a
           // misconfigured model spec fails closed without leaking a reservation.
           const decisionPiModel = await resolveDecisionPiModel();
@@ -600,11 +695,17 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 catch (error) { console.error(`pi-claude-supervisor candidate webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`); }
               }
             },
+            onHumanRequired: onHumanRequired(ctx),
           });
           pendingStartSessions.add(session);
           const recoveryOperation = (async () => {
             let startedHandle: WorkerHandle | undefined;
             try {
+              if (recoveryInteractive) {
+                if (!hookServer || !hookServerReady) throw new Error("interactive tmux supervision requires PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux");
+                await hookServerReady;
+                if (recoveryHookSettingsPath) await writeHookSettingsFile(recoveryHookSettingsPath, hookRelayCommand(relayPath));
+              }
               const handle = await session.start({
                 taskId: record.taskId,
                 onProgress: progress(ctx),
@@ -621,6 +722,10 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 env: selectedWorkerEnvironment(automaticRecovery),
                 approval,
                 automation: automaticRecovery,
+                interactive: recoveryInteractive,
+                hookSource: recoveryInteractive ? hookServer : undefined,
+                hookSettingsPath: recoveryHookSettingsPath,
+                keepWorkerOnCompletion: recoveryInteractive ? !closeWorkerOnCompletion() : undefined,
                 retainCgroupUntilLeaseRelease: automaticRecovery,
                 workerArgOptions: automaticRecovery
                   ? { model: workerModel(), autocompactTokens: workerAutocompactTokens(), mcpConfigPath: workerMcpConfigPath() }
@@ -784,7 +889,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           }
         } else if (operation === "sessions") {
           const recoverable = await decisionStore.list({ activeOnly: true });
-          message = formatSessions(sessions, recoverable);
+          message = formatSessions(sessions, recoverable, tmuxModeLabel());
           const quarantined = await cwdLeaseStore.quarantined();
           if (quarantined.length > 0) {
             message += `\nQuarantined cwd lease records (${quarantined.length}) in ${leaseDir}/quarantine: ${redactText(quarantined.join(", "))}`;
@@ -792,10 +897,16 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         } else if (operation === "status") {
           const { session, sessionId } = resolveSession(sessions, activeTaskId, rest, true);
           message = session
-            ? `task=${sessionId} state=${session.state} worker=${session.handle?.id ?? "none"} ${formatUsageDetail(session.usage)}`
-            : formatSessions(sessions, await decisionStore.list({ activeOnly: true }));
+            ? `task=${sessionId} state=${session.state} worker=${session.handle?.id ?? "none"}${tmuxModeLabel() ? ` mode=${tmuxModeLabel()}` : ""} ${formatUsageDetail(session.usage)}`
+            : formatSessions(sessions, await decisionStore.list({ activeOnly: true }), tmuxModeLabel());
         } else if (operation === "capabilities") {
           message = JSON.stringify(adapter.capabilities(), null, 2);
+        } else if (operation === "install-hooks" || operation === "uninstall-hooks") {
+          const settingsPath = claudeUserSettingsPath();
+          const result = operation === "install-hooks"
+            ? await installUserHooks({ stateDir, settingsPath })
+            : await uninstallUserHooks({ stateDir, settingsPath });
+          message = `${operation}: ${result.changed ? "updated" : "already up to date"} ${result.settingsPath}`;
         } else if (operation === "poll" && rest[0] === "all") {
           const reports = await Promise.all(activeSessions().map(async ([taskId, session]) => {
             const result = await session.poll();
@@ -836,7 +947,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           } else if (operation === "resume-auto") {
             await session.resumeAutomation(); message = `Automatic decisions resumed: ${sessionId}.`;
           } else {
-            throw new Error("Usage: /supervise start|adopt-tmux|recover [--takeover]|sessions|status|poll [all|taskId]|send [taskId]|pause [taskId]|resume [taskId]|stop [taskId]|verify [taskId]|approve [taskId] <allow|deny>|takeover [taskId]|resume-auto [taskId]|capabilities");
+            throw new Error("Usage: /supervise start|adopt-tmux|recover [--takeover]|sessions|status|poll [all|taskId]|send [taskId]|pause [taskId]|resume [taskId]|stop [taskId]|verify [taskId]|approve [taskId] <allow|deny>|takeover [taskId]|resume-auto [taskId]|capabilities|install-hooks|uninstall-hooks");
           }
         }
         notify(ctx, message);
@@ -872,6 +983,18 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
       }
       const results = await Promise.allSettled([...sessions.values()].map((session) => stopSession(session, "Pi session shutdown", true, true)));
       await releaseSettledReservations();
+      if (hookServer) {
+        try {
+          // listen() may still be in flight (e.g. shutdown racing startup, or
+          // a task that never reached an interactive start); close() only
+          // tears down the socket once #server is set, so an unawaited
+          // listen() here would leak an open listening socket forever.
+          if (hookServerReady) await hookServerReady.catch(() => {});
+          await hookServer.close();
+        } catch (error) {
+          console.error(`pi-claude-supervisor hook server shutdown failed: ${redactText(error instanceof Error ? error.message : String(error))}`);
+        }
+      }
       const failures = [...startupFailures, ...results.filter((result): result is PromiseRejectedResult => result.status === "rejected")];
       if (failures.length > 0) {
         for (const failure of failures) console.error(`pi-claude-supervisor shutdown cleanup failed: ${redactText(failure.reason instanceof Error ? failure.reason.message : String(failure.reason))}`);
@@ -916,12 +1039,13 @@ function requiresWorkerCleanup(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && (error as { workerCleanupRequired?: unknown }).workerCleanupRequired === true);
 }
 
-function formatSessions(sessions: Map<string, Supervisor>, recoverable: DecisionSessionRecord[] = []): string {
+function formatSessions(sessions: Map<string, Supervisor>, recoverable: DecisionSessionRecord[] = [], tmuxModeLabel?: string): string {
+  const modeSuffix = tmuxModeLabel ? ` mode=${tmuxModeLabel}` : "";
   const active = [...sessions.entries()]
-    .map(([taskId, session]) => `${taskId} state=${session.state} cwd=${session.task?.cwd ?? "-"} worker=${session.handle?.id ?? "-"}`);
+    .map(([taskId, session]) => `${taskId} state=${session.state} cwd=${session.task?.cwd ?? "-"} worker=${session.handle?.id ?? "-"}${modeSuffix}`);
   const pending = recoverable
     .filter((record) => !sessions.has(record.taskId))
-    .map((record) => `${record.taskId} state=recoverable recovery=${record.recoveryState} cwd=${record.cwd} worker=${record.recoveryWorker?.id ?? "-"}`);
+    .map((record) => `${record.taskId} state=recoverable recovery=${record.recoveryState} cwd=${record.cwd} worker=${record.recoveryWorker?.id ?? "-"}${modeSuffix}`);
   return [...active, ...pending].join("\n") || "No task sessions.";
 }
 

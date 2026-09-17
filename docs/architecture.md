@@ -185,6 +185,88 @@ private tmux server teardown, including after partial session creation, and a
 confirmed `kill-server` is sufficient cleanup evidence. A normal Claude
 `--resume` starts another process from history and is not a live PTY migration.
 
+### Interactive tmux transport
+
+`PI_CLAUDE_SUPERVISOR_TMUX_MODE=interactive` (the default when `TRANSPORT=tmux`)
+runs the real Claude Code TUI in the tmux pane instead of the structured
+stream-json bridge described above (`bridge` mode is the pre-existing
+transport, kept as an opt-out). `TmuxWorkerAdapter.start({ automatic: true,
+interactive: true, ... })` selects it; `interactive` and `structured` (bridge)
+are mutually exclusive sub-modes of the automatic tmux transport.
+
+**Hook relay and server.** Claude Code hooks (`SessionStart`, `PreToolUse`,
+`PermissionRequest`, `Stop`, `Notification`, `UserPromptSubmit`, `SessionEnd`)
+are configured to run a small embedded relay script
+(`src/hooks/relay.ts`'s `HOOK_RELAY_SCRIPT`, written to
+`<stateDir>/hooks/relay.js`). The relay reads the hook event JSON from stdin,
+hashes the event's `cwd` to find `<stateDir>/hooks/by-cwd/<sha256(cwd)>` — a
+symlink to a `HookServer`'s unix socket, created only while a Supervisor holds
+that cwd — and forwards the event over the socket, printing the reply as
+Claude's hook output. A cwd with no owning Supervisor is a fast no-op: the
+relay `stat`s the symlink path and returns before touching `net`. Non-blocking
+events (`SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Notification`) are
+fire-and-forget; `PreToolUse`, `PermissionRequest` and `Stop` block Claude for
+up to `HOOK_TIMEOUT_SECONDS` (180s) waiting for a reply, and an unanswered
+request fails open to "no decision" so a relay or Supervisor bug never wedges
+Claude. `HookServer` (`src/hooks/server.ts`) is one socket per Pi process, with
+`subscribe(cwd, handler)` installing the per-cwd symlink; a Supervisor session
+subscribes for the lifetime of its task and unsubscribes on stop/release.
+`installUserHooks`/`uninstallUserHooks` (`src/hooks/install.ts`, exposed as
+`/supervise install-hooks`/`uninstall-hooks`) register the relay for all seven
+events in the user's real `~/.claude/settings.json` (or
+`$CLAUDE_CONFIG_DIR/settings.json`), required once for `adopt-tmux`; an owned
+launch instead writes a standalone settings file
+(`writeHookSettingsFile`, `src/hooks/settings.ts`) passed as Claude's
+`--settings <path>`, so it never touches the user's own configuration.
+
+**Two permission phases.** `PreToolUse` fires before Claude's own permission
+mode runs and is the enforced boundary: the Supervisor answers a policy denial
+there (a `PreToolUse` deny is reported to block a tool such as `git push`
+even under `permissions.defaultMode: auto`), forwards `AskUserQuestion` to the
+Decision Worker, and otherwise returns no decision (`defer: true`) so Claude's
+own permission mode decides — every other tool call is intentionally not
+audited at this phase, since it
+would just reproduce Claude's own prompt. `PermissionRequest` fires only when
+Claude is about to show a human a permission prompt (i.e. its own mode did not
+already decide); the Supervisor's existing hybrid/policy/Decision-Worker
+authority answers it exactly as before. `WorkerPermissionRequest.phase` is
+`"pre" | "prompt"` for an interactive session and `undefined` for the
+stream-json bridge or process-pipe transports. `AskUserQuestion` is always
+answered by the Decision Worker as a permission deny whose message is
+`Supervisor answer: <reason>` — Claude reads a `PreToolUse`/`PermissionRequest`
+deny's message as the reason the tool did not run, so the chosen answer and
+its rationale reach the model as ordinary text and the turn continues.
+
+**Human coexistence.** A prompt Claude receives that the Supervisor did not
+send (a human typing into the attached tmux pane) surfaces as a `human_input`
+Worker event; the Supervisor appends a bounded `human_input` event, enters
+human takeover (`human_takeover` with `data.source: "worker_prompt"`) if not
+already active, and pauses Decision Worker notification of further
+`turn_completed` events (they are still recorded so `resume-auto` can replay
+the last one) until `/supervise resume-auto`. A `pre`-phase request is still
+answered automatically during a human takeover (policy deny or defer) since it
+is not something a human is expected to approve; only a `prompt`-phase request
+pends for `/supervise approve`.
+
+**What stays scraped.** `pipe-pane`/`capture-pane` still provide the raw
+output log and a stable-prompt readiness signal for owned startup
+(`#waitForInteractiveReady`); no permission or completion decision is ever
+derived from screen text in interactive mode — `Stop` (→ `turn_completed`,
+`result.result` the last assistant message, `subtype: "stop"`) and the two
+permission hooks are the only structured signals. `--max-budget-usd` has no
+effect on the interactive TUI (Claude Code only enforces it under `-p`), so
+`automaticClaudeArgs`'s injected `--permission-mode default` and
+`--max-budget-usd` are stripped for an interactive launch; the Supervisor's own
+cumulative cost check (`#recordWorkerUsage`) is the only budget enforcement
+left, and it tolerates a `Stop` result with no `total_cost_usd`/`usage` (turn
+count still increments).
+
+A completed task normally releases (not stops) an interactive Worker,
+leaving the session open for the operator to review or continue by hand;
+`PI_CLAUDE_SUPERVISOR_CLOSE_WORKER_ON_COMPLETION=1` restores the old
+close-on-completion behavior. A blocked or failed outcome always stops the
+Worker as before.
+
 ## State machine
 
 ```text
