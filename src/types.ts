@@ -285,7 +285,7 @@ export interface TaskContext {
   startedAt: string;
   /** Repository HEAD before this task; used to review local commits as well as worktree changes. */
   baseCommit?: string;
-  /** Non-protected local branch recorded before automatic work begins. */
+  /** The branch the task started on; the Worker may move to another branch, the baseline commit stays the anchor. */
   baseBranch?: string;
   spec: TaskSpec;
   repairRound: number;

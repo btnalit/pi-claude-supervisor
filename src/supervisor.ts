@@ -4,7 +4,7 @@ import { EventLog, type SupervisorEvent } from "./events.ts";
 import { SupervisorStateMachine } from "./state.ts";
 import { evaluatePermission, isRoutinePermission } from "./policy.ts";
 import { PiDecisionWorker, type DecisionAction, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
-import { collectRepositoryEvidence, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryWorkTree, verifyAll, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
+import { collectRepositoryEvidence, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryIsAncestor, repositoryWorkTree, verifyAll, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { redactSensitive } from "./redaction.ts";
 import { assertAutomaticClaudePermissionConfiguration, assertTrustedAutomaticClaudeExecutable, automaticClaudeArgs, automaticWorkerEnvironment, type AutomaticClaudeArgOptions } from "./worker/environment.ts";
@@ -160,6 +160,10 @@ export interface CandidateNotice extends HumanInterventionNotice {
   status: "ready" | "blocked" | "failed";
   deliverable: boolean;
   usage?: SupervisorTokenUsage;
+  /** The candidate's current branch, when known; any branch, including a protected one, may host a candidate. */
+  branch?: string;
+  /** True when `branch` is a protected integration branch; informational only, never a rejection. */
+  protectedBranch?: boolean;
 }
 
 export class Supervisor {
@@ -167,6 +171,8 @@ export class Supervisor {
   readonly #events: EventLog;
   readonly #machine = new SupervisorStateMachine();
   #task?: TaskContext;
+  /** The most recently observed branch for an automatic task; `#task.baseBranch` stays the starting branch. */
+  #lastObservedBranch?: string;
   #handle?: WorkerHandle;
   #lastVerification?: AcceptanceReport;
   #workerOutput = "";
@@ -263,6 +269,7 @@ export class Supervisor {
     const taskId = options.taskId ?? randomUUID();
     const spec = normalizeTaskSpec(options.spec, options.task);
     this.#handle = undefined;
+    this.#lastObservedBranch = undefined;
     this.#lastVerification = undefined;
     this.#workerOutput = "";
     this.#lastWorkerResult = undefined;
@@ -319,10 +326,15 @@ export class Supervisor {
       let workerArgs = options.args;
       if (this.#automation) {
         if (recovering && !options.baseCommit) throw new Error("automatic recovery requires a persisted git baseline");
-        const boundary = await automaticRepositoryBoundary(options.cwd, options.baseCommit, options.baseBranch, startAbortController.signal);
+        const boundary = await automaticRepositoryBoundary(options.cwd, options.baseCommit, startAbortController.signal);
         this.#assertStartNotAborted(startAbortController.signal);
         this.#task.baseCommit = boundary.baseCommit;
-        this.#task.baseBranch = boundary.branch;
+        // The task is anchored to the baseline commit, not to a branch name: a
+        // recovered task keeps its persisted starting branch even if the Worker
+        // has since moved off it (tracked separately, below); a fresh task
+        // records wherever it currently sits, including a protected branch.
+        this.#task.baseBranch = options.baseBranch ?? boundary.branch;
+        this.#lastObservedBranch = this.#task.baseBranch;
         startupHead = boundary.head;
       }
       await this.#appendEvent({
@@ -401,7 +413,8 @@ export class Supervisor {
         await this.#decision.start();
       }
       if (this.#automation) {
-        await automaticRepositoryBoundary(options.cwd, this.#task.baseCommit, this.#task.baseBranch, startAbortController.signal, startupHead);
+        const boundary = await automaticRepositoryBoundary(options.cwd, this.#task.baseCommit, startAbortController.signal, startupHead);
+        await this.#trackBranchChange(boundary.branch);
         this.#assertStartNotAborted(startAbortController.signal);
       }
       const input: WorkerStartInput = {
@@ -425,7 +438,8 @@ export class Supervisor {
         preSpawnCheck: this.#automation
           ? async (provisionalHandle) => {
               if (provisionalHandle) await options.onWorkerPreSpawn?.(provisionalHandle);
-              await automaticRepositoryBoundary(options.cwd, this.#task!.baseCommit, this.#task!.baseBranch, startAbortController.signal, startupHead);
+              const boundary = await automaticRepositoryBoundary(options.cwd, this.#task!.baseCommit, startAbortController.signal, startupHead);
+              await this.#trackBranchChange(boundary.branch);
               await assertAutomaticClaudePermissionConfiguration(options.cwd, workerArgs ?? [], workerEnvironment);
               this.#assertStartNotAborted(startAbortController.signal);
             }
@@ -782,6 +796,20 @@ export class Supervisor {
   }
 
   /**
+   * Record, best effort, that the task's current branch diverged from the
+   * last one observed. The task is anchored to its baseline commit, not to a
+   * branch name (Claude Code's own "branch first" guidance means the Worker
+   * commonly branches off `main` mid-task), so a name change is audited, not
+   * rejected; it fires at most once per observed divergence.
+   */
+  async #trackBranchChange(branch: string | undefined): Promise<void> {
+    if (!this.#automation || !this.#task || !branch || branch === this.#lastObservedBranch) return;
+    const from = this.#lastObservedBranch;
+    this.#lastObservedBranch = branch;
+    await this.#appendEvent({ type: "worker_branch_changed", taskId: this.#task.taskId, workerId: this.#handle?.id, data: { from, to: branch } }).catch(() => {});
+  }
+
+  /**
    * Park a task without making a human callback part of the control loop.
    * The Worker is stopped and its evidence is retained. A caller may later
    * recover the Decision Worker session or inspect the local candidate.
@@ -831,6 +859,7 @@ export class Supervisor {
       status: cleanupError ? "failed" : "blocked",
       deliverable: false,
       usage: this.usage,
+      ...(this.#lastObservedBranch ? { branch: this.#lastObservedBranch, protectedBranch: isProtectedBranch(this.#lastObservedBranch) } : {}),
     };
     await this.#appendEvent({
       type: "candidate_parked",
@@ -1177,6 +1206,18 @@ export class Supervisor {
         await this.#parkCandidate(`local repository evidence could not be collected: ${safeMessage(error)}`);
         return result;
       }
+      await this.#trackBranchChange(repositoryEvidence.branch);
+      // The candidate is anchored to the baseline commit, not to a branch
+      // name: it may live on any branch, including a protected one. The
+      // baseline itself must remain an ancestor of HEAD, or history was
+      // rewritten out from under the recorded commit and the candidate
+      // cannot be trusted.
+      if (this.#automation && this.#task.baseCommit
+        && !(await repositoryIsAncestor(this.#task.cwd, this.#task.baseCommit, "HEAD", verificationAbortController.signal))) {
+        this.#lastVerification = result;
+        await this.#parkCandidate(`the candidate no longer descends from the recorded baseline commit ${this.#task.baseCommit.slice(0, 12)}; refusing to accept rewritten history`);
+        return result;
+      }
       // Evidence collection stamps a truncated field as incomplete too (its
       // content was cut, not merely absent), so truncation must be checked
       // before the generic incompleteness park below or it would never get a
@@ -1199,9 +1240,9 @@ export class Supervisor {
         await this.#parkCandidate("repository evidence is incomplete or truncated; candidate cannot be published");
         return result;
       }
-      if (this.#automation && this.#task.baseCommit && (!repositoryEvidence.branch || isProtectedBranch(repositoryEvidence.branch))) {
+      if (this.#automation && this.#task.baseCommit && !repositoryEvidence.branch) {
         this.#lastVerification = result;
-        await this.#parkCandidate(`local candidate branch is unavailable or protected: ${repositoryEvidence.branch ?? "(detached)"}`);
+        await this.#parkCandidate("local candidate branch is unavailable (detached HEAD)");
         return result;
       }
       if (this.#task.spec.autonomy.requireLocalCommit) {
@@ -1294,8 +1335,8 @@ export class Supervisor {
       await this.#appendEvent({ type: "candidate_blocked", taskId: task.taskId, workerId: this.#handle?.id, data: { reason: "repository evidence is incomplete while checking the required local commit" } });
       return "blocked";
     }
-    if (!evidence.branch || isProtectedBranch(evidence.branch)) {
-      await this.#appendEvent({ type: "candidate_blocked", taskId: task.taskId, workerId: this.#handle?.id, data: { reason: `local candidate branch is unavailable or protected: ${evidence.branch ?? "(detached)"}` } });
+    if (!evidence.branch) {
+      await this.#appendEvent({ type: "candidate_blocked", taskId: task.taskId, workerId: this.#handle?.id, data: { reason: "local candidate branch is unavailable (detached HEAD)" } });
       return "blocked";
     }
     const status = evidence.status.trim();
@@ -1383,7 +1424,7 @@ export class Supervisor {
     if (this.#machine.state === "verifying") this.#machine.transition(terminalState);
     const candidateReason = outcomeReason ?? (result.ok ? "candidate is ready after independent acceptance" : "candidate did not satisfy acceptance/review");
     this.#reportProgress(stopRequested ? "stopping" : verificationSucceeded ? "completed" : terminalState === "blocked" ? "candidate" : "failed", stopRequested ? "verification stopped by operator" : verificationSucceeded ? "verification and independent review passed" : candidateReason, true);
-    const eventData = { ...result, ...(stopRequested ? { cancelled: true, stopReason: this.#stopRequested } : {}), ...(terminalState === "blocked" ? { candidateReason } : {}), ...(cleanupError ? { cleanupError: safeMessage(cleanupError) } : {}) };
+    const eventData = { ...result, ...(stopRequested ? { cancelled: true, stopReason: this.#stopRequested } : {}), ...(terminalState === "blocked" ? { candidateReason } : {}), ...(cleanupError ? { cleanupError: safeMessage(cleanupError) } : {}), ...(this.#lastObservedBranch ? { branch: this.#lastObservedBranch, protectedBranch: isProtectedBranch(this.#lastObservedBranch) } : {}) };
     let eventError: unknown;
     try {
       await this.#appendEvent({ type: verificationSucceeded ? "verification_passed" : terminalState === "blocked" ? "candidate_parked" : "verification_failed", taskId: this.#task?.taskId, workerId: this.#handle?.id, data: eventData });
@@ -1421,6 +1462,7 @@ export class Supervisor {
         status: verificationSucceeded ? "ready" : "blocked",
         deliverable: verificationSucceeded,
         usage: this.usage,
+        ...(this.#lastObservedBranch ? { branch: this.#lastObservedBranch, protectedBranch: isProtectedBranch(this.#lastObservedBranch) } : {}),
       };
       this.#terminalNoticeSent = true;
       void Promise.resolve(this.#onCandidate?.(notice)).catch(() => {});
@@ -1687,7 +1729,6 @@ export class Supervisor {
 async function automaticRepositoryBoundary(
   cwd: string,
   expectedBaseCommit: string | undefined,
-  expectedBranch: string | undefined,
   signal?: AbortSignal,
   expectedHead?: string,
 ): Promise<{ baseCommit: string; branch: string; head: string }> {
@@ -1715,9 +1756,12 @@ async function automaticRepositoryBoundary(
   if (signal?.aborted) throw new Error("automatic repository boundary check aborted");
   if (workTree !== true) throw new Error("automatic supervision requires a verified non-bare git worktree");
   if (!branch) throw new Error("automatic supervision cannot start from a detached, unreadable, or missing git branch");
-  if (isProtectedBranch(branch)) throw new Error("automatic local candidates cannot start on a protected integration branch");
-  if (expectedBranch && branch !== expectedBranch) {
-    throw new Error(`automatic recovery branch changed from ${expectedBranch} to ${branch}`);
+  // The task is anchored to the baseline commit, not to a branch name: any
+  // branch, including a protected one, may host a supervised task or a
+  // candidate. Only the baseline itself must still be reachable, so history
+  // was not rewritten out from under the recorded commit.
+  if (!await repositoryIsAncestor(cwd, baseCommit, head, signal)) {
+    throw new Error(`automatic supervision baseline ${baseCommit.slice(0, 12)} is not an ancestor of the current repository HEAD; refusing to continue from rewritten history`);
   }
   const finalHead = await repositoryHead(cwd, signal);
   if (signal?.aborted) throw new Error("automatic repository boundary check aborted");

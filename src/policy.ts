@@ -112,7 +112,10 @@ interface ShellToken {
 }
 
 const protectedBranches = new Set(["main", "master", "trunk", "integration", "develop"]);
-const protectedBranchOperations = new Set(["checkout", "switch", "branch", "reset", "restore", "worktree", "update-ref", "symbolic-ref"]);
+/** Rewriting a protected ref's identity directly; `checkout`/`switch`/`restore`/`worktree` are read-only uses of a branch name and are not included. */
+const protectedBranchRewriteOperations = new Set(["reset", "update-ref", "symbolic-ref"]);
+/** `branch` only rewrites or deletes a protected branch when combined with one of these flags. */
+const protectedBranchDeleteOrMoveFlags = new Set(["-d", "-m", "-f", "--force", "--delete", "--move"]);
 const remoteOperations = new Set(["push", "merge", "send-pack", "receive-pack", "update-ref"]);
 
 function containsRemoteCliMutation(command: string): boolean {
@@ -154,7 +157,12 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   const hasDynamicArgument = tokens.some((token) => !token.operator && token.dynamic);
   const hasProtectedBranch = lower.some((value) => protectedBranches.has(value))
     || /(?:^|\s)(?:[^\s]*\.git[\\/]refs[\\/]heads[\\/]|[^\s]*refs[\\/]heads[\\/])(?:main|master|trunk|integration|develop)(?:$|\s)/iu.test(canonical);
-  const gitOperation = lower.find((value) => protectedBranchOperations.has(value));
+  const hasRewriteOperation = lower.some((value) => protectedBranchRewriteOperations.has(value));
+  const hasBranchDeleteOrMove = lower.includes("branch") && lower.some((value) => protectedBranchDeleteOrMoveFlags.has(value));
+  // `checkout -B main` / `switch -C main` reset the protected ref like `branch -f main`.
+  const rawValues = tokens.filter((token) => !token.operator).map((token) => token.value);
+  const hasForcedBranchCreate = (lower.includes("checkout") && rawValues.includes("-B"))
+    || (lower.includes("switch") && (rawValues.includes("-C") || rawValues.includes("--force-create")));
 
   if (hasDynamicArgument) {
     return { decision: "deny", reason: "dynamic shell arguments cannot be capability-checked safely" };
@@ -170,8 +178,8 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   if (hasGitAliasConfiguration) {
     return { decision: "deny", reason: "Worker cannot redefine Git command aliases" };
   }
-  if (hasGit && gitOperation && hasProtectedBranch) {
-    return { decision: "deny", reason: "Worker cannot switch to or mutate a protected integration branch" };
+  if (hasGit && (hasRewriteOperation || hasBranchDeleteOrMove || hasForcedBranchCreate) && hasProtectedBranch) {
+    return { decision: "deny", reason: "Worker cannot rewrite or delete a protected integration branch" };
   }
   const directRefWrite = tokens.some((token) => token.operator && (token.value === ">" || token.value === ">>"))
     || ["cp", "echo", "install", "mv", "printf", "sed", "tee"].includes(lower[0] ?? "");
@@ -232,8 +240,9 @@ function evaluateTokens(tokens: readonly ShellToken[], depth: number): PolicyRes
     if (/\b(?:curl|wget)\b[\s\S]*(?:github|gitlab|bitbucket|registry\.npmjs)\b/iu.test(canonical)) {
       return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
     }
-    if (/\bgit\b[\s\S]*\b(?:checkout|switch|branch|reset|restore|worktree|update-ref|symbolic-ref)\b[\s\S]*\b(?:main|master|trunk|integration|develop)\b/iu.test(canonical)) {
-      return { decision: "deny", reason: "Worker cannot switch to or mutate a protected integration branch" };
+    if (/\bgit\b[\s\S]*\b(?:reset|update-ref|symbolic-ref)\b[\s\S]*\b(?:main|master|trunk|integration|develop)\b/iu.test(canonical)
+      || /\bgit\b[\s\S]*\bbranch\b[\s\S]*(?:^|\s)(?:-d|-m|-f|--force|--delete|--move)\b[\s\S]*\b(?:main|master|trunk|integration|develop)\b/iu.test(canonical)) {
+      return { decision: "deny", reason: "Worker cannot rewrite or delete a protected integration branch" };
     }
     if (/\b(?:npm|pnpm|yarn)\b[\s\S]*\bpublish\b/iu.test(canonical)) {
       return { decision: "deny", reason: "package publication belongs to the protected release workflow" };
