@@ -31,6 +31,9 @@ function getRuntime(agentDir: string): Promise<ModelRuntime> {
   if (!cached) {
     cached = ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json") });
     runtimeCache.set(agentDir, cached);
+    // A transient read failure must not pin every later start/recover to the
+    // same rejection; only a successful runtime is worth keeping.
+    cached.catch(() => { if (runtimeCache.get(agentDir) === cached) runtimeCache.delete(agentDir); });
   }
   return cached;
 }

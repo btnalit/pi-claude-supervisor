@@ -1,5 +1,5 @@
 import { lstatSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 export type PolicyDecision = "allow" | "review" | "deny";
 
@@ -309,28 +309,47 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
 
 const SEGMENT_SPLIT_OPERATORS = new Set(["|", "&&", "||", ";", "&"]);
 
+/**
+ * Utilities whose effects are fully visible in their static argv. Anything that
+ * can run another program from an option (`xargs`, `sort --compress-program`,
+ * `env`, `find -exec`, `file -C`) is either absent or has that option rejected.
+ */
 const ROUTINE_SHELL_COMMANDS = new Set([
-  "ls", "cat", "head", "tail", "grep", "rg", "egrep", "fgrep", "sed", "awk", "cut", "sort", "uniq", "wc", "tr",
-  "find", "xargs", "echo", "printf", "pwd", "which", "env", "true", "false", "test", "[", "diff", "stat", "file",
+  "ls", "cat", "head", "tail", "grep", "rg", "egrep", "fgrep", "sed", "awk", "cut", "uniq", "wc", "tr",
+  "find", "echo", "printf", "pwd", "which", "true", "false", "test", "[", "diff", "stat",
   "basename", "dirname", "realpath", "readlink", "date", "sleep", "timeout", "node", "npm", "tsc", "git",
 ]);
 
+/** Read-only or local-commit git subcommands whose remaining arguments cannot discard or relocate work. */
 const ROUTINE_GIT_SUBCOMMANDS = new Set([
-  "status", "diff", "log", "show", "rev-parse", "rev-list", "branch", "add", "commit", "stash", "restore",
-  "switch", "checkout", "ls-files", "blame", "describe", "cat-file", "merge-base", "tag",
+  "status", "diff", "log", "show", "rev-parse", "rev-list", "ls-files", "blame", "describe", "cat-file", "merge-base",
+  "add", "commit", "branch", "tag", "stash",
 ]);
-
+const ROUTINE_GIT_BRANCH_FLAGS = new Set(["-a", "-r", "-v", "-vv", "--list", "--show-current", "--contains", "--merged", "--no-merged", "--no-color"]);
+const ROUTINE_GIT_TAG_FLAGS = new Set(["-l", "--list", "-n", "--contains", "--merged", "--no-merged"]);
+const ROUTINE_GIT_STASH_SUBCOMMANDS = new Set(["list", "show", "push"]);
+const ROUTINE_GIT_GLOBAL_FLAGS = new Set(["--no-pager", "-P", "--no-optional-locks"]);
+/** `npm run <script>` executes repository-defined scripts; that is accepted by design because the scripts are reviewed repository content, like `node ./script.js`. */
 const ROUTINE_NPM_SUBCOMMANDS = new Set(["test", "run", "ls"]);
-const WRAPPER_COMMANDS = new Set(["xargs", "timeout", "env"]);
-const NODE_INLINE_FLAGS = new Set(["-e", "--eval", "-p", "--print"]);
-const NODE_INLINE_RISK = /\bhttps?\b|\bnet\b|\bchild_process\b|fetch\(/iu;
+const ROUTINE_NODE_FLAG = /^(?:--test(?:-(?:only|name-pattern|skip-pattern|concurrency|timeout|force-exit|coverage|isolation)(?:=.*)?)?|--check|-c|--version|-v|--enable-source-maps|--no-warnings|--experimental-strip-types)$/u;
+/** `timeout` is the only transparent wrapper: it runs exactly the static argv that follows its duration. */
+const WRAPPER_COMMANDS = new Set(["timeout"]);
+const GIT_DRIVER_FLAGS = /^--(?:ext-diff|textconv|no-textconv|exec-path)/u;
+const NODE_BUILTIN_REPORTERS = new Set(["spec", "tap", "dot", "junit", "lcov"]);
+const NPM_RELOCATING_FLAGS = /^(?:--prefix|-C|--userconfig|--globalconfig|--location|-g|--global|--registry|--cache|--script-shell|--ignore-scripts)(?:=|$)/u;
+const FIND_WRITE_ACTIONS = new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"]);
 
 /**
  * A conservative, deterministic classifier for the narrow set of permission
  * requests routine enough for the Supervisor to answer from policy alone,
  * without a Decision Worker model call. It never overturns a policy denial;
  * it only recognizes local read-only and local-dev shapes it can fully
- * account for, and treats anything unrecognized as not routine.
+ * account for, and treats anything unrecognized as not routine. Executing
+ * repository code (`node ./x.js`, `npm test`, `npm run <script>`) is routine by
+ * design: that code is reviewed repository content and can equally be run
+ * through the allowed file tools. Inline scripts, network clients, privilege
+ * escalation, destructive git operations and any write outside the task cwd
+ * are never routine; the Decision Worker judges those.
  */
 export function isRoutinePermission(toolName: string, input: unknown, cwd: string): boolean {
   const policyResult = evaluatePermission(toolName, input, cwd);
@@ -355,8 +374,13 @@ function isRoutineShellCommand(command: string, cwd: string): boolean {
   const lexical = lexShell(command.trim());
   if (lexical.error) return false;
   if (lexical.tokens.some((token) => !token.operator && token.dynamic)) return false;
+  // Process substitution (<(cmd), >(cmd)) and subshells hide a whole command
+  // behind a word the segment scan would otherwise treat as an argument.
+  if (hasUnquotedParenthesis(command)) return false;
+  const tokens = withoutFdDuplication(lexical.tokens);
+  if (!tokens) return false;
   const segments: ShellToken[][] = [[]];
-  for (const token of lexical.tokens) {
+  for (const token of tokens) {
     if (token.operator && SEGMENT_SPLIT_OPERATORS.has(token.value)) {
       segments.push([]);
       continue;
@@ -364,74 +388,219 @@ function isRoutineShellCommand(command: string, cwd: string): boolean {
     segments.at(-1)!.push(token);
   }
   if (segments.some((segment) => segment.length === 0)) return false;
-  return segments.every((segment) => isRoutineSegment(segment, cwd, command, 0));
+  return segments.every((segment) => isRoutineSegment(segment, cwd, 0));
 }
 
-function isRoutineSegment(segment: readonly ShellToken[], cwd: string, rawCommand: string, depth: number): boolean {
+/** True when `(` or `)` appears outside single/double quotes and not backslash-escaped. */
+function hasUnquotedParenthesis(command: string): boolean {
+  let quote: "single" | "double" | undefined;
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index]!;
+    if (quote === "single") { if (character === "'") quote = undefined; continue; }
+    if (quote === "double") {
+      if (character === "\\") { index += 1; continue; }
+      if (character === '"') quote = undefined;
+      continue;
+    }
+    if (character === "\\") { index += 1; continue; }
+    if (character === "'") { quote = "single"; continue; }
+    if (character === '"') { quote = "double"; continue; }
+    if (character === "(" || character === ")") return true;
+  }
+  return false;
+}
+
+/**
+ * Remove `N>&M`, `>&N`, `N>&-` and `<&N` descriptor duplications, which only
+ * re-route existing streams and never name a file. The lexer emits them as
+ * `[N] > & M`; any other `&` adjacent to a redirection (e.g. `&> file`) is
+ * left in place and fails the ordinary target check.
+ */
+function withoutFdDuplication(tokens: readonly ShellToken[]): ShellToken[] | undefined {
+  const result: ShellToken[] = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    const redirect = token.operator && (token.value === ">" || token.value === ">>" || token.value === "<") ? token : undefined;
+    const ampersand = tokens[index + 1];
+    const target = tokens[index + 2];
+    if (redirect && ampersand?.operator && ampersand.value === "&" && target && !target.operator && /^(?:\d+|-)$/u.test(target.value)) {
+      // An optional leading descriptor number belongs to this redirection.
+      const previous = result.at(-1);
+      if (previous && !previous.operator && /^\d+$/u.test(previous.value) && result.length > 0) result.pop();
+      index += 2;
+      continue;
+    }
+    result.push(token);
+  }
+  return result;
+}
+
+function isRoutineSegment(segment: readonly ShellToken[], cwd: string, depth: number): boolean {
   if (depth > 5) return false;
   if (hasUnsafeRedirection(segment, cwd)) return false;
   const words = segment.filter((token) => !token.operator).map((token) => token.value);
   if (words.length === 0) return false;
-  return isRoutineWords(words, cwd, rawCommand, depth);
+  return isRoutineWords(words, cwd, depth);
 }
 
-function isRoutineWords(words: readonly string[], cwd: string, rawCommand: string, depth: number): boolean {
+function isRoutineWords(words: readonly string[], cwd: string, depth: number): boolean {
   if (depth > 5) return false;
-  const head = words[0]!.split(/[\\/]/u).at(-1)!.toLowerCase();
+  const first = words[0]!;
+  // A program named by path (./ls, /tmp/x/ls) is an arbitrary executable, not
+  // the well-known utility; leave it to the Decision Worker.
+  if (/[\\/]/u.test(first)) return false;
+  const head = first.toLowerCase();
   if (WRAPPER_COMMANDS.has(head)) {
     const wrapped = unwrapWrapper(head, words.slice(1));
-    if (wrapped.length === 0) return false;
-    return isRoutineWords(wrapped, cwd, rawCommand, depth + 1);
+    if (!wrapped || wrapped.length === 0) return false;
+    return isRoutineWords(wrapped, cwd, depth + 1);
   }
   if (!ROUTINE_SHELL_COMMANDS.has(head)) return false;
-  if (head === "git") return isRoutineGitSubcommand(words.slice(1));
-  if (head === "npm") return isRoutineNpmSubcommand(words.slice(1));
-  if (head === "node") return isRoutineNode(words.slice(1), cwd, rawCommand);
-  return true;
+  const rest = words.slice(1);
+  // Every path-looking argument (absolute, `..`-escaping, `~`, or the value of
+  // a `--flag=path`) must resolve inside the task cwd. This keeps reads of
+  // /etc, ~/.ssh or ~/.aws and every option that names an outside file out of
+  // the routine set, at the cost of an occasional model call for a sed script
+  // that happens to start with `/`.
+  if (rest.some((word) => namesPathOutsideCwd(word, cwd))) return false;
+  switch (head) {
+    case "git": return isRoutineGit(rest, cwd);
+    case "npm": return isRoutineNpm(rest);
+    case "node": return isRoutineNode(rest, cwd);
+    case "tsc": return isRoutineTsc(rest, cwd);
+    case "sed": return isRoutineSed(rest);
+    case "awk": return !rest.some((word) => word.startsWith("-i") || word === "-f" || word.startsWith("--file") || /[>|]|\bsystem\b|\bgetline\b/u.test(word));
+    case "find": return !rest.some((word) => FIND_WRITE_ACTIONS.has(word));
+    case "uniq": return rest.filter((word) => !word.startsWith("-")).length <= 1;
+    case "date": return !rest.some((word) => word === "-s" || word.startsWith("--set"));
+    // --pre runs a preprocessor and -z/--search-zip runs decompressors from PATH.
+    case "rg": return !rest.some((word) => word.startsWith("--pre") || word === "-z" || word === "--search-zip" || /^-[a-zA-Z]*z/u.test(word));
+    default: return true;
+  }
 }
 
-function unwrapWrapper(head: string, rest: readonly string[]): string[] {
+function unwrapWrapper(head: string, rest: readonly string[]): string[] | undefined {
+  if (head !== "timeout") return undefined;
   const words = [...rest];
   let index = 0;
-  if (head === "timeout") {
-    while (index < words.length && words[index]!.startsWith("-")) index += 1;
-    if (index < words.length) index += 1; // the duration argument
-    return words.slice(index);
+  // Only the plain `timeout [--foreground] DURATION command...` form is transparent;
+  // options with values (-k, -s) shift what the duration is and are not routine.
+  while (index < words.length && words[index]!.startsWith("-")) {
+    if (words[index] !== "--foreground" && words[index] !== "--preserve-status") return undefined;
+    index += 1;
   }
-  if (head === "env") {
-    while (index < words.length && (words[index]!.startsWith("-") || /^[A-Za-z_]\w*=/u.test(words[index]!))) index += 1;
-    return words.slice(index);
-  }
-  // xargs
-  while (index < words.length && words[index]!.startsWith("-")) index += 1;
-  return words.slice(index);
+  if (index >= words.length || !/^\d+(?:\.\d+)?[smhd]?$/u.test(words[index]!)) return undefined;
+  return words.slice(index + 1);
 }
 
-function isRoutineGitSubcommand(rest: readonly string[]): boolean {
+function isRoutineGit(rest: readonly string[], cwd: string): boolean {
   let index = 0;
   while (index < rest.length) {
     const word = rest[index]!;
-    if (word === "-C" || word === "-c") { index += 2; continue; }
-    if (word.startsWith("-")) { index += 1; continue; }
-    return ROUTINE_GIT_SUBCOMMANDS.has(word.toLowerCase());
+    if (word === "-C") {
+      const target = rest[index + 1];
+      if (!target || !isInsideCwdArgument(target, cwd)) return false;
+      index += 2;
+      continue;
+    }
+    if (word.startsWith("-")) {
+      // -c key=value, --git-dir, --work-tree, --exec-path and other global
+      // options relocate or reconfigure git; none are routine.
+      if (!ROUTINE_GIT_GLOBAL_FLAGS.has(word)) return false;
+      index += 1;
+      continue;
+    }
+    const subcommand = word.toLowerCase();
+    if (!ROUTINE_GIT_SUBCOMMANDS.has(subcommand)) return false;
+    const args = rest.slice(index + 1);
+    // --output writes a file for diff/log/show; --ext-diff/--textconv run
+    // configured driver programs. Keep every routine subcommand free of them.
+    if (args.some((arg) => arg.startsWith("--output") || arg === "-o" || GIT_DRIVER_FLAGS.test(arg))) return false;
+    // Rewriting the tip (--amend, --fixup/--squash for a later autosquash) discards
+    // the previous commit's content; a fresh commit is the only routine form.
+    if (subcommand === "commit") return !args.some((arg) => /^--(?:amend|fixup|squash)(?:=|$)/u.test(arg));
+    if (subcommand === "branch") return args.every((arg) => !arg.startsWith("-") || ROUTINE_GIT_BRANCH_FLAGS.has(arg));
+    if (subcommand === "tag") return args.every((arg) => !arg.startsWith("-") || ROUTINE_GIT_TAG_FLAGS.has(arg) || /^-n\d*$/u.test(arg));
+    if (subcommand === "stash") {
+      const action = args.find((arg) => !arg.startsWith("-"));
+      return action === undefined ? args.length === 0 : ROUTINE_GIT_STASH_SUBCOMMANDS.has(action.toLowerCase());
+    }
+    return true;
   }
   return false;
 }
 
-function isRoutineNpmSubcommand(rest: readonly string[]): boolean {
-  const subcommand = rest.find((word) => !word.startsWith("-"));
+const TSC_PATH_FLAGS = /^--?(?:out|outDir|outFile|declarationDir|tsBuildInfoFile|rootDir|project|p|build|b)$/u;
+
+function isRoutineTsc(rest: readonly string[], cwd: string): boolean {
+  // Every flag that names an output or project location must stay inside the
+  // task cwd, whether written as `--outDir dir` or `--outDir=dir`.
+  for (let index = 0; index < rest.length; index += 1) {
+    const word = rest[index]!;
+    const equals = word.indexOf("=");
+    const flag = equals > 0 ? word.slice(0, equals) : word;
+    if (!TSC_PATH_FLAGS.test(flag)) continue;
+    const value = equals > 0 ? word.slice(equals + 1) : rest[index + 1];
+    if (value === undefined || value.startsWith("-")) continue;
+    if (!isInsideCwdArgument(value, cwd)) return false;
+    if (equals < 0) index += 1;
+  }
+  return true;
+}
+
+function isRoutineNpm(rest: readonly string[]): boolean {
+  const separator = rest.indexOf("--");
+  const npmArguments = separator >= 0 ? rest.slice(0, separator) : rest;
+  // --prefix/-C/-g/--userconfig... make npm run scripts or read configuration
+  // from somewhere other than the task cwd.
+  if (npmArguments.some((word) => NPM_RELOCATING_FLAGS.test(word))) return false;
+  const subcommand = npmArguments.find((word) => !word.startsWith("-"));
   return subcommand !== undefined && ROUTINE_NPM_SUBCOMMANDS.has(subcommand.toLowerCase());
 }
 
-function isRoutineNode(rest: readonly string[], cwd: string, rawCommand: string): boolean {
-  // An inline-eval flag can appear after other flags or a preloaded module
-  // (`node -r ./x.js -e '...'`); check for it across the whole argument list
-  // before treating an earlier non-flag word as an ordinary script path.
-  if (rest.some((word) => NODE_INLINE_FLAGS.has(word))) return !NODE_INLINE_RISK.test(rawCommand);
+function isRoutineNode(rest: readonly string[], cwd: string): boolean {
+  // Inline evaluation (-e/-p/--eval=/--print=/--input-type) and module
+  // preloading (-r/--require/--import) run ad-hoc code; only a script inside
+  // the task cwd, with a small set of harmless flags, is routine.
+  let sawScript = false;
   for (const word of rest) {
-    if (!word.startsWith("-")) return !isAbsolute(word) || isInsideCwd(word, cwd);
+    if (sawScript) continue; // arguments to the script itself
+    if (word.startsWith("-")) {
+      if (word === "--") continue;
+      // A custom reporter is a module loaded by path; only the built-in names are routine.
+      if (word.startsWith("--test-reporter=")) { if (!NODE_BUILTIN_REPORTERS.has(word.slice("--test-reporter=".length))) return false; continue; }
+      if (!ROUTINE_NODE_FLAG.test(word)) return false;
+      continue;
+    }
+    if (!isInsideCwdArgument(word, cwd)) return false;
+    sawScript = true;
   }
-  return false;
+  return sawScript || rest.some((word) => /^--test/u.test(word));
+}
+
+function isRoutineSed(rest: readonly string[]): boolean {
+  let expectExpression = false;
+  for (const word of rest) {
+    if (expectExpression) {
+      if (sedScriptWritesFiles(word)) return false;
+      expectExpression = false;
+      continue;
+    }
+    if (word === "-e" || word === "--expression") { expectExpression = true; continue; }
+    if (word.startsWith("-")) {
+      if (!/^-(?:n|E|r|s|z|u|-quiet|-silent|-regexp-extended|-separate|-null-data)$/u.test(word)) return false;
+      continue;
+    }
+    // The first positional word is the script when no -e was given; a script
+    // is never an existing path we can distinguish here, so check it as well.
+    if (sedScriptWritesFiles(word)) return false;
+  }
+  return true;
+}
+
+/** sed's `w`/`W` commands and the `s///w file` flag write files; `r`/`R` read arbitrary files and `e` executes. Refuse any script containing them. */
+function sedScriptWritesFiles(script: string): boolean {
+  return /(?:^|[;{}\s])[wWrRe]\s*[^\s]|\/[gIp\d]*[we]/u.test(script);
 }
 
 function hasUnsafeRedirection(segment: readonly ShellToken[], cwd: string): boolean {
@@ -447,10 +616,49 @@ function hasUnsafeRedirection(segment: readonly ShellToken[], cwd: string): bool
 }
 
 function isUnsafeRedirectTarget(target: string, cwd: string): boolean {
-  if (target.startsWith("/dev/")) return true;
-  if (target.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return true;
-  if (!isAbsolute(target)) return false;
-  return !isInsideCwd(target, cwd);
+  if (target === "/dev/null") return false; // the one device sink that discards rather than writes
+  if (target.startsWith("/dev/") || target.startsWith("~") || target.startsWith("&")) return true;
+  // The same check the Write/Edit tools get: inside the cwd after resolving
+  // `..`, not Git metadata, and not through a symlink or hard link out of it.
+  return classifyWritePath(target, cwd) !== undefined;
+}
+
+/** True for an argument that names a filesystem location outside the task cwd (or ~), including `--flag=path` values. */
+function namesPathOutsideCwd(word: string, cwd: string): boolean {
+  const value = word.startsWith("--") && word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
+  if (value === "/dev/null") return false;
+  if (value.startsWith("~")) return true;
+  const pathLike = value.startsWith("/") || /(?:^|[\\/])\.\.(?:[\\/]|$)/u.test(value);
+  if (pathLike && !isInsideCwd(value, cwd)) return true;
+  // An argument that exists on disk may be (or pass through) a symlink that
+  // leaves the cwd; compare real paths. A non-existent argument is a pattern or
+  // a literal and needs no check.
+  if (value.startsWith("-") || value === "") return false;
+  let root: string;
+  try { root = realpathSync(cwd); }
+  catch { return true; }
+  // Resolve the nearest existing ancestor so a symlinked directory component
+  // (`link/new-file`) is caught even when the leaf does not exist yet.
+  let candidate = resolve(cwd, value);
+  while (true) {
+    try {
+      const real = realpathSync(candidate);
+      const rel = relative(root, real);
+      return rel !== "" && (rel.startsWith("..") || isAbsolute(rel));
+    } catch {
+      const parent = dirname(candidate);
+      if (parent === candidate) return false;
+      const relParent = relative(cwd, parent);
+      if (relParent === "" ) return false; // reached the cwd itself: nothing left to resolve
+      candidate = parent;
+    }
+  }
+}
+
+function isInsideCwdArgument(pathValue: string, cwd: string): boolean {
+  if (pathValue.startsWith("~")) return false;
+  const value = pathValue.includes("=") && pathValue.startsWith("--") ? pathValue.slice(pathValue.indexOf("=") + 1) : pathValue;
+  return isInsideCwd(value, cwd);
 }
 
 function isInsideCwd(pathValue: string, cwd: string): boolean {

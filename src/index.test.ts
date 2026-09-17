@@ -517,6 +517,77 @@ test("index does not leak a cwd reservation when the Decision Worker model spec 
   }
 });
 
+test("index recover does not leak a cwd reservation when the Decision Worker model spec is invalid", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-badmodel-recover-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-badmodel-recover-state-"));
+  const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-badmodel-recover-leases-"));
+  const taskId = "33333333-3333-4333-8333-333333333333";
+  const decisionStore = new DecisionSessionStore(join(stateDir, "decision-sessions"));
+  const decisionSessionDirectory = decisionStore.sessionDirectory(taskId);
+  await mkdir(decisionSessionDirectory, { recursive: true });
+  const decisionSessionFile = join(decisionSessionDirectory, "session.jsonl");
+  await writeFile(decisionSessionFile, `${JSON.stringify({ type: "session", version: 3, id: randomUUID(), timestamp: new Date().toISOString(), cwd })}\n`);
+  await decisionStore.save({
+    taskId,
+    task: "recover with a bad decision model spec",
+    spec: { goal: "recover with a bad decision model spec", scope: [], constraints: [], forbidden: [], acceptance: [], maxRepairRounds: 0, autonomy: { unattended: false, requireLocalCommit: false, maxDecisionRetries: 0, permissionAuthority: "hybrid" } },
+    cwd,
+    command: process.execPath,
+    args: ["-e", "setInterval(() => {}, 10000)"],
+    decisionSessionFile,
+    maxTurns: 2,
+    deadlineMs: 60_000,
+    noOutputTimeoutMs: 60_000,
+    startedAt: new Date().toISOString(),
+    turn: 0,
+    state: "active",
+  });
+  const keys = ["PI_CLAUDE_SUPERVISOR_WORKER", "PI_CLAUDE_SUPERVISOR_STATE_DIR", "PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR", "PI_CLAUDE_SUPERVISOR_TRANSPORT", "PI_CLAUDE_SUPERVISOR_CGROUP_MODE", "PI_CLAUDE_SUPERVISOR_MODE", "PI_CLAUDE_SUPERVISOR_AUTOMATION", "PI_CLAUDE_SUPERVISOR_DECISION_MODEL"] as const;
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]])) as Record<typeof keys[number], string | undefined>;
+  process.env.PI_CLAUDE_SUPERVISOR_WORKER = `${process.execPath} -e "setInterval(() => {}, 10000)"`;
+  process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
+  process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
+  process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "process-pipe";
+  process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "off";
+  process.env.PI_CLAUDE_SUPERVISOR_MODE = "manual";
+  process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "0";
+  process.env.PI_CLAUDE_SUPERVISOR_DECISION_MODEL = "not-a-valid-spec";
+  const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
+  const messages: string[] = [];
+  const context: TestContext = { cwd, hasUI: true, ui: { confirm: async () => false, notify: (message) => messages.push(message) } };
+  let shutdownHandler: (() => Promise<void>) | undefined;
+  try {
+    const fakePi = {
+      registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) { registrations.commands.push({ name, definition }); },
+      on(name: string, handler: () => Promise<void>) { registrations.events.push({ name, handler }); },
+    };
+    extension(fakePi as never);
+    const command = registrations.commands.find(({ name }) => name === "supervise")?.definition;
+    shutdownHandler = registrations.events.find(({ name }) => name === "session_shutdown")?.handler;
+    assert.ok(command);
+    await command.handler(`recover ${taskId}`, context);
+    assert.match(messages.at(-1) ?? "", /provider\/model-id/u);
+    // Nothing was reserved: no lease file, and the record is still recoverable (not claimed).
+    assert.deepEqual(await new CwdLeaseStore(leaseDir).list(), []);
+    const record = await decisionStore.load(taskId);
+    assert.equal(record?.state, "active");
+    assert.equal(record?.recoveryState, "ready");
+    // A second attempt in the same cwd fails for the same reason, never for an overlapping cwd.
+    await command.handler(`recover ${taskId}`, context);
+    assert.match(messages.at(-1) ?? "", /provider\/model-id/u);
+    assert.doesNotMatch(messages.at(-1) ?? "", /overlapping cwd/u);
+  } finally {
+    if (shutdownHandler) await shutdownHandler().catch(() => {});
+    for (const key of keys) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+    await rm(cwd, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(leaseDir, { recursive: true, force: true });
+  }
+});
+
 async function canUseRequiredCgroup(): Promise<boolean> {
   try {
     await preflightCgroupContainment();

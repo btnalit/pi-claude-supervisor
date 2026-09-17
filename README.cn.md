@@ -216,9 +216,12 @@ Pull Request 必须通过聚合的 `CI / Quality gate`。Release Please 根据 C
 花费几乎全部来自 Worker，而不是 Supervisor 自身的 Decision Worker 或 Reviewer 调用。这次运行中
 Worker 每轮平均消耗约 22 万 token 的上下文，原因是它以单个长期 `-p` session 运行在 1M token 窗口下，
 从未触发过 compact；一次普通的 Claude Code 轮次仅系统提示词就要消耗约 2.4 万 prompt token，
-与配置了哪些 MCP server 无关。30 次 Decision Worker 调用中有 28 次是权限请求，其中 24 次本可由
-确定性 policy 直接回答而无需模型调用；Decision Worker 推翻 policy 的情形只有 4 次（拒绝下载和
-任务目录之外的写入）——这正是默认 `permissionAuthority` 选择 `hybrid` 而不是 `policy` 的原因。
+与配置了哪些 MCP server 无关。30 次 Decision Worker 调用中有 28 次是权限请求；Decision Worker
+推翻确定性 policy 的情形有 4 次（拒绝下载和任务目录之外的写入）——这正是默认 `permissionAuthority`
+选择 `hybrid` 而不是 `policy` 的原因。把这 28 次请求回放到实际发布的 `isRoutinePermission`
+分类器，有 4 次可在本地直接回答；那次任务以内联 `node -e` 脚本和 `$(...)` 替换为主，这两类
+永远不算例行操作。普通实现类任务主要是 cwd 内的 `Edit`/`Write`、`npm test` 和
+`git status/diff/add/commit`，这些都是例行操作，Decision Worker 调用次数会下降得多得多。
 
 各项开关及其默认值和取舍：
 

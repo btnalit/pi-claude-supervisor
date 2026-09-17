@@ -1441,6 +1441,49 @@ test("noop on a clean exit proceeds to verification instead of stranding the tas
   }
 });
 
+test("a recovered task continues its cost budget from the persisted total", async () => {
+  const handle: WorkerHandle = { id: "recovered-cost-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  let running = true;
+  let eventListener: WorkerStartInput["eventListener"] | undefined;
+  const progress: number[] = [];
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async (input) => { eventListener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running, activeRequests: 1, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "recovered cost",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    initialWorkerCostUsd: 0.5,
+    spec: { ...automaticSpec(), autonomy: { ...automaticSpec().autonomy, maxWorkerCostUsd: 0.7 } },
+    onDecisionSessionProgress: (info) => { progress.push(info.workerCostUsd); },
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+  });
+  assert.equal(supervisor.usage.workerCostUsd, 0.5);
+  eventListener?.({ type: "turn_completed", handle, sequence: 1, result: { total_cost_usd: 0.1, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, num_turns: 1 } });
+  await supervisor.poll();
+  assert.equal(Number(supervisor.usage.workerCostUsd.toFixed(4)), 0.6);
+  assert.ok(progress.includes(0.6), "cumulative cost is persisted through the progress hook");
+  assert.notEqual(supervisor.state, "blocked");
+  eventListener?.({ type: "turn_completed", handle, sequence: 2, result: { total_cost_usd: 0.3, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, num_turns: 2 } });
+  await supervisor.poll();
+  assert.equal(Number(supervisor.usage.workerCostUsd.toFixed(4)), 0.8);
+  assert.equal(supervisor.state, "blocked");
+  assert.equal(supervisor.candidateParked, true);
+});
+
 test("stop still transitions when a pending event keeps failing", async () => {
   const handle: WorkerHandle = { id: "pending-flush-worker", startedAt: new Date().toISOString(), cwd: "/tmp" };
   let running = true;
