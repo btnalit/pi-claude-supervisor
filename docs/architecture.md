@@ -202,7 +202,11 @@ updates run through one serial queue, so concurrent `poll`, `send`, `stop`,
 watchdog and shutdown work cannot produce duplicate terminal transitions. If a
 lifecycle event append fails after the state transition, it remains pending and
 is retried before the next lifecycle operation; output events restore their
-chunks for a lossless retry.
+chunks for a lossless retry. Worker lifecycle events (`turn_completed`,
+`permission_request`, `exited`) whose processing fails are kept in a deferred
+set and retried both by the watchdog tick and by `poll`, so an unattended task
+cannot lose its exit or turn result. `worker_output` events are size-capped
+(per-chunk and per-event) while the in-memory Reviewer tail stays complete.
 
 ### Cross-process cwd leases and startup cancellation
 
@@ -233,6 +237,17 @@ re-adoptable. A detached adopted session retains its lease while the verified pa
 is alive; the extension periodically rechecks released sessions and removes the
 lease only after the pane is confirmed gone. If that check fails, the lease is
 retained rather than allowing a cwd overlap.
+
+A lease record that cannot be read (corrupt JSON, unexpected shape) is
+quarantined into `<leaseDir>/quarantine/` instead of blocking every other cwd
+lookup; `/supervise sessions` lists the current quarantined records so an
+operator can inspect and clean them up. A lease whose own directory has since
+disappeared is not treated the same as an unreadable record: it still fails
+closed for its own (possibly reused) path, but a directory that merely
+disappeared does not block lookups for unrelated, non-overlapping cwds.
+Releasing a retained cgroup removes verified-empty nested child cgroups
+bottom-up, since systemd/Claude can create child cgroups under a Worker's own
+cgroup that would otherwise leave the parent non-empty.
 
 Before model or Worker execution, automatic starts validate a full existing Git
 baseline, a non-bare worktree, a readable non-protected branch, the direct bare
@@ -271,8 +286,12 @@ work, and the Supervisor rechecks cancellation before reporting `running`; a can
 Events are JSONL with a monotonic sequence number, timestamp, task ID and worker
 ID. Appends use a per-log atomic lock directory with owner PID, bounded waiting
 and stale-owner detection. Each append refreshes the sequence from disk while
-holding the lock, so independent Pi processes cannot reuse sequence numbers.
-The log is diagnostic evidence, not an authorization mechanism. Log contents
+holding the lock, so independent Pi processes cannot reuse sequence numbers;
+that refresh reads only the file's tail for the last sequence number rather
+than the whole log, keeping appends O(1) in log size. `events.jsonl` rotates to
+a timestamped sibling (`events.jsonl.<stamp>`) before an append that would
+exceed `PI_CLAUDE_SUPERVISOR_EVENT_LOG_MAX_BYTES` (default 64 MiB), keeping the
+5 most recent rotated files. The log is diagnostic evidence, not an authorization mechanism. Log contents
 must be treated as sensitive because worker output may contain repository data.
 
 For Claude JSONL, the adapter tracks `activeRequests`, `lastInputAt` and
@@ -292,13 +311,19 @@ and task mapping are persisted under the supervisor state directory. After an
 unclean Pi restart, recovery is explicit: `/supervise recover [--takeover]
 <task-id>` restores
 the Decision Worker context and starts a new Claude Worker. It does not silently
-resume or duplicate a task. It does not poll to detect turn completion. A watchdog timer remains only as a deadlock safety
-fallback. Permission and other actions pass through the configured autonomy policy and
+resume or duplicate a task. It does not poll to detect turn completion. In automatic
+mode the watchdog is always armed: besides the deadline and no-output timeouts, it
+retries deferred lifecycle events, classifies a Worker that exited without an exit
+event, and starts verification for it. Permission and other actions pass through the configured autonomy policy and
 are recorded. The local development loop must not require synchronous human
 approval for ordinary actions; a task that cannot safely produce a candidate is
-parked or failed without granting remote/main authority. If the Decision Worker
+parked or failed without granting remote/main authority. Model/API failures are
+detected from the Pi `stopReason` (a provider error resolves the prompt normally
+rather than throwing); if the Decision Worker
 API/model call fails, the system records `decision_worker_failed`, applies the
-bounded retry/park policy and preserves the candidate evidence. Optional alert
+bounded retry/park policy and preserves the candidate evidence. An abort is never
+retried, and a `noop` reply on a completed turn or a permission request parks the
+candidate rather than being treated as a resolved decision. Optional alert
 delivery remains independent from event-log persistence, but notification is not
 the control boundary.
 
@@ -319,7 +344,11 @@ conversation or control channel. It can inspect only `read`, `grep`, `find` and 
 `pass`, `revise` or `human` with bounded structured findings. Invalid Reviewer
 output, incomplete evidence or a Reviewer API failure must prevent a candidate
 from crossing the remote/main boundary; the local system may retry, repair or
-park it without requiring a human to be online.
+park it without requiring a human to be online. The Reviewer retries a provider
+error once within a total review budget
+(`PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS`, default 10 minutes). Truncated
+(oversize) evidence requests a bounded repair before parking, while incomplete
+evidence still parks.
 
 A `revise` result produces an audited repair round and sends a bounded corrective
 instruction to a still-live `repairableSession` Worker. Checks and review then run again.
