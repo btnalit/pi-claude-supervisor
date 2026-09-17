@@ -194,6 +194,9 @@ Decision Worker，它只在 Claude 本来要问*你*的地方做判断。硬边�
 与权限模式无关——已在 Claude Code 2.1.273 的 `auto` 模式下实测——这也是该模式在你自己的
 设置之外唯一的保证。需要让每个 `Bash` 调用都经过 Supervisor 时，请使用 headless（`bridge`）模式。
 
+**接管空闲会话。** `adopt-tmux` 只在 Claude 空闲停在提示符时才把任务敲进去；
+接管时正在跑的一轮会保留其当前工作，等它下一次 `Stop` 再判断。
+
 **人机协同。** 如果你在已 attach 的 session 中输入内容，自动化会暂停
 （`human_takeover`，以警告形式呈现），直到你执行 `/supervise resume-auto <task-id>`；
 你接管期间完成的那一轮会在此时重放给 Decision Worker，因此不会丢失已经完成的工作。

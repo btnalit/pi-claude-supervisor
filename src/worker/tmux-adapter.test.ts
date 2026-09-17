@@ -1269,8 +1269,10 @@ test("adopting an interactive tmux session subscribes hooks, completes a Stop tu
   const socketPath = join(stateDir, "tmux.sock");
   const sessionName = `pi-adopt-interactive-${process.pid}-${Date.now()}`;
   const claudeScript = join(stateDir, "claude");
+  // Mirror the real TUI: a prompt glyph with the input separator beneath it
+  // is what the readiness check treats as an idle prompt.
   await writeFile(claudeScript, `#!/usr/bin/env node
-process.stdout.write("\\u276f \\n");
+process.stdout.write("\\u276f \\n" + "\\u2500".repeat(40) + "\\n");
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => { process.stdout.write(chunk); });
 process.stdin.resume();
@@ -1298,6 +1300,15 @@ setInterval(() => {}, 10000);
     });
     assert.equal(handle.ownership, "adopted");
     assert.match(handle.tmuxPaneId ?? "", /^%[0-9]+$/u);
+    // The adopted session was idle at its prompt, so babysitting starts by
+    // typing the task; the fake worker echoes what it receives.
+    let typed = "";
+    for (let attempt = 0; attempt < 50 && !typed.includes("observe interactive adoption"); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      typed = spawnSync("tmux", ["-S", socketPath, "capture-pane", "-p", "-t", sessionName], { encoding: "utf8" }).stdout ?? "";
+    }
+    assert.match(typed, /observe interactive adoption/u);
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 1);
     // A dispatch that resolves (rather than throwing "no hook subscription
     // for cwd") proves the adapter subscribed the hook source for the pane's cwd.
     // A real hook's ppid is the pane's Claude process; a matching pane id alone
