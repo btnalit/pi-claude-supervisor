@@ -85,16 +85,22 @@ function normalizeRepairRounds(value: unknown): number {
 }
 
 function normalizeAutonomy(value: unknown): TaskSpec["autonomy"] {
-  if (value === undefined) return { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2 };
+  if (value === undefined) return { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid" };
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("task spec autonomy must be an object");
   const source = value as Record<string, unknown>;
   if (source.unattended !== undefined && typeof source.unattended !== "boolean") throw new Error("task spec autonomy.unattended must be boolean");
   if (source.requireLocalCommit !== undefined && typeof source.requireLocalCommit !== "boolean") throw new Error("task spec autonomy.requireLocalCommit must be boolean");
   const retries = source.maxDecisionRetries ?? 2;
   if (typeof retries !== "number" || !Number.isSafeInteger(retries) || retries < 0 || retries > 10) throw new Error("task spec autonomy.maxDecisionRetries must be between 0 and 10");
+  const authority = source.permissionAuthority ?? "hybrid";
+  if (authority !== "policy" && authority !== "hybrid" && authority !== "decision-worker") throw new Error("task spec autonomy.permissionAuthority must be policy, hybrid or decision-worker");
+  const maxWorkerCostUsd = source.maxWorkerCostUsd;
+  if (maxWorkerCostUsd !== undefined && (typeof maxWorkerCostUsd !== "number" || !Number.isFinite(maxWorkerCostUsd) || maxWorkerCostUsd <= 0)) throw new Error("task spec autonomy.maxWorkerCostUsd must be a positive number");
   return {
     unattended: source.unattended !== false,
     requireLocalCommit: source.requireLocalCommit !== false,
     maxDecisionRetries: retries,
+    permissionAuthority: authority,
+    ...(maxWorkerCostUsd !== undefined ? { maxWorkerCostUsd } : {}),
   };
 }

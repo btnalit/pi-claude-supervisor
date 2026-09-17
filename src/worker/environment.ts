@@ -66,7 +66,18 @@ export function automaticWorkerEnvironment(
  * the adapter. The supervisor policy still blocks known remote push/main
  * integration and destructive operations.
  */
-export function automaticClaudeArgs(command: string, args: readonly string[] = []): string[] {
+export interface AutomaticClaudeArgOptions {
+  /** `--model` for the Worker; a user-supplied --model in args wins. */
+  model?: string;
+  /** `--autocompact <tokens>`; 0/undefined keeps Claude's default. */
+  autocompactTokens?: number;
+  /** `--max-budget-usd`; Claude stops the session itself once exceeded. */
+  maxBudgetUsd?: number;
+  /** `--strict-mcp-config --mcp-config <path>`; restricts the Worker to the listed MCP servers. */
+  mcpConfigPath?: string;
+}
+
+export function automaticClaudeArgs(command: string, args: readonly string[] = [], _options: AutomaticClaudeArgOptions = {}): string[] {
   if (!isDirectClaudeName(command)) {
     throw new Error("automatic supervision requires the direct Claude executable command name; custom executable paths need their own host boundary");
   }

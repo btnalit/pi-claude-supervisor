@@ -5,7 +5,7 @@ import { lstat, open, rename, rm, writeFile, type FileHandle } from "node:fs/pro
 import { isDeepStrictEqual } from "node:util";
 import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { extractJsonObjects } from "./json-extract.ts";
-import type { TaskSpec, WorkerEvent } from "./types.ts";
+import type { PiUsageSample, TaskSpec, WorkerEvent } from "./types.ts";
 import { redactSensitive } from "./redaction.ts";
 
 const MAX_DECISION_RESPONSE_BYTES = 32 * 1024;
@@ -55,7 +55,15 @@ export interface DecisionWorkerOptions {
   onSessionReady?: (info: { sessionFile: string; sessionId: string; restored: boolean }) => Promise<void> | void;
   /** Test seam: inject a fake Pi session instead of the real createAgentSession. */
   sessionFactory?: (options: Parameters<typeof createAgentSession>[0]) => Promise<{ session: AgentSession }>;
+  /** Pi model for this session; undefined keeps Pi's configured default. */
+  model?: PiModel;
+  /** Compact the persistent session once its estimated context exceeds this many tokens (0 disables). */
+  compactionTokens?: number;
+  /** Token accounting for every model call made by this session. */
+  onUsage?: (usage: PiUsageSample) => void;
 }
+
+export type PiModel = NonNullable<NonNullable<Parameters<typeof createAgentSession>[0]>["model"]>;
 
 /**
  * A persistent Pi SDK session used only for supervision decisions.

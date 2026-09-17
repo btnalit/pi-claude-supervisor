@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { EventLog, type SupervisorEvent } from "./events.ts";
 import { SupervisorStateMachine } from "./state.ts";
 import { evaluatePermission } from "./policy.ts";
-import { PiDecisionWorker, type DecisionAction, type DecisionWorkerFactory, type DecisionWorkerLike } from "./decision-worker.ts";
+import { PiDecisionWorker, type DecisionAction, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
 import { collectRepositoryEvidence, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryWorkTree, verifyAll, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { redactSensitive } from "./redaction.ts";
@@ -62,6 +62,16 @@ export interface SupervisorProgress {
 export interface DecisionSessionClosedInfo {
   cleanupConfirmed: boolean;
   reason: DecisionSessionCloseReason;
+}
+
+export interface SupervisorTokenUsage {
+  /** Cumulative Claude Worker API cost reported by its result records. */
+  workerCostUsd: number;
+  workerTurns: number;
+  workerTokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  /** Cumulative Pi-side (Decision Worker + Reviewer) tokens. */
+  decision: { calls: number; input: number; output: number; cacheRead: number; cacheWrite: number; costUsd: number };
+  reviewer: { calls: number; input: number; output: number; cacheRead: number; cacheWrite: number; costUsd: number };
 }
 
 export interface SupervisorStartOptions {
@@ -190,7 +200,7 @@ export class Supervisor {
   #releasing = false;
   #terminalNoticeSent = false;
 
-  constructor(adapter: WorkerAdapter, events = new EventLog(), hooks: { onCandidate?: (notice: CandidateNotice) => Promise<void> | void; onHumanRequired?: (notice: HumanInterventionNotice) => Promise<void> | void; reviewer?: TaskReviewer; reviewTimeoutMs?: number } = {}) {
+  constructor(adapter: WorkerAdapter, events = new EventLog(), hooks: { onCandidate?: (notice: CandidateNotice) => Promise<void> | void; onHumanRequired?: (notice: HumanInterventionNotice) => Promise<void> | void; reviewer?: TaskReviewer; reviewTimeoutMs?: number; progressHeartbeatMs?: number; decisionModel?: PiModel; decisionCompactionTokens?: number } = {}) {
     this.#adapter = adapter;
     this.#events = events;
     this.#onCandidate = hooks.onCandidate;

@@ -194,6 +194,30 @@ export interface TaskAutonomy {
   requireLocalCommit: boolean;
   /** Number of autonomous Decision Worker retries before parking a candidate. */
   maxDecisionRetries: number;
+  /**
+   * Who answers Worker permission requests. `policy` never consults the
+   * Decision Worker; `decision-worker` always does; `hybrid` (default) answers
+   * routine in-cwd file edits and read-only/local-dev shell commands from the
+   * deterministic policy and asks the Decision Worker for everything else.
+   */
+  permissionAuthority: PermissionAuthority;
+  /** Park the candidate once the Worker's cumulative API cost exceeds this amount; undefined disables the cap. */
+  maxWorkerCostUsd?: number;
+}
+
+export type PermissionAuthority = "policy" | "hybrid" | "decision-worker";
+
+/** One model call's token accounting for a Pi-side session (Decision Worker or Reviewer). */
+export interface PiUsageSample {
+  role: "decision" | "reviewer";
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalTokens: number;
+  costUsd?: number;
+  /** Estimated context size after the call, when the session reports it. */
+  contextTokens?: number | null;
 }
 
 export interface TaskSpec {
@@ -229,6 +253,8 @@ export interface ReviewReport {
   findings: ReviewFinding[];
   round: number;
   checkedAt: string;
+  /** Aggregate Reviewer session usage for this round, when the Reviewer reports it. */
+  usage?: Omit<PiUsageSample, "role">;
 }
 
 export interface TaskContext {

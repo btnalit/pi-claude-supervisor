@@ -2,6 +2,7 @@ import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { redactSensitive } from "./redaction.ts";
+import type { PermissionAuthority } from "./types.ts";
 
 const allowed = new Set([
   "PI_CLAUDE_SUPERVISOR_MODE",
@@ -21,6 +22,18 @@ const allowed = new Set([
   "PI_CLAUDE_SUPERVISOR_UNATTENDED",
   "PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT",
   "PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES",
+  "PI_CLAUDE_SUPERVISOR_PERMISSION_AUTHORITY",
+  "PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD",
+  "PI_CLAUDE_SUPERVISOR_WORKER_MODEL",
+  "PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS",
+  "PI_CLAUDE_SUPERVISOR_WORKER_MCP_CONFIG",
+  "PI_CLAUDE_SUPERVISOR_DECISION_MODEL",
+  "PI_CLAUDE_SUPERVISOR_REVIEWER_MODEL",
+  "PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS",
+  "PI_CLAUDE_SUPERVISOR_PROGRESS_HEARTBEAT_MS",
+  "PI_CLAUDE_SUPERVISOR_DECISION_SESSION_RETENTION_DAYS",
+  "PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES",
+  "PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES",
   "PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS",
   "PI_CLAUDE_SUPERVISOR_EVENT_LOG_MAX_BYTES",
 ]);
@@ -29,6 +42,8 @@ export interface AutonomyDefaults {
   unattended: boolean;
   requireLocalCommit: boolean;
   maxDecisionRetries: number;
+  permissionAuthority: PermissionAuthority;
+  maxWorkerCostUsd?: number;
 }
 
 export function autonomyDefaults(env: NodeJS.ProcessEnv = process.env): AutonomyDefaults {
@@ -36,6 +51,8 @@ export function autonomyDefaults(env: NodeJS.ProcessEnv = process.env): Autonomy
     unattended: readBoolean(env.PI_CLAUDE_SUPERVISOR_UNATTENDED, true),
     requireLocalCommit: readBoolean(env.PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT, true),
     maxDecisionRetries: readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES, 2, 0, 10),
+    permissionAuthority: readPermissionAuthority(env.PI_CLAUDE_SUPERVISOR_PERMISSION_AUTHORITY),
+    ...(readPositiveNumber(env.PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD) !== undefined ? { maxWorkerCostUsd: readPositiveNumber(env.PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD) } : {}),
   };
 }
 
@@ -78,4 +95,15 @@ function readBoundedInteger(value: string | undefined, fallback: number, minimum
   if (value === undefined) return fallback;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+}
+
+function readPermissionAuthority(value: string | undefined): PermissionAuthority {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === "policy" || normalized === "decision-worker" ? normalized : "hybrid";
+}
+
+function readPositiveNumber(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }

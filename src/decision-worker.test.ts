@@ -159,7 +159,7 @@ test("a provider error retries within maxDecisionRetries and succeeds", async ()
       state: "starting",
       turn: 0,
       maxTurns: 1,
-      spec: { goal: "x", scope: [], constraints: [], forbidden: [], acceptance: [], maxRepairRounds: 0, autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1 } },
+      spec: { goal: "x", scope: [], constraints: [], forbidden: [], acceptance: [], maxRepairRounds: 0, autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, permissionAuthority: "hybrid" } },
     },
   }));
   await worker.start();
@@ -192,7 +192,7 @@ test("exhausting maxDecisionRetries on repeated provider errors calls onFailure,
       state: "starting",
       turn: 0,
       maxTurns: 1,
-      spec: { goal: "x", scope: [], constraints: [], forbidden: [], acceptance: [], maxRepairRounds: 0, autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1 } },
+      spec: { goal: "x", scope: [], constraints: [], forbidden: [], acceptance: [], maxRepairRounds: 0, autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, permissionAuthority: "hybrid" } },
     },
   }));
   await worker.start();

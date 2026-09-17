@@ -2,7 +2,8 @@ import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager 
 import { isDeepStrictEqual } from "node:util";
 import { extractJsonObjects } from "./json-extract.ts";
 import { redactSensitive } from "./redaction.ts";
-import type { AcceptanceReport, ReviewFinding, ReviewReport, TaskSpec } from "./types.ts";
+import type { AcceptanceReport, PiUsageSample, ReviewFinding, ReviewReport, TaskSpec } from "./types.ts";
+import type { PiModel } from "./decision-worker.ts";
 import type { RepositoryEvidence } from "./verifier.ts";
 
 const MAX_REVIEW_RESPONSE_BYTES = 128 * 1024;
@@ -19,6 +20,8 @@ export interface ReviewInput {
   round: number;
   /** Abort a review when the operator stops or shuts down the Supervisor. */
   signal?: AbortSignal;
+  /** Token accounting for every model call made while reviewing. */
+  onUsage?: (usage: PiUsageSample) => void;
 }
 
 export interface TaskReviewer {
@@ -32,6 +35,8 @@ export interface TaskReviewer {
  */
 export interface PiReadOnlyReviewerOptions {
   timeoutMs?: number;
+  /** Pi model for Reviewer sessions; undefined keeps Pi's configured default. */
+  model?: PiModel;
 }
 
 export class PiReadOnlyReviewer implements TaskReviewer {
