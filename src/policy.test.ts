@@ -115,6 +115,55 @@ test("policy denies dynamic arguments only where they could reach the boundary",
   assert.equal(evaluateCommand("rm -rf --no-preserve-root /").decision, "deny");
 });
 
+test("a quoted heredoc body means what its consumer makes of it", () => {
+  // Fed to a shell it is a command and is evaluated as one.
+  assert.equal(evaluateCommand("bash <<'EOF'\ngit push origin main\nEOF").decision, "deny");
+  assert.equal(evaluateCommand("cat <<'EOF' | sh\ngit push origin main\nEOF").decision, "deny");
+  assert.equal(evaluateCommand("cat <<'EOF' | tee x | bash\ngit push origin main\nEOF").decision, "deny");
+  assert.equal(evaluateCommand("eval \"$(cat <<'EOF'\ngit push origin main\nEOF\n)\"").decision, "deny");
+  assert.equal(evaluateCommand("bash -c \"$(cat <<'EOF'\ngit push origin main\nEOF\n)\"").decision, "deny");
+  // Fed to anything else it stays visible to the pattern checks.
+  assert.equal(evaluateCommand("python3 - <<'PY'\nimport subprocess; subprocess.run([\"git\",\"push\",\"origin\",\"main\"])\nPY").decision, "deny");
+  assert.equal(evaluateCommand("node - <<'EOF'\nrequire('child_process').execSync('git push origin main')\nEOF").decision, "deny");
+  assert.equal(evaluateCommand("node - <<'EOF'\nconsole.log(1)\nEOF").decision, "allow");
+  // An unquoted delimiter expands: a substitution in the body runs.
+  assert.equal(evaluateCommand("cat <<EOF\n$(git push origin main)\nEOF").decision, "deny");
+  // Fed to a data sink it is text the boundary never sees.
+  assert.equal(evaluateCommand("cat > notes.md <<'EOF'\nrun git push origin main later\nEOF").decision, "allow");
+  assert.equal(evaluateCommand("cat <<'EOF' | grep push\ngit push origin main\nEOF").decision, "allow");
+  assert.equal(evaluateCommand("git commit -m \"$(cat <<'EOF'\nfix: merge two loops, reset main and push them\nEOF\n)\"").decision, "allow");
+  assert.equal(evaluateCommand("git commit -m \"$(cat <<'EOF'\nmsg\nEOF\n)\" && git push origin main").decision, "deny");
+  // A ref write through a heredoc is still a ref write.
+  assert.equal(evaluateCommand("cat > .git/refs/heads/main <<'EOF'\nabc\nEOF").decision, "deny");
+});
+
+test("newlines separate statements and comments are ignored", () => {
+  assert.equal(evaluateCommand("echo start\n$CMD --flag").decision, "deny");
+  assert.equal(evaluateCommand("cd x\n$CMD").decision, "deny");
+  assert.equal(evaluateCommand("( $CMD )").decision, "deny");
+  assert.equal(evaluateCommand("($CMD)").decision, "deny");
+  assert.equal(evaluateCommand("find . -exec $CMD {} \\;").decision, "deny");
+  assert.equal(evaluateCommand("setsid $CMD").decision, "deny");
+  assert.equal(evaluateCommand("echo hi # don't").decision, "allow");
+  assert.equal(evaluateCommand("npm test &&\n  npm run lint").decision, "allow");
+  assert.equal(evaluateCommand("{ echo \"$x\"; }").decision, "allow");
+  assert.equal(evaluateCommand("( echo hi )").decision, "allow");
+  assert.equal(evaluateCommand("echo '#not a comment' # but this is\nls").decision, "allow");
+});
+
+test("the Bash tool path and direct command evaluation agree", () => {
+  const matrix = [
+    "git push origin main", "git pu{sh,} origin main", "$CMD --flag", "timeout 30 $CMD", "claude --permission-mode \"$MODE\"",
+    "sh -c \"$x\"", "bash -lc 'git push origin main'", "npm publish", "gh pr create --title \"$title\"",
+    "for f in a b; do echo \"$f\"; done", "rm -rf /tmp/*", "rm -rf /", "cat > notes.md <<'EOF'\ngit push origin main\nEOF",
+    "bash <<'EOF'\ngit push origin main\nEOF", "git commit -m \"$(cat <<'EOF'\nfix: merge\nEOF\n)\"", "echo hi # don't",
+    "if [ -d .git ]; then git status; fi", "echo start\n$CMD", "c'l'a'u'de --print review",
+  ];
+  for (const command of matrix) {
+    assert.equal(evaluatePermission("Bash", { command }).decision, evaluateCommand(command).decision, command);
+  }
+});
+
 test("policy allows ordinary read-only commands and literal argv values", () => {
   assert.equal(evaluateCommand("git diff --check").decision, "allow");
   assert.equal(evaluateCommand("node", ["-e", "console.log({ value: 1 })"]).decision, "allow");

@@ -204,11 +204,13 @@ Supervisor being able to see it, or when you don't need to attach.
   `.git` metadata writes, and destructive rewrites of protected branches
   (`reset`, `update-ref`, `symbolic-ref`, or a delete/move/force `branch`).
   A shell argument the policy cannot see through (`$VAR`, `$(…)`, a glob)
-  is denied only on the commands where it could reach that boundary — git,
-  gh, npm/pnpm/yarn, curl/wget/ssh, a nested `claude`, or an interpreter
-  such as `eval`, `sh -c`, `xargs` — and quoted heredoc bodies are data.
-  Everything else (`for f in …; do echo "$f"`, `rm -rf ./dist`, a Write to
-  Claude's own scratchpad) follows the configured policy.
+  is vetoed, best-effort, only on the commands where it could reach that
+  boundary — git, gh, npm/pnpm/yarn, curl/wget/ssh, a nested `claude`, or an
+  interpreter/runner such as `eval`, `sh -c`, `xargs`, `find -exec`. A quoted
+  heredoc body is judged by its consumer: a shell runs it, `cat > file` or
+  `git commit -m` stores it. Everything else (`for f in …; do echo "$f"`,
+  `rm -rf ./dist`, a Write to Claude's own scratchpad) follows the configured
+  policy — Claude's own permission mode governs it, as when you run Claude.
 - `autonomy.permissionAuthority` (`policy` | `hybrid` default |
   `decision-worker`) controls who answers a permission request — every
   request in headless mode, and in interactive tmux mode only those Claude

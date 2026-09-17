@@ -21,8 +21,12 @@ custom/nested descendants are trusted rather than denied by a nested-process gua
 ## Findings addressed in this pass
 
 - Policy now evaluates every shell argument as well as the executable and argv
-  together; dynamic arguments are denied because their capability cannot be checked,
-  including Claude permission-bypass flags.
+  together. A dynamic argument (`$VAR`, `$(…)`, a glob) is denied on the commands
+  where it could reach the boundary — repository, package, network, nested
+  `claude`, interpreters and runners, or a dynamic command name — as a best-effort
+  veto; elsewhere it is ordinary shell that Claude's own permission mode governs.
+  Quoted heredoc bodies are evaluated according to their consumer (a shell runs
+  them, a data sink stores them, anything else keeps them visible to the checks).
 - Automatic startup pins a secure resolved Claude executable identity and rejects
   explicit paths, persists that identity for recovery, and rechecks the exact startup
   HEAD through the built-in adapter's final `preSpawnCheck` immediately before spawn.
