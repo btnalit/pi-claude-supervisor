@@ -9,6 +9,7 @@ const allowed = new Set([
   "PI_CLAUDE_SUPERVISOR_AUTOMATION",
   "PI_CLAUDE_SUPERVISOR_TRANSPORT",
   "PI_CLAUDE_SUPERVISOR_TMUX_MODE",
+  "PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS",
   "PI_CLAUDE_SUPERVISOR_CLOSE_WORKER_ON_COMPLETION",
   "PI_CLAUDE_SUPERVISOR_CGROUP_MODE",
   "PI_CLAUDE_SUPERVISOR_TMUX_SOCKET",
@@ -171,4 +172,9 @@ export function tmuxMode(env: NodeJS.ProcessEnv = process.env): "interactive" | 
 /** Exit the interactive Worker and its tmux session once a task completes; default keeps it open for the operator. */
 export function closeWorkerOnCompletion(env: NodeJS.ProcessEnv = process.env): boolean {
   return readBoolean(env.PI_CLAUDE_SUPERVISOR_CLOSE_WORKER_ON_COMPLETION, false);
+}
+
+/** Install the user-level Claude Code hook entries automatically when the interactive tmux mode is configured. */
+export function autoInstallHooks(env: NodeJS.ProcessEnv = process.env): boolean {
+  return readBoolean(env.PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS, true);
 }

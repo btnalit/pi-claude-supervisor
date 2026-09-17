@@ -12,22 +12,7 @@ import { TmuxWorkerAdapter, attachCommand } from "./worker/tmux-adapter.ts";
 import { Supervisor, type DecisionSessionClosedInfo, type HumanInterventionNotice, type SupervisorProgress, type SupervisorTokenUsage } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
-import {
-  autonomyDefaults,
-  closeWorkerOnCompletion,
-  decisionCompactionTokens,
-  decisionModel,
-  decisionSessionRetentionDays,
-  eventLogMaxBytes,
-  loadSupervisorEnvironment,
-  progressHeartbeatMs,
-  reviewerModel,
-  reviewTimeoutMs,
-  tmuxMode,
-  workerAutocompactTokens,
-  workerMcpConfigPath,
-  workerModel,
-} from "./config.ts";
+import { autoInstallHooks, autonomyDefaults, closeWorkerOnCompletion, decisionCompactionTokens, decisionModel, decisionSessionRetentionDays, eventLogMaxBytes, loadSupervisorEnvironment, progressHeartbeatMs, reviewTimeoutMs, reviewerModel, tmuxMode, workerAutocompactTokens, workerMcpConfigPath, workerModel } from "./config.ts";
 import { DecisionSessionStore, type DecisionSessionRecord } from "./decision-session-store.ts";
 import { CwdLeaseStore, type CwdLeaseHandle, pathsOverlap, workerIdentity } from "./cwd-lease.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
@@ -136,10 +121,25 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   const hookServer = interactiveHooksEnabled ? new HookServer({ directory: hookSocketDirectory(stateDir) }) : undefined;
   const relayPath = join(hookSocketDirectory(stateDir), "relay.js");
   let hookServerReady: Promise<void> | undefined;
+  // Adoption needs the relay in the user's own Claude settings (a running
+  // Claude only picks hooks up from live-reloaded settings files). Installing
+  // at extension load rather than at npm install time keeps it under the
+  // operator's explicit transport configuration, idempotent, and reversible
+  // with /supervise uninstall-hooks; the relay is a ~1 ms no-op when no
+  // Supervisor is listening, so leaving it installed costs nothing.
+  let hookInstallNotice: string | undefined;
   if (hookServer) {
     hookServerReady = (async () => {
       await writeRelayScript(relayPath);
       await hookServer.listen();
+      if (autoInstallHooks()) {
+        try {
+          const installed = await installUserHooks({ stateDir, settingsPath: claudeUserSettingsPath() });
+          if (installed.changed) hookInstallNotice = `Installed the Claude Code hook relay in ${installed.settingsPath} so running sessions can be adopted (PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS=0 disables this; /supervise uninstall-hooks removes it)`;
+        } catch (error) {
+          console.error(`pi-claude-supervisor automatic hook install failed: ${redactText(error instanceof Error ? error.message : String(error))}`);
+        }
+      }
     })();
     hookServerReady.catch((error) => {
       console.error(`pi-claude-supervisor hook server startup failed: ${redactText(error instanceof Error ? error.message : String(error))}`);
@@ -387,7 +387,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           if (!goal) throw new Error(operation === "adopt-tmux" ? "Usage: /supervise adopt-tmux [--spec <file>] <tmux-session> <task>" : "Usage: /supervise start [--spec <file>] <task>");
           if (operation === "adopt-tmux" && adapter.capabilities().transport !== "tmux") throw new Error("/supervise adopt-tmux requires PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux");
           if (operation === "adopt-tmux" && interactive && !await userHooksInstalled(claudeUserSettingsPath())) {
-            throw new Error("run /supervise install-hooks first so the adopted session can report its events");
+            await hookServerReady?.catch(() => {});
+            if (!await userHooksInstalled(claudeUserSettingsPath())) throw new Error("run /supervise install-hooks first so the adopted session can report its events");
           }
           const [command, ...workerArgs] = parseCommand(process.env.PI_CLAUDE_SUPERVISOR_WORKER ?? "claude");
           if (!command) throw new Error("PI_CLAUDE_SUPERVISOR_WORKER must contain an executable");
@@ -965,6 +966,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             throw new Error("Usage: /supervise start|adopt-tmux|recover [--takeover]|sessions|status|poll [all|taskId]|send [taskId]|pause [taskId]|resume [taskId]|stop [taskId]|verify [taskId]|approve [taskId] <allow|deny>|takeover [taskId]|resume-auto [taskId]|capabilities|install-hooks|uninstall-hooks");
           }
         }
+        if (hookInstallNotice) { notify(ctx, hookInstallNotice); hookInstallNotice = undefined; }
         notify(ctx, message);
       } catch (error) {
         notify(ctx, error instanceof Error ? error.message : String(error), "warning");

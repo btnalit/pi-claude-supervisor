@@ -648,6 +648,62 @@ test("install-hooks writes the relay hook and is idempotent; uninstall-hooks rem
   }
 });
 
+test("loading the extension with the interactive tmux transport installs the user hooks automatically, unless opted out", { concurrency: false }, async () => {
+  const run = async (autoInstall: string | undefined): Promise<{ installed: boolean; messages: string[] }> => {
+    const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-autohooks-state-"));
+    const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-autohooks-leases-"));
+    const configDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-autohooks-config-"));
+    const keys = ["PI_CLAUDE_SUPERVISOR_STATE_DIR", "PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR", "PI_CLAUDE_SUPERVISOR_TRANSPORT", "PI_CLAUDE_SUPERVISOR_TMUX_MODE", "PI_CLAUDE_SUPERVISOR_MODE", "PI_CLAUDE_SUPERVISOR_CGROUP_MODE", "PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS", "CLAUDE_CONFIG_DIR"] as const;
+    const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]])) as Record<typeof keys[number], string | undefined>;
+    process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
+    process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
+    process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "tmux";
+    process.env.PI_CLAUDE_SUPERVISOR_TMUX_MODE = "interactive";
+    process.env.PI_CLAUDE_SUPERVISOR_MODE = "auto";
+    process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "auto";
+    if (autoInstall === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS; else process.env.PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS = autoInstall;
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+    const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
+    const messages: string[] = [];
+    const context: TestContext = { cwd: process.cwd(), hasUI: true, ui: { confirm: async () => false, notify: (message) => messages.push(message) } };
+    let shutdownHandler: (() => Promise<void>) | undefined;
+    try {
+      extension({
+        registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) { registrations.commands.push({ name, definition }); },
+        on(name: string, handler: () => Promise<void>) { registrations.events.push({ name, handler }); },
+      } as never);
+      const command = registrations.commands.find(({ name }) => name === "supervise")?.definition;
+      shutdownHandler = registrations.events.find(({ name }) => name === "session_shutdown")?.handler;
+      assert.ok(command);
+      // The install runs in the background at load; the first command waits for it via the hook server readiness.
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        await command.handler("capabilities", context);
+        if (messages.some((message) => /Installed the Claude Code hook relay/u.test(message))) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        if (autoInstall === "0" && attempt >= 10) break;
+      }
+      let installed = false;
+      try {
+        const settings = JSON.parse(await readFile(join(configDir, "settings.json"), "utf8")) as { hooks?: Record<string, unknown> };
+        installed = Boolean(settings.hooks?.PreToolUse && settings.hooks?.Stop);
+      } catch { installed = false; }
+      return { installed, messages };
+    } finally {
+      if (shutdownHandler) await shutdownHandler().catch(() => {});
+      for (const key of keys) { if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key]; }
+      await rm(stateDir, { recursive: true, force: true });
+      await rm(leaseDir, { recursive: true, force: true });
+      await rm(configDir, { recursive: true, force: true });
+    }
+  };
+  const automatic = await run(undefined);
+  assert.equal(automatic.installed, true);
+  assert.ok(automatic.messages.some((message) => /Installed the Claude Code hook relay/u.test(message)), "one-time notice surfaced");
+  assert.equal(automatic.messages.filter((message) => /Installed the Claude Code hook relay/u.test(message)).length, 1);
+  const optedOut = await run("0");
+  assert.equal(optedOut.installed, false);
+});
+
 test("adopt-tmux in interactive mode requires install-hooks first, checked before any tmux interaction", { concurrency: false }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-hooks-state2-"));
   const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-hooks-leases2-"));
@@ -665,6 +721,9 @@ test("adopt-tmux in interactive mode requires install-hooks first, checked befor
   process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "tmux";
   process.env.PI_CLAUDE_SUPERVISOR_MODE = "auto";
   process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "1";
+  // Automatic installation is covered separately; here the precheck itself is under test.
+  const previousAutoInstall = process.env.PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS;
+  process.env.PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS = "0";
   // No settings.json under this empty configDir: install-hooks was never run.
   process.env.CLAUDE_CONFIG_DIR = configDir;
   const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
@@ -694,6 +753,7 @@ test("adopt-tmux in interactive mode requires install-hooks first, checked befor
     if (previous.mode === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_MODE; else process.env.PI_CLAUDE_SUPERVISOR_MODE = previous.mode;
     if (previous.automation === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION; else process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = previous.automation;
     if (previous.configDir === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = previous.configDir;
+    if (previousAutoInstall === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS; else process.env.PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS = previousAutoInstall;
     await rm(stateDir, { recursive: true, force: true });
     await rm(leaseDir, { recursive: true, force: true });
     await rm(configDir, { recursive: true, force: true });
