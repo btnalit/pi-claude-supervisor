@@ -1194,6 +1194,7 @@ test("a UserPromptSubmit carrying Claude's own task notification is not human in
     for (const prompt of [
       "<task-notification>\n<task-id>b1k34un3w</task-id>\n<summary>Monitor event: \"reviewer transcripts idle\"</summary>\n<event>both idle for 45s</event>\n</task-notification>",
       "  <system-reminder>\nBackground task completed.\n</system-reminder>",
+      "<agent-message from=\"a883949751acb2c0b\">\n[Subagent hand-back] The text below is the final report of a subagent this session delegated to.\n</agent-message>",
     ]) {
       const reply = await hookSource.dispatch(stateDir, {
         version: 1,
@@ -1212,6 +1213,14 @@ test("a UserPromptSubmit carrying Claude's own task notification is not human in
     });
     assert.deepEqual(reply, {});
     assert.equal(events.filter((event) => event.type === "human_input").length, 1);
+    // Pasted markup without a hyphenated runtime tag is still a person.
+    await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "UserPromptSubmit", session_id: "session-1", cwd: stateDir, prompt: "<div>why does this render twice?</div>" },
+    });
+    assert.equal(events.filter((event) => event.type === "human_input").length, 2);
   } finally {
     await adapter.stop(handle, "runtime prompt test cleanup").catch(() => {});
     await rm(stateDir, { recursive: true, force: true });
