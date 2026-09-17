@@ -15,7 +15,7 @@ test("legacy tasks receive a default acceptance check", () => {
   assert.equal(spec.goal, "inspect the repository");
   assert.deepEqual(spec.acceptance.map((check) => check.id), ["diff-check"]);
   assert.equal(spec.maxRepairRounds, 3);
-  assert.deepEqual(spec.autonomy, { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2 });
+  assert.deepEqual(spec.autonomy, { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid" });
 });
 
 test("task specs validate checks and reject duplicate ids", () => {
