@@ -170,11 +170,13 @@ export class Supervisor {
   #decision?: DecisionWorkerLike;
   #onCandidate?: (notice: CandidateNotice) => Promise<void> | void;
   #handledEvents = new Set<string>();
+  #deferredWorkerEvents = new Map<string, WorkerEvent>();
   #pendingPermissions = new Map<string, WorkerPermissionRequest>();
   #humanRequired = false;
   #humanGate: "permission" | "other" | undefined;
   #candidateParked = false;
   #stopRequested?: string;
+  #stopCloseReason?: DecisionSessionCloseReason;
   #onDecisionSessionProgress?: (info: { taskId: string; turn: number; repairRound: number; lastFindingSignature?: string }) => Promise<void> | void;
   #onDecisionSessionClosed?: (taskId: string, info: DecisionSessionClosedInfo) => Promise<void> | void;
   #startAbortController?: AbortController;
@@ -183,6 +185,8 @@ export class Supervisor {
   #startAbortError?: unknown;
   #startAbortCompletion?: Promise<void>;
   #released = false;
+  #releasing = false;
+  #terminalNoticeSent = false;
 
   constructor(adapter: WorkerAdapter, events = new EventLog(), hooks: { onCandidate?: (notice: CandidateNotice) => Promise<void> | void; onHumanRequired?: (notice: HumanInterventionNotice) => Promise<void> | void; reviewer?: TaskReviewer } = {}) {
     this.#adapter = adapter;
@@ -221,10 +225,13 @@ export class Supervisor {
     this.#onDecisionSessionClosed = options.onDecisionSessionClosed;
     this.#onProgress = options.onProgress;
     this.#handledEvents.clear();
+    this.#deferredWorkerEvents.clear();
     this.#pendingPermissions.clear();
     this.#humanRequired = false;
     this.#candidateParked = false;
     this.#released = false;
+    this.#releasing = false;
+    this.#terminalNoticeSent = false;
     this.#task = { taskId, task: spec.goal, cwd: options.cwd, maxTurns: options.maxTurns ?? 100, startedAt: options.startedAt ?? new Date().toISOString(), ...(options.baseCommit ? { baseCommit: options.baseCommit } : {}), ...(options.baseBranch ? { baseBranch: options.baseBranch } : {}), spec, repairRound: options.initialRepairRound ?? 0, ...(options.initialFindingSignature ? { lastFindingSignature: options.initialFindingSignature } : {}) };
     this.#repairRound = options.initialRepairRound ?? 0;
     this.#lastFindingSignature = options.initialFindingSignature;
@@ -236,6 +243,7 @@ export class Supervisor {
     this.#progressPhase = undefined;
     this.#lastProgressAt = 0;
     this.#stopRequested = undefined;
+    this.#stopCloseReason = undefined;
     this.#humanGate = undefined;
     this.#clearWatchdog();
     this.#machine.transition("starting");
@@ -414,7 +422,10 @@ export class Supervisor {
   }
 
   async poll(): Promise<{ status: WorkerStatus; output: WorkerOutputChunk[] }> {
-    return this.#exclusive(() => this.#pollInternal());
+    return this.#exclusive(async () => {
+      await this.#retryDeferredWorkerEvents();
+      return this.#pollInternal();
+    });
   }
 
   async #pollInternal(intentionalVerification = false): Promise<{ status: WorkerStatus; output: WorkerOutputChunk[] }> {
@@ -426,8 +437,9 @@ export class Supervisor {
     const status = await this.#adapter.getStatus(handle);
     if (output.length) {
       this.#workerOutput = appendBoundedOutput(this.#workerOutput, output.map((chunk) => `[${chunk.stream}] ${chunk.text}`).join(""));
+      const bounded = boundOutputChunks(output);
       try {
-        await this.#events.append({ type: "worker_output", taskId, workerId: handle.id, data: { chunks: output } });
+        await this.#events.append({ type: "worker_output", taskId, workerId: handle.id, data: { chunks: bounded.chunks, ...(bounded.truncated ? { truncated: true, omittedBytes: bounded.omittedBytes } : {}) } });
       } catch (error) {
         if (this.#adapter.restoreOutput) {
           try { await this.#adapter.restoreOutput(handle, output); } catch { /* preserve append failure */ }
@@ -455,6 +467,7 @@ export class Supervisor {
         await this.#decision?.close().catch(() => {});
         this.#decision = undefined;
         await Promise.resolve(this.#onDecisionSessionClosed?.(taskId, { cleanupConfirmed: cleanupSafe, reason: "recoverable_failure" })).catch(() => {});
+        await this.#notifyFailure(`Worker exited unexpectedly: reason=${status.exitReason ?? "unknown"} exit=${status.exitCode ?? "-"} signal=${status.signal ?? "-"}${status.cleanupError ? `; cleanup: ${status.cleanupError}` : ""}`);
       }
     }
     return { status, output };
@@ -473,21 +486,41 @@ export class Supervisor {
     if (!taskId || !handle || event.handle.id !== handle.id) return;
     const key = workerEventKey(event);
     if (this.#handledEvents.has(key)) return;
-    this.#handledEvents.add(key);
-    if (event.type === "turn_completed") this.#lastWorkerResult = event.result;
-    if (event.type === "turn_completed" || event.type === "exited") await this.#pollInternal();
-    if (event.type === "permission_request") {
-      this.#pendingPermissions.set(event.request.requestId, event.request);
-      await this.#appendEvent({
-        type: "permission_requested",
-        taskId,
-        workerId: handle.id,
-        data: { requestId: event.request.requestId, toolUseId: event.request.toolUseId, toolName: event.request.toolName, input: event.request.input },
-      });
+    try {
+      if (event.type === "turn_completed") this.#lastWorkerResult = event.result;
+      // Do not call #pollInternal from within a deferred retry: it would
+      // recurse back into #retryDeferredWorkerEvents through #pollInternal's
+      // callers and reprocess this same event twice.
+      if (event.type === "turn_completed" || event.type === "exited") await this.#pollInternal();
+      if (event.type === "permission_request") {
+        this.#pendingPermissions.set(event.request.requestId, event.request);
+        await this.#appendEvent({
+          type: "permission_requested",
+          taskId,
+          workerId: handle.id,
+          data: { requestId: event.request.requestId, toolUseId: event.request.toolUseId, toolName: event.request.toolName, input: event.request.input },
+        });
+      }
+      if (this.#decision && (event.type === "permission_request" || event.type === "turn_completed" || event.type === "exited")) {
+        this.#decision.updateContext({ state: this.#machine.state, turn: this.#turn, repairRound: this.#repairRound });
+        this.#decision.notify(event);
+      }
+      this.#handledEvents.add(key);
+      this.#deferredWorkerEvents.delete(key);
+    } catch (error) {
+      this.#deferredWorkerEvents.set(key, event);
+      throw error;
     }
-    if (this.#decision && (event.type === "permission_request" || event.type === "turn_completed" || event.type === "exited")) {
-      this.#decision.updateContext({ state: this.#machine.state, turn: this.#turn, repairRound: this.#repairRound });
-      this.#decision.notify(event);
+  }
+
+  /** Retry lifecycle events whose earlier processing failed before it could
+   * complete; called from poll() and the watchdog, never from #pollInternal
+   * itself (which #processWorkerEvent may call, and which would recurse). */
+  async #retryDeferredWorkerEvents(): Promise<void> {
+    for (const event of [...this.#deferredWorkerEvents.values()]) {
+      try {
+        await this.#processWorkerEvent(event);
+      } catch { /* remains deferred for the next retry */ }
     }
   }
 
@@ -507,11 +540,53 @@ export class Supervisor {
     }).catch((auditError) => {
       console.error(`pi-claude-supervisor candidate audit failed: ${safeMessage(auditError)}`);
     });
+    this.#terminalNoticeSent = true;
     void Promise.resolve(this.#onCandidate?.({ taskId: task.taskId, cwd: task.cwd, task: task.task, reason, status: "failed", deliverable: false })).catch(() => {});
+  }
+
+  /**
+   * Emit a single terminal failure notice for unattended runs that would
+   * otherwise end silently (a dead Worker, a watchdog stop, a failed
+   * verification operation). `#candidateParked` guards against duplicating
+   * the notice `#parkCandidate`/`#finalizeVerification` already sent.
+   */
+  async #notifyFailure(reason: string, event?: WorkerEvent): Promise<void> {
+    if (!this.#automation || this.#terminalNoticeSent || this.#candidateParked) return;
+    const task = this.#task;
+    const handle = this.#handle;
+    this.#terminalNoticeSent = true;
+    await this.#appendEvent({
+      type: "candidate_failed",
+      taskId: task?.taskId,
+      workerId: handle?.id,
+      data: { status: "failed", deliverable: false, reason },
+    }).catch((auditError) => {
+      console.error(`pi-claude-supervisor candidate failure audit failed: ${safeMessage(auditError)}`);
+    });
+    const permission = event?.type === "permission_request" ? {
+      requestId: event.request.requestId,
+      toolUseId: event.request.toolUseId,
+      toolName: event.request.toolName,
+      input: event.request.input,
+    } : undefined;
+    void Promise.resolve(this.#onCandidate?.({
+      taskId: task?.taskId ?? "",
+      workerId: handle?.id,
+      cwd: task?.cwd ?? "",
+      task: task?.task ?? "",
+      reason,
+      status: "failed",
+      deliverable: false,
+      ...(permission ? { permission } : {}),
+    })).catch(() => {});
   }
 
   async #decisionFailure(event: WorkerEvent, error: unknown): Promise<void> {
     return this.#exclusive(async () => {
+      if (this.#releasing || this.#released) {
+        await this.#appendDecisionIgnored(event, undefined);
+        return;
+      }
       await this.#appendEvent({
         type: "decision_worker_failed",
         taskId: this.#task?.taskId,
@@ -522,10 +597,23 @@ export class Supervisor {
     });
   }
 
+  async #appendDecisionIgnored(event: WorkerEvent, action: DecisionAction | undefined): Promise<void> {
+    await this.#appendEvent({
+      type: "decision_ignored",
+      taskId: this.#task?.taskId,
+      workerId: event.handle.id,
+      data: { ...(action ? { action: action.action } : {}), reason: "worker released", eventType: event.type },
+    }).catch(() => {});
+  }
+
   async #applyDecision(action: DecisionAction, event: WorkerEvent): Promise<void> {
     return this.#exclusive(async () => {
       const task = this.#task;
       const handle = this.#handle;
+      if (this.#releasing || this.#released) {
+        await this.#appendDecisionIgnored(event, action);
+        return;
+      }
       if (!task || !handle || !this.#automation || this.#humanRequired || ["completed", "blocked", "failed", "stopped"].includes(this.#machine.state)) return;
       const actionKey = `${workerEventKey(event)}:${action.action}`;
       if (this.#handledEvents.has(actionKey)) return;
@@ -562,6 +650,12 @@ export class Supervisor {
         }
         if (this.#machine.state === "verifying") await this.#verifyInternal();
         else await this.#parkCandidate(`Decision Worker requested verification from state ${this.#machine.state}`, event);
+        return;
+      }
+      if (action.action === "noop") {
+        if (event.type === "turn_completed" || event.type === "permission_request") {
+          await this.#parkCandidate(`Decision Worker returned noop for ${event.type}; a concrete action is required`, event);
+        }
         return;
       }
       if (action.action === "park" || action.action === "ask_human") {
@@ -635,6 +729,7 @@ export class Supervisor {
       workerId: handle?.id,
       data: { ...notice, ...(cleanupError ? { cleanupError: safeMessage(cleanupError) } : {}) },
     });
+    this.#terminalNoticeSent = true;
     void Promise.resolve(this.#onCandidate?.(notice)).catch(() => {});
     if (cleanupError) throw cleanupError;
   }
@@ -762,6 +857,7 @@ export class Supervisor {
   }
 
   async release(reason = "Pi session disconnected"): Promise<void> {
+    this.#releasing = true;
     this.#verificationAbortController?.abort(reason);
     const handle = this.#handle;
     const preemptiveRelease = handle
@@ -786,6 +882,7 @@ export class Supervisor {
       // Record intent before starting adapter cleanup; exit events can arrive
       // synchronously from stop() and must not win the lifecycle race.
       this.#stopRequested = reason;
+      this.#stopCloseReason = options.preserveDecisionSession ? "recoverable_failure" : "human_stop";
       if (this.#machine.state === "verifying") this.#verificationAbortController?.abort(reason);
     }
     // A stop must be able to preempt startup rather than waiting behind a
@@ -808,10 +905,17 @@ export class Supervisor {
   }
 
   async #stopInternal(reason: string, flushPendingEvents = true, closeReason: DecisionSessionCloseReason = "recoverable_failure"): Promise<void> {
-    if (flushPendingEvents) await this.#flushPendingEvents();
+    // The preemptive adapter stop already killed the Worker; a persistently
+    // failing event log must not block the state transition below.
+    let flushError: unknown;
+    if (flushPendingEvents) {
+      try { await this.#flushPendingEvents(); }
+      catch (error) { flushError = error; }
+    }
     if (!this.#handle) throw new Error("no active task");
     if (this.#machine.state === "stopped") {
       this.#stopRequested = undefined;
+      this.#stopCloseReason = undefined;
       const preemptiveStop = this.#preemptiveStop;
       this.#preemptiveStop = undefined;
       if (preemptiveStop) await preemptiveStop;
@@ -819,6 +923,7 @@ export class Supervisor {
     }
     if (this.#machine.state === "failed") {
       this.#stopRequested = undefined;
+      this.#stopCloseReason = undefined;
       // A failed startup or cleanup attempt may still retain a live handle.
       // Retry group termination during shutdown instead of treating the state
       // as fully reclaimed.
@@ -863,6 +968,7 @@ export class Supervisor {
     const stopped = cleanupConfirmed;
     this.#machine.transition(stopped ? "stopped" : "failed");
     this.#stopRequested = undefined;
+    this.#stopCloseReason = undefined;
     let eventError: unknown;
     try {
       await this.#appendEvent({ type: stopped ? "worker_stopped" : "worker_stop_failed", taskId: this.#task?.taskId, workerId: this.#handle.id, data: { reason, ...(stopError ? { error: safeMessage(stopError) } : {}), ...(cleanupConfirmed ? {} : { cleanupConfirmed: false }) } });
@@ -872,7 +978,10 @@ export class Supervisor {
     await this.#decision?.close().catch(() => {});
     this.#decision = undefined;
     await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", { cleanupConfirmed, reason: stopped ? closeReason : "recoverable_failure" })).catch(() => {});
-    const errors = [stopError, outputError, eventError].filter(Boolean);
+    if (!stopped && closeReason !== "human_stop") {
+      await this.#notifyFailure(`worker cleanup could not be confirmed: ${reason}`);
+    }
+    const errors = [flushError, stopError, outputError, eventError].filter(Boolean);
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1) throw new AggregateError(errors, "worker stop cleanup and audit failed");
   }
@@ -880,8 +989,9 @@ export class Supervisor {
   async #drainOutputAfterStop(handle: WorkerHandle): Promise<void> {
     const output = await this.#adapter.readOutput(handle);
     if (!output.length) return;
+    const bounded = boundOutputChunks(output);
     try {
-      await this.#appendEvent({ type: "worker_output", taskId: this.#task?.taskId, workerId: handle.id, data: { chunks: output } });
+      await this.#appendEvent({ type: "worker_output", taskId: this.#task?.taskId, workerId: handle.id, data: { chunks: bounded.chunks, ...(bounded.truncated ? { truncated: true, omittedBytes: bounded.omittedBytes } : {}) } });
     } catch (error) {
       if (this.#adapter.restoreOutput) await this.#adapter.restoreOutput(handle, output).catch(() => {});
       throw error;
@@ -1105,6 +1215,7 @@ export class Supervisor {
   async #finalizeVerification(result: AcceptanceReport, outcome: "completed" | "blocked" = result.ok ? "completed" : "blocked", outcomeReason?: string): Promise<AcceptanceReport> {
     this.#clearWatchdog();
     const stopRequested = this.#stopRequested !== undefined;
+    const stopCloseReason = this.#stopCloseReason ?? "human_stop";
     if (outcome === "blocked") this.#candidateParked = true;
     let cleanupError: unknown;
     if (this.#handle) {
@@ -1144,9 +1255,10 @@ export class Supervisor {
     await this.#decision?.close().catch(() => {});
     this.#decision = undefined;
     this.#stopRequested = undefined;
+    this.#stopCloseReason = undefined;
     await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", {
       cleanupConfirmed,
-      reason: stopRequested ? "human_stop" : verificationSucceeded ? "completed" : terminalState === "blocked" ? "blocked" : "recoverable_failure",
+      reason: stopRequested ? stopCloseReason : verificationSucceeded ? "completed" : terminalState === "blocked" ? "blocked" : "recoverable_failure",
     })).catch(() => {});
     this.#verificationAbortController = undefined;
     if (cleanupError && eventError) throw new AggregateError([cleanupError, eventError], "verification cleanup and audit failed");
@@ -1163,6 +1275,7 @@ export class Supervisor {
         status: verificationSucceeded ? "ready" : "blocked",
         deliverable: verificationSucceeded,
       };
+      this.#terminalNoticeSent = true;
       void Promise.resolve(this.#onCandidate?.(notice)).catch(() => {});
     }
     return result;
@@ -1197,6 +1310,7 @@ export class Supervisor {
       await this.#decision?.close().catch(() => {});
       this.#decision = undefined;
       await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task.taskId, { cleanupConfirmed, reason: "recoverable_failure" })).catch(() => {});
+      await this.#notifyFailure(`verification operation failed: ${safeMessage(error)}`);
     }
   }
 
@@ -1216,7 +1330,7 @@ export class Supervisor {
   }
 
   #armWatchdog(): void {
-    if (this.#deadlineMs <= 0 && this.#noOutputTimeoutMs <= 0) return;
+    if (!this.#automation && this.#deadlineMs <= 0 && this.#noOutputTimeoutMs <= 0) return;
     this.#watchdog = setInterval(() => { void this.#checkWatchdog().catch(() => { /* lifecycle state is retained for the next explicit operation */ }); }, 1_000);
     this.#watchdog.unref();
   }
@@ -1231,9 +1345,15 @@ export class Supervisor {
   }
 
   async #checkWatchdogInternal(): Promise<void> {
+    if (this.#task && this.#handle) await this.#retryDeferredWorkerEvents();
     if (!this.#task || !this.#handle || !["running", "waiting", "paused"].includes(this.#machine.state)) return;
     const status = await this.#adapter.getStatus(this.#handle);
-    if (!status.running) return;
+    if (!status.running) {
+      // The adapter's own exit event may have been lost (F2); classify the
+      // dead Worker here instead of leaving state stuck at running/waiting.
+      if (["running", "waiting", "paused"].includes(this.#machine.state)) await this.#pollInternal();
+      return;
+    }
     this.#reportProgress("worker", `Worker ${this.#machine.state}; heartbeat`, false);
     const now = Date.now();
     const taskStartedAt = Date.parse(this.#task.startedAt);
@@ -1258,7 +1378,11 @@ export class Supervisor {
     }
     // Termination must not wait for a persistently failing event log. The
     // timeout event remains queued and is retried after the adapter stop.
-    await this.#stopInternal(reason, false);
+    try {
+      await this.#stopInternal(reason, false);
+    } finally {
+      await this.#notifyFailure(`watchdog: ${reason}`);
+    }
     if (timeoutEventError) throw timeoutEventError;
   }
 
@@ -1427,6 +1551,36 @@ function appendBoundedOutput(current: string, addition: string, maxBytes = 256 *
   const combined = `${current}${addition}`;
   if (Buffer.byteLength(combined, "utf8") <= maxBytes) return combined;
   return Buffer.from(combined, "utf8").subarray(-maxBytes).toString("utf8");
+}
+
+/**
+ * A long-running unattended task can emit tens of MB of raw `--verbose`
+ * stream-json chunks; cap what lands in events.jsonl per poll while leaving
+ * `#workerOutput` (the in-memory Reviewer tail) and `restoreOutput` untouched.
+ */
+function boundOutputChunks(chunks: WorkerOutputChunk[], maxChunkBytes = 8 * 1024, maxTotalBytes = 64 * 1024): { chunks: WorkerOutputChunk[]; truncated: boolean; omittedBytes: number } {
+  const bounded: WorkerOutputChunk[] = [];
+  let truncated = false;
+  let omittedBytes = 0;
+  let totalBytes = 0;
+  for (const chunk of chunks) {
+    const originalBytes = Buffer.byteLength(chunk.text, "utf8");
+    let text = chunk.text;
+    if (originalBytes > maxChunkBytes) {
+      const kept = Buffer.from(text, "utf8").subarray(0, maxChunkBytes).toString("utf8");
+      text = `${kept}…[truncated ${originalBytes - Buffer.byteLength(kept, "utf8")} bytes]`;
+      truncated = true;
+    }
+    const textBytes = Buffer.byteLength(text, "utf8");
+    if (totalBytes + textBytes > maxTotalBytes) {
+      truncated = true;
+      omittedBytes += textBytes;
+      continue;
+    }
+    totalBytes += textBytes;
+    bounded.push({ ...chunk, text });
+  }
+  return { chunks: bounded, truncated, omittedBytes };
 }
 
 function cancelledAcceptanceReport(reason: string): AcceptanceReport {
