@@ -7,6 +7,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 import type { SupervisorEvent } from "./events.ts";
 import type { WorkerAdapter, WorkerHandle, WorkerOutputChunk, WorkerStartInput, WorkerStatus } from "./types.ts";
+import type { DecisionWorkerFactory } from "./decision-worker.ts";
 import { Supervisor } from "./supervisor.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
 import { TmuxWorkerAdapter } from "./worker/tmux-adapter.ts";
@@ -1174,4 +1175,245 @@ test("supervisor requires independent verification after worker exit", async () 
   const result = await supervisor.verify({ command: process.execPath, args: ["-e", "process.exit(0)"] });
   assert.equal(result.ok, true);
   assert.equal(supervisor.state, "completed");
+});
+
+test("deferred exited event is retried by the watchdog", async () => {
+  const handle: WorkerHandle = { id: "deferred-exit-worker", startedAt: new Date().toISOString(), cwd: "/tmp" };
+  let running = true;
+  let readOutputCalls = 0;
+  let capturedListener: WorkerStartInput["eventListener"];
+  const log = new FlakyEventLog("worker_output");
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "process-pipe", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true }),
+    start: async (input) => { capturedListener = input.eventListener; return handle; },
+    getStatus: async (): Promise<WorkerStatus> => ({ handle, running, exitReason: running ? undefined : "completed", processGroupCleaned: !running }),
+    readOutput: async () => {
+      readOutputCalls += 1;
+      return readOutputCalls === 1 ? [{ stream: "stdout" as const, text: "hello", at: new Date().toISOString() }] : [];
+    },
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, log as unknown as ConstructorParameters<typeof Supervisor>[1]);
+  await supervisor.start({ task: "deferred exit", cwd: "/tmp", command: "fixture", deadlineMs: 0, noOutputTimeoutMs: 60_000 });
+  running = false;
+  capturedListener?.({ type: "exited", handle });
+  // The first delivery fails inside #pollInternal (worker_output append), so
+  // the exit must remain deferred rather than classifying the Worker as failed.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(supervisor.state, "running");
+  let attempt = 0;
+  while (supervisor.state === "running" && attempt < 60) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    attempt += 1;
+  }
+  assert.ok(["verifying", "failed"].includes(supervisor.state));
+  assert.ok(log.events.some((event) => event.type === "worker_exited"));
+  await supervisor.stop("test complete").catch(() => {});
+});
+
+test("watchdog classifies a Worker that exited without an event", async () => {
+  const handle: WorkerHandle = { id: "unreported-exit-worker", startedAt: new Date().toISOString(), cwd: "/tmp" };
+  let running = true;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "process-pipe", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true }),
+    start: async () => handle,
+    getStatus: async (): Promise<WorkerStatus> => ({ handle, running, exitReason: running ? undefined : "completed", processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter);
+  await supervisor.start({ task: "unreported exit", cwd: "/tmp", command: "fixture", deadlineMs: 0, noOutputTimeoutMs: 60_000 });
+  running = false;
+  let attempt = 0;
+  while (supervisor.state === "running" && attempt < 60) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    attempt += 1;
+  }
+  assert.notEqual(supervisor.state, "running");
+  await supervisor.stop("test complete").catch(() => {});
+});
+
+test("stop with preserveDecisionSession during verifying reports a recoverable close reason", async () => {
+  const handle: WorkerHandle = { id: "preserve-session-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  let running = true;
+  let closure: { cleanupConfirmed: boolean; reason: string } | undefined;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, repairableSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, undefined, {
+    reviewer: { review: async () => new Promise<never>(() => {}) },
+  });
+  await supervisor.start({
+    task: "preserve decision session",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: { ...automaticSpec(), acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 1_000 }] },
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    onDecisionSessionClosed: (_taskId, info) => { closure = info; },
+  });
+  await supervisor.poll();
+  const verification = supervisor.verify();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  await supervisor.stop("shutdown", { preserveDecisionSession: true });
+  await verification;
+  assert.equal(supervisor.state, "stopped");
+  assert.notEqual(closure?.reason, "human_stop");
+  assert.equal(closure?.reason, "recoverable_failure");
+});
+
+test("release ignores a late decision", async () => {
+  const handle: WorkerHandle = { id: "release-race-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  let running = true;
+  let released = false;
+  let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+  const events = new FlakyEventLog("never-fail");
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    release: async () => { released = true; running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "release race",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: (options) => { onAction = options.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+  });
+  await supervisor.release();
+  assert.equal(released, true);
+  await onAction?.({ action: "park", reason: "late" }, { type: "turn_completed", handle, result: {}, sequence: 1 });
+  assert.ok(!events.events.some((event) => event.type === "candidate_parked"));
+  assert.ok(events.events.some((event) => event.type === "decision_ignored"));
+});
+
+test("unexpected exit notifies a failed candidate in automation mode", async () => {
+  const handle: WorkerHandle = { id: "unexpected-exit-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  let running = true;
+  let capturedListener: WorkerStartInput["eventListener"];
+  const candidates: Array<{ status: string }> = [];
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async (input) => { capturedListener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running, exitReason: running ? undefined : "crashed", processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, undefined, {
+    reviewer: automaticReviewer(),
+    onCandidate: (notice) => { candidates.push(notice); },
+  });
+  await supervisor.start({
+    task: "unexpected exit",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+  });
+  running = false;
+  capturedListener?.({ type: "exited", handle });
+  let attempt = 0;
+  while (candidates.length === 0 && attempt < 60) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    attempt += 1;
+  }
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0]?.status, "failed");
+});
+
+test("noop on a completed turn parks the candidate", async () => {
+  const handle: WorkerHandle = { id: "noop-turn-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  let running = true;
+  let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async () => handle,
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "noop turn",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: (options) => { onAction = options.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+  });
+  await onAction?.({ action: "noop", reason: "nothing to do" }, { type: "turn_completed", handle, result: {}, sequence: 1 });
+  assert.equal(supervisor.state, "blocked");
+  assert.equal(supervisor.candidateParked, true);
+});
+
+test("stop still transitions when a pending event keeps failing", async () => {
+  const handle: WorkerHandle = { id: "pending-flush-worker", startedAt: new Date().toISOString(), cwd: "/tmp" };
+  let running = true;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "process-pipe", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true }),
+    start: async () => handle,
+    getStatus: async (): Promise<WorkerStatus> => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const log = new SelectiveFailingEventLog(new Set(["worker_waiting"]));
+  const supervisor = new Supervisor(adapter, log as unknown as ConstructorParameters<typeof Supervisor>[1]);
+  await supervisor.start({ task: "fixture", cwd: "/tmp", command: "fixture", deadlineMs: 0, noOutputTimeoutMs: 0 });
+  await assert.rejects(() => supervisor.poll(), /persistent event failure/u);
+  assert.equal(supervisor.state, "waiting");
+  await assert.rejects(() => supervisor.stop("test complete"));
+  assert.equal(supervisor.state, "stopped");
 });
