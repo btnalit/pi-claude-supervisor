@@ -175,6 +175,11 @@ test("a name bound to literal text is not an unseen argument", () => {
   assert.equal(evaluateCommand("C=$(git rev-parse HEAD); git show $C").decision, "deny");
   assert.equal(evaluateCommand("git show $c").decision, "deny");
   assert.equal(evaluateCommand("X=literal; X=$Y; git show $X").decision, "deny");
+  // A tilde expands only at the start of a word: `HEAD~1` is a revision, `~/x` is a home path.
+  assert.equal(evaluateCommand("git reset -q --soft HEAD~1 && git restore --staged docs/x.md").decision, "allow");
+  assert.equal(evaluateCommand("git diff HEAD~3..HEAD -- src/").decision, "allow");
+  assert.equal(evaluateCommand("git reset --hard main").decision, "deny");
+  assert.equal(evaluateCommand("git add ~/other/file").decision, "deny");
 });
 
 test("newlines separate statements and comments are ignored", () => {
