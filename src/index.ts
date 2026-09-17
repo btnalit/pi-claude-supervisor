@@ -77,7 +77,8 @@ async function userHooksInstalled(settingsPath: string): Promise<boolean> {
       group && typeof group === "object" && Array.isArray((group as { hooks?: unknown }).hooks)
       && (group as { hooks: unknown[] }).hooks.some((entry) =>
         entry && typeof entry === "object" && typeof (entry as { command?: unknown }).command === "string"
-        && (entry as { command: string }).command.includes(RELAY_HOOK_MARKER))));
+        && (entry as { command: string }).command.includes(RELAY_HOOK_MARKER)
+        && /(?:^|\s)(?:'[^']*\/hooks\/relay\.js'|"[^"]*\/hooks\/relay\.js"|\S*\/hooks\/relay\.js)$/u.test((entry as { command: string }).command.trim()))));
 }
 
 /**

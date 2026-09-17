@@ -61,6 +61,8 @@ interface TmuxRecord {
   lastInputAt?: string;
   activeRequests: number;
   turnSequence: number;
+  /** Monotonic counter for prompt-phase permission request ids. */
+  promptSequence: number;
   readyStreak: number;
   turnObservedOutput: boolean;
   inputAt?: number;
@@ -614,6 +616,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       permissionResponses: new Set(),
       activeRequests: 0,
       turnSequence: 0,
+      promptSequence: 0,
       readyStreak: 0,
       turnObservedOutput: false,
       sentKeys: new Set(),
@@ -1946,15 +1949,17 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   }
 
   async #bindsToRecord(record: TmuxRecord, request: HookRelayRequest): Promise<boolean> {
-    if (record.handle.tmuxPaneId && request.tmuxPane && request.tmuxPane === record.handle.tmuxPaneId) return true;
-    // claudePid (pinned by #assertExistingSession recovery) is the verified
-    // Claude process itself; panePid is the pane's occupant, which may be a
-    // launcher one or more hops above Claude in the hook relay's ppid chain.
+    // The relay's ppid is kernel-provided and cannot be forged by another
+    // same-uid process, so descent from the pane's Claude (or its launcher) is
+    // the binding proof. claudePid (pinned by #assertExistingSession recovery)
+    // is the verified Claude process itself; panePid is the pane's occupant,
+    // which may be a launcher one or more hops above Claude in the chain.
     const anchor = record.claudePid ?? record.panePid;
     if (anchor !== undefined) return this.#ppidDescendsFrom(request.ppid, anchor);
-    // The pane identity is not established yet (owned startup window); a cwd
-    // has at most one subscribed Supervisor session at a time, so accept.
-    return true;
+    // Pre-identity window (owned startup, a few hundred ms): the pane id is the
+    // only evidence available; it is client-supplied, so it is never trusted
+    // once a pid anchor exists.
+    return Boolean(record.handle.tmuxPaneId && request.tmuxPane && request.tmuxPane === record.handle.tmuxPaneId);
   }
 
   async #handleHookRequest(record: TmuxRecord, request: HookRelayRequest): Promise<HookRelayReply | undefined> {
@@ -1989,12 +1994,18 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         return this.#awaitPermissionDecision(record, event, "pre", event.tool_use_id ?? randomUUID());
       case "PermissionRequest": {
         const digest = createHash("sha256").update(`${event.session_id}${event.tool_name ?? ""}${JSON.stringify(event.tool_input ?? null)}`).digest("hex").slice(0, 16);
-        return this.#awaitPermissionDecision(record, event, "prompt", `prompt:${digest}`);
+        // A per-record sequence keeps byte-identical repeats (the same `npm test`
+        // after a repair round) distinct: the Supervisor dedupes events by requestId.
+        record.promptSequence += 1;
+        return this.#awaitPermissionDecision(record, event, "prompt", `prompt:${digest}:${record.promptSequence}`);
       }
       case "Stop": {
         record.activeRequests = 0;
         record.lastOutputAt = new Date().toISOString();
         record.turnSequence += 1;
+        // Every message pasted before this turn ended has been consumed; a
+        // confirmation that never arrived must not shadow a later human prompt.
+        record.pendingSentMessages.length = 0;
         this.#emit(record, {
           type: "turn_completed",
           handle: record.handle,

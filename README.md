@@ -270,6 +270,19 @@ operation (or forwards an `AskUserQuestion`); it never second-guesses a normal
 edit, read or local command — those reach your own permission mode with no
 decision from Pi at all.
 
+**What this means for the boundary.** Interactive mode deliberately does not
+run the headless-mode check that refuses inherited `Bash` pre-authorization
+or an `auto`/`bypassPermissions` mode in your Claude settings: your own
+configuration governs what Claude may do without asking, exactly as when you
+run Claude yourself. Anything your settings already allow never reaches the
+Decision Worker, so its judgment applies only where Claude would have asked
+*you*. The hard boundary (remote push/merge/PR, remote CLI mutation, `.git`
+writes, destructive protected-branch rewrites) is enforced by the `PreToolUse`
+hook regardless of permission mode — verified against `auto` mode on Claude
+Code 2.1.273 — and is the only guarantee this mode makes beyond your own
+settings. Use the headless (`bridge`) mode when every `Bash` call must be
+visible to the Supervisor.
+
 **Human coexistence.** If you type into the attached session, automation
 pauses (`human_takeover`, visible as a warning) until you run `/supervise
 resume-auto <task-id>`; the turn that completed while you were driving is
