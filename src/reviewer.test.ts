@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { extractJsonObjects } from "./json-extract.ts";
 import { normalizeReviewReport, parseReview } from "./reviewer.ts";
 
 test("Reviewer parser accepts bounded structured findings", () => {
@@ -57,6 +58,13 @@ test("Reviewer output and finding counts are bounded", () => {
   const tooManyFindings = Array.from({ length: 65 }, (_, index) => ({ id: `F${index}`, severity: "P2", message: "too many findings" }));
   const bounded = parseReview(JSON.stringify({ verdict: "revise", summary: "too many", findings: tooManyFindings }), 0);
   assert.equal(bounded.verdict, "human");
+});
+
+test("extractJsonObjects finds every balanced JSON object in surrounding text", () => {
+  const objects = extractJsonObjects('{"a":1} text {"b":2}');
+  assert.equal(objects.length, 2);
+  assert.deepEqual(objects[0], { a: 1 });
+  assert.deepEqual(objects[1], { b: 2 });
 });
 
 test("Reviewer pass with a blocking finding is normalized by the supervisor contract", () => {
