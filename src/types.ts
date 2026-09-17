@@ -146,7 +146,7 @@ export interface PermissionDecision {
 export interface WorkerAdapter {
   capabilities(): WorkerCapabilities;
   /** Validate host/transport prerequisites before starting a Worker. */
-  preflight?(input: Pick<WorkerStartInput, "cwd" | "command" | "args" | "env" | "approval" | "automatic">): Promise<void>;
+  preflight?(input: Pick<WorkerStartInput, "cwd" | "command" | "args" | "env" | "approval" | "automatic" | "interactive">): Promise<void>;
   start(input: WorkerStartInput): Promise<WorkerHandle>;
   /** Cancel adapter-owned startup work before a WorkerHandle is returned. */
   abortStart?(reason: string, startupToken?: string): Promise<void>;
