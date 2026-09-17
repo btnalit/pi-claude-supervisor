@@ -162,6 +162,21 @@ test("a dynamic argument counts only in the statement that holds the sensitive c
   assert.equal(evaluateCommand("ls | xargs $tool").decision, "deny");
 });
 
+test("a name bound to literal text is not an unseen argument", () => {
+  // Shapes a Worker actually ran.
+  assert.equal(evaluateCommand("for c in 5dae138 feff500 6098949; do echo \"=== $c\"; git show --stat --format='%s' $c | tail -n +1; done").decision, "allow");
+  assert.equal(evaluateCommand("S=/tmp/claude/scratchpad && (npm run test:pi > $S/test-pi.log 2>&1; echo \"exit=$?\" >> $S/test-pi.log) && (npm_config_cache=$S/npm-cache npm run test:install > $S/test-install.log 2>&1)").decision, "allow");
+  assert.equal(evaluateCommand("FILE=src/policy.ts; git diff -- \"$FILE\"; git log --oneline -3 -- ${FILE}").decision, "allow");
+  // Every bound value is substituted, so a loop that would push is still a push.
+  assert.equal(evaluateCommand("for c in status push; do git $c origin main; done").decision, "deny");
+  assert.equal(evaluateCommand("ACTION=push; git $ACTION origin main").decision, "deny");
+  // A binding to dynamic text, or an unbound name, is still unseen.
+  assert.equal(evaluateCommand("for c in $(git rev-list HEAD~3..HEAD); do git show $c; done").decision, "deny");
+  assert.equal(evaluateCommand("C=$(git rev-parse HEAD); git show $C").decision, "deny");
+  assert.equal(evaluateCommand("git show $c").decision, "deny");
+  assert.equal(evaluateCommand("X=literal; X=$Y; git show $X").decision, "deny");
+});
+
 test("newlines separate statements and comments are ignored", () => {
   assert.equal(evaluateCommand("echo start\n$CMD --flag").decision, "deny");
   assert.equal(evaluateCommand("cd x\n$CMD").decision, "deny");
