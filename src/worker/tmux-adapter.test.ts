@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
-import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS } from "./tmux-adapter.ts";
+import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS, sweepDeadTmuxSockets } from "./tmux-adapter.ts";
 import { preflightCgroupContainment } from "./process-adapter.ts";
 import type { HookEventSource, HookRelayReply, HookRelayRequest } from "../hooks/types.ts";
 import type { WorkerEvent } from "../types.ts";
@@ -1509,3 +1509,30 @@ async function waitForFile(path: string): Promise<void> {
   }
   assert.fail(`file was not created before timeout: ${path}`);
 }
+
+test("sweepDeadTmuxSockets removes pi-cs sockets no server answers on and keeps live ones", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-sockets-"));
+  const live = join(directory, "pi-cs-11111111-1111-4111-8111-111111111111.sock");
+  const dead = join(directory, "pi-cs-22222222-2222-4222-8222-222222222222.sock");
+  try {
+    assert.equal(spawnSync("tmux", ["-S", live, "new-session", "-d", "-s", "sweep-live", "sleep 30"], { stdio: "ignore" }).status, 0);
+    // The real case: a server killed outright (as by its cgroup) leaves its socket behind.
+    assert.equal(spawnSync("tmux", ["-S", dead, "new-session", "-d", "-s", "sweep-dead", "sleep 30"], { stdio: "ignore" }).status, 0);
+    const serverPid = Number(spawnSync("tmux", ["-S", dead, "display-message", "-p", "#{pid}"], { encoding: "utf8" }).stdout.trim());
+    assert.ok(serverPid > 0);
+    process.kill(serverPid, "SIGKILL");
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try { process.kill(serverPid, 0); await new Promise((resolve) => setTimeout(resolve, 20)); } catch { break; }
+    }
+    await access(dead);
+    await writeFile(join(directory, "pi-cs-not-a-socket.txt"), "x");
+    const removed = sweepDeadTmuxSockets(directory);
+    assert.equal(removed, 1);
+    await assert.rejects(access(dead));
+    await access(live);
+    await access(join(directory, "pi-cs-not-a-socket.txt"));
+  } finally {
+    spawnSync("tmux", ["-S", live, "kill-server"], { stdio: "ignore" });
+    await rm(directory, { recursive: true, force: true });
+  }
+});

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
-import { constants as fsConstants } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { constants as fsConstants, lstatSync, readdirSync, unlinkSync } from "node:fs";
 import { access, chmod, lstat, mkdir, open, readdir, readFile, realpath, rm, rmdir, stat, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
@@ -798,6 +798,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       if (record.owned) {
         await this.#stopGuardian(record).catch((error) => { record.cleanupError ??= asError(error); });
         await this.#run(record, ["kill-server"], undefined, undefined, true).catch(() => {});
+        removeDeadTmuxSocket(record.handle.tmuxSocket);
       } else await this.#detachPipe(record);
     }
     const deadline = Date.now() + 25_000;
@@ -1670,6 +1671,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       if (isMissingSession(error)) record.serverKilled = true;
       else record.cleanupError = asError(error);
     }
+    if (record.serverKilled) removeDeadTmuxSocket(record.handle.tmuxSocket);
     if (!record.serverKilled) await this.#ensurePaneGone(record);
     if (record.cgroupPath) {
       try {
@@ -2282,6 +2284,41 @@ function normalizeForMatch(value: string): string {
 }
 
 /**
+ * A tmux server removes its socket when it exits normally, but not when it is
+ * killed with its cgroup; a dead `pi-cs-*.sock` is unlinked once no server
+ * answers on it. `sweepDeadTmuxSockets` does the same for every socket the
+ * adapter's naming scheme left behind in the temp directory.
+ */
+function removeDeadTmuxSocket(socketPath: string | undefined): void {
+  if (!socketPath || !/[\\/]pi-cs-[0-9a-f-]+\.sock$/u.test(socketPath)) return;
+  try {
+    const probe = spawnSync("tmux", ["-S", socketPath, "list-sessions"], { stdio: "ignore", timeout: 2_000 });
+    // A server that answers, or a socket something else holds open (the probe
+    // timed out), is left alone.
+    if (probe.status === 0 || probe.signal) return;
+    unlinkSync(socketPath);
+  } catch { /* already gone, or not ours to remove */ }
+}
+
+export function sweepDeadTmuxSockets(directory = tmpdir()): number {
+  let removed = 0;
+  let names: string[];
+  try { names = readdirSync(directory); } catch { return 0; }
+  for (const name of names) {
+    if (!/^pi-cs-[0-9a-f-]+\.sock$/u.test(name)) continue;
+    const socketPath = join(directory, name);
+    try {
+      if (!lstatSync(socketPath).isSocket()) continue;
+      const probe = spawnSync("tmux", ["-S", socketPath, "list-sessions"], { stdio: "ignore", timeout: 2_000 });
+      if (probe.status === 0 || probe.signal) continue;
+      unlinkSync(socketPath);
+      removed += 1;
+    } catch { /* skip */ }
+  }
+  return removed;
+}
+
+/**
  * True for a prompt Claude Code injected itself, which a human never typed:
  * `<task-notification>`, `<system-reminder>`, `<agent-message …>` and the
  * other hyphenated runtime wrappers it frames delivered content with. A
@@ -2412,7 +2449,10 @@ function isPaneIdentityError(error: unknown): boolean {
 }
 
 function isMissingSession(error: unknown): boolean {
-  return error instanceof Error && /(can't find session|no server running|session not found|failed to connect)/iu.test(error.message);
+  // tmux leaves its socket behind on exit ("no server running") unless it was
+  // unlinked, in which case it reports "error connecting … (No such file or
+  // directory)"; both mean the same thing here.
+  return error instanceof Error && /(can't find session|no server running|session not found|failed to connect|error connecting to [^\n]*No such file or directory)/iu.test(error.message);
 }
 
 function isMissingFile(error: unknown): boolean {

@@ -8,7 +8,7 @@ import { EventLog } from "./events.ts";
 import { redactSensitive } from "./redaction.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
 import { automaticWorkerEnvironment } from "./worker/environment.ts";
-import { TmuxWorkerAdapter, attachCommand } from "./worker/tmux-adapter.ts";
+import { TmuxWorkerAdapter, attachCommand, sweepDeadTmuxSockets } from "./worker/tmux-adapter.ts";
 import { Supervisor, type DecisionSessionClosedInfo, type HumanInterventionNotice, type SupervisorProgress, type SupervisorTokenUsage } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
@@ -128,6 +128,9 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   // with /supervise uninstall-hooks; the relay is a ~1 ms no-op when no
   // Supervisor is listening, so leaving it installed costs nothing.
   let hookInstallNotice: string | undefined;
+  // A Worker killed with its cgroup leaves its tmux socket behind; sweep the
+  // ones no server answers on so the temp directory does not fill with them.
+  if (transport === "tmux") sweepDeadTmuxSockets();
   if (hookServer) {
     hookServerReady = (async () => {
       await writeRelayScript(relayPath);
