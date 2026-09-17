@@ -24,6 +24,8 @@ export interface ClaudeHookEvent {
   permission_mode?: string;
   /** SessionStart */
   source?: string;
+  /** SessionStart: Claude Code's per-session scratchpad directory (outside the cwd). */
+  scratchpad_dir?: string;
   /** SessionEnd */
   reason?: string;
   /** UserPromptSubmit */

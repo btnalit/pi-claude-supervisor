@@ -120,6 +120,8 @@ interface TmuxRecord {
   hookUnsubscribe?: () => Promise<void>;
   claudeSessionId?: string;
   transcriptPath?: string;
+  /** Claude Code's per-session scratchpad directory (from SessionStart); an extra write root for the policy. */
+  scratchpadDir?: string;
   /** Primary readiness signal for interactive startup: SessionStart observed. */
   sessionStartReceived: boolean;
   /** Messages the adapter itself pasted, awaiting UserPromptSubmit acknowledgement. */
@@ -1990,6 +1992,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         record.claudeSessionId ??= event.session_id;
         record.handle.sessionId = event.session_id;
         if (event.transcript_path) record.transcriptPath = event.transcript_path;
+        if (typeof event.scratchpad_dir === "string" && isAbsolute(event.scratchpad_dir) && !event.scratchpad_dir.includes("\0")) record.scratchpadDir = event.scratchpad_dir;
         record.sessionStartReceived = true;
         return {};
       }
@@ -2069,6 +2072,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         input: event.tool_input,
         raw: event as unknown as Record<string, unknown>,
         phase,
+        ...(record.scratchpadDir ? { writeRoots: [record.scratchpadDir] } : {}),
       },
     });
     return new Promise<HookRelayReply>((resolve) => {

@@ -25,6 +25,12 @@ export interface WorkerPermissionRequest {
    * prompt to a human. Bridge/JSONL requests have no phase.
    */
   phase?: "pre" | "prompt";
+  /**
+   * Directories outside the task cwd that the Worker may write to for this
+   * session — today Claude Code's own per-session scratchpad, reported by its
+   * SessionStart hook. Never a repository or a home directory.
+   */
+  writeRoots?: string[];
 }
 
 export type WorkerEvent =

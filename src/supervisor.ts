@@ -651,7 +651,7 @@ export class Supervisor {
             this.#pendingPermissions.delete(event.request.requestId);
             skipDecisionNotify = true;
           } else {
-            const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd);
+            const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd, { writeRoots: event.request.writeRoots });
             if (policy.decision === "deny") {
               if (this.#adapter.respondPermission) {
                 await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, {
@@ -682,9 +682,9 @@ export class Supervisor {
           skipDecisionNotify = true;
         } else if (this.#automation && !this.#humanRequired) {
           const authority = task.spec.autonomy.permissionAuthority;
-          const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd);
+          const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd, { writeRoots: event.request.writeRoots });
           const answerLocally = authority === "policy"
-            || (authority === "hybrid" && (policy.decision === "deny" || isRoutinePermission(event.request.toolName, event.request.input, task.cwd)));
+            || (authority === "hybrid" && (policy.decision === "deny" || isRoutinePermission(event.request.toolName, event.request.input, task.cwd, { writeRoots: event.request.writeRoots })));
           if (answerLocally && this.#adapter.respondPermission) {
             const behavior: "allow" | "deny" = policy.decision === "deny" ? "deny" : "allow";
             await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, {
@@ -865,7 +865,7 @@ export class Supervisor {
         // checked before the generic policy-deny reason, or the Decision
         // Worker's chosen answer would never reach Claude.
         const isAskUserQuestionAnswer = event.request.toolName === "AskUserQuestion" && action.action === "deny_permission";
-        const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd);
+        const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd, { writeRoots: event.request.writeRoots });
         const behavior = policy.decision === "deny" ? "deny" : action.action === "allow_permission" ? "allow" : "deny";
         const message = behavior !== "deny"
           ? undefined
@@ -1042,7 +1042,7 @@ export class Supervisor {
       const request = requestId ? this.#pendingPermissions.get(requestId) : [...this.#pendingPermissions.values()].at(-1);
       if (!request) throw new Error("no pending permission request");
       if (this.#humanRequired && this.#humanGate !== "permission") throw new Error("automatic decisions are held by a separate human gate; use resume-auto explicitly");
-      const policy = evaluatePermission(request.toolName, request.input, task.cwd);
+      const policy = evaluatePermission(request.toolName, request.input, task.cwd, { writeRoots: request.writeRoots });
       if (policy.decision === "deny" && behavior === "allow") throw new Error(`permission denied by policy: ${policy.reason}`);
       await this.#adapter.respondPermission(handle, request.requestId, request.toolUseId, { behavior: policy.decision === "deny" ? "deny" : behavior }, behavior === "allow" ? request.input : undefined);
       this.#pendingPermissions.delete(request.requestId);
