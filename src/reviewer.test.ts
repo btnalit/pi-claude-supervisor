@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { extractJsonObjects } from "./json-extract.ts";
-import { normalizeReviewReport, parseReview } from "./reviewer.ts";
+import { normalizeReviewReport, parseReview, usageFromSessionStats } from "./reviewer.ts";
 
 test("Reviewer parser accepts bounded structured findings", () => {
   const report = parseReview(JSON.stringify({
@@ -65,6 +65,11 @@ test("extractJsonObjects finds every balanced JSON object in surrounding text", 
   assert.equal(objects.length, 2);
   assert.deepEqual(objects[0], { a: 1 });
   assert.deepEqual(objects[1], { b: 2 });
+});
+
+test("usageFromSessionStats maps aggregate session token counters onto ReviewReport.usage", () => {
+  const usage = usageFromSessionStats({ input: 500, output: 120, cacheRead: 40, cacheWrite: 10, total: 670 });
+  assert.deepEqual(usage, { input: 500, output: 120, cacheRead: 40, cacheWrite: 10, totalTokens: 670 });
 });
 
 test("Reviewer pass with a blocking finding is normalized by the supervisor contract", () => {

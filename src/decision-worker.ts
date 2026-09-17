@@ -65,6 +65,8 @@ export interface DecisionWorkerOptions {
 
 export type PiModel = NonNullable<NonNullable<Parameters<typeof createAgentSession>[0]>["model"]>;
 
+const DEFAULT_COMPACTION_TOKENS = 60_000;
+
 /**
  * A persistent Pi SDK session used only for supervision decisions.
  * It has read-only repository tools and can request typed actions, but it
@@ -81,12 +83,16 @@ export class PiDecisionWorker implements DecisionWorkerLike {
   #context: DecisionContext;
   readonly #timeoutMs: number;
   readonly #retryBackoffMs: number;
+  readonly #compactionTokens: number;
+  /** Set after a compaction; the next primary decision prompt re-sends the startup instructions once. */
+  #instructionsStale = false;
 
   constructor(options: DecisionWorkerOptions) {
     this.#options = options;
     this.#context = { ...options.context };
     this.#timeoutMs = options.timeoutMs ?? 120_000;
     this.#retryBackoffMs = options.retryBackoffMs ?? 500;
+    this.#compactionTokens = options.compactionTokens ?? DEFAULT_COMPACTION_TOKENS;
   }
 
   async start(): Promise<void> {
@@ -119,6 +125,7 @@ export class PiDecisionWorker implements DecisionWorkerLike {
       sessionManager,
       thinkingLevel: "low",
       tools: ["read", "grep", "find", "ls"],
+      model: this.#options.model,
     });
     this.#session = session;
     this.#sessionFile = session.sessionFile;
@@ -128,7 +135,7 @@ export class PiDecisionWorker implements DecisionWorkerLike {
     }
     if (!restored) {
       try {
-        await promptForText(session, decisionInstructions(this.#context), this.#timeoutMs, "Decision Worker startup", MAX_DECISION_RESPONSE_BYTES);
+        await promptForText(session, decisionInstructions(this.#context), this.#timeoutMs, "Decision Worker startup", MAX_DECISION_RESPONSE_BYTES, { role: "decision", onUsage: this.#options.onUsage });
       } catch (error) {
         try { await this.#options.onStartupFailure?.(error); } catch { /* preserve the original startup failure */ }
         throw error;
@@ -172,12 +179,23 @@ export class PiDecisionWorker implements DecisionWorkerLike {
     // (below) switches this to a corrective follow-up on the same session.
     let prompt: string | undefined;
     let repromptAttempted = false;
+    // Set only when this attempt's primary prompt actually carried the
+    // re-sent startup instructions; cleared once that prompt succeeds so a
+    // failed attempt does not silently drop the re-send on retry.
+    let usedInstructionsPrefix = false;
     while (true) {
       let text: string;
       try {
-        text = prompt === undefined
-          ? await askDecision(this.#session, event, this.#context, this.#timeoutMs)
-          : await promptForText(this.#session, prompt, this.#timeoutMs, "Decision Worker request", MAX_DECISION_RESPONSE_BYTES);
+        if (prompt === undefined) {
+          const instructionsPrefix = this.#instructionsStale
+            ? `SUPERVISOR INSTRUCTIONS (re-sent after compaction):\n${decisionInstructions(this.#context)}\n\n`
+            : undefined;
+          usedInstructionsPrefix = Boolean(instructionsPrefix);
+          text = await askDecision(this.#session, event, this.#context, this.#timeoutMs, { instructionsPrefix, onUsage: this.#options.onUsage });
+        } else {
+          usedInstructionsPrefix = false;
+          text = await promptForText(this.#session, prompt, this.#timeoutMs, "Decision Worker request", MAX_DECISION_RESPONSE_BYTES, { role: "decision", onUsage: this.#options.onUsage });
+        }
       } catch (error) {
         if (this.#closed) return;
         if (error instanceof Error && error.name === "AbortError") throw error;
@@ -188,6 +206,7 @@ export class PiDecisionWorker implements DecisionWorkerLike {
         continue;
       }
       if (this.#closed) return;
+      if (usedInstructionsPrefix) this.#instructionsStale = false;
       const action = parseDecision(text, event);
       // A single bounded re-prompt: give the model one more chance to return a
       // valid single JSON action before parking. A second parse failure keeps
@@ -200,7 +219,27 @@ export class PiDecisionWorker implements DecisionWorkerLike {
       // An action handler may stop or close the session. Do not replay an
       // already-decoded action if the handler itself fails.
       await this.#options.onAction(action, event);
+      await this.#maybeCompact();
       return;
+    }
+  }
+
+  /**
+   * Compact the persistent session once its estimated context grows past the
+   * configured threshold. Runs only between decisions (no prompt in flight);
+   * a failure here must not fail the decision that already succeeded.
+   */
+  async #maybeCompact(): Promise<void> {
+    if (this.#compactionTokens <= 0 || !this.#session || this.#closed) return;
+    const tokens = this.#session.getContextUsage?.()?.tokens;
+    if (typeof tokens !== "number" || tokens <= this.#compactionTokens) return;
+    try {
+      await this.#session.compact(
+        "Preserve: the task specification, the policy rules for permissions and boundaries, the current state, and the last three decisions with their reasons.",
+      );
+      this.#instructionsStale = true;
+    } catch {
+      // A compaction failure must not fail the decision that already succeeded.
     }
   }
 
@@ -258,9 +297,125 @@ wait for a human to be online. For an exited event choose verify, park or stop; 
 verify. A completed turn or a permission request always requires a concrete action.`;
 }
 
-async function askDecision(session: AgentSession, event: WorkerEvent, context: DecisionContext, timeoutMs: number): Promise<string> {
-  const prompt = `UNTRUSTED SUPERVISOR EVENT:\n${boundedJson(event)}\n\nCURRENT CONTEXT:\n${boundedJson(context)}\n\nChoose one action now.`;
-  return promptForText(session, prompt, timeoutMs, "Decision Worker request", MAX_DECISION_RESPONSE_BYTES);
+/**
+ * The task/spec/cwd already live in the startup instructions; every
+ * subsequent prompt sends only the compact event summary and the small
+ * pieces of context that actually change turn to turn.
+ */
+async function askDecision(
+  session: AgentSession,
+  event: WorkerEvent,
+  context: DecisionContext,
+  timeoutMs: number,
+  options: { instructionsPrefix?: string; onUsage?: (usage: PiUsageSample) => void } = {},
+): Promise<string> {
+  const currentContext = { state: context.state, turn: context.turn, maxTurns: context.maxTurns, repairRound: context.repairRound ?? 0 };
+  const prompt = `${options.instructionsPrefix ?? ""}UNTRUSTED SUPERVISOR EVENT:\n${boundedEventJson(event)}\n\nCURRENT CONTEXT:\n${boundedJson(currentContext)}\n\nChoose one action now.`;
+  return promptForText(session, prompt, timeoutMs, "Decision Worker request", MAX_DECISION_RESPONSE_BYTES, { role: "decision", onUsage: options.onUsage });
+}
+
+const KEPT_PERMISSION_INPUT_FIELDS = ["command", "description", "file_path", "path", "notebook_path", "pattern", "url"] as const;
+const CONTENT_REPLACED_PERMISSION_INPUT_FIELDS = ["content", "new_string", "old_string", "new_source"] as const;
+const CONTENT_REPLACING_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+
+/**
+ * Compact, model-facing summary of a Worker event. A `permission_request`
+ * carries the whole tool input and a `turn_completed` carries the whole
+ * Claude result record; both are large enough (up to 32 KB) that sending them
+ * verbatim on every prompt grew the Decision Worker's context unboundedly.
+ */
+function summarizeEvent(event: WorkerEvent): Record<string, unknown> {
+  if (event.type === "turn_completed") {
+    const result = event.result as { subtype?: unknown; is_error?: unknown; num_turns?: unknown; duration_ms?: unknown; total_cost_usd?: unknown; result?: unknown };
+    const text = typeof result.result === "string" ? result.result : "";
+    return {
+      type: event.type,
+      sequence: event.sequence,
+      result: {
+        subtype: result.subtype,
+        is_error: result.is_error,
+        num_turns: result.num_turns,
+        duration_ms: result.duration_ms,
+        total_cost_usd: result.total_cost_usd,
+        result: boundTail(text, 4_096),
+      },
+    };
+  }
+  if (event.type === "permission_request") {
+    const { requestId, toolUseId, toolName, input } = event.request;
+    return {
+      type: event.type,
+      requestId,
+      toolUseId,
+      toolName,
+      input: compactPermissionInput(toolName, input),
+      inputBytes: Buffer.byteLength(JSON.stringify(input) ?? "null", "utf8"),
+    };
+  }
+  if (event.type === "exited") {
+    return { type: event.type, exitCode: event.exitCode, signal: event.signal };
+  }
+  return { type: event.type };
+}
+
+function compactPermissionInput(toolName: string, input: unknown): Record<string, unknown> {
+  if (!input || typeof input !== "object") return {};
+  const source = input as Record<string, unknown>;
+  const compact: Record<string, unknown> = {};
+  for (const field of KEPT_PERMISSION_INPUT_FIELDS) {
+    const value = source[field];
+    if (typeof value === "string") compact[field] = boundHead(value, 2_048);
+  }
+  if (Array.isArray(source.edits)) compact.edits = { count: source.edits.length };
+  if (CONTENT_REPLACING_TOOLS.has(toolName)) {
+    for (const field of CONTENT_REPLACED_PERMISSION_INPUT_FIELDS) {
+      const value = source[field];
+      if (typeof value === "string") compact[field] = { bytes: Buffer.byteLength(value, "utf8"), preview: value.slice(0, 512) };
+    }
+  }
+  return compact;
+}
+
+function boundedEventJson(event: WorkerEvent): string {
+  const text = JSON.stringify(redactDecisionValue(summarizeEvent(event)), null, 2) ?? "null";
+  return text.length <= 8_000 ? text : `${text.slice(0, 8_000)}\n[TRUNCATED]`;
+}
+
+function boundHead(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  return `${Buffer.from(value, "utf8").subarray(0, maxBytes).toString("utf8")}\n[TRUNCATED]`;
+}
+
+function boundTail(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  return `[TRUNCATED]\n${Buffer.from(value, "utf8").subarray(-maxBytes).toString("utf8")}`;
+}
+
+interface PromptUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalTokens: number;
+  cost?: { total: number };
+}
+
+function addPromptUsage(total: PromptUsage | undefined, next: PromptUsage | undefined): PromptUsage | undefined {
+  if (!next) return total;
+  if (!total) return { ...next, ...(next.cost ? { cost: { total: next.cost.total } } : {}) };
+  return {
+    input: total.input + next.input,
+    output: total.output + next.output,
+    cacheRead: total.cacheRead + next.cacheRead,
+    cacheWrite: total.cacheWrite + next.cacheWrite,
+    totalTokens: total.totalTokens + next.totalTokens,
+    ...(total.cost || next.cost ? { cost: { total: (total.cost?.total ?? 0) + (next.cost?.total ?? 0) } } : {}),
+  };
+}
+
+export interface PromptForTextOptions {
+  role?: PiUsageSample["role"];
+  onUsage?: (usage: PiUsageSample) => void;
 }
 
 /**
@@ -269,8 +424,9 @@ async function askDecision(session: AgentSession, event: WorkerEvent, context: D
  * captured `message_end` stopReason/errorMessage are checked after it resolves:
  * an aborted turn raises an AbortError, a provider error raises a
  * DecisionWorkerApiError, and neither is treated as a normal empty reply.
+ * Also used by the Reviewer, which shares this exact assistant-text capture.
  */
-async function promptForText(session: AgentSession, prompt: string, timeoutMs: number, label: string, maxBytes: number): Promise<string> {
+export async function promptForText(session: AgentSession, prompt: string, timeoutMs: number, label: string, maxBytes: number, options: PromptForTextOptions = {}): Promise<string> {
   let current = "";
   let finalMessage = "";
   let capturingAssistant = false;
@@ -278,8 +434,9 @@ async function promptForText(session: AgentSession, prompt: string, timeoutMs: n
   let finalTooLarge = false;
   let stopReason: string | undefined;
   let errorMessage: string | undefined;
+  let usage: PromptUsage | undefined;
   const unsubscribe = session.subscribe((value) => {
-    const record = value as unknown as { type?: string; message?: { role?: string; content?: unknown; stopReason?: string; errorMessage?: string }; assistantMessageEvent?: { type?: string; delta?: string } };
+    const record = value as unknown as { type?: string; message?: { role?: string; content?: unknown; stopReason?: string; errorMessage?: string; usage?: PromptUsage }; assistantMessageEvent?: { type?: string; delta?: string } };
     const role = record.message?.role;
     if (record.type === "message_start" && role === "assistant") {
       current = "";
@@ -302,6 +459,9 @@ async function promptForText(session: AgentSession, prompt: string, timeoutMs: n
       finalTooLarge = currentTooLarge;
       stopReason = record.message?.stopReason;
       errorMessage = record.message?.errorMessage;
+      // A decision that uses read-only tools produces several assistant
+      // messages in one prompt; report the sum, not the last message.
+      usage = addPromptUsage(usage, record.message?.usage);
       current = "";
       currentTooLarge = false;
       capturingAssistant = false;
@@ -316,6 +476,20 @@ async function promptForText(session: AgentSession, prompt: string, timeoutMs: n
     }
   } finally {
     unsubscribe();
+  }
+  // Reported for both a successful reply and a provider error turn, since
+  // both consumed tokens against the persistent session.
+  if (usage && options.onUsage) {
+    options.onUsage({
+      role: options.role ?? "decision",
+      input: usage.input,
+      output: usage.output,
+      cacheRead: usage.cacheRead,
+      cacheWrite: usage.cacheWrite,
+      totalTokens: usage.totalTokens,
+      costUsd: usage.cost?.total,
+      contextTokens: session.getContextUsage?.()?.tokens ?? null,
+    });
   }
   if (stopReason === "aborted") {
     await session.abort().catch(() => {});
