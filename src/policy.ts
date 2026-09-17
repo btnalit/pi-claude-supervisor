@@ -333,7 +333,8 @@ function evaluateCommandInternal(command: string, depth: number): PolicyResult {
 }
 
 function evaluateTokens(rawTokens: readonly ShellToken[], depth: number): PolicyResult {
-  const { tokens, embedded } = resolveDataTokens(rawTokens);
+  const { tokens: dataResolved, embedded } = resolveDataTokens(rawTokens);
+  const tokens = resolveLiteralBindings(dataResolved);
   if (depth < 4) {
     for (const body of embedded) {
       const nestedResult = evaluateCommandInternal(body, depth + 1);
@@ -361,6 +362,61 @@ function evaluateTokens(rawTokens: readonly ShellToken[], depth: number): Policy
     return { decision: "deny", reason: "command matches a prohibited destructive pattern" };
   }
   return { decision: "allow", reason: "command is allowed for unattended local development" };
+}
+
+/**
+ * `NAME=literal` and `for NAME in literal…` bind a name to text the policy can
+ * see, so a later `$NAME` is not an unseen argument: `for c in 5dae138 feff500;
+ * do git show $c; done` and `S=/tmp/x && cat > $S/log` are literal commands.
+ * Every bound value is substituted (a loop over `status push` yields
+ * `git status push …`, which the boundary checks still catch), and a name
+ * rebound to dynamic text is forgotten again.
+ */
+function resolveLiteralBindings(tokens: readonly ShellToken[]): ShellToken[] {
+  const bindings = new Map<string, string>();
+  const resolved: ShellToken[] = [];
+  const substitute = (token: ShellToken): ShellToken => {
+    if (token.operator || token.data || !token.dynamic || bindings.size === 0) return token;
+    const value = token.value.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/gu, (match, name: string) => bindings.get(name) ?? match);
+    if (value === token.value) return token;
+    const dynamic = /[$`*?[\]{}~]/u.test(value) && !/^[[\]{}]+$/u.test(value);
+    return { ...token, value, dynamic };
+  };
+  let commandPosition = true;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = substitute(tokens[index]!);
+    resolved.push(token);
+    if (token.operator) { commandPosition = SEGMENT_SPLIT_OPERATORS.has(token.value); continue; }
+    const word = token.value;
+    if (commandPosition) {
+      const assignment = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/su.exec(word);
+      if (assignment) {
+        if (token.dynamic) bindings.delete(assignment[1]!);
+        else bindings.set(assignment[1]!, assignment[2]!);
+        continue;
+      }
+      if (word.toLowerCase() === "for") {
+        const name = tokens[index + 1]?.value;
+        const inWord = tokens[index + 2]?.value.toLowerCase();
+        if (name && /^[A-Za-z_][A-Za-z0-9_]*$/u.test(name) && inWord === "in") {
+          const values: string[] = [];
+          let cursor = index + 3;
+          let literal = true;
+          for (; cursor < tokens.length; cursor += 1) {
+            const item = tokens[cursor]!;
+            if (item.operator || item.value.toLowerCase() === "do") break;
+            const substituted = substitute(item);
+            if (substituted.dynamic || substituted.data) literal = false;
+            values.push(substituted.value);
+          }
+          if (literal && values.length > 0) bindings.set(name, values.join(" "));
+          else bindings.delete(name);
+        }
+      }
+      if (!COMMAND_POSITION_KEYWORDS.has(word.toLowerCase())) commandPosition = false;
+    }
+  }
+  return resolved;
 }
 
 /**
