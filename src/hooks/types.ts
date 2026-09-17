@@ -12,6 +12,7 @@ export type ClaudeHookEventName =
   | "PreToolUse"
   | "PermissionRequest"
   | "Stop"
+  | "StopFailure"
   | "Notification";
 
 /** The subset of Claude Code hook input the Supervisor consumes (all fields untrusted). */
@@ -34,6 +35,8 @@ export interface ClaudeHookEvent {
   /** Stop */
   last_assistant_message?: string;
   stop_hook_active?: boolean;
+  /** StopFailure (an API/model error ended the turn; no Stop fires) */
+  error?: unknown;
   /** Notification */
   notification_type?: string;
   message?: string;

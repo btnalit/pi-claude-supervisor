@@ -1962,6 +1962,16 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     return Boolean(record.handle.tmuxPaneId && request.tmuxPane && request.tmuxPane === record.handle.tmuxPaneId);
   }
 
+  #completeTurn(record: TmuxRecord, result: Record<string, unknown>): void {
+    record.activeRequests = 0;
+    record.lastOutputAt = new Date().toISOString();
+    record.turnSequence += 1;
+    // Every message pasted before this turn ended has been consumed; a
+    // confirmation that never arrived must not shadow a later human prompt.
+    record.pendingSentMessages.length = 0;
+    this.#emit(record, { type: "turn_completed", handle: record.handle, sequence: record.turnSequence, result });
+  }
+
   async #handleHookRequest(record: TmuxRecord, request: HookRelayRequest): Promise<HookRelayReply | undefined> {
     if (!(await this.#bindsToRecord(record, request))) {
       record.ignoredHookRequests += 1;
@@ -2000,24 +2010,26 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         return this.#awaitPermissionDecision(record, event, "prompt", `prompt:${digest}:${record.promptSequence}`);
       }
       case "Stop": {
-        record.activeRequests = 0;
-        record.lastOutputAt = new Date().toISOString();
-        record.turnSequence += 1;
-        // Every message pasted before this turn ended has been consumed; a
-        // confirmation that never arrived must not shadow a later human prompt.
-        record.pendingSentMessages.length = 0;
-        this.#emit(record, {
-          type: "turn_completed",
-          handle: record.handle,
-          sequence: record.turnSequence,
-          result: { subtype: "stop", result: event.last_assistant_message ?? "", stop_hook_active: Boolean(event.stop_hook_active) },
-        });
+        this.#completeTurn(record, { subtype: "stop", result: event.last_assistant_message ?? "", stop_hook_active: Boolean(event.stop_hook_active) });
+        return {};
+      }
+      case "StopFailure": {
+        // An API/model error ended the turn and no Stop will follow. Surface it
+        // as an errored turn so the Decision Worker can retry or park instead
+        // of the task idling until the no-output watchdog.
+        this.#completeTurn(record, { subtype: "error", is_error: true, result: describeHookError(event.error) });
         return {};
       }
       case "Notification": {
         if (event.notification_type === "permission_prompt") {
           const hasPendingPrompt = [...record.pendingPermissionRequests.values()].some((pending) => pending.phase === "prompt");
           if (!hasPendingPrompt) this.#logOutput(record, "[supervisor] Claude is waiting at a permission prompt the hook did not intercept\n");
+        } else if (event.notification_type === "idle_prompt" && record.activeRequests > 0) {
+          // Claude has been idle at its prompt for a minute with no Stop
+          // delivered (interrupted turn, lost hook): close the turn so the
+          // Supervisor is not left waiting for a completion that will not come.
+          this.#logOutput(record, "[supervisor] Claude went idle without a Stop hook; treating the turn as finished\n");
+          this.#completeTurn(record, { subtype: "idle", result: "" });
         }
         return {};
       }
@@ -2261,6 +2273,17 @@ function normalizeForMatch(value: string): string {
  * it matches exactly (after whitespace normalization) or shares the same
  * first 200 characters.
  */
+function describeHookError(error: unknown): string {
+  if (typeof error === "string") return error.slice(0, 2_000);
+  if (error && typeof error === "object") {
+    const record = error as { message?: unknown; type?: unknown; status?: unknown };
+    const parts = [record.type, record.status, record.message].filter((part) => part !== undefined && part !== null).map(String);
+    if (parts.length > 0) return parts.join(" ").slice(0, 2_000);
+    try { return JSON.stringify(error).slice(0, 2_000); } catch { /* unserializable */ }
+  }
+  return "Claude Code reported a turn failure";
+}
+
 function matchesPendingMessage(pending: string, prompt: string): boolean {
   const normalizedPending = normalizeForMatch(pending);
   const normalizedPrompt = normalizeForMatch(prompt);

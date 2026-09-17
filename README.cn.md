@@ -177,7 +177,8 @@ export PI_CLAUDE_SUPERVISOR_MODE=auto
 /supervise adopt-tmux <tmux-session> <task>
 ```
 
-Pi 会在 Claude 结束一轮对话时（`Stop`）、Claude 即将向你展示真实权限提示时（仅此时——
+Pi 会在 Claude 结束一轮对话时（`Stop`；轮中 API/模型失败会以 `StopFailure` 到达并按"出错的一轮"
+交给 Decision Worker 重试；提示符空闲一分钟且没有结束信号时作为兜底把这一轮收尾）、Claude 即将向你展示真实权限提示时（仅此时——
 其余每一次普通工具调用都交给你自己的 Claude Code 权限模式处理）、Claude 询问
 `AskUserQuestion` 时（Decision Worker 会选择一个答案，Claude 以普通文本形式继续，
 与无人值守自动模式中完全一致），以及 session 退出时介入。在展示提示之前的
