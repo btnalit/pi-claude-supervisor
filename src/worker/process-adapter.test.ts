@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { access, chmod, constants, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { claudeJsonlArgs, cleanupCgroup, preflightCgroupContainment, ProcessWorkerAdapter } from "./process-adapter.ts";
+import { claudeJsonlArgs, cleanupCgroup, PROCESS_EMBEDDED_SCRIPTS, preflightCgroupContainment, ProcessWorkerAdapter, processGroupHasLiveMember } from "./process-adapter.ts";
 
 const requiredCgroupTestAvailable = process.platform === "linux" && await canCreateCgroup();
 
@@ -771,6 +772,34 @@ test("claude-jsonl mode frames initial and subsequent messages", async () => {
   await adapter.stop(handle, "test complete");
   assert.equal((await adapter.getStatus(handle)).running, false);
   assert.equal(adapter.capabilities().transport, "jsonl");
+});
+
+test("embedded process-adapter scripts are syntactically valid JavaScript", () => {
+  for (const script of Object.values(PROCESS_EMBEDDED_SCRIPTS)) {
+    assert.doesNotThrow(() => new Function(script));
+  }
+});
+
+test("processGroupHasLiveMember detects live and reaped process groups", { skip: process.platform !== "linux" }, async () => {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", () => resolve());
+      child.once("error", reject);
+    });
+    assert.ok(child.pid);
+    assert.equal(await processGroupHasLiveMember(child.pid!), true);
+    process.kill(-child.pid!, "SIGKILL");
+    await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    let stillLive = true;
+    for (let attempt = 0; attempt < 200 && stillLive; attempt += 1) {
+      stillLive = await processGroupHasLiveMember(child.pid!);
+      if (stillLive) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(stillLive, false);
+  } finally {
+    child.unref();
+  }
 });
 
 async function canCreateCgroup(): Promise<boolean> {

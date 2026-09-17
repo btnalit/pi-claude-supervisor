@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
-import { TmuxWorkerAdapter } from "./tmux-adapter.ts";
+import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS } from "./tmux-adapter.ts";
 import { preflightCgroupContainment } from "./process-adapter.ts";
 
 const tmuxAvailable = process.platform === "linux" && spawnSync("tmux", ["-V"], { stdio: "ignore" }).status === 0;
@@ -12,6 +12,12 @@ const automaticTmuxAvailable = tmuxAvailable && await (async () => {
   try { await preflightCgroupContainment(); return true; }
   catch { return false; }
 })();
+
+test("embedded tmux-adapter scripts are syntactically valid JavaScript", () => {
+  for (const script of Object.values(TMUX_EMBEDDED_SCRIPTS)) {
+    assert.doesNotThrow(() => new Function(script));
+  }
+});
 
 test("automatic tmux preflight rejects disabled cgroup containment", { skip: process.platform !== "linux" || !tmuxAvailable }, async () => {
   const adapter = new TmuxWorkerAdapter({ cgroupMode: "off" });
