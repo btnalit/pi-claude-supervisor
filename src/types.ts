@@ -18,6 +18,13 @@ export interface WorkerPermissionRequest {
   toolName: string;
   input: unknown;
   raw: Record<string, unknown>;
+  /**
+   * Interactive (hook-driven) sessions ask twice: `pre` is the PreToolUse veto
+   * point before Claude's own permission mode runs — only a policy denial is
+   * answered there — and `prompt` means Claude would now show a permission
+   * prompt to a human. Bridge/JSONL requests have no phase.
+   */
+  phase?: "pre" | "prompt";
 }
 
 export type WorkerEvent =
@@ -132,6 +139,8 @@ export interface WorkerStatus {
 export interface PermissionDecision {
   behavior: "allow" | "deny";
   message?: string;
+  /** Interactive sessions only: answer "no decision" so Claude's own permission mode decides. */
+  defer?: boolean;
 }
 
 export interface WorkerAdapter {
