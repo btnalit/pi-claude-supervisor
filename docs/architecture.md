@@ -323,7 +323,8 @@ rather than throwing); if the Decision Worker
 API/model call fails, the system records `decision_worker_failed`, applies the
 bounded retry/park policy and preserves the candidate evidence. An abort is never
 retried, and a `noop` reply on a completed turn or a permission request parks the
-candidate rather than being treated as a resolved decision. Optional alert
+candidate rather than being treated as a resolved decision, while a `noop` on a
+clean Worker exit proceeds to verification. Optional alert
 delivery remains independent from event-log persistence, but notification is not
 the control boundary.
 

@@ -1394,6 +1394,53 @@ test("noop on a completed turn parks the candidate", async () => {
   assert.equal(supervisor.candidateParked, true);
 });
 
+test("noop on a clean exit proceeds to verification instead of stranding the task", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-noop-exit-"));
+  try {
+    await initializeGitRepository(cwd, "worker/noop-exit");
+    const handle: WorkerHandle = { id: "noop-exit-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    let reviews = 0;
+    let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+    let eventListener: WorkerStartInput["eventListener"] | undefined;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async (input) => { eventListener = input.eventListener; return handle; },
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running, exitReason: running ? undefined : "completed" }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const supervisor = new Supervisor(adapter, undefined, {
+      reviewer: { review: async () => { reviews += 1; return { verdict: "pass" as const, summary: "ok", findings: [], round: 0, checkedAt: new Date().toISOString() }; } },
+    });
+    await supervisor.start({
+      task: "noop exit",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: automaticSpec(),
+      decisionWorkerFactory: (options) => { onAction = options.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+    });
+    running = false;
+    const exited = { type: "exited" as const, handle, exitCode: 0 };
+    eventListener?.(exited);
+    await supervisor.poll();
+    assert.equal(supervisor.state, "verifying");
+    await onAction?.({ action: "noop", reason: "worker finished" }, exited);
+    assert.equal(reviews, 1);
+    assert.equal(supervisor.state, "completed");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("stop still transitions when a pending event keeps failing", async () => {
   const handle: WorkerHandle = { id: "pending-flush-worker", startedAt: new Date().toISOString(), cwd: "/tmp" };
   let running = true;

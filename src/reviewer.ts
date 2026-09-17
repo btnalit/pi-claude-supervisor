@@ -51,7 +51,12 @@ export class PiReadOnlyReviewer implements TaskReviewer {
     if (first.kind === "report") return first.report;
     // A raw provider error (429/529, auth, network) gets one retry with a
     // fresh session after a short cooldown, budget permitting.
-    if (deadline - Date.now() >= 5_000) await new Promise<void>((resolveWait) => setTimeout(resolveWait, 2_000));
+    if (deadline - Date.now() >= 5_000) await abortableDelay(2_000, input.signal);
+    if (input.signal?.aborted) {
+      const error = new Error("independent Reviewer aborted");
+      error.name = "AbortError";
+      throw error;
+    }
     const remaining = deadline - Date.now();
     if (remaining <= 0) return invalidReview(`Reviewer model request failed: ${first.message}`, input.round, new Date().toISOString());
     const second = await this.#attempt(input, remaining);
@@ -267,6 +272,16 @@ function invalidReview(reason: string, round: number, checkedAt: string): Review
     round,
     checkedAt,
   };
+}
+
+/** Sleep that returns early when the caller's abort signal fires; the caller re-checks the signal. */
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolveWait) => {
+    if (signal?.aborted) return resolveWait();
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolveWait(); }, ms);
+    function onAbort(): void { clearTimeout(timer); resolveWait(); }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function boundedJson(value: unknown, maxBytes = 32_000): string {
