@@ -25,7 +25,9 @@ export type WorkerEvent =
   | { type: "jsonl"; handle: WorkerHandle; record: Record<string, unknown> }
   | { type: "turn_completed"; handle: WorkerHandle; result: Record<string, unknown>; sequence: number }
   | { type: "permission_request"; handle: WorkerHandle; request: WorkerPermissionRequest }
-  | { type: "exited"; handle: WorkerHandle; exitCode?: number | null; signal?: NodeJS.Signals };
+  | { type: "exited"; handle: WorkerHandle; exitCode?: number | null; signal?: NodeJS.Signals }
+  /** A prompt the Supervisor did not send reached an interactive Worker: a human is driving. */
+  | { type: "human_input"; handle: WorkerHandle; text: string };
 
 export type WorkerEventListener = (event: WorkerEvent) => void | Promise<void>;
 
@@ -54,6 +56,15 @@ export interface WorkerStartInput {
   sendInitialInput?: boolean;
   /** Automatic mode selects the structured tmux bridge instead of the manual TUI transport. */
   automatic?: boolean;
+  /**
+   * Automatic mode that drives the real interactive Claude TUI through Claude
+   * Code hooks instead of the stream-json bridge. Requires `hookSource`.
+   */
+  interactive?: boolean;
+  /** Hook event routing for interactive sessions (owned or adopted). */
+  hookSource?: import("./hooks/types.ts").HookEventSource;
+  /** Hook settings file the owned interactive launch passes as `--settings`. */
+  hookSettingsPath?: string;
   /** Keep an empty automatic cgroup until the owning cwd lease is finalized. */
   retainCgroupUntilLeaseRelease?: boolean;
   /** Persist the planned automatic resource identity before adapter setup. */

@@ -8,6 +8,8 @@ const allowed = new Set([
   "PI_CLAUDE_SUPERVISOR_MODE",
   "PI_CLAUDE_SUPERVISOR_AUTOMATION",
   "PI_CLAUDE_SUPERVISOR_TRANSPORT",
+  "PI_CLAUDE_SUPERVISOR_TMUX_MODE",
+  "PI_CLAUDE_SUPERVISOR_CLOSE_WORKER_ON_COMPLETION",
   "PI_CLAUDE_SUPERVISOR_CGROUP_MODE",
   "PI_CLAUDE_SUPERVISOR_TMUX_SOCKET",
   "PI_CLAUDE_SUPERVISOR_WORKER",
@@ -159,4 +161,14 @@ function readPositiveNumber(value: string | undefined): number | undefined {
   if (value === undefined || value.trim() === "") return undefined;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/** How automatic tmux supervision drives Claude: the real TUI through hooks (default) or the stream-json bridge. */
+export function tmuxMode(env: NodeJS.ProcessEnv = process.env): "interactive" | "bridge" {
+  return env.PI_CLAUDE_SUPERVISOR_TMUX_MODE?.trim().toLowerCase() === "bridge" ? "bridge" : "interactive";
+}
+
+/** Exit the interactive Worker and its tmux session once a task completes; default keeps it open for the operator. */
+export function closeWorkerOnCompletion(env: NodeJS.ProcessEnv = process.env): boolean {
+  return readBoolean(env.PI_CLAUDE_SUPERVISOR_CLOSE_WORKER_ON_COMPLETION, false);
 }

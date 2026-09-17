@@ -574,6 +574,7 @@ function eventKey(event: WorkerEvent): string {
   if (event.type === "turn_completed") return `${event.handle.id}:result:${event.sequence}`;
   if (event.type === "exited") return `${event.handle.id}:exit`;
   if (event.type === "jsonl") return `${event.handle.id}:jsonl:${String(event.record.uuid ?? event.record.request_id ?? JSON.stringify(event.record))}`;
+  if (event.type === "human_input") return `${event.handle.id}:human:${event.text.slice(0, 80)}`;
   return `${event.handle.id}:output:${event.chunk.at}:${event.chunk.text.slice(0, 80)}`;
 }
 
