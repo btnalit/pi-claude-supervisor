@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants as fsConstants, readFileSync } from "node:fs";
-import { access, mkdir, readFile, readdir, rm, rmdir, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rmdir, stat, writeFile } from "node:fs/promises";
 import { delimiter, isAbsolute, join } from "node:path";
 import type {
   WorkerAdapter,
@@ -915,6 +915,8 @@ child.once("exit", (code, signal) => {
 }
 `;
 
+export const PROCESS_EMBEDDED_SCRIPTS = { guardedBootstrap: GUARDED_BOOTSTRAP_SCRIPT } as const;
+
 function guardedBootstrapLaunch(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv, cgroupPath: string | undefined, parentPid: number, parentStartTime: string, retainCgroup: boolean): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
   const encode = (value: string) => Buffer.from(value, "utf8").toString("base64");
   return {
@@ -1100,10 +1102,32 @@ async function removeCgroupDirectory(path: string): Promise<void> {
   } catch (error) {
     if (error instanceof Error && /ENOENT/u.test(error.message)) return;
   }
-  await rm(path, { recursive: true, force: true });
+  // cgroupfs control files cannot be unlinked, so a plain recursive rm fails
+  // on a non-empty cgroup. Only nested directories are ever real subgroups;
+  // remove those bottom-up and leave the control files for rmdir to reap.
+  await removeEmptyCgroupChildDirectories(path);
   try { await rmdir(path); }
   catch (error) {
     if (!(error instanceof Error && /ENOENT/u.test(error.message))) throw error;
+  }
+}
+
+async function removeEmptyCgroupChildDirectories(path: string): Promise<void> {
+  let entries;
+  try {
+    entries = await readdir(path, { withFileTypes: true });
+  } catch (error) {
+    if (error instanceof Error && /ENOENT/u.test(error.message)) return;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    const child = `${path}/${entry.name}`;
+    await removeEmptyCgroupChildDirectories(child);
+    try { await rmdir(child); }
+    catch (error) {
+      if (!(error instanceof Error && /ENOENT/u.test(error.message))) throw error;
+    }
   }
 }
 
@@ -1185,7 +1209,7 @@ function boundedPositiveInteger(value: number, name: string): number {
   return value;
 }
 
-async function processGroupHasLiveMember(pgid: number): Promise<boolean> {
+export async function processGroupHasLiveMember(pgid: number): Promise<boolean> {
   if (process.platform !== "linux") {
     try { process.kill(-pgid, 0); return true; }
     catch (error) {
@@ -1197,12 +1221,12 @@ async function processGroupHasLiveMember(pgid: number): Promise<boolean> {
   try { names = await readdir("/proc"); }
   catch { return true; }
   for (const name of names) {
-    if (!/^\\d+$/u.test(name)) continue;
+    if (!/^\d+$/u.test(name)) continue;
     try {
       const statText = await readFile(`/proc/${name}/stat`, "utf8");
       const closeParen = statText.lastIndexOf(")");
       if (closeParen < 0) continue;
-      const fields = statText.slice(closeParen + 2).trim().split(/\\s+/u);
+      const fields = statText.slice(closeParen + 2).trim().split(/\s+/u);
       const state = fields[0];
       const processGroup = Number(fields[2]);
       if (processGroup === pgid && state !== "Z") return true;

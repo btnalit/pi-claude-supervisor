@@ -374,6 +374,8 @@ const GUARDIAN_KEYS = {
   parentStart: "PI_CLAUDE_SUPERVISOR_TMUX_PARENT_START",
 } as const;
 
+const GUARDIAN_READY_MARKER = "PI_CLAUDE_SUPERVISOR_GUARDIAN_READY";
+
 const TMUX_GUARDIAN_SCRIPT = `
 const { spawnSync } = require("node:child_process");
 const { readFileSync, writeFileSync } = require("node:fs");
@@ -395,6 +397,7 @@ const alive = () => Boolean(parentPid > 0 && (() => {
   try { process.kill(parentPid, 0); } catch { return false; }
   return !parentStart || readStart(parentPid) === parentStart;
 })());
+process.stdout.write(${JSON.stringify(GUARDIAN_READY_MARKER)} + "\\n");
 const timer = setInterval(() => {
   if (alive()) return;
   clearInterval(timer);
@@ -411,7 +414,7 @@ const timer = setInterval(() => {
           return;
         }
       } catch (error) {
-        if (error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "ENOENT") {
+        if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
           process.exit(0);
           return;
         }
@@ -422,6 +425,12 @@ const timer = setInterval(() => {
   } else process.exit(0);
 }, 100);
 `;
+
+export const TMUX_EMBEDDED_SCRIPTS = {
+  paneBootstrap: TMUX_PANE_BOOTSTRAP_SCRIPT,
+  bridge: TMUX_BRIDGE_SCRIPT,
+  guardian: TMUX_GUARDIAN_SCRIPT,
+} as const;
 
 /**
  * Interactive Claude Code transport backed by a private tmux server and PTY.
@@ -1257,13 +1266,38 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       [GUARDIAN_KEYS.parentPid]: encode(String(process.pid)),
       [GUARDIAN_KEYS.parentStart]: encode(parent.startTime),
     };
-    const child = spawn(nodeScriptCommand(), ["-e", TMUX_GUARDIAN_SCRIPT], { detached: true, stdio: "ignore", env });
+    const child = spawn(nodeScriptCommand(), ["-e", TMUX_GUARDIAN_SCRIPT], { detached: true, stdio: ["ignore", "pipe", "ignore"], env });
     await new Promise<void>((resolve, reject) => {
       child.once("spawn", () => resolve());
       child.once("error", reject);
     });
     if (!child.pid) throw new Error("tmux parent-death guardian did not expose a pid");
     record.guardianPid = child.pid;
+    const ready = await new Promise<boolean>((resolve) => {
+      let buffer = "";
+      let settled = false;
+      const finish = (value: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        child.stdout?.off("data", onData);
+        child.off("exit", onExit);
+        resolve(value);
+      };
+      const onData = (chunk: Buffer | string) => {
+        buffer += String(chunk);
+        if (buffer.includes(GUARDIAN_READY_MARKER)) finish(true);
+      };
+      const onExit = () => finish(false);
+      const timer = setTimeout(() => finish(false), 2_000);
+      child.stdout?.on("data", onData);
+      child.once("exit", onExit);
+    });
+    if (!ready) {
+      try { process.kill(child.pid, "SIGKILL"); } catch {}
+      throw new Error("tmux parent-death guardian did not become ready");
+    }
+    child.stdout?.destroy();
     const identity = await processIdentity(child.pid);
     if (!identity?.startTime) {
       try { process.kill(child.pid, "SIGKILL"); } catch {}
@@ -1274,8 +1308,6 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       if (!record.cleanupComplete && !record.stopping && !record.paneDead) record.cleanupError ??= new Error("tmux parent-death guardian exited unexpectedly");
     });
     child.unref();
-    await delay(10);
-    if (!isPidAlive(child.pid) || await isZombie(child.pid)) throw new Error("tmux parent-death guardian exited during startup");
   }
 
   async #stopGuardian(record: TmuxRecord): Promise<void> {
