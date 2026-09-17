@@ -203,7 +203,12 @@ Supervisor being able to see it, or when you don't need to attach.
   merge/PR into `main` or an integration branch, other remote CLI mutations,
   `.git` metadata writes, and destructive rewrites of protected branches
   (`reset`, `update-ref`, `symbolic-ref`, or a delete/move/force `branch`).
-  Everything else follows the configured policy.
+  A shell argument the policy cannot see through (`$VAR`, `$(…)`, a glob)
+  is denied only on the commands where it could reach that boundary — git,
+  gh, npm/pnpm/yarn, curl/wget/ssh, a nested `claude`, or an interpreter
+  such as `eval`, `sh -c`, `xargs` — and quoted heredoc bodies are data.
+  Everything else (`for f in …; do echo "$f"`, `rm -rf ./dist`, a Write to
+  Claude's own scratchpad) follows the configured policy.
 - `autonomy.permissionAuthority` (`policy` | `hybrid` default |
   `decision-worker`) controls who answers a permission request — every
   request in headless mode, and in interactive tmux mode only those Claude

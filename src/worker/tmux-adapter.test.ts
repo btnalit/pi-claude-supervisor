@@ -1187,6 +1187,34 @@ test("PreToolUse waits for respondPermission and maps defer/deny/allow", { skip:
   }
 });
 
+test("SessionStart scratchpad_dir becomes an extra write root on permission requests", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const fixture = await startInteractiveOwnedFixture();
+  const { adapter, handle, hookSource, events, stateDir, fakePid } = fixture;
+  try {
+    const scratchpad = join(stateDir, "claude-scratchpad");
+    await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "SessionStart", session_id: "session-1", cwd: stateDir, scratchpad_dir: scratchpad },
+    });
+    const replyPromise = hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "PreToolUse", session_id: "session-1", cwd: stateDir, tool_name: "Write", tool_input: { file_path: join(scratchpad, "probe.ts"), content: "" }, tool_use_id: "tool-1" },
+    });
+    await waitFor(() => events.some((event) => event.type === "permission_request" && event.request.requestId === "tool-1"));
+    const request = events.find((event): event is Extract<WorkerEvent, { type: "permission_request" }> => event.type === "permission_request" && event.request.requestId === "tool-1")!;
+    assert.deepEqual(request.request.writeRoots, [scratchpad]);
+    await adapter.respondPermission(handle, request.request.requestId, request.request.toolUseId, { behavior: "allow", defer: true });
+    assert.deepEqual(await replyPromise, {});
+  } finally {
+    await adapter.stop(handle, "scratchpad test cleanup").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("PermissionRequest maps to phase prompt with a derived requestId", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
   const fixture = await startInteractiveOwnedFixture();
   const { adapter, handle, hookSource, events, stateDir, fakePid } = fixture;

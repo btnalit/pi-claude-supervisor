@@ -83,15 +83,36 @@ test("policy does not create a synchronous human gate for local development", ()
   assert.equal(evaluateCommand("curl https://api.github.com/repos/acme/project/issues -X POST").decision, "deny");
 });
 
-test("policy denies every dynamic shell argument", () => {
-  assert.equal(evaluateCommand("rm -rf \"$TARGET\"").decision, "deny");
+test("policy denies dynamic arguments only where they could reach the boundary", () => {
+  // Interpreters, runners, nested workers and repository/package commands cannot be checked with an unseen argument.
   assert.equal(evaluateCommand("claude --permission-mode \"$MODE\"").decision, "deny");
   assert.equal(evaluateCommand("bash -c 'claude --permission-mode \"$MODE\"'").decision, "deny");
   assert.equal(evaluateCommand("git pu{sh,} origin main").decision, "deny");
   assert.equal(evaluateCommand("bash -c 'git pu{sh,} origin main'").decision, "deny");
-  assert.equal(evaluateCommand("rm -rf /tmp/*").decision, "deny");
   assert.equal(evaluateCommand("echo ref > .git/refs/heads/$BRANCH").decision, "deny");
-  assert.equal(evaluateCommand("echo \"$VALUE\" > \"$TARGET\"").decision, "deny");
+  assert.equal(evaluateCommand("eval \"$cmd\"").decision, "deny");
+  assert.equal(evaluateCommand("timeout 30 $CMD").decision, "deny");
+  assert.equal(evaluateCommand("$CMD --flag").decision, "deny");
+  assert.equal(evaluateCommand("X=1 $CMD").decision, "deny");
+  assert.equal(evaluateCommand("do $CMD; done").decision, "deny");
+  assert.equal(evaluateCommand(". \"$f\"").decision, "deny");
+  assert.equal(evaluateCommand("xargs -0 $tool < list").decision, "deny");
+  assert.equal(evaluateCommand("npx $pkg").decision, "deny");
+  assert.equal(evaluateCommand("curl -X POST -d \"$body\" https://example.test").decision, "deny");
+  // Ordinary local commands with dynamic text are Claude's own business.
+  assert.equal(evaluateCommand("rm -rf \"$TARGET\"").decision, "allow");
+  assert.equal(evaluateCommand("rm -rf /tmp/*").decision, "allow");
+  assert.equal(evaluateCommand("rm -rf ./dist /home/u/x/node_modules").decision, "allow");
+  assert.equal(evaluateCommand("echo \"$VALUE\" > \"$TARGET\"").decision, "allow");
+  assert.equal(evaluateCommand("if [ -d .git ]; then git status; fi").decision, "allow");
+  assert.equal(evaluateCommand("if [ -n \"$x\" ]; then echo hi; fi").decision, "allow");
+  assert.equal(evaluateCommand("find . -name '*.o' -exec rm {} \\;").decision, "allow");
+  assert.equal(evaluateCommand("ls *.ts").decision, "allow");
+  assert.equal(evaluateCommand("python3 -c 'import sys' \"$f\"").decision, "allow");
+  // The catastrophe guard covers the filesystem root itself, not every absolute path.
+  assert.equal(evaluateCommand("rm -rf /").decision, "deny");
+  assert.equal(evaluateCommand("rm -rf /*").decision, "deny");
+  assert.equal(evaluateCommand("rm -rf --no-preserve-root /").decision, "deny");
 });
 
 test("policy allows ordinary read-only commands and literal argv values", () => {
@@ -101,7 +122,7 @@ test("policy allows ordinary read-only commands and literal argv values", () => 
 
 test("permission policy allows the full Claude tool and nested-worker surface", () => {
   assert.equal(evaluatePermission("Bash", { command: "claude --print review" }).decision, "allow");
-  assert.equal(evaluatePermission("Bash", { command: "c'l'a'u'd'e --print review" }).decision, "allow");
+  assert.equal(evaluatePermission("Bash", { command: "c'l'a'u'de --print review" }).decision, "allow");
   assert.equal(evaluatePermission("Bash", { command: "/usr/local/bin/claude --print review" }).decision, "allow");
   assert.equal(evaluatePermission("Bash", { command: "env CLAUDE_ENV=1 /usr/local/bin/claude --print review" }).decision, "allow");
   assert.equal(evaluatePermission("Bash", { command: "python3 -c 'import os; os.execv(\"/opt/Claude Code/bin/claude\", [\"claude\"])'" }).decision, "allow");
@@ -309,6 +330,40 @@ test("isRoutinePermission rejects file writes outside the task cwd", async () =>
     assert.equal(isRoutinePermission("Write", { file_path: "../outside.txt", content: "outside\n" }, root), false);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("dynamic text only matters on a repository or package command, and publish must be the subcommand", () => {
+  // Shapes a review Worker actually ran; every one was wrongly denied as "destructive".
+  assert.equal(evaluateCommand("for f in scripts/build-package.mjs scripts/publish-package.mjs; do echo \"$f\"; sed -n 1,20p \"$f\"; done").decision, "allow");
+  assert.equal(evaluateCommand("cd /tmp/probe && cat > verify.ts <<'EOF'\nconst merge = (a, b) => ({ ...a, ...b }); console.log(`${merge({}, {})}`);\nEOF").decision, "allow");
+  assert.equal(evaluateCommand("f=$(find node_modules -name models.generated.js | head -1); node -e 'console.log(process.argv[1])' \"$f\"").decision, "allow");
+  assert.equal(evaluateCommand("echo \"$x\" | grep publish").decision, "allow");
+  assert.equal(evaluateCommand("cat scripts/publish-package.mjs").decision, "allow");
+  // The boundary itself is unchanged.
+  assert.equal(evaluateCommand("npm publish").decision, "deny");
+  assert.equal(evaluateCommand("npm --tag next publish").decision, "deny");
+  assert.equal(evaluateCommand("pnpm publish --access public").decision, "deny");
+  assert.equal(evaluateCommand("git push $REMOTE main").decision, "deny");
+  assert.equal(evaluateCommand("git $ACTION origin main").decision, "deny");
+  assert.equal(evaluateCommand("gh pr create --title \"$title\"").decision, "deny");
+  assert.equal(evaluateCommand("npm run $script").decision, "deny");
+  assert.match(evaluateCommand("git $ACTION origin main").reason, /dynamic argument/u);
+});
+
+test("file tools may write inside an extra write root such as Claude's scratchpad, with the same metadata rules", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-policy-cwd-"));
+  const scratchpad = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-policy-scratch-"));
+  try {
+    const target = join(scratchpad, "probe.ts");
+    assert.equal(evaluatePermission("Write", { file_path: target }, cwd).decision, "deny");
+    assert.equal(evaluatePermission("Write", { file_path: target }, cwd, { writeRoots: [scratchpad] }).decision, "allow");
+    assert.equal(evaluatePermission("Write", { file_path: join(scratchpad, ".git", "config") }, cwd, { writeRoots: [scratchpad] }).decision, "deny");
+    assert.equal(evaluatePermission("Write", { file_path: join(tmpdir(), "elsewhere.txt") }, cwd, { writeRoots: [scratchpad] }).decision, "deny");
+    assert.equal(isRoutinePermission("Write", { file_path: target }, cwd, { writeRoots: [scratchpad] }), true);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+    await rm(scratchpad, { recursive: true, force: true });
   }
 });
 

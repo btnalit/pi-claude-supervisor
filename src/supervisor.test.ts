@@ -791,7 +791,7 @@ test("verification policy rejection stops a persistent worker", async () => {
   const supervisor = new Supervisor(adapter);
   await supervisor.start({ task: "fixture", cwd: "/tmp", command: "fixture", deadlineMs: 0, noOutputTimeoutMs: 0 });
   await supervisor.poll();
-  await assert.rejects(() => supervisor.verify({ command: "rm", args: ["-rf", "/tmp/should-not-run"] }), /destructive|unsafe|policy/u);
+  await assert.rejects(() => supervisor.verify({ command: "git", args: ["push", "origin", "main"] }), /destructive|unsafe|policy/u);
   assert.equal(stopped, true);
   assert.equal(supervisor.state, "failed");
 });

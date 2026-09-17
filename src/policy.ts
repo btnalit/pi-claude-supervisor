@@ -15,12 +15,17 @@ export interface PolicyResult {
  * allowed; only the explicit unattended interaction and repository/remote
  * authority boundaries below remain special-cased.
  */
-export function evaluatePermission(toolName: string, input: unknown, cwd = process.cwd()): PolicyResult {
+export interface PermissionPolicyOptions {
+  /** Extra directories the Worker may write to (Claude's per-session scratchpad); each must be an absolute path. */
+  writeRoots?: readonly string[];
+}
+
+export function evaluatePermission(toolName: string, input: unknown, cwd = process.cwd(), options: PermissionPolicyOptions = {}): PolicyResult {
   if (toolName === "AskUserQuestion") return { decision: "deny", reason: "interactive questions are converted to ordinary Worker text" };
   if (toolName === "Edit" || toolName === "Write" || toolName === "NotebookEdit") {
     const paths = fileToolPaths(input);
     if (paths.length === 0) return { decision: "deny", reason: `${toolName} request has no recognizable file path` };
-    const violation = paths.map((path) => ({ path, classification: classifyWritePath(path, cwd) })).find((entry) => entry.classification !== undefined);
+    const violation = paths.map((path) => ({ path, classification: classifyWritePath(path, cwd, options.writeRoots) })).find((entry) => entry.classification !== undefined);
     if (violation?.classification === "outside-cwd") return { decision: "deny", reason: `Worker cannot write outside the task working directory: ${violation.path}` };
     if (violation?.classification === "git-metadata") return { decision: "deny", reason: "Worker cannot write Git metadata or protected branch refs" };
     return { decision: "allow", reason: `local Claude file tool is allowed by the task policy: ${toolName}` };
@@ -30,7 +35,9 @@ export function evaluatePermission(toolName: string, input: unknown, cwd = proce
     ? (input as { command: string }).command
     : "";
   if (!command) return { decision: "deny", reason: "Bash request has no recognizable command" };
-  return evaluateCommand("bash", ["-lc", command]);
+  // Lex the command itself: wrapping it as a literal `bash -lc` argument would
+  // hide its structure (heredoc bodies, dynamic words) from the token checks.
+  return evaluateCommand(command);
 }
 
 function fileToolPaths(input: unknown): string[] {
@@ -43,8 +50,16 @@ function fileToolPaths(input: unknown): string[] {
 
 type WritePathViolation = "outside-cwd" | "git-metadata";
 
-function classifyWritePath(value: string, cwd: string): WritePathViolation | undefined {
+function classifyWritePath(value: string, cwd: string, writeRoots: readonly string[] = []): WritePathViolation | undefined {
   if (value.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return "git-metadata";
+  // A path inside an extra write root (Claude's own scratchpad) is judged
+  // against that root instead of the cwd, with the same symlink/metadata rules.
+  for (const root of writeRoots) {
+    if (!isAbsolute(root) || !isAbsolute(value)) continue;
+    const rel = relative(root, value);
+    if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) continue;
+    return classifyWritePath(value, root);
+  }
   let root: string;
   try { root = realpathSync(cwd); }
   catch { return "git-metadata"; }
@@ -93,12 +108,18 @@ function classifyWritePath(value: string, cwd: string): WritePathViolation | und
 }
 
 const deniedPatterns = [
-  /\b(?:npm|pnpm|yarn)\b[\s\S]*\bpublish\b/iu,
+  // `publish` must be the subcommand; a later argument that merely contains the
+  // word (scripts/publish-package.mjs) is not a publication.
+  /\b(?:npm|pnpm|yarn)\b(?:\s+-\S+)*\s+publish\b/iu,
   /\b(?:curl|wget)\b[\s\S]*(?:-X\s*(?:POST|PUT|PATCH|DELETE)|--request(?:=|\s+)(?:POST|PUT|PATCH|DELETE)|--method(?:=|\s+)(?:POST|PUT|PATCH|DELETE)|(?:^|\s)(?:-d|--data(?:[-a-z]*)(?:=|\s+)|--post-data(?:=|\s+)|--body-data(?:=|\s+)))[\s\S]*https?:\/\/(?:api\.)?(?:github|gitlab|bitbucket|registry\.npmjs)\b/iu,
-  /(?:\$\{?[^\s`}]+\}?|`[^`]*`|\$\([^)]*\))[\s\S]*\b(?:push|merge|publish)\b|\b(?:push|merge|publish)\b[\s\S]*(?:\$\{?[^\s`}]+\}?|`[^`]*`|\$\([^)]*\))/iu,
+  // A repository/package command with a dynamic argument cannot be
+  // capability-checked (`git $ACTION origin main`); dynamic text elsewhere in a
+  // command is ordinary shell and is not a boundary concern.
+  /\b(?:git|gh|glab|hub|npm|pnpm|yarn)\b[^|;&\n]*(?:\$\{?[^\s`}]+\}?|`[^`]*`|\$\([^)]*\))/iu,
   /--(?:allow-)?dangerously-skip-permissions\b/iu,
   /--permission-mode\s+(?:bypasspermissions|dontask)\b/iu,
-  /\brm\s+-rf\s+\//iu,
+  // Only the filesystem root itself; `rm -rf /abs/path/dist` is ordinary local work.
+  /\brm\s+(?:-\S+\s+)*\/+(?:\*|\s|$)/iu,
   /\bmkfs(?:\.|\s)/iu,
   /\bdd\s+if=/iu,
   /:\(\)\s*\{\s*:\|/u,
@@ -112,6 +133,18 @@ interface ShellToken {
 }
 
 const protectedBranches = new Set(["main", "master", "trunk", "integration", "develop"]);
+/**
+ * Commands whose dynamic arguments could carry a boundary-crossing action or
+ * execute arbitrary expanded text: the repository, package, network and
+ * nested-worker surfaces, plus interpreters, runners and the catastrophe guards.
+ */
+const DYNAMIC_SENSITIVE_COMMANDS = new Set([
+  "git", "gh", "glab", "hub", "npm", "pnpm", "yarn", "npx", "curl", "wget", "ssh", "scp", "rsync", "sftp", "claude",
+  "eval", "exec", "source", "sh", "bash", "zsh", "dash", "ksh", "fish", "xargs", "env", "sudo", "su", "doas",
+  "timeout", "time", "nice", "nohup", "command", "builtin", "watch", "dd", "mkfs", "shred",
+]);
+/** Shell words after which the next word is again in command position. */
+const COMMAND_POSITION_KEYWORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "!", "time", "exec", "command", "builtin", "nohup", "sudo", "doas"]);
 /** Rewriting a protected ref's identity directly; `checkout`/`switch`/`restore`/`worktree` are read-only uses of a branch name and are not included. */
 const protectedBranchRewriteOperations = new Set(["reset", "update-ref", "symbolic-ref"]);
 /** `branch` only rewrites or deletes a protected branch when combined with one of these flags. */
@@ -164,8 +197,13 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   const hasForcedBranchCreate = (lower.includes("checkout") && rawValues.includes("-B"))
     || (lower.includes("switch") && (rawValues.includes("-C") || rawValues.includes("--force-create")));
 
-  if (hasDynamicArgument) {
-    return { decision: "deny", reason: "dynamic shell arguments cannot be capability-checked safely" };
+  // An argument the lexer cannot see through matters only where it could reach
+  // the boundary: a repository, package, network or remote-shell command, or an
+  // interpreter that would execute the expanded text. Dynamic text in an
+  // ordinary local command (`for f in …; echo "$f"`) is Claude's own business.
+  const dynamicSensitive = lower.some((value) => DYNAMIC_SENSITIVE_COMMANDS.has(value.split(/[\\/]/u).at(-1) ?? value));
+  if (hasDynamicArgument && (hasGit || hasGhRemote || hasPackagePublication || dynamicSensitive || hasDynamicCommandName(tokens))) {
+    return { decision: "deny", reason: "a repository, package, network or shell command with a dynamic argument cannot be capability-checked" };
   }
   if (/\bgit\b[\s\S]*\b(?:push|merge(?!-)|send-pack|receive-pack|update-ref)\b/iu.test(canonical)
     || /\bgit-(?:send|receive|upload)-pack\b/iu.test(canonical)
@@ -198,6 +236,26 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   return undefined;
 }
 
+/** A dynamic word in command position (`$CMD …`, `; $CMD`, `do . $file`) could name anything. */
+function hasDynamicCommandName(tokens: readonly ShellToken[]): boolean {
+  let commandPosition = true;
+  for (const token of tokens) {
+    if (token.operator) {
+      commandPosition = SEGMENT_SPLIT_OPERATORS.has(token.value);
+      continue;
+    }
+    if (!commandPosition) continue;
+    // `VAR=value cmd` keeps the following word in command position; the value itself is data.
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/u.test(token.value)) continue;
+    if (token.dynamic) return true;
+    const word = token.value.toLowerCase();
+    if (word === "." || word === "source") return true;
+    if (COMMAND_POSITION_KEYWORDS.has(word)) continue;
+    commandPosition = false;
+  }
+  return false;
+}
+
 function nestedShellCommands(lower: readonly string[], values: readonly string[]): string[] {
   const nested: string[] = [];
   const shellNames = new Set(["sh", "bash", "dash", "zsh", "fish", "ksh"]);
@@ -205,7 +263,8 @@ function nestedShellCommands(lower: readonly string[], values: readonly string[]
     const executable = lower[index]!.split(/[\\/]/u).at(-1);
     if (executable && shellNames.has(executable)) {
       for (let option = index + 1; option < lower.length; option += 1) {
-        if (["-c", "--command"].includes(lower[option]!)) {
+        // `-c`, `--command`, or a combined short option such as `-lc` / `-ec`.
+        if (lower[option] === "--command" || /^-[a-z]*c[a-z]*$/u.test(lower[option]!)) {
           const command = values.slice(option + 1).join(" ").trim();
           if (command) nested.push(command);
           break;
@@ -244,30 +303,74 @@ function evaluateTokens(tokens: readonly ShellToken[], depth: number): PolicyRes
       || /\bgit\b[\s\S]*\bbranch\b[\s\S]*(?:^|\s)(?:-d|-m|-f|--force|--delete|--move)\b[\s\S]*\b(?:main|master|trunk|integration|develop)\b/iu.test(canonical)) {
       return { decision: "deny", reason: "Worker cannot rewrite or delete a protected integration branch" };
     }
-    if (/\b(?:npm|pnpm|yarn)\b[\s\S]*\bpublish\b/iu.test(canonical)) {
+    if (/\b(?:npm|pnpm|yarn)\b(?:\s+-\S+)*\s+publish\b/iu.test(canonical)) {
       return { decision: "deny", reason: "package publication belongs to the protected release workflow" };
+    }
+    if (/\b(?:git|gh|glab|hub|npm|pnpm|yarn)\b[^|;&\n]*(?:\$\{?[^\s`}]+\}?|`[^`]*`|\$\([^)]*\))/iu.test(canonical)) {
+      return { decision: "deny", reason: "a repository or package command with a dynamic argument cannot be capability-checked" };
     }
     return { decision: "deny", reason: "command matches a prohibited destructive pattern" };
   }
   return { decision: "allow", reason: "command is allowed for unattended local development" };
 }
 
+/**
+ * `$(cat <<'EOF' … EOF\n)` inside double quotes: Claude Code's commit-message
+ * idiom. With a quoted delimiter nothing in the body expands or runs, so the
+ * whole substitution is literal data.
+ */
+const LITERAL_CAT_HEREDOC = /^\$\(\s*cat\s+<<-?\s*(['"])([^'"\s]+)\1[ \t]*\n(?:[\s\S]*?\n)?[ \t]*\2[ \t]*\n?\s*\)/u;
+
 function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
   const tokens: ShellToken[] = [];
   let value = "";
   let dynamic = false;
   let started = false;
+  let tokenQuoted = false;
   let quote: "single" | "double" | undefined;
+  // Heredocs: the word after `<<` names the delimiter; the body starts on the
+  // next line and ends at a line equal to it. A quoted delimiter makes the body
+  // pure data, which the boundary never needs to see.
+  let expectDelimiter: { stripTabs: boolean } | undefined;
+  const pendingHeredocs: { delimiter: string; quoted: boolean; stripTabs: boolean }[] = [];
   const flush = (): void => {
     if (!started) return;
+    // A bare `[`, `[[`, `]` or `]]` is the test builtin's syntax, not a glob.
+    if (/^[[\]]+$/u.test(value)) dynamic = false;
+    if (expectDelimiter) {
+      pendingHeredocs.push({ delimiter: value, quoted: tokenQuoted, stripTabs: expectDelimiter.stripTabs });
+      expectDelimiter = undefined;
+      dynamic = false;
+    }
     tokens.push({ value, operator: false, dynamic });
     value = "";
     dynamic = false;
     started = false;
+    tokenQuoted = false;
   };
   const pushOperator = (operator: string): void => {
     flush();
     tokens.push({ value: operator, operator: true, dynamic: false });
+  };
+  /** Consume the heredoc bodies that start after the newline at `newlineIndex`; returns the index to resume lexing at. */
+  const consumeHeredocs = (newlineIndex: number): number => {
+    let position = newlineIndex + 1;
+    for (const heredoc of pendingHeredocs.splice(0)) {
+      const bodyLines: string[] = [];
+      let terminated = false;
+      while (position <= input.length) {
+        const lineEnd = input.indexOf("\n", position);
+        const line = input.slice(position, lineEnd === -1 ? input.length : lineEnd);
+        position = lineEnd === -1 ? input.length + 1 : lineEnd + 1;
+        if ((heredoc.stripTabs ? line.replace(/^\t+/u, "") : line) === heredoc.delimiter) { terminated = true; break; }
+        bodyLines.push(line);
+      }
+      if (heredoc.quoted) continue;
+      const body = bodyLines.join("\n");
+      tokens.push({ value: body, operator: false, dynamic: /[$`]/u.test(body) });
+      if (!terminated) break;
+    }
+    return Math.min(position, input.length);
   };
   for (let index = 0; index < input.length; index += 1) {
     const character = input[index]!;
@@ -282,16 +385,28 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
       if (character === '"') quote = undefined;
       else if (character === "\\" && next === "\n") index += 1;
       else if (character === "\\" && next !== undefined && /[\\"$`]/u.test(next)) { value += next; index += 1; }
-      else { value += character; if (character === "$" || character === "`") dynamic = true; }
+      else if (character === "$") {
+        const literal = LITERAL_CAT_HEREDOC.exec(input.slice(index));
+        if (literal) { index += literal[0].length - 1; }
+        else { value += character; dynamic = true; }
+      }
+      else { value += character; if (character === "`") dynamic = true; }
       started = true;
       continue;
     }
-    if (character === "'") { quote = "single"; started = true; continue; }
-    if (character === '"') { quote = "double"; started = true; continue; }
+    if (character === "'") { quote = "single"; started = true; tokenQuoted = true; continue; }
+    if (character === '"') { quote = "double"; started = true; tokenQuoted = true; continue; }
     if (character === "\\") {
       if (next === "\n") index += 1;
       else if (next !== undefined) { value += next; index += 1; }
       started = true;
+      continue;
+    }
+    if (character === "\n" && (pendingHeredocs.length > 0 || expectDelimiter)) {
+      flush();
+      expectDelimiter = undefined;
+      pushOperator(";");
+      index = consumeHeredocs(index) - 1;
       continue;
     }
     if (/\s/u.test(character)) { flush(); continue; }
@@ -301,7 +416,16 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
     // dynamic rather than attempting to model Bash's expansion order.
     if ("*?[]{}~".includes(character)) { dynamic = true; value += character; started = true; continue; }
     if (";&|<>".includes(character)) {
-      const operator = next && ((character === "&" && next === "&") || (character === "|" && next === "|") || (character === ">" && next === ">") || (character === "<" && next === "<"))
+      if (character === "<" && next === "<") {
+        const third = input[index + 2];
+        if (third === "<") { pushOperator("<<<"); index += 2; continue; }
+        const stripTabs = third === "-";
+        pushOperator("<<");
+        expectDelimiter = { stripTabs };
+        index += stripTabs ? 2 : 1;
+        continue;
+      }
+      const operator = next && ((character === "&" && next === "&") || (character === "|" && next === "|") || (character === ">" && next === ">"))
         ? `${character}${next}`
         : character;
       pushOperator(operator);
@@ -360,8 +484,8 @@ const FIND_WRITE_ACTIONS = new Set(["-delete", "-exec", "-execdir", "-ok", "-okd
  * escalation, destructive git operations and any write outside the task cwd
  * are never routine; the Decision Worker judges those.
  */
-export function isRoutinePermission(toolName: string, input: unknown, cwd: string): boolean {
-  const policyResult = evaluatePermission(toolName, input, cwd);
+export function isRoutinePermission(toolName: string, input: unknown, cwd: string, options: PermissionPolicyOptions = {}): boolean {
+  const policyResult = evaluatePermission(toolName, input, cwd, options);
   if (policyResult.decision === "deny") return false;
   if (toolName === "Edit" || toolName === "Write" || toolName === "NotebookEdit") return true;
   if (toolName === "Read" || toolName === "Glob" || toolName === "Grep" || toolName === "LS" || toolName === "TodoWrite") return true;
