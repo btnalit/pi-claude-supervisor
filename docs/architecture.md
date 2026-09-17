@@ -79,9 +79,13 @@ one capability from the other.
 This is a control-boundary fixture and headless transport. It does not emulate a
 terminal. Manual compatibility mode remains `process-pipe`; automatic mode
 (`PI_CLAUDE_SUPERVISOR_MODE=auto`) defaults to Claude JSONL and can select the
-Supervisor-owned tmux bridge. The bridge uses the CLI contract validated by the
+tmux transport, which by default drives the real interactive Claude TUI through
+Claude Code hooks (`PI_CLAUDE_SUPERVISOR_TMUX_MODE=interactive`, see "Interactive
+tmux transport" below) and can fall back to the Supervisor-owned bridge
+(`TMUX_MODE=bridge`). The bridge uses the CLI contract validated by the
 fixed-version spike, renders the stream in the pane and carries structured records
-through private framing on the same PTY; explicit adoption remains manual-only.
+through private framing on the same PTY; the bridge cannot adopt an existing
+session, whereas the interactive mode adopts one through the user-level hook relay.
 
 A worker exit automatically triggers cleanup, and terminal status waits for
 that cleanup to be confirmed (or reports a cleanup error). Automatic Claude
