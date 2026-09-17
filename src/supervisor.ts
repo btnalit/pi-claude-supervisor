@@ -98,6 +98,8 @@ export interface SupervisorStartOptions {
   deadlineMs?: number;
   /** Maximum time without worker output; defaults to 20 minutes. Set to 0 to disable. */
   noOutputTimeoutMs?: number;
+  /** After a `wait` decision, how long the Worker may stay silent before the Decision Worker is asked again; defaults to 10 minutes. Set to 0 to disable. */
+  waitTimeoutMs?: number;
   /** Human approval for a review-level worker command. */
   approval?: { actor: "human"; reason: string };
   /** Adopt an existing tmux session instead of starting a new worker. */
@@ -196,6 +198,9 @@ export class Supervisor {
   #workerOutput = "";
   #lastWorkerResult?: Record<string, unknown>;
   #lastTurnCompleted?: WorkerEvent;
+  /** Armed by a `wait` decision: re-asks the Decision Worker if the Worker never resumes on its own. */
+  #waitTimer?: NodeJS.Timeout;
+  #waitTimeoutMs = 10 * 60_000;
   #turn = 0;
   #repairRound = 0;
   #lastFindingSignature?: string;
@@ -324,6 +329,7 @@ export class Supervisor {
     this.#turn = options.initialTurn ?? 0;
     this.#deadlineMs = options.deadlineMs ?? 4 * 60 * 60_000;
     this.#noOutputTimeoutMs = options.noOutputTimeoutMs ?? 20 * 60_000;
+    this.#waitTimeoutMs = options.waitTimeoutMs ?? 10 * 60_000;
     this.#noOutputBaselineAt = undefined;
     this.#verificationAbortController = undefined;
     this.#progressPhase = undefined;
@@ -608,6 +614,8 @@ export class Supervisor {
     if (this.#handledEvents.has(key)) return;
     try {
       let skipDecisionNotify = false;
+      // Any fresh Worker activity supersedes a pending wait.
+      this.#clearWaitTimer();
       if (event.type === "turn_completed") { this.#lastWorkerResult = event.result; this.#lastTurnCompleted = event; }
       // Do not call #pollInternal from within a deferred retry: it would
       // recurse back into #retryDeferredWorkerEvents through #pollInternal's
@@ -901,7 +909,14 @@ export class Supervisor {
         return;
       }
       if (action.action === "continue" || action.action === "redirect" || action.action === "answer") {
+        if (await this.#decisionIsStale(event)) return;
         await this.#sendInternal(action.message);
+        return;
+      }
+      if (action.action === "wait") {
+        // The Worker will be re-invoked by its own background work; send
+        // nothing, but re-ask if it stays silent for the wait timeout.
+        this.#armWaitTimer(event);
         return;
       }
       if (action.action === "verify") {
@@ -938,10 +953,55 @@ export class Supervisor {
         return;
       }
       if (action.action === "retry") {
-        if (action.message?.trim()) await this.#sendInternal(action.message);
-        else await this.#parkCandidate(`Retry requires a concrete corrective instruction: ${action.reason}`, event);
+        if (!action.message?.trim()) { await this.#parkCandidate(`Retry requires a concrete corrective instruction: ${action.reason}`, event); return; }
+        if (await this.#decisionIsStale(event)) return;
+        await this.#sendInternal(action.message);
       }
     });
+  }
+
+  /**
+   * A decision about a completed turn is stale once the Worker has started a
+   * new turn on its own (a background agent, task or monitor of its own
+   * re-invoked it). Sending then would be refused by the adapter; it is not a
+   * failure of anything, so record it and let the next turn drive a new decision.
+   */
+  async #decisionIsStale(event: WorkerEvent): Promise<boolean> {
+    const handle = this.#handle;
+    if (!handle || event.type !== "turn_completed") return false;
+    const status = await this.#adapter.getStatus(handle).catch(() => undefined);
+    if (!status || status.activeRequests === undefined || status.activeRequests === 0) return false;
+    await this.#appendEvent({
+      type: "decision_ignored",
+      taskId: this.#task?.taskId,
+      workerId: handle.id,
+      data: { reason: "worker resumed on its own before the decision arrived", eventType: event.type },
+    }).catch(() => {});
+    return true;
+  }
+
+  #armWaitTimer(event: WorkerEvent): void {
+    this.#clearWaitTimer();
+    if (this.#waitTimeoutMs <= 0) return;
+    this.#waitTimer = setTimeout(() => {
+      this.#waitTimer = undefined;
+      void this.#exclusive(async () => {
+        if (!this.#decision || !this.#automation || this.#humanRequired || this.#machine.state !== "waiting" || this.#lastTurnCompleted !== event) return;
+        const handle = this.#handle;
+        if (!handle) return;
+        const status = await this.#adapter.getStatus(handle).catch(() => undefined);
+        if (status?.activeRequests) return;
+        await this.#appendEvent({ type: "wait_expired", taskId: this.#task?.taskId, workerId: handle.id, data: { waitTimeoutMs: this.#waitTimeoutMs } }).catch(() => {});
+        this.#decision.updateContext({ state: this.#machine.state, turn: this.#turn, repairRound: this.#repairRound });
+        this.#decision.replay?.(event);
+      }).catch(() => { /* the watchdog still covers a silent Worker */ });
+    }, this.#waitTimeoutMs);
+    this.#waitTimer.unref?.();
+  }
+
+  #clearWaitTimer(): void {
+    if (this.#waitTimer) clearTimeout(this.#waitTimer);
+    this.#waitTimer = undefined;
   }
 
   /**
@@ -1069,7 +1129,11 @@ export class Supervisor {
       this.#humanRequired = false;
       this.#humanGate = undefined;
       await this.#appendEvent({ type: "automation_resumed", taskId: this.#task?.taskId, workerId: this.#handle?.id });
-      if (this.#decision && this.#machine.state === "waiting" && this.#lastTurnCompleted) {
+      if (this.#decision && this.#machine.state === "waiting" && this.#lastTurnCompleted && this.#handle) {
+        // Replay the last completed turn only if the Worker is really idle; if
+        // it has resumed on its own, its next Stop brings a fresh turn.
+        const status = await this.#adapter.getStatus(this.#handle).catch(() => undefined);
+        if (status?.activeRequests) return;
         this.#decision.updateContext({ state: this.#machine.state, turn: this.#turn, repairRound: this.#repairRound });
         this.#decision.replay?.(this.#lastTurnCompleted);
       }
@@ -1727,6 +1791,7 @@ export class Supervisor {
   #clearWatchdog(): void {
     if (this.#watchdog) clearInterval(this.#watchdog);
     this.#watchdog = undefined;
+    this.#clearWaitTimer();
   }
 
   async #checkWatchdog(): Promise<void> {

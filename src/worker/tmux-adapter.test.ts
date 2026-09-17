@@ -1187,6 +1187,37 @@ test("PreToolUse waits for respondPermission and maps defer/deny/allow", { skip:
   }
 });
 
+test("a UserPromptSubmit carrying Claude's own task notification is not human input", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const fixture = await startInteractiveOwnedFixture();
+  const { adapter, handle, hookSource, events, stateDir, fakePid } = fixture;
+  try {
+    for (const prompt of [
+      "<task-notification>\n<task-id>b1k34un3w</task-id>\n<summary>Monitor event: \"reviewer transcripts idle\"</summary>\n<event>both idle for 45s</event>\n</task-notification>",
+      "  <system-reminder>\nBackground task completed.\n</system-reminder>",
+    ]) {
+      const reply = await hookSource.dispatch(stateDir, {
+        version: 1,
+        pid: fakePid + 1,
+        ppid: fakePid,
+        event: { hook_event_name: "UserPromptSubmit", session_id: "session-1", cwd: stateDir, prompt },
+      });
+      assert.deepEqual(reply, {});
+    }
+    assert.equal(events.some((event) => event.type === "human_input"), false);
+    const reply = await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "UserPromptSubmit", session_id: "session-1", cwd: stateDir, prompt: "please also update the changelog" },
+    });
+    assert.deepEqual(reply, {});
+    assert.equal(events.filter((event) => event.type === "human_input").length, 1);
+  } finally {
+    await adapter.stop(handle, "runtime prompt test cleanup").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("SessionStart scratchpad_dir becomes an extra write root on permission requests", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
   const fixture = await startInteractiveOwnedFixture();
   const { adapter, handle, hookSource, events, stateDir, fakePid } = fixture;

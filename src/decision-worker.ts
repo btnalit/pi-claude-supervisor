@@ -14,7 +14,7 @@ const MAX_DECISION_FIELD_BYTES = 8 * 1024;
 export type DecisionAction =
   | { action: "continue" | "redirect" | "answer"; message: string; reason: string; confidence?: number }
   | { action: "allow_permission" | "deny_permission"; requestId: string; toolUseId: string; reason: string; confidence?: number }
-  | { action: "verify" | "stop" | "park" | "ask_human" | "noop"; reason: string; question?: string; confidence?: number }
+  | { action: "verify" | "stop" | "park" | "ask_human" | "noop" | "wait"; reason: string; question?: string; confidence?: number }
   | { action: "retry"; reason: string; message?: string; confidence?: number };
 
 export interface DecisionContext {
@@ -280,7 +280,7 @@ Current repair round: ${context.repairRound ?? 0}
 Task specification: ${boundedJson(context.spec ?? { goal: context.task })}
 
 Return exactly one JSON object and no markdown:
-{"action":"continue|redirect|answer|allow_permission|deny_permission|verify|retry|stop|park|noop",...}
+{"action":"continue|redirect|answer|allow_permission|deny_permission|verify|retry|stop|park|wait|noop",...}
 For continue/redirect/answer include message and reason. For permission actions include
 requestId and toolUseId. Retry may include a corrective message. Never choose allow_permission
 for a command that crosses the remote push or main/integration merge boundary; the deterministic
@@ -300,7 +300,10 @@ Claude says it will stop; choose stop only for an explicit stop or technical con
 Use park only when the task cannot safely produce a candidate because required evidence,
 authority, or runtime capability is unavailable. A parked candidate is asynchronous and must not
 wait for a human to be online. For an exited event choose verify, park or stop; a noop on an exited event is treated as
-verify. A completed turn or a permission request always requires a concrete action.`;
+verify. Choose wait when the Worker's result says it is waiting for its own background agents,
+tasks or monitors: their completion re-invokes the Worker automatically, a message would only
+interrupt it, and the Supervisor asks you again if the Worker has not resumed within the wait
+timeout. A completed turn or a permission request always requires a concrete action.`;
 }
 
 /**
@@ -544,7 +547,7 @@ function parseDecision(text: string, event: WorkerEvent): DecisionAction {
     const value = distinct[0] as Record<string, unknown>;
     const action = value.action;
     if (typeof action !== "string") throw new Error("missing action");
-    const allowed = new Set(["continue", "redirect", "answer", "allow_permission", "deny_permission", "verify", "retry", "stop", "park", "ask_human", "noop"]);
+    const allowed = new Set(["continue", "redirect", "answer", "allow_permission", "deny_permission", "verify", "retry", "stop", "park", "ask_human", "noop", "wait"]);
     if (!allowed.has(action)) throw new Error(`unsupported action: ${action}`);
     const reason = typeof value.reason === "string" && value.reason.trim() ? boundedDecisionText(value.reason, "reason") : "no reason provided";
     const confidence = value.confidence === undefined ? undefined : typeof value.confidence === "number" && Number.isFinite(value.confidence) && value.confidence >= 0 && value.confidence <= 1
@@ -564,7 +567,7 @@ function parseDecision(text: string, event: WorkerEvent): DecisionAction {
     if (action === "retry") {
       return { action, reason, message: typeof value.message === "string" ? boundedDecisionText(value.message, "message") : undefined, confidence };
     }
-    return { action: action as "verify" | "stop" | "park" | "ask_human" | "noop", reason, question: typeof value.question === "string" ? boundedDecisionText(value.question, "question") : undefined, confidence };
+    return { action: action as "verify" | "stop" | "park" | "ask_human" | "noop" | "wait", reason, question: typeof value.question === "string" ? boundedDecisionText(value.question, "question") : undefined, confidence };
   } catch (error) {
     return { action: "park", reason: `invalid Decision Worker action: ${error instanceof Error ? error.message : String(error)}` };
   }

@@ -1836,6 +1836,107 @@ test("truncated repository evidence requests a repair before parking", async () 
   }
 });
 
+test("a continue decision is ignored, not parked, when the Worker has resumed on its own", async () => {
+  const handle: WorkerHandle = { id: "stale-decision-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  let activeRequests = 0;
+  let stopped = false;
+  let capturedListener: WorkerStartInput["eventListener"];
+  let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+  const events = new FlakyEventLog("never-fail");
+  const sent: string[] = [];
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true }),
+    start: async (input) => { capturedListener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running: !stopped, activeRequests, processGroupCleaned: stopped }),
+    readOutput: async () => [],
+    send: async (_handle, message) => { sent.push(message); },
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { stopped = true; },
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "stale decision",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: (options) => { onAction = options.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+  });
+  const turnEvent: WorkerEvent = { type: "turn_completed", handle, result: { subtype: "stop", result: "Waiting for 2 background agents" }, sequence: 1 };
+  capturedListener?.(turnEvent);
+  await supervisor.poll();
+  assert.equal(supervisor.state, "waiting");
+  // A background agent finished and re-invoked Claude before the decision arrived.
+  activeRequests = 1;
+  await onAction?.({ action: "continue", message: "keep going", reason: "r" }, turnEvent);
+  assert.deepEqual(sent, []);
+  assert.equal(stopped, false);
+  assert.equal(supervisor.candidateParked, false);
+  assert.ok(events.events.some((event) => event.type === "decision_ignored" && /resumed on its own/u.test(String((event.data as { reason?: string } | undefined)?.reason))));
+  assert.ok(!events.events.some((event) => event.type === "decision_worker_failed" || event.type === "candidate_parked"));
+  // resume-auto after a takeover must not replay into a live turn either.
+  await supervisor.takeover();
+  await supervisor.resumeAutomation();
+  assert.ok(!events.events.some((event) => event.type === "worker_message_sent"));
+});
+
+test("a wait decision sends nothing and re-asks the Decision Worker only if the Worker stays idle", async () => {
+  const handle: WorkerHandle = { id: "wait-decision-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  let capturedListener: WorkerStartInput["eventListener"];
+  let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+  const replays: WorkerEvent[] = [];
+  const events = new FlakyEventLog("never-fail");
+  const sent: string[] = [];
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true }),
+    start: async (input) => { capturedListener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running: true, activeRequests: 0, processGroupCleaned: false }),
+    readOutput: async () => [],
+    send: async (_handle, message) => { sent.push(message); },
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "wait decision",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    waitTimeoutMs: 60,
+    spec: automaticSpec(),
+    decisionWorkerFactory: (options) => {
+      onAction = options.onAction;
+      return { start: async () => {}, updateContext: () => {}, notify: () => {}, replay: (event) => { replays.push(event); }, close: async () => {} };
+    },
+  });
+  const turnEvent: WorkerEvent = { type: "turn_completed", handle, result: { subtype: "stop", result: "Both reviewer agents are still running; their completion notifications will arrive automatically." }, sequence: 1 };
+  capturedListener?.(turnEvent);
+  await supervisor.poll();
+  await onAction?.({ action: "wait", reason: "worker is waiting for its own agents" }, turnEvent);
+  assert.deepEqual(sent, []);
+  assert.equal(supervisor.state, "waiting");
+  assert.equal(supervisor.candidateParked, false);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(replays.length, 1);
+  assert.ok(events.events.some((event) => event.type === "wait_expired"));
+  // A fresh turn cancels a pending wait: no second replay follows.
+  await onAction?.({ action: "wait", reason: "still waiting" }, turnEvent);
+  capturedListener?.({ type: "turn_completed", handle, result: { subtype: "stop", result: "done" }, sequence: 2 });
+  await supervisor.poll();
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(replays.length, 1);
+});
+
 test("resume-auto replays the last completed turn", async () => {
   const handle: WorkerHandle = { id: "resume-replay-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
   const running = true;

@@ -2003,7 +2003,11 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
           record.pendingSentMessages.splice(matchedIndex, 1);
           return {};
         }
-        this.#emit(record, { type: "human_input", handle: record.handle, text: boundTextHead(prompt, 4_096) });
+        // Claude Code delivers its own background-task, monitor and agent
+        // completions through this hook as a user-role message; nobody typed it.
+        if (!isClaudeRuntimePrompt(prompt)) {
+          this.#emit(record, { type: "human_input", handle: record.handle, text: boundTextHead(prompt, 4_096) });
+        }
         record.activeRequests = 1;
         record.inputAt = Date.now();
         record.lastInputAt = new Date().toISOString();
@@ -2275,6 +2279,11 @@ function boundTextHead(value: string, maxBytes: number): string {
 
 function normalizeForMatch(value: string): string {
   return value.trim().replace(/\s+/gu, " ");
+}
+
+/** True for a prompt Claude Code injected itself (`<task-notification>`, `<system-reminder>`), which a human never typed. */
+function isClaudeRuntimePrompt(prompt: string): boolean {
+  return /^\s*<(?:task-notification|system-reminder)\b/u.test(prompt);
 }
 
 /**
