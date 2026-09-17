@@ -286,6 +286,10 @@ Code 2.1.273 — and is the only guarantee this mode makes beyond your own
 settings. Use the headless (`bridge`) mode when every `Bash` call must be
 visible to the Supervisor.
 
+**Adopting an idle session.** `adopt-tmux` types the task into the session
+only when Claude is idle at its prompt; a session caught mid-turn keeps its
+current work and is judged on its next `Stop` instead.
+
 **Human coexistence.** If you type into the attached session, automation
 pauses (`human_takeover`, visible as a warning) until you run `/supervise
 resume-auto <task-id>`; the turn that completed while you were driving is

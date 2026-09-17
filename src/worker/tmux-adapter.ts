@@ -756,6 +756,12 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
           // A non-prompt screen indicates that adoption is observing an
           // already-running turn; an idle prompt stays inactive.
           record.turnObservedOutput = true;
+        } else if (interactive && input.task.trim()) {
+          // Babysitting an idle interactive session: nobody else will start the
+          // work, so the task is typed in now. A session caught mid-turn keeps
+          // its current work and is judged on its next Stop instead.
+          await this.#send(record, input.task, `${id}:initial`);
+          this.#logOutput(record, "[supervisor] adopted session was idle; task sent\n");
         }
       } else {
         // Explicit idle startup is used by recovery; do not create a blank
