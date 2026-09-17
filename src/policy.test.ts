@@ -3,7 +3,11 @@ import { link, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { assertSafeWorkerCommand, evaluateCommand, evaluatePermission } from "./policy.ts";
+import { assertSafeWorkerCommand, evaluateCommand, evaluatePermission, isRoutinePermission } from "./policy.ts";
+
+function bash(command: string) {
+  return { command };
+}
 
 test("policy denies destructive commands", () => {
   assert.equal(evaluateCommand("rm -rf /").decision, "deny");
@@ -128,6 +132,47 @@ test("policy denies unsafe worker permission flags even when passed as arguments
   assert.equal(evaluateCommand("claude", ["--allow-dangerously-skip-permissions"]).decision, "deny");
   assert.equal(evaluateCommand("claude", ["--permission-mode=bypassPermissions"]).decision, "deny");
   assert.equal(evaluateCommand("claude", ["--permission-mode=bypass-permissions"]).decision, "deny");
+});
+
+test("isRoutinePermission recognizes routine local-dev Bash shapes", () => {
+  const cwd = process.cwd();
+  assert.equal(isRoutinePermission("Bash", bash("ls -la"), cwd), true);
+  assert.equal(isRoutinePermission("Bash", bash("grep -rn foo src/ | head"), cwd), true);
+  assert.equal(isRoutinePermission("Bash", bash("git status && git diff --stat"), cwd), true);
+  assert.equal(isRoutinePermission("Bash", bash("sed -n 1,40p src/x.ts"), cwd), true);
+  assert.equal(isRoutinePermission("Bash", bash("node --test src/a.test.ts"), cwd), true);
+  assert.equal(isRoutinePermission("Bash", bash("npm run typecheck"), cwd), true);
+  assert.equal(isRoutinePermission("Bash", bash("timeout 120 npm test"), cwd), true);
+  assert.equal(isRoutinePermission("Bash", bash("node -e 'console.log(1)'"), cwd), true);
+});
+
+test("isRoutinePermission rejects anything it cannot fully account for", () => {
+  const cwd = process.cwd();
+  assert.equal(isRoutinePermission("Bash", bash("curl -sL https://x"), cwd), false);
+  assert.equal(isRoutinePermission("Bash", bash("npx --yes -p node@22 node -e 1"), cwd), false);
+  assert.equal(isRoutinePermission("Bash", bash("cat > /tmp/p.mts <<'EOF'"), cwd), false);
+  assert.equal(isRoutinePermission("Bash", bash("cd /tmp && ls"), cwd), false);
+  assert.equal(isRoutinePermission("Bash", bash("rm -rf build"), cwd), false);
+  assert.equal(isRoutinePermission("Bash", bash("git push origin main"), cwd), false);
+  assert.equal(isRoutinePermission("Bash", bash("node -e 'require(\"http\").get(...)'"), cwd), false);
+  assert.equal(isRoutinePermission("Bash", bash("node -r ./x.js -e 'require(\"http\").get(...)'"), cwd), false);
+  assert.equal(isRoutinePermission("Bash", bash("ls $(echo x)"), cwd), false);
+  assert.equal(isRoutinePermission("Bash", bash("sudo ls"), cwd), false);
+  assert.equal(isRoutinePermission("Bash", bash("ls & curl https://x -o /tmp/y"), cwd), false);
+  assert.equal(isRoutinePermission("Bash", bash("ls\ncurl https://x"), cwd), false);
+  assert.equal(isRoutinePermission("Bash", bash("echo x > .git/config"), cwd), false);
+  assert.equal(isRoutinePermission("mcp__Gmail__send_message", {}, cwd), false);
+  assert.equal(isRoutinePermission("WebFetch", {}, cwd), false);
+});
+
+test("isRoutinePermission rejects file writes outside the task cwd", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-policy-routine-"));
+  try {
+    assert.equal(isRoutinePermission("Write", { file_path: "src/index.ts", content: "ok" }, root), true);
+    assert.equal(isRoutinePermission("Write", { file_path: "../outside.txt", content: "outside\n" }, root), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("remote and destructive commands remain denied even with a legacy approval", () => {

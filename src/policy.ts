@@ -1,5 +1,5 @@
 import { lstatSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 export type PolicyDecision = "allow" | "review" | "deny";
 
@@ -305,6 +305,158 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
   if (quote) return { tokens, error: "unterminated quote" };
   flush();
   return { tokens };
+}
+
+const SEGMENT_SPLIT_OPERATORS = new Set(["|", "&&", "||", ";", "&"]);
+
+const ROUTINE_SHELL_COMMANDS = new Set([
+  "ls", "cat", "head", "tail", "grep", "rg", "egrep", "fgrep", "sed", "awk", "cut", "sort", "uniq", "wc", "tr",
+  "find", "xargs", "echo", "printf", "pwd", "which", "env", "true", "false", "test", "[", "diff", "stat", "file",
+  "basename", "dirname", "realpath", "readlink", "date", "sleep", "timeout", "node", "npm", "tsc", "git",
+]);
+
+const ROUTINE_GIT_SUBCOMMANDS = new Set([
+  "status", "diff", "log", "show", "rev-parse", "rev-list", "branch", "add", "commit", "stash", "restore",
+  "switch", "checkout", "ls-files", "blame", "describe", "cat-file", "merge-base", "tag",
+]);
+
+const ROUTINE_NPM_SUBCOMMANDS = new Set(["test", "run", "ls"]);
+const WRAPPER_COMMANDS = new Set(["xargs", "timeout", "env"]);
+const NODE_INLINE_FLAGS = new Set(["-e", "--eval", "-p", "--print"]);
+const NODE_INLINE_RISK = /\bhttps?\b|\bnet\b|\bchild_process\b|fetch\(/iu;
+
+/**
+ * A conservative, deterministic classifier for the narrow set of permission
+ * requests routine enough for the Supervisor to answer from policy alone,
+ * without a Decision Worker model call. It never overturns a policy denial;
+ * it only recognizes local read-only and local-dev shapes it can fully
+ * account for, and treats anything unrecognized as not routine.
+ */
+export function isRoutinePermission(toolName: string, input: unknown, cwd: string): boolean {
+  const policyResult = evaluatePermission(toolName, input, cwd);
+  if (policyResult.decision === "deny") return false;
+  if (toolName === "Edit" || toolName === "Write" || toolName === "NotebookEdit") return true;
+  if (toolName === "Read" || toolName === "Glob" || toolName === "Grep" || toolName === "LS" || toolName === "TodoWrite") return true;
+  if (toolName === "Bash") {
+    const command = input && typeof input === "object" && typeof (input as { command?: unknown }).command === "string"
+      ? (input as { command: string }).command
+      : "";
+    return command ? isRoutineShellCommand(command, cwd) : false;
+  }
+  // WebFetch, WebSearch, Task, mcp__* tools and any unrecognized tool name.
+  return false;
+}
+
+function isRoutineShellCommand(command: string, cwd: string): boolean {
+  // A newline can carry a heredoc body, a second statement, or other content
+  // this single-line lexer never sees; treat any multi-line command as
+  // unrecognized rather than reasoning about what follows the first line.
+  if (/[\r\n]/u.test(command)) return false;
+  const lexical = lexShell(command.trim());
+  if (lexical.error) return false;
+  if (lexical.tokens.some((token) => !token.operator && token.dynamic)) return false;
+  const segments: ShellToken[][] = [[]];
+  for (const token of lexical.tokens) {
+    if (token.operator && SEGMENT_SPLIT_OPERATORS.has(token.value)) {
+      segments.push([]);
+      continue;
+    }
+    segments.at(-1)!.push(token);
+  }
+  if (segments.some((segment) => segment.length === 0)) return false;
+  return segments.every((segment) => isRoutineSegment(segment, cwd, command, 0));
+}
+
+function isRoutineSegment(segment: readonly ShellToken[], cwd: string, rawCommand: string, depth: number): boolean {
+  if (depth > 5) return false;
+  if (hasUnsafeRedirection(segment, cwd)) return false;
+  const words = segment.filter((token) => !token.operator).map((token) => token.value);
+  if (words.length === 0) return false;
+  return isRoutineWords(words, cwd, rawCommand, depth);
+}
+
+function isRoutineWords(words: readonly string[], cwd: string, rawCommand: string, depth: number): boolean {
+  if (depth > 5) return false;
+  const head = words[0]!.split(/[\\/]/u).at(-1)!.toLowerCase();
+  if (WRAPPER_COMMANDS.has(head)) {
+    const wrapped = unwrapWrapper(head, words.slice(1));
+    if (wrapped.length === 0) return false;
+    return isRoutineWords(wrapped, cwd, rawCommand, depth + 1);
+  }
+  if (!ROUTINE_SHELL_COMMANDS.has(head)) return false;
+  if (head === "git") return isRoutineGitSubcommand(words.slice(1));
+  if (head === "npm") return isRoutineNpmSubcommand(words.slice(1));
+  if (head === "node") return isRoutineNode(words.slice(1), cwd, rawCommand);
+  return true;
+}
+
+function unwrapWrapper(head: string, rest: readonly string[]): string[] {
+  const words = [...rest];
+  let index = 0;
+  if (head === "timeout") {
+    while (index < words.length && words[index]!.startsWith("-")) index += 1;
+    if (index < words.length) index += 1; // the duration argument
+    return words.slice(index);
+  }
+  if (head === "env") {
+    while (index < words.length && (words[index]!.startsWith("-") || /^[A-Za-z_]\w*=/u.test(words[index]!))) index += 1;
+    return words.slice(index);
+  }
+  // xargs
+  while (index < words.length && words[index]!.startsWith("-")) index += 1;
+  return words.slice(index);
+}
+
+function isRoutineGitSubcommand(rest: readonly string[]): boolean {
+  let index = 0;
+  while (index < rest.length) {
+    const word = rest[index]!;
+    if (word === "-C" || word === "-c") { index += 2; continue; }
+    if (word.startsWith("-")) { index += 1; continue; }
+    return ROUTINE_GIT_SUBCOMMANDS.has(word.toLowerCase());
+  }
+  return false;
+}
+
+function isRoutineNpmSubcommand(rest: readonly string[]): boolean {
+  const subcommand = rest.find((word) => !word.startsWith("-"));
+  return subcommand !== undefined && ROUTINE_NPM_SUBCOMMANDS.has(subcommand.toLowerCase());
+}
+
+function isRoutineNode(rest: readonly string[], cwd: string, rawCommand: string): boolean {
+  // An inline-eval flag can appear after other flags or a preloaded module
+  // (`node -r ./x.js -e '...'`); check for it across the whole argument list
+  // before treating an earlier non-flag word as an ordinary script path.
+  if (rest.some((word) => NODE_INLINE_FLAGS.has(word))) return !NODE_INLINE_RISK.test(rawCommand);
+  for (const word of rest) {
+    if (!word.startsWith("-")) return !isAbsolute(word) || isInsideCwd(word, cwd);
+  }
+  return false;
+}
+
+function hasUnsafeRedirection(segment: readonly ShellToken[], cwd: string): boolean {
+  for (let index = 0; index < segment.length; index += 1) {
+    const token = segment[index]!;
+    if (token.operator && (token.value === ">" || token.value === ">>")) {
+      const target = segment[index + 1];
+      if (!target || target.operator) return true;
+      if (isUnsafeRedirectTarget(target.value, cwd)) return true;
+    }
+  }
+  return false;
+}
+
+function isUnsafeRedirectTarget(target: string, cwd: string): boolean {
+  if (target.startsWith("/dev/")) return true;
+  if (target.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return true;
+  if (!isAbsolute(target)) return false;
+  return !isInsideCwd(target, cwd);
+}
+
+function isInsideCwd(pathValue: string, cwd: string): boolean {
+  const resolved = resolve(cwd, pathValue);
+  const rel = relative(cwd, resolved);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
 /**
