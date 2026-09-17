@@ -112,10 +112,6 @@ const deniedPatterns = [
   // word (scripts/publish-package.mjs) is not a publication.
   /\b(?:npm|pnpm|yarn)\b(?:\s+-\S+)*\s+publish\b/iu,
   /\b(?:curl|wget)\b[\s\S]*(?:-X\s*(?:POST|PUT|PATCH|DELETE)|--request(?:=|\s+)(?:POST|PUT|PATCH|DELETE)|--method(?:=|\s+)(?:POST|PUT|PATCH|DELETE)|(?:^|\s)(?:-d|--data(?:[-a-z]*)(?:=|\s+)|--post-data(?:=|\s+)|--body-data(?:=|\s+)))[\s\S]*https?:\/\/(?:api\.)?(?:github|gitlab|bitbucket|registry\.npmjs)\b/iu,
-  // A repository/package command with a dynamic argument cannot be
-  // capability-checked (`git $ACTION origin main`); dynamic text elsewhere in a
-  // command is ordinary shell and is not a boundary concern.
-  /\b(?:git|gh|glab|hub|npm|pnpm|yarn)\b[^|;&\n]*(?:\$\{?[^\s`}]+\}?|`[^`]*`|\$\([^)]*\))/iu,
   /--(?:allow-)?dangerously-skip-permissions\b/iu,
   /--permission-mode\s+(?:bypasspermissions|dontask)\b/iu,
   // Only the filesystem root itself; `rm -rf /abs/path/dist` is ordinary local work.
@@ -261,9 +257,17 @@ function segmentsOf(tokens: readonly ShellToken[]): ShellToken[][] {
 
 /** True when one statement combines a dynamic word with a command whose dynamic argument could reach the boundary. */
 function hasDynamicSensitiveArgument(segment: readonly ShellToken[]): boolean {
-  // A leading `NAME=value` prefix sets the environment; its value never reaches
-  // the command's argv, so `npm_config_cache=$TMPDIR/x npm run check` is literal.
-  const words = segment.filter((token) => !token.operator);
+  // A leading `NAME=value` prefix sets the environment and a redirection
+  // target names a file; neither reaches the command's argv, so
+  // `npm_config_cache=$TMPDIR/x npm run check` and `git show HEAD:f > $OLD/f`
+  // are literal commands.
+  const words: ShellToken[] = [];
+  let afterRedirect = false;
+  for (const token of segment) {
+    if (token.operator) { afterRedirect = [">", ">>", "<", "<<<"].includes(token.value); continue; }
+    if (!afterRedirect) words.push(token);
+    afterRedirect = false;
+  }
   let argvStart = 0;
   while (argvStart < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[argvStart]!.value)) argvStart += 1;
   if (!words.slice(argvStart).some((token) => token.dynamic)) return false;
@@ -353,9 +357,6 @@ function evaluateTokens(rawTokens: readonly ShellToken[], depth: number): Policy
     }
     if (/\b(?:npm|pnpm|yarn)\b(?:\s+-\S+)*\s+publish\b/iu.test(canonical)) {
       return { decision: "deny", reason: "package publication belongs to the protected release workflow" };
-    }
-    if (/\b(?:git|gh|glab|hub|npm|pnpm|yarn)\b[^|;&\n]*(?:\$\{?[^\s`}]+\}?|`[^`]*`|\$\([^)]*\))/iu.test(canonical)) {
-      return { decision: "deny", reason: "a repository or package command with a dynamic argument cannot be capability-checked" };
     }
     return { decision: "deny", reason: "command matches a prohibited destructive pattern" };
   }
