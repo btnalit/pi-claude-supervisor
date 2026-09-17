@@ -261,8 +261,13 @@ function segmentsOf(tokens: readonly ShellToken[]): ShellToken[][] {
 
 /** True when one statement combines a dynamic word with a command whose dynamic argument could reach the boundary. */
 function hasDynamicSensitiveArgument(segment: readonly ShellToken[]): boolean {
-  if (!segment.some((token) => !token.operator && token.dynamic)) return false;
-  const values = segment.filter((token) => !token.operator).map((token) => token.value);
+  // A leading `NAME=value` prefix sets the environment; its value never reaches
+  // the command's argv, so `npm_config_cache=$TMPDIR/x npm run check` is literal.
+  const words = segment.filter((token) => !token.operator);
+  let argvStart = 0;
+  while (argvStart < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[argvStart]!.value)) argvStart += 1;
+  if (!words.slice(argvStart).some((token) => token.dynamic)) return false;
+  const values = words.map((token) => token.value);
   const lower = values.map((value) => value.toLowerCase());
   const executables = lower.map((value) => value.split(/[\\/]/u).at(-1) ?? value);
   const canonical = values.join(" ");

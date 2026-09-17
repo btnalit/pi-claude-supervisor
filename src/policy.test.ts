@@ -144,6 +144,11 @@ test("a dynamic argument counts only in the statement that holds the sensitive c
   assert.equal(evaluateCommand("git status; echo \"$x\"").decision, "allow");
   assert.equal(evaluateCommand("x=$(ls); git status").decision, "allow");
   assert.equal(evaluateCommand("echo \"$x\" | git apply --check").decision, "allow");
+  // An environment prefix's value never reaches the argv.
+  assert.equal(evaluateCommand("npm_config_cache=$TMPDIR/npm-cache npm run check 2>&1 | grep -E \"^ℹ\" | head -20; echo \"check exit: ${PIPESTATUS[0]}\"").decision, "allow");
+  assert.equal(evaluateCommand("GIT_DIR=$X git status").decision, "allow");
+  assert.equal(evaluateCommand("X=1 npm run $script").decision, "deny");
+  assert.equal(evaluateCommand("x=$(ls) git add \"$x\"").decision, "deny");
   // The same statement still cannot be checked.
   assert.equal(evaluateCommand("git status; git add \"$x\"").decision, "deny");
   assert.equal(evaluateCommand("echo ok && npm run $script").decision, "deny");
