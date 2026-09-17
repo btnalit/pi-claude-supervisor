@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented here.
 
+## [0.7.2](https://github.com/btnalit/pi-claude-supervisor/compare/v0.7.1...v0.7.2) (2026-09-17)
+
+
+### Bug Fixes
+
+* **policy:** a redirection target is not a dynamic argument, and drop the regex twin of the token check ([94742c7](https://github.com/btnalit/pi-claude-supervisor/commit/94742c7c8c8c810843ddb62703d7b3c1fea1254f))
+* **policy:** an environment prefix's dynamic value is not a dynamic argument ([b53e77c](https://github.com/btnalit/pi-claude-supervisor/commit/b53e77c6932851a1c88452bca38c8d5bdf1030b5))
+* **policy:** scope the dynamic-argument veto to the statement holding the sensitive command ([5515a2b](https://github.com/btnalit/pi-claude-supervisor/commit/5515a2b0d746d3d3cd05b0ef4ba86602f92eb072))
+* **redaction:** keep numeric token counts in usage events ([6d4e183](https://github.com/btnalit/pi-claude-supervisor/commit/6d4e1831b588b71175d581764b611e5ed5cbe664))
+* **supervisor:** survive Claude's own background work in an interactive session ([d883b9a](https://github.com/btnalit/pi-claude-supervisor/commit/d883b9a2b187c55693ff2669a1ba4f7f949272d3))
+
 ## [0.7.1](https://github.com/btnalit/pi-claude-supervisor/compare/v0.7.0...v0.7.1) (2026-09-17)
 
 
