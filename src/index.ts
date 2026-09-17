@@ -264,6 +264,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
             reviewer: taskAutomation ? reviewer : undefined,
+            reviewTimeoutMs: reviewTimeoutMs(),
             onCandidate: async (notice) => {
               if (ctx.hasUI) notify(ctx, `Candidate ${notice.status}: ${notice.reason}`, notice.status === "ready" ? "info" : "warning");
               if (humanWebhook.enabled) {
@@ -517,6 +518,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
             reviewer: automaticRecovery ? reviewer : undefined,
+            reviewTimeoutMs: reviewTimeoutMs(),
             onCandidate: async (notice) => {
               if (ctx.hasUI) notify(ctx, `Candidate ${notice.status}: ${notice.reason}`, notice.status === "ready" ? "info" : "warning");
               if (humanWebhook.enabled) {
