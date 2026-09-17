@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createConnection } from "node:net";
 import { createHash } from "node:crypto";
-import { lstat, mkdtemp, readlink, realpath, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readlink, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hookSocketDirectory, HookServer } from "./server.ts";
@@ -62,6 +62,38 @@ async function send(socketPath: string, line: string): Promise<{ reply: string; 
     socket.on("close", () => resolveReply({ reply: buffer, closed: true }));
   });
 }
+
+test("a deep state directory still yields a connectable socket (unix sun_path limit)", async () => {
+  const deep = join(await mkdtemp(join(tmpdir(), "pi-cs-hooks-")), "a".repeat(60), "b".repeat(40), "hooks");
+  await mkdir(deep, { recursive: true });
+  assert.ok(Buffer.byteLength(join(deep, "by-cwd", "x".repeat(64))) > 108, "fixture path must exceed sun_path");
+  const server = new HookServer({ directory: deep });
+  await server.listen();
+  try {
+    assert.ok(Buffer.byteLength(server.socketPath ?? "") <= 100);
+    const cwd = await mkdtemp(join(tmpdir(), "pi-cs-cwd-"));
+    const unsubscribe = await server.subscribe(cwd, async () => ({ permissionDecision: "deny", permissionDecisionReason: "deep" }));
+    try {
+      const link = join(deep, "by-cwd", createHash("sha256").update(await realpath(cwd)).digest("hex"));
+      const target = await realpath(link);
+      const reply = await new Promise<string>((resolveReply, reject) => {
+        const socket = createConnection(target, () => {
+          socket.write(`${JSON.stringify({ version: 1, pid: process.pid, ppid: process.ppid, event: { hook_event_name: "PreToolUse", session_id: "s", cwd, tool_name: "Bash", tool_input: {}, tool_use_id: "t" } })}\n`);
+        });
+        let data = "";
+        socket.on("data", (chunk) => { data += String(chunk); });
+        socket.on("end", () => resolveReply(data));
+        socket.on("error", reject);
+      });
+      assert.equal(JSON.parse(reply).permissionDecision, "deny");
+    } finally {
+      await unsubscribe();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  } finally {
+    await server.close();
+  }
+});
 
 test("routes a request to the handler subscribed for its canonical cwd and replies with its result", async () => {
   await withServer(async (server, directory) => {
