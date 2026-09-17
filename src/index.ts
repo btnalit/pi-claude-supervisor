@@ -90,13 +90,23 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   // Resolve once and cache the promise so a misconfigured model fails closed on
   // every subsequent start/recover rather than silently falling back.
   let decisionPiModelPromise: Promise<PiModel | undefined> | undefined;
+  // Resolve each model once, but forget a rejected resolution so a transient
+  // failure (or a corrected env file) does not poison the rest of the process.
   const resolveDecisionPiModel = (): Promise<PiModel | undefined> => {
-    if (!decisionPiModelPromise) decisionPiModelPromise = resolvePiModel(decisionModelSpec);
+    if (!decisionPiModelPromise) {
+      const attempt = resolvePiModel(decisionModelSpec);
+      decisionPiModelPromise = attempt;
+      attempt.catch(() => { if (decisionPiModelPromise === attempt) decisionPiModelPromise = undefined; });
+    }
     return decisionPiModelPromise;
   };
   let reviewerPiModelPromise: Promise<PiModel | undefined> | undefined;
   const getReviewer = async (): Promise<PiReadOnlyReviewer> => {
-    if (!reviewerPiModelPromise) reviewerPiModelPromise = resolvePiModel(reviewerModelSpec);
+    if (!reviewerPiModelPromise) {
+      const attempt = resolvePiModel(reviewerModelSpec);
+      reviewerPiModelPromise = attempt;
+      attempt.catch(() => { if (reviewerPiModelPromise === attempt) reviewerPiModelPromise = undefined; });
+    }
     return new PiReadOnlyReviewer({ timeoutMs: reviewTimeoutMs(), model: await reviewerPiModelPromise });
   };
   const sessions = new Map<string, Supervisor>();
@@ -422,7 +432,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                     ...(current?.recoveryWorker ? { recoveryWorker: current.recoveryWorker } : {}),
                   });
                 },
-                onDecisionSessionProgress: (info) => decisionStore.update(info.taskId, { turn: info.turn, repairRound: info.repairRound, ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}) }),
+                onDecisionSessionProgress: (info) => decisionStore.update(info.taskId, { turn: info.turn, repairRound: info.repairRound, workerCostUsd: info.workerCostUsd, ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}) }),
                 onDecisionSessionClosed: handleDecisionSessionClosed,
               });
               const startedTaskId = session.task?.taskId;
@@ -660,6 +670,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 initialTurn: record.turn,
                 initialRepairRound: record.repairRound,
                 initialFindingSignature: record.lastFindingSignature,
+                initialWorkerCostUsd: record.workerCostUsd,
                 decisionSessionFile: record.decisionSessionFile,
                 decisionSessionDir: decisionStore.directory,
                 onDecisionSessionReady: async (info) => {
@@ -692,7 +703,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                     ...(current.recoveryWorker ? { recoveryWorker: current.recoveryWorker } : {}),
                   });
                 },
-                onDecisionSessionProgress: (info) => decisionStore.update(info.taskId, { turn: info.turn, repairRound: info.repairRound, ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}) }),
+                onDecisionSessionProgress: (info) => decisionStore.update(info.taskId, { turn: info.turn, repairRound: info.repairRound, workerCostUsd: info.workerCostUsd, ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}) }),
                 onDecisionSessionClosed: handleDecisionSessionClosed,
               });
               startedHandle = handle;

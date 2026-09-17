@@ -131,9 +131,11 @@ export interface SupervisorStartOptions {
   startedAt?: string;
   initialTurn?: number;
   initialRepairRound?: number;
+  /** Cumulative Worker cost from previous Worker processes of this task (recovery). */
+  initialWorkerCostUsd?: number;
   initialFindingSignature?: string;
   onDecisionSessionReady?: (info: DecisionSessionReadyInfo) => Promise<void> | void;
-  onDecisionSessionProgress?: (info: { taskId: string; turn: number; repairRound: number; lastFindingSignature?: string }) => Promise<void> | void;
+  onDecisionSessionProgress?: (info: { taskId: string; turn: number; repairRound: number; lastFindingSignature?: string; workerCostUsd: number }) => Promise<void> | void;
   onDecisionSessionClosed?: (taskId: string, info: DecisionSessionClosedInfo) => Promise<void> | void;
   onProgress?: (info: SupervisorProgress) => Promise<void> | void;
   /** Optional, non-blocking delivery for a parked or ready candidate. */
@@ -199,7 +201,7 @@ export class Supervisor {
   #candidateParked = false;
   #stopRequested?: string;
   #stopCloseReason?: DecisionSessionCloseReason;
-  #onDecisionSessionProgress?: (info: { taskId: string; turn: number; repairRound: number; lastFindingSignature?: string }) => Promise<void> | void;
+  #onDecisionSessionProgress?: (info: { taskId: string; turn: number; repairRound: number; lastFindingSignature?: string; workerCostUsd: number }) => Promise<void> | void;
   #onDecisionSessionClosed?: (taskId: string, info: DecisionSessionClosedInfo) => Promise<void> | void;
   #startAbortController?: AbortController;
   #startToken?: string;
@@ -280,7 +282,10 @@ export class Supervisor {
     this.#releasing = false;
     this.#terminalNoticeSent = false;
     this.#usage = emptyUsage();
-    this.#workerCostBaseline = 0;
+    // A recovered task continues its budget from the cost its earlier Worker
+    // processes already reported; a Claude result record only counts its own process.
+    this.#usage.workerCostUsd = Math.max(0, options.initialWorkerCostUsd ?? 0);
+    this.#workerCostBaseline = this.#usage.workerCostUsd;
     this.#lastWorkerResultCost = 0;
     this.#repairSendInProgress = false;
     this.#task = { taskId, task: spec.goal, cwd: options.cwd, maxTurns: options.maxTurns ?? 100, startedAt: options.startedAt ?? new Date().toISOString(), ...(options.baseCommit ? { baseCommit: options.baseCommit } : {}), ...(options.baseBranch ? { baseBranch: options.baseBranch } : {}), spec, repairRound: options.initialRepairRound ?? 0, ...(options.initialFindingSignature ? { lastFindingSignature: options.initialFindingSignature } : {}) };
@@ -342,7 +347,10 @@ export class Supervisor {
         workerArgs = automaticClaudeArgs(options.command, options.args, {
           ...options.workerArgOptions,
           // Claude's own cap is the first line of defence; the Supervisor's cumulative check is the second.
-          ...(options.workerArgOptions?.maxBudgetUsd === undefined && spec.autonomy.maxWorkerCostUsd !== undefined ? { maxBudgetUsd: spec.autonomy.maxWorkerCostUsd } : {}),
+          // On recovery Claude's own cap reflects what is left of the task budget, not the whole of it.
+          ...(options.workerArgOptions?.maxBudgetUsd === undefined && spec.autonomy.maxWorkerCostUsd !== undefined
+            ? { maxBudgetUsd: Math.max(0.01, spec.autonomy.maxWorkerCostUsd - this.#usage.workerCostUsd) }
+            : {}),
         });
         await assertAutomaticClaudePermissionConfiguration(options.cwd, workerArgs, workerEnvironment);
         await this.#appendEvent({ type: "worker_executable_pinned", taskId, data: { command: options.command, resolvedExecutable: trustedWorkerCommand } });
@@ -555,6 +563,7 @@ export class Supervisor {
       if (event.type === "turn_completed" && !this.#usageRecordedEvents.has(key)) {
         this.#usageRecordedEvents.add(key);
         const budgetReason = this.#recordWorkerUsage(event.result);
+        await this.#persistProgress();
         if (this.#automation && budgetReason) {
           skipDecisionNotify = true;
           await this.#parkCandidate(budgetReason, event);
@@ -902,7 +911,7 @@ export class Supervisor {
     this.#turn = nextTurn;
     if (this.#machine.state === "waiting") this.#machine.transition("running");
     await this.#appendEvent({ type: "worker_message_sent", taskId, workerId: handle.id, idempotencyKey: `${taskId}:turn:${this.#turn}`, data: { message } });
-    await Promise.resolve(this.#onDecisionSessionProgress?.({ taskId, turn: this.#turn, repairRound: this.#repairRound, ...(this.#lastFindingSignature ? { lastFindingSignature: this.#lastFindingSignature } : {}) })).catch(() => {});
+    await this.#persistProgress();
   }
 
   async pause(): Promise<void> {
@@ -1547,6 +1556,12 @@ export class Supervisor {
    * the prior session's total is folded into `#workerCostBaseline` before tracking
    * continues. Returns a park reason when the cost budget is exhausted, else undefined.
    */
+  async #persistProgress(): Promise<void> {
+    const taskId = this.#task?.taskId;
+    if (!taskId) return;
+    await Promise.resolve(this.#onDecisionSessionProgress?.({ taskId, turn: this.#turn, repairRound: this.#repairRound, ...(this.#lastFindingSignature ? { lastFindingSignature: this.#lastFindingSignature } : {}), workerCostUsd: this.#usage.workerCostUsd })).catch(() => {});
+  }
+
   #recordWorkerUsage(result: Record<string, unknown>): string | undefined {
     const totalCostUsd = typeof result.total_cost_usd === "number" && Number.isFinite(result.total_cost_usd) ? result.total_cost_usd : undefined;
     const rawUsage = result.usage && typeof result.usage === "object" ? result.usage as Record<string, unknown> : undefined;

@@ -335,7 +335,19 @@ request to the model, and the `hybrid` default answers a request from policy alo
 only when the policy already denies it or `isRoutinePermission` in `src/policy.ts`
 recognizes it as a routine in-cwd file edit or a local read-only/dev shell command
 it can fully account for; anything it does not recognize is not routine and still
-goes to the Decision Worker. A policy denial always wins regardless of authority; the
+goes to the Decision Worker. The shell classifier is deliberately narrow: every
+pipeline segment must start with an allow-listed utility (`ls`, `grep`, `sed -n`,
+`git status/diff/log/add/commit`, `npm test|run`, `node ./script`, `tsc`, ...),
+inline scripts (`node -e`), programs named by path, `$(...)`/backticks, process
+substitution, `env`, `xargs`, `sort` and every other utility that can run a
+program from an option, git shapes that discard or relocate work
+(`checkout`/`restore`/`reset`, `stash drop`, `-C` outside the cwd, `-c`,
+`--git-dir`, `--ext-diff`/`--textconv`), file-writing modes of
+`sed`/`awk`/`find`/`tsc`, any argument that names a path outside the cwd (reads
+of `/etc` or `~/.ssh` included), and any redirection whose target is outside the
+cwd (after resolving `..`, `~` and symlinks) are never routine. Executing repository code (`npm run <script>`,
+`node ./x.js`) is routine by design: it is reviewed repository content and the
+Worker could run it through the allowed file tools regardless. A policy denial always wins regardless of authority; the
 classifier only ever narrows what reaches the model, never what the policy refuses.
 An explicit human takeover suspends this local fast path entirely, so every
 permission request stays pending for the human once takeover is active, even one

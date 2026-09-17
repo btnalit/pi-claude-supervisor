@@ -296,10 +296,15 @@ or Reviewer calls. In this run the Worker averaged ~220k tokens of context per t
 because it ran as a single long `-p` session under a 1M-token window that never
 compacted; a trivial Claude Code turn costs roughly 24k prompt tokens for its system
 prompt alone, regardless of which MCP servers are configured. Of the 30 Decision
-Worker calls, 28 were permission requests; the deterministic policy could have
-answered 24 of those without a model call, and the Decision Worker overrode the
-policy 4 times (denying downloads and writes outside the task directory) — this is
-why `hybrid` is the default `permissionAuthority`, not `policy`.
+Worker calls, 28 were permission requests, and the Decision Worker overrode the
+deterministic policy 4 times (denying downloads and writes outside the task
+directory) — this is why `hybrid` is the default `permissionAuthority`, not
+`policy`. Replaying those 28 requests through the shipped `isRoutinePermission`
+classifier answers 4 of them locally; that task was dominated by inline `node -e`
+scripts and `$(...)` substitutions, which are never routine. An ordinary
+implementation task is mostly in-cwd `Edit`/`Write`, `npm test` and
+`git status/diff/add/commit`, all of which are routine, so its Decision Worker
+call count drops much further.
 
 Knobs, with their defaults and trade-offs:
 

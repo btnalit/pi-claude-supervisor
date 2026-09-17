@@ -34,6 +34,8 @@ export interface DecisionSessionRecord {
   turn: number;
   repairRound?: number;
   lastFindingSignature?: string;
+  /** Cumulative Claude Worker API cost so far; recovery seeds the next Worker's budget accounting with it. */
+  workerCostUsd?: number;
   state: "active" | "closed";
   recoveryState: DecisionRecoveryState;
   recoveryAttempt: number;
@@ -129,7 +131,7 @@ export class DecisionSessionStore {
     });
   }
 
-  async update(taskId: string, patch: Partial<Pick<DecisionSessionRecord, "turn" | "repairRound" | "lastFindingSignature" | "updatedAt">>): Promise<void> {
+  async update(taskId: string, patch: Partial<Pick<DecisionSessionRecord, "turn" | "repairRound" | "lastFindingSignature" | "workerCostUsd" | "updatedAt">>): Promise<void> {
     assertTaskId(taskId);
     await this.#withLock(async () => {
       const record = await this.#loadUnlocked(taskId);
@@ -403,6 +405,7 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     || (value.recoveryOwnerStartTime !== undefined && (typeof value.recoveryOwnerStartTime !== "string" || !/^\d+$/u.test(value.recoveryOwnerStartTime)))
     || (value.recoveryState !== undefined && !isRecoveryState(value.recoveryState))
     || (value.lastFindingSignature !== undefined && (typeof value.lastFindingSignature !== "string" || value.lastFindingSignature.length > 128))
+    || (value.workerCostUsd !== undefined && (typeof value.workerCostUsd !== "number" || !Number.isFinite(value.workerCostUsd) || value.workerCostUsd < 0))
     || (value.baseCommit !== undefined && (typeof value.baseCommit !== "string" || !/^[0-9a-f]{40,64}$/iu.test(value.baseCommit)))
     || (value.baseBranch !== undefined && (typeof value.baseBranch !== "string" || !/^[A-Za-z0-9._/-]+$/u.test(value.baseBranch)))
     || (value.resolvedExecutable !== undefined && (typeof value.resolvedExecutable !== "string" || !isAbsolute(value.resolvedExecutable) || value.resolvedExecutable.length > 4_096))
@@ -440,6 +443,7 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     turn: value.turn ?? 0,
     repairRound: value.repairRound ?? 0,
     ...(typeof value.lastFindingSignature === "string" ? { lastFindingSignature: value.lastFindingSignature } : {}),
+    ...(typeof value.workerCostUsd === "number" ? { workerCostUsd: value.workerCostUsd } : {}),
     state: value.state,
     recoveryState: value.recoveryState ?? "ready",
     recoveryAttempt: value.recoveryAttempt ?? 0,
