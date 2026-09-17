@@ -590,7 +590,10 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
     // Brace, tilde and pathname expansion can change command names, targets or
     // Git refs after this lexical pass. Treat all unquoted expansion markers as
     // dynamic rather than attempting to model Bash's expansion order.
-    if ("*?[]{}~".includes(character)) { dynamic = true; value += character; started = true; continue; }
+    // A tilde expands only at the start of a word (or of an assignment value);
+    // `HEAD~1` and `a~b` are literal text.
+    if (character === "~") { if (value === "" || /[=:]$/u.test(value)) dynamic = true; value += character; started = true; continue; }
+    if ("*?[]{}".includes(character)) { dynamic = true; value += character; started = true; continue; }
     if (";&|<>".includes(character)) {
       if (character === "<" && next === "<") {
         const third = input[index + 2];
