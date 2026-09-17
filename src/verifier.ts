@@ -96,6 +96,22 @@ export async function repositoryCommitExists(cwd: string, commit: string, signal
   }
 }
 
+/** Verify that `ancestor` is reachable from `descendant` (or is `descendant` itself) without invoking a shell. */
+export async function repositoryIsAncestor(cwd: string, ancestor: string, descendant: string, signal?: AbortSignal): Promise<boolean> {
+  try {
+    await execFileAsync("git", ["merge-base", "--is-ancestor", ancestor, descendant], {
+      cwd,
+      timeout: 30_000,
+      maxBuffer: 1024,
+      signal,
+      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Determine whether cwd is a non-bare Git worktree without invoking a shell. */
 export async function repositoryWorkTree(cwd: string, signal?: AbortSignal): Promise<boolean | undefined> {
   try {

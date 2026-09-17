@@ -133,14 +133,14 @@ Worker 意外退出、watchdog 超时或清理未确认等无人值守失败会�
 进程组已消失且 cgroup 仍是真实、可读取的空边界时，才可显式添加 `--takeover`；缺失、仍存活或无法确认的 Worker 会被拒绝。自动 Worker 会保留已验证为空的 cgroup，直到所属 cwd 租约释放，以覆盖正常退出后 Pi 在租约收尾前崩溃的窗口；释放租约时再删除它。租约获取时会先持久化“尚未 spawn”的启动标记；适配器会在创建 cgroup/socket 前持久化生成的资源计划，再分阶段记录 cgroup identity 和 tmux server identity，启动期崩溃恢复会检查并清理已创建但尚未完成登记的空资源，而不是假定没有资源。只有确认旧 owner 已退出后才能接管残留标记。租约拒绝被替换或改名的 cgroup。自动 tmux 还要求确认 Supervisor 所有、tmux server identity 已死亡、私有 tmux session 已消失，并先持久化 cleanup-pending 事务，再原子保留私有 socket；替换会复用旧租约记录，写入新租约后才释放保留并删除 guardian 留下的空 cgroup；若恢复中断，新的 Supervisor 会先协调该待清理事务。手动 owned tmux
 Worker 可在重启后使用 `adopt-tmux`，而不是 takeover；自动 bridge 会由 parent-death guardian
 在 Supervisor 消失时终止，只有通过上述证据检查的 `recover --takeover` 才能重新取得 cwd lease。
-自动模式下，Decision Worker 在任务授权范围内自动处理普通问题、测试失败和修复轮次，记录假设和证据；无法形成可交付候选时自动挂起并保留证据，而不是要求人工必须在线。可通过 `PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=0` 或 task `autonomy.requireLocalCommit` 关闭本地 commit 要求，但自动模式仍要求有效 Git baseline 和非保护 worktree；远程 push 和 main/integration merge 仍由独立边界控制。
+自动模式下，Decision Worker 在任务授权范围内自动处理普通问题、测试失败和修复轮次，记录假设和证据；无法形成可交付候选时自动挂起并保留证据，而不是要求人工必须在线。可通过 `PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=0` 或 task `autonomy.requireLocalCommit` 关闭本地 commit 要求，但自动模式仍要求有效 Git baseline 和可验证的 worktree——任务锚定在该 baseline commit 上，而不是分支名：任务可以在任意分支（包括 `main`）上启动或落地候选，因为 Worker 经常会在任务过程中自行切换分支。远程 push、merge/PR 以及对受保护分支的破坏性改写（硬 reset、直接改写 ref、或删除/移动/强制更新分支）仍由独立边界拒绝。
 
 `v0.5.0` 已完成并发布“多命令验收—独立只读 Reviewer—结构化修复轮次—再次验收”闭环。
 任务可通过 API 或 JSON spec 提供 `goal`、`scope`、`constraints`、`forbidden`、多个
 `acceptance` 命令和 `autonomy` 控制；旧的纯文本任务继续使用默认 `git diff --check`。
 Reviewer 只能使用 `read`、`grep`、`find`、`ls`，不会修改工作树或批准权限。自动模式在
 Worker 启动前捕获 git baseline，要求完整的 baseline-relative tracked/commit/untracked evidence，
-并在默认情况下要求 Worker 在非保护分支本地 commit；无效输出、证据不完整、重复 finding、P0/P1 或预算耗尽
+并在默认情况下要求 Worker 在候选所在的分支（包括受保护分支）本地 commit；候选通知会报告候选当前所在的分支及其是否受保护，仅作信息展示。无效输出、证据不完整、重复 finding、P0/P1 或预算耗尽
 会自动挂起候选。自动模式拒绝 process-pipe，并在模型执行前检查目录、可执行文件、依赖
 和 cgroup；Claude 的完整工具、Agent/Task、插件、MCP、网络和环境会保持可用。自动模式会在未指定时加入安全的 `default` permission mode，并拒绝 Bash 预授权；Bash 仍通过 Supervisor 可见的 permission request 使用。详见 [自动化目标](docs/autonomy-target.md)。协同多 Worker 属于后续独立开发阶段，
 自动模式只接受裸的直接 Claude 命令名，会固定解析后的操作者拥有的可执行文件；任意自定义可执行文件和显式可执行路径会在自动模式拒绝。需要固定路径时设置 `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE`。自定义工具和嵌套 Worker 的 remote/main 权限必须由独立 host/仓库边界保护。

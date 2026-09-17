@@ -156,9 +156,14 @@ path must be pinned explicitly. Custom tools and nested workers are trusted capa
 so a hard remote/main boundary must remain independently protected outside this process.
 Set `PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=0` only for a task that intentionally
 produces no local commit candidate, or set `autonomy.requireLocalCommit` in its spec;
-automatic mode still requires a valid Git baseline and non-protected worktree.
+automatic mode still requires a valid Git baseline and a verified worktree, anchored
+to that baseline commit rather than to a branch name — a task may start, or a
+candidate may land, on any branch, including `main`, since the Worker commonly
+branches mid-task on its own. A required local commit is checked on whatever branch
+the candidate lives on, including a protected one; only a remote push/merge/PR or a
+destructive rewrite of a protected branch (a hard reset, a direct ref rewrite, or
+deleting/moving/force-updating it) is denied.
 `PI_CLAUDE_SUPERVISOR_UNATTENDED=0` opts a task out of automatic Decision Worker control;
-a required local commit is checked on a non-protected task branch;
 `PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES` bounds retries of a Decision Worker
 request that times out or whose model/API call fails (429/529, network, auth);
 exhausted retries record `decision_worker_failed` and park the candidate, while

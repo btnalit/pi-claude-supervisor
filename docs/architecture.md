@@ -250,13 +250,28 @@ bottom-up, since systemd/Claude can create child cgroups under a Worker's own
 cgroup that would otherwise leave the parent non-empty.
 
 Before model or Worker execution, automatic starts validate a full existing Git
-baseline, a non-bare worktree, a readable non-protected branch, the direct bare
+baseline, a non-bare worktree, a readable branch, the direct bare
 `claude`/`claude.exe` command name, JSONL transport, runtime state/lease directories
-and, when requested, the real writable cgroup-v2 boundary. The resolved Claude
+and, when requested, the real writable cgroup-v2 boundary. The task is anchored to
+this baseline commit, not to the branch name: any branch, including `main`, may
+start or host a supervised task, since Claude Code's own "branch first" guidance is
+advisory and the Worker commonly branches mid-task on its own. A protected branch
+name (`main`, `master`, `trunk`, `integration`, `develop`) is never itself a reason
+to refuse a start or park a candidate; only a remote push/merge/PR or a destructive
+rewrite of a protected branch (`reset`, `update-ref`, `symbolic-ref`, or `branch`
+with a delete/move/force flag) remains denied by policy. The resolved Claude
 executable is checked for an operator-owned, non-writable path and then pinned by
 absolute path; `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` can pin the expected identity. The initial repository HEAD is captured, and the repository boundary immediately
 before the Worker adapter starts must report that exact same HEAD (recovery captures
 and compares its current HEAD separately while retaining the persisted baseline).
+Every boundary check, and candidate verification itself, also requires the recorded
+baseline commit to remain an ancestor of the current HEAD; if history was rewritten
+out from under it, the boundary check fails closed and a candidate is parked rather
+than accepted. A branch name change (the Worker moving off its starting branch, most
+often onto a fresh feature branch) is recorded once as a `worker_branch_changed`
+event rather than rejected; the task context keeps the original starting branch,
+and a candidate notice reports the branch a candidate currently lives on together
+with whether it is protected, purely for information.
 Automatic lease acquisition also persists a no-spawn startup marker. Automatic
 adapters then persist the generated Worker/cgroup identity and clear that marker
 before the actual Worker spawn, closing the startup-registration crash window;

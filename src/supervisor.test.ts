@@ -55,7 +55,14 @@ async function initializeGitRepository(cwd: string, branch = "worker/test"): Pro
   await writeFile(join(cwd, "base.txt"), "base\n");
   await execFileAsync("git", ["add", "base.txt"], { cwd });
   await execFileAsync("git", ["commit", "-qm", "base"], { cwd });
-  await execFileAsync("git", ["switch", "-c", branch], { cwd });
+  // `git init`'s own default branch name is environment-dependent (e.g. a
+  // local `init.defaultBranch=main`); only switch when the repository is not
+  // already on the requested branch, so a caller can stay on the initial
+  // branch (including `main`) without a spurious "already exists" failure.
+  const { stdout: currentBranch } = await execFileAsync("git", ["branch", "--show-current"], { cwd });
+  if (currentBranch.trim() !== branch) {
+    await execFileAsync("git", ["switch", "-c", branch], { cwd });
+  }
   const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd });
   return stdout.trim();
 }
@@ -228,28 +235,98 @@ test("automatic supervision rechecks the exact startup HEAD before spawning", as
   }
 });
 
-test("protected branches are rejected even when local commits are optional", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-protected-start-"));
+test("automatic supervision starts on the initial branch, including main", async () => {
+  // The task is anchored to the baseline commit, not to a branch name: Claude
+  // Code's own "branch first" guidance is advisory, and a task may legitimately
+  // start (or land) on `main`. Only push/merge/PR and a destructive rewrite of
+  // a protected branch remain restricted.
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-main-start-"));
   try {
-    await execFileAsync("git", ["init", "-q", "-b", "main"], { cwd });
-    await execFileAsync("git", ["config", "user.email", "test@example.invalid"], { cwd });
-    await execFileAsync("git", ["config", "user.name", "Test"], { cwd });
-    await writeFile(join(cwd, "base.txt"), "base\n");
-    await execFileAsync("git", ["add", "base.txt"], { cwd });
-    await execFileAsync("git", ["commit", "-qm", "base"], { cwd });
-    const supervisor = new Supervisor(new ProcessWorkerAdapter(), undefined, {
-      reviewer: { review: async () => ({ verdict: "pass", summary: "unused", findings: [], round: 0, checkedAt: new Date().toISOString() }) },
-    });
-    await assert.rejects(() => supervisor.start({
-      task: "protected branch",
+    await initializeGitRepository(cwd, "main");
+    const handle: WorkerHandle = { id: "main-start-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async () => handle,
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "start on main",
       cwd,
-      command: process.execPath,
-      args: ["-e", "setInterval(() => {}, 1000)"],
+      command: "claude",
       automation: true,
       deadlineMs: 0,
       noOutputTimeoutMs: 0,
-      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 } },
-    }), /protected integration branch/u);
+      spec: automaticSpec(),
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    });
+    assert.equal(supervisor.state, "running");
+    assert.equal(supervisor.task?.baseBranch, "main");
+    // No branch change occurred, so the boundary re-checks must not report one.
+    assert.ok(!events.events.some((event) => event.type === "worker_branch_changed"));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("automatic recovery follows the Worker onto a new branch instead of rejecting it", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-branch-follow-"));
+  try {
+    const baseCommit = await initializeGitRepository(cwd, "main");
+    // Claude Code's own advisory guidance is "branch first"; the Worker may
+    // branch off main mid-task, including across a Pi restart that recovers
+    // the task with its originally recorded starting branch.
+    await execFileAsync("git", ["switch", "-c", "feature/x"], { cwd });
+    await writeFile(join(cwd, "feature.txt"), "feature\n");
+    await execFileAsync("git", ["add", "feature.txt"], { cwd });
+    await execFileAsync("git", ["commit", "-qm", "feature work"], { cwd });
+
+    const handle: WorkerHandle = { id: "branch-follow-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async () => handle,
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      taskId: "recovered-branch-follow",
+      startedAt: new Date().toISOString(),
+      task: "recovery after the Worker branched",
+      cwd,
+      command: "claude",
+      automation: true,
+      baseCommit,
+      baseBranch: "main",
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: automaticSpec(),
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    });
+    assert.equal(supervisor.state, "running");
+    // The starting branch recorded in the task context never changes...
+    assert.equal(supervisor.task?.baseBranch, "main");
+    // ...but the divergence is recorded once as an audited event.
+    const changed = events.events.filter((event) => event.type === "worker_branch_changed");
+    assert.equal(changed.length, 1);
+    assert.deepEqual(changed[0]?.data, { from: "main", to: "feature/x" });
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -1441,6 +1518,57 @@ test("noop on a clean exit proceeds to verification instead of stranding the tas
   }
 });
 
+test("a candidate on a protected branch completes and reports where it lives", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-candidate-main-"));
+  try {
+    await initializeGitRepository(cwd, "main");
+    const handle: WorkerHandle = { id: "candidate-main-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+    let eventListener: WorkerStartInput["eventListener"] | undefined;
+    const candidates: Array<{ status: string; branch?: string; protectedBranch?: boolean }> = [];
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async (input) => { eventListener = input.eventListener; return handle; },
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running, exitReason: running ? undefined : "completed" }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const supervisor = new Supervisor(adapter, undefined, {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push(notice); },
+    });
+    await supervisor.start({
+      task: "candidate on main",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: automaticSpec(),
+      decisionWorkerFactory: (options) => { onAction = options.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+    });
+    running = false;
+    const exited = { type: "exited" as const, handle, exitCode: 0 };
+    eventListener?.(exited);
+    await supervisor.poll();
+    assert.equal(supervisor.state, "verifying");
+    await onAction?.({ action: "noop", reason: "worker finished" }, exited);
+    assert.equal(supervisor.state, "completed");
+    assert.equal(candidates.length, 1);
+    assert.equal(candidates[0]?.status, "ready");
+    assert.equal(candidates[0]?.branch, "main");
+    assert.equal(candidates[0]?.protectedBranch, true);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("a recovered task continues its cost budget from the persisted total", async () => {
   const handle: WorkerHandle = { id: "recovered-cost-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
   let running = true;
@@ -1609,6 +1737,53 @@ test("a committed task branch with a dirty worktree requests repair", async () =
     const sentIndex = events.events.findIndex((event) => event.type === "worker_message_sent");
     assert.ok(repairedIndex >= 0 && sentIndex > repairedIndex);
     assert.ok(!events.events.slice(repairedIndex, sentIndex + 1).some((event) => event.type === "worker_waiting"));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("rewritten history parks the candidate even on the same branch name", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-rewritten-history-"));
+  try {
+    await initializeGitRepository(cwd, "worker/rewritten");
+    const handle: WorkerHandle = { id: "rewritten-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async () => handle,
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "rewritten history",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: automaticSpec(),
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    });
+    // The Worker rewrote history under the same branch name (e.g. an orphan
+    // commit, or a hard reset to an unrelated commit) instead of building on
+    // the recorded baseline: the baseline is no longer an ancestor of HEAD.
+    await execFileAsync("git", ["checkout", "-q", "--orphan", "rewritten"], { cwd });
+    await execFileAsync("git", ["commit", "-qm", "orphan"], { cwd });
+    await supervisor.poll();
+    const result = await supervisor.verify();
+    assert.equal(result.ok, true);
+    assert.equal(supervisor.state, "blocked");
+    assert.equal(supervisor.candidateParked, true);
+    const parked = events.events.find((event) => event.type === "candidate_parked");
+    assert.match(String(parked?.data?.candidateReason ?? ""), /no longer descends from the recorded baseline/u);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

@@ -22,16 +22,17 @@ test("policy hard-denies publication and remote/integration writes", () => {
   assert.equal(evaluateCommand("git push origin main").decision, "deny");
   assert.equal(evaluateCommand("git -C /tmp/repo push origin main").decision, "deny");
   assert.equal(evaluateCommand("git merge main").decision, "deny");
-  assert.equal(evaluateCommand("git switch main").decision, "deny");
   assert.equal(evaluateCommand("npm publish").decision, "deny");
   assert.equal(evaluateCommand("npm --prefix /tmp/pkg publish").decision, "deny");
   assert.equal(evaluateCommand("gh pr merge 25").decision, "deny");
   assert.equal(evaluateCommand("gh api -X POST repos/acme/project/releases").decision, "deny");
   assert.equal(evaluateCommand("git send-pack ssh://example.invalid/repo").decision, "deny");
-  assert.equal(evaluateCommand("git checkout -B main").decision, "deny");
+  assert.equal(evaluateCommand("git reset --hard main").decision, "deny");
+  assert.equal(evaluateCommand("git branch -D main").decision, "deny");
+  assert.equal(evaluateCommand("git update-ref refs/heads/main HEAD~1").decision, "deny");
   assert.equal(evaluateCommand("git branch -f main").decision, "deny");
   assert.equal(evaluateCommand("git \"$ACTION\" \"$BRANCH\"").decision, "deny");
-  assert.equal(evaluateCommand("g''it switch main").decision, "deny");
+  assert.equal(evaluateCommand("g''it reset --hard main").decision, "deny");
   assert.equal(evaluateCommand("git \\\npush origin main").decision, "deny");
   assert.equal(evaluateCommand("echo ref > .git/refs/heads/main").decision, "deny");
   assert.equal(evaluateCommand("echo ref > refs/heads/main").decision, "deny");
@@ -46,6 +47,28 @@ test("policy allows read-only git merge lookups but still denies git merge", () 
   assert.equal(evaluateCommand("git merge-tree a b").decision, "allow");
   assert.equal(evaluateCommand("git merge main").decision, "deny");
   assert.equal(evaluateCommand("git merge --ff-only origin/main").decision, "deny");
+});
+
+test("policy anchors the branch boundary to the baseline commit, not the branch name", () => {
+  // A task may be started, or may legitimately land, on any branch including
+  // main; only push/merge/PR and a destructive rewrite of a protected branch
+  // (not a read-only use of its name) are denied.
+  assert.equal(evaluateCommand("git checkout main").decision, "allow");
+  assert.equal(evaluateCommand("git switch main").decision, "allow");
+  assert.equal(evaluateCommand("git restore --source=main -- f").decision, "allow");
+  assert.equal(evaluateCommand("git worktree add ../wt main").decision, "allow");
+  const reset = evaluateCommand("git reset --hard main");
+  assert.equal(reset.decision, "deny");
+  assert.equal(reset.reason, "Worker cannot rewrite or delete a protected integration branch");
+  const branchDelete = evaluateCommand("git branch -D main");
+  assert.equal(branchDelete.decision, "deny");
+  assert.equal(branchDelete.reason, "Worker cannot rewrite or delete a protected integration branch");
+  // Forced (re)creation moves the protected ref exactly like `branch -f`.
+  assert.equal(evaluateCommand("git checkout -B main").decision, "deny");
+  assert.equal(evaluateCommand("git switch -C main").decision, "deny");
+  assert.equal(evaluateCommand("git switch --force-create main").decision, "deny");
+  assert.equal(evaluateCommand("git checkout -b feature/x").decision, "allow");
+  assert.equal(evaluateCommand("git switch -c feature/x main").decision, "allow");
 });
 
 test("policy does not create a synchronous human gate for local development", () => {
