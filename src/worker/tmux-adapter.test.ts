@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, rmdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
@@ -244,6 +244,61 @@ setInterval(() => {}, 10_000);
   } finally {
     if (!child.killed) child.kill("SIGKILL");
     if (identity) spawnSync("tmux", ["-S", identity.socket, "kill-server"], { stdio: "ignore" });
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("release migrates an owned interactive session's cgroup, leaving it detached and still running", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  // Interactive sessions are always started with retainCgroupUntilLeaseRelease
+  // (index.ts passes retainCgroupUntilLeaseRelease: taskAutomation, and
+  // interactive implies taskAutomation), so the production shape leaves the
+  // verified-empty cgroup directory for the cwd lease's own release to reclaim.
+  const fixture = await startInteractiveOwnedFixture({ retainCgroupUntilLeaseRelease: true });
+  const { adapter, handle, stateDir } = fixture;
+  try {
+    const cgroupPath = handle.cgroupPath;
+    assert.ok(cgroupPath, "an owned interactive session must be cgroup-contained");
+    await adapter.release(handle, "task completed; interactive session kept open");
+    const status = await adapter.getStatus(handle);
+    assert.equal(status.detached, true);
+    assert.equal(status.running, true);
+    // The processes are intentionally still alive; the released Supervisor
+    // must not claim the process-group boundary was cleaned.
+    assert.equal(status.processGroupCleaned, false);
+    assert.equal(spawnSync("tmux", ["-S", handle.tmuxSocket!, "has-session", "-t", handle.sessionName!], { stdio: "ignore" }).status, 0);
+    // Every process (the launcher and the fake Claude it spawned) was
+    // migrated out of the Worker cgroup, which is left behind verified empty
+    // for the cwd lease to reclaim.
+    const cgroupProcs = (await readFile(join(cgroupPath!, "cgroup.procs"), "utf8")).trim();
+    assert.equal(cgroupProcs, "");
+  } finally {
+    await adapter.killProcessGroup(handle, "test cleanup").catch(() => {});
+    // retainCgroupUntilLeaseRelease leaves the emptied directory behind for
+    // the cwd lease's own release to reclaim; nothing here plays that role.
+    if (handle.cgroupPath) await rmdir(handle.cgroupPath).catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("killProcessGroup after release still closes a kept-open interactive session", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const fixture = await startInteractiveOwnedFixture({ retainCgroupUntilLeaseRelease: true });
+  const { adapter, handle, stateDir } = fixture;
+  try {
+    await adapter.release(handle, "task completed; interactive session kept open");
+    assert.equal((await adapter.getStatus(handle)).detached, true);
+    // `/supervise stop <task>` on an already-released (kept-open) session
+    // uses killProcessGroup directly; it must still close the session even
+    // though the Worker cgroup was already emptied and its (retained, empty)
+    // directory still exists.
+    await adapter.killProcessGroup(handle, "/supervise stop after kept-open completion");
+    const status = await adapter.getStatus(handle);
+    assert.equal(status.running, false);
+    assert.equal(status.processGroupCleaned, true);
+    assert.notEqual(spawnSync("tmux", ["-S", handle.tmuxSocket!, "has-session", "-t", handle.sessionName!], { stdio: "ignore" }).status, 0);
+  } finally {
+    // retainCgroupUntilLeaseRelease leaves the emptied directory behind for
+    // the cwd lease's own release to reclaim; nothing here plays that role.
+    if (handle.cgroupPath) await rmdir(handle.cgroupPath).catch(() => {});
     await rm(stateDir, { recursive: true, force: true });
   }
 });
@@ -1249,7 +1304,7 @@ async function waitForFileContent(path: string): Promise<string> {
 }
 
 /** Owned interactive fixture already past the trust dialog and bound via a SessionStart hook. */
-async function startInteractiveOwnedFixture(): Promise<{
+async function startInteractiveOwnedFixture(options: { retainCgroupUntilLeaseRelease?: boolean } = {}): Promise<{
   stateDir: string;
   adapter: TmuxWorkerAdapter;
   handle: Awaited<ReturnType<TmuxWorkerAdapter["start"]>>;
@@ -1284,6 +1339,7 @@ setInterval(() => {}, 10000);
     hookSource,
     hookSettingsPath,
     sendInitialInput: false,
+    retainCgroupUntilLeaseRelease: options.retainCgroupUntilLeaseRelease,
     eventListener: (event) => { events.push(event); },
   });
   const fakePid = Number(await waitForFileContent(pidFile));

@@ -254,8 +254,12 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         const adoptedDetachConfirmed = detached
           && session.handle.ownership === "adopted"
           && !status.running;
-        const cleanupConfirmed = status.processGroupCleaned === true || adoptedDetachConfirmed;
-        if (!status.running && cleanupConfirmed && !status.cleanupError && (!status.cgroupError || status.cgroupRequired === false)) {
+        // A hand-back (owned interactive `release()`) leaves the Worker
+        // intentionally running; `detached` is its own cleanup confirmation
+        // and does not wait for `!status.running`.
+        const handedBackConfirmed = status.detached === true;
+        const cleanupConfirmed = status.processGroupCleaned === true || adoptedDetachConfirmed || handedBackConfirmed;
+        if ((handedBackConfirmed || !status.running) && cleanupConfirmed && !status.cleanupError && (!status.cgroupError || status.cgroupRequired === false)) {
           if (await releaseLease(taskId)) forgetSession(taskId);
           else unconfirmedSweepAttempts.set(taskId, attempts + 1);
         } else {
@@ -276,8 +280,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   const workerCleanupConfirmed = async (handle: NonNullable<Supervisor["handle"]>): Promise<boolean> => {
     try {
       const status = await adapter.getStatus(handle);
-      return !status.running
-        && status.processGroupCleaned === true
+      return (status.detached === true || !status.running)
+        && (status.processGroupCleaned === true || status.detached === true)
         && !status.cleanupError
         && (!status.cgroupError || status.cgroupRequired === false);
     } catch {
@@ -285,6 +289,14 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     }
   };
   const stopSession = async (session: Supervisor, reason: string, releasePersistent = false, preserveDecisionSession = false): Promise<void> => {
+    // Already handed back to the operator (a kept-open interactive session,
+    // or an adopted session released earlier in this same shutdown pass) and
+    // this call is itself a hand-back sweep (`releasePersistent`, used only
+    // at shutdown): there is nothing left to stop, and polling for
+    // `!running` would wait out the deadline against a Worker that is alive
+    // on purpose. An explicit `/supervise stop` (`releasePersistent` false)
+    // must still fall through so it can kill a kept-open session on request.
+    if (session.released && releasePersistent) return;
     const handle = session.handle;
     const persistent = adapter.capabilities().persistentSession && Boolean(handle);
     const taskId = session.task?.taskId;
