@@ -9,14 +9,29 @@ import { redactSensitive } from "./redaction.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
 import { automaticWorkerEnvironment } from "./worker/environment.ts";
 import { TmuxWorkerAdapter, attachCommand } from "./worker/tmux-adapter.ts";
-import { Supervisor, type DecisionSessionClosedInfo, type SupervisorProgress } from "./supervisor.ts";
+import { Supervisor, type DecisionSessionClosedInfo, type SupervisorProgress, type SupervisorTokenUsage } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
-import { autonomyDefaults, eventLogMaxBytes, loadSupervisorEnvironment, reviewTimeoutMs } from "./config.ts";
+import {
+  autonomyDefaults,
+  decisionCompactionTokens,
+  decisionModel,
+  decisionSessionRetentionDays,
+  eventLogMaxBytes,
+  loadSupervisorEnvironment,
+  progressHeartbeatMs,
+  reviewerModel,
+  reviewTimeoutMs,
+  workerAutocompactTokens,
+  workerMcpConfigPath,
+  workerModel,
+} from "./config.ts";
 import { DecisionSessionStore, type DecisionSessionRecord } from "./decision-session-store.ts";
 import { CwdLeaseStore, type CwdLeaseHandle, pathsOverlap, workerIdentity } from "./cwd-lease.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { PiReadOnlyReviewer } from "./reviewer.ts";
+import { resolvePiModel } from "./pi-model.ts";
+import type { PiModel } from "./decision-worker.ts";
 import type { TaskSpec, WorkerHandle } from "./types.ts";
 
 /**
@@ -63,8 +78,27 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   assertRuntimeDirectory(leaseDir, "lease");
   const events = new EventLog(join(stateDir, "events.jsonl"), { maxBytes: eventLogMaxBytes() });
   const decisionStore = new DecisionSessionStore(join(stateDir, "decision-sessions"));
+  const retentionDays = decisionSessionRetentionDays();
+  if (retentionDays > 0) {
+    void decisionStore.prune({ maxAgeMs: retentionDays * 86_400_000 }).catch((error) => {
+      console.error(`pi-claude-supervisor decision session retention prune failed: ${redactText(error instanceof Error ? error.message : String(error))}`);
+    });
+  }
   const cwdLeaseStore = new CwdLeaseStore(leaseDir);
-  const reviewer = automation ? new PiReadOnlyReviewer({ timeoutMs: reviewTimeoutMs() }) : undefined;
+  const decisionModelSpec = decisionModel();
+  const reviewerModelSpec = reviewerModel();
+  // Resolve once and cache the promise so a misconfigured model fails closed on
+  // every subsequent start/recover rather than silently falling back.
+  let decisionPiModelPromise: Promise<PiModel | undefined> | undefined;
+  const resolveDecisionPiModel = (): Promise<PiModel | undefined> => {
+    if (!decisionPiModelPromise) decisionPiModelPromise = resolvePiModel(decisionModelSpec);
+    return decisionPiModelPromise;
+  };
+  let reviewerPiModelPromise: Promise<PiModel | undefined> | undefined;
+  const getReviewer = async (): Promise<PiReadOnlyReviewer> => {
+    if (!reviewerPiModelPromise) reviewerPiModelPromise = resolvePiModel(reviewerModelSpec);
+    return new PiReadOnlyReviewer({ timeoutMs: reviewTimeoutMs(), model: await reviewerPiModelPromise });
+  };
   const sessions = new Map<string, Supervisor>();
   const cwdLeases = new Map<string, CwdLeaseHandle>();
   const cleanupRequiredTasks = new Set<string>();
@@ -72,6 +106,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   const pendingCwds = new Set<string>();
   const pendingStarts = new Set<Promise<void>>();
   const pendingStartSessions = new Set<Supervisor>();
+  const unconfirmedSweepAttempts = new Map<string, number>();
   let activeTaskId: string | undefined;
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;
@@ -112,6 +147,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     sessions.delete(taskId);
     reservedCwds.delete(taskId);
     cleanupRequiredTasks.delete(taskId);
+    unconfirmedSweepAttempts.delete(taskId);
     if (activeTaskId === taskId) activeTaskId = undefined;
   };
   const releaseSettledReservations = async (): Promise<void> => {
@@ -123,6 +159,13 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         if (await releaseLease(taskId)) forgetSession(taskId);
         continue;
       }
+      // A stuck session is otherwise polled at 1 Hz forever; back off to once
+      // every 10 sweeps after the first 10 unconfirmed attempts.
+      const attempts = unconfirmedSweepAttempts.get(taskId) ?? 0;
+      if (!(attempts < 10 || attempts % 10 === 0)) {
+        unconfirmedSweepAttempts.set(taskId, attempts + 1);
+        continue;
+      }
       try {
         const status = await adapter.getStatus(session.handle);
         const adoptedDetachConfirmed = detached
@@ -131,9 +174,13 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         const cleanupConfirmed = status.processGroupCleaned === true || adoptedDetachConfirmed;
         if (!status.running && cleanupConfirmed && !status.cleanupError && (!status.cgroupError || status.cgroupRequired === false)) {
           if (await releaseLease(taskId)) forgetSession(taskId);
+          else unconfirmedSweepAttempts.set(taskId, attempts + 1);
+        } else {
+          unconfirmedSweepAttempts.set(taskId, attempts + 1);
         }
       } catch {
         // Keep the reservation when cleanup status cannot be confirmed.
+        unconfirmedSweepAttempts.set(taskId, attempts + 1);
       }
     }
   };
@@ -243,6 +290,10 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           const policy = evaluateCommand(command, workerArgs);
           const approval: { actor: "human"; reason: string } | undefined = undefined;
           if (policy.decision === "deny") throw new Error(`Worker command denied: ${policy.reason}`);
+          // Resolve models before any lease/reservation state is mutated below, so
+          // a misconfigured model spec fails closed without leaking a reservation.
+          const decisionPiModel = await resolveDecisionPiModel();
+          const reviewer = taskAutomation ? await getReviewer() : undefined;
           if (shuttingDown) throw new Error("Pi session is shutting down");
           const cwdKey = await canonicalCwd(ctx.cwd);
           await releaseSettledReservations();
@@ -263,10 +314,13 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           }
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
-            reviewer: taskAutomation ? reviewer : undefined,
+            reviewer,
             reviewTimeoutMs: reviewTimeoutMs(),
+            progressHeartbeatMs: progressHeartbeatMs(),
+            decisionModel: decisionPiModel,
+            decisionCompactionTokens: decisionCompactionTokens(),
             onCandidate: async (notice) => {
-              if (ctx.hasUI) notify(ctx, `Candidate ${notice.status}: ${notice.reason}`, notice.status === "ready" ? "info" : "warning");
+              if (ctx.hasUI) notify(ctx, `Candidate ${notice.status}: ${notice.reason}${formatUsageSuffix(notice.usage)}`, notice.status === "ready" ? "info" : "warning");
               if (humanWebhook.enabled) {
                 try { await humanWebhook.notifyCandidate(notice); }
                 catch (error) { console.error(`pi-claude-supervisor candidate webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`); }
@@ -289,6 +343,9 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 approval,
                 automation: taskAutomation,
                 retainCgroupUntilLeaseRelease: taskAutomation,
+                workerArgOptions: taskAutomation
+                  ? { model: workerModel(), autocompactTokens: workerAutocompactTokens(), mcpConfigPath: workerMcpConfigPath() }
+                  : undefined,
                 onWorkerStartup: taskAutomation
                   ? async (startupHandle) => {
                       await lease.updateWorker({
@@ -490,6 +547,10 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           if (policy.decision === "deny") throw new Error(`Worker command denied: ${policy.reason}`);
           const automaticRecovery = record.spec?.autonomy.unattended !== false;
           if (automaticRecovery && !record.resolvedExecutable) throw new Error("automatic recovery requires a persisted resolved Claude executable identity");
+          // Resolve models before any lease/recovery state is mutated below, so a
+          // misconfigured model spec fails closed without leaking a reservation.
+          const decisionPiModel = await resolveDecisionPiModel();
+          const reviewer = automaticRecovery ? await getReviewer() : undefined;
           const approval = record.approval;
           const lease = await cwdLeaseStore.acquire(cwdKey, record.taskId, adapter.capabilities().transport, {
             startup: automaticRecovery,
@@ -517,10 +578,13 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           }
           pendingCwds.add(cwdKey);
           const session = new Supervisor(adapter, events, {
-            reviewer: automaticRecovery ? reviewer : undefined,
+            reviewer,
             reviewTimeoutMs: reviewTimeoutMs(),
+            progressHeartbeatMs: progressHeartbeatMs(),
+            decisionModel: decisionPiModel,
+            decisionCompactionTokens: decisionCompactionTokens(),
             onCandidate: async (notice) => {
-              if (ctx.hasUI) notify(ctx, `Candidate ${notice.status}: ${notice.reason}`, notice.status === "ready" ? "info" : "warning");
+              if (ctx.hasUI) notify(ctx, `Candidate ${notice.status}: ${notice.reason}${formatUsageSuffix(notice.usage)}`, notice.status === "ready" ? "info" : "warning");
               if (humanWebhook.enabled) {
                 try { await humanWebhook.notifyCandidate(notice); }
                 catch (error) { console.error(`pi-claude-supervisor candidate webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`); }
@@ -548,6 +612,9 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 approval,
                 automation: automaticRecovery,
                 retainCgroupUntilLeaseRelease: automaticRecovery,
+                workerArgOptions: automaticRecovery
+                  ? { model: workerModel(), autocompactTokens: workerAutocompactTokens(), mcpConfigPath: workerMcpConfigPath() }
+                  : undefined,
                 onWorkerStartup: automaticRecovery
                   ? async (startupHandle) => {
                       await lease.updateWorker({
@@ -714,7 +781,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         } else if (operation === "status") {
           const { session, sessionId } = resolveSession(sessions, activeTaskId, rest, true);
           message = session
-            ? `task=${sessionId} state=${session.state} worker=${session.handle?.id ?? "none"}`
+            ? `task=${sessionId} state=${session.state} worker=${session.handle?.id ?? "none"} ${formatUsageDetail(session.usage)}`
             : formatSessions(sessions, await decisionStore.list({ activeOnly: true }));
         } else if (operation === "capabilities") {
           message = JSON.stringify(adapter.capabilities(), null, 2);
@@ -845,6 +912,22 @@ function formatSessions(sessions: Map<string, Supervisor>, recoverable: Decision
     .filter((record) => !sessions.has(record.taskId))
     .map((record) => `${record.taskId} state=recoverable recovery=${record.recoveryState} cwd=${record.cwd} worker=${record.recoveryWorker?.id ?? "-"}`);
   return [...active, ...pending].join("\n") || "No task sessions.";
+}
+
+function tokenTotal(tokens: { input: number; output: number; cacheRead: number; cacheWrite: number }): number {
+  return tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite;
+}
+
+function formatUsageDetail(usage: SupervisorTokenUsage): string {
+  const workerTokens = tokenTotal(usage.workerTokens);
+  const piTokens = tokenTotal(usage.decision) + tokenTotal(usage.reviewer);
+  return `cost=$${usage.workerCostUsd.toFixed(2)} workerTurns=${usage.workerTurns} workerTokens=${workerTokens} piTokens=${piTokens} decisionCalls=${usage.decision.calls} reviewerCalls=${usage.reviewer.calls}`;
+}
+
+function formatUsageSuffix(usage?: SupervisorTokenUsage): string {
+  if (!usage) return "";
+  const piTokens = tokenTotal(usage.decision) + tokenTotal(usage.reviewer);
+  return ` (worker $${usage.workerCostUsd.toFixed(2)}, Pi ${piTokens} tokens)`;
 }
 
 function selectedWorkerEnvironment(automatic = false): NodeJS.ProcessEnv {

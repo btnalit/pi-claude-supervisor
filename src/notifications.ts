@@ -98,7 +98,7 @@ function toGeneric(notice: HumanInterventionNotice | CandidateNotice): Record<st
     reason: sanitize(notice.reason),
     question: sanitize(notice.question),
     permission: notice.permission ? sanitize(notice.permission) : undefined,
-    ...(candidate ? { status: notice.status, deliverable: notice.deliverable } : { actions: ["approve_or_deny_permission", "send_instruction", "stop_worker", "takeover"] }),
+    ...(candidate ? { status: notice.status, deliverable: notice.deliverable, ...(notice.usage ? { usage: usageSummary(notice.usage) } : {}) } : { actions: ["approve_or_deny_permission", "send_instruction", "stop_worker", "takeover"] }),
     note: candidate
       ? "This is an optional candidate notification. It does not grant remote push or main/integration merge permission."
       : "This is an outbound notification. Use the Pi session or a separately authenticated callback service to approve actions.",
@@ -110,14 +110,28 @@ function toWeCom(notice: HumanInterventionNotice | CandidateNotice): Record<stri
   const permission = notice.permission ? `\n工具: ${safeText(notice.permission.toolName)}\n请求 ID: ${safeText(notice.permission.requestId)}` : "";
   const question = notice.question ? `\n问题: ${safeText(notice.question)}` : "";
   const title = candidate ? "Claude Supervisor 候选状态" : "Claude Supervisor 需要人工介入";
+  const usage = candidate && notice.usage ? `\n> Worker 费用: $${notice.usage.workerCostUsd.toFixed(2)} (${notice.usage.workerTurns} turns)\n> Pi tokens: ${usageSummary(notice.usage).piTokens}` : "";
   const suffix = candidate
-    ? `\n> 状态: ${safeText(notice.status)}\n> 可交付: ${notice.deliverable ? "yes" : "no"}\n\n该通知不授予远程 push 或 main/integration merge 权限。`
+    ? `\n> 状态: ${safeText(notice.status)}\n> 可交付: ${notice.deliverable ? "yes" : "no"}${usage}\n\n该通知不授予远程 push 或 main/integration merge 权限。`
     : "\n\n请在 Pi 中执行对应的 approve/deny、send、stop 或 takeover 操作。";
   return {
     msgtype: "markdown",
     markdown: {
       content: `### ${title}\n> 任务: ${safeText(notice.task)}\n> Task ID: ${safeText(notice.taskId)}\n> 原因: ${safeText(notice.reason)}${escapeMarkdown(question)}${escapeMarkdown(permission)}${suffix}`,
     },
+  };
+}
+
+/** Numeric-only cost summary for outbound payloads; never includes free text. */
+function usageSummary(usage: NonNullable<CandidateNotice["usage"]>): { workerCostUsd: number; workerTurns: number; workerTokens: number; piTokens: number; decisionCalls: number; reviewerCalls: number } {
+  const total = (tokens: { input: number; output: number; cacheRead: number; cacheWrite: number }) => tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite;
+  return {
+    workerCostUsd: Number(usage.workerCostUsd.toFixed(4)),
+    workerTurns: usage.workerTurns,
+    workerTokens: total(usage.workerTokens),
+    piTokens: total(usage.decision) + total(usage.reviewer),
+    decisionCalls: usage.decision.calls,
+    reviewerCalls: usage.reviewer.calls,
   };
 }
 

@@ -126,6 +126,7 @@ export PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_FORMAT=generic
 
 当前 webhook 只是出站候选通知，不直接接受批准命令；显式 stop、takeover 等兼容控制仍通过 Pi。
 Worker 意外退出、watchdog 超时或清理未确认等无人值守失败会发出 `candidate_failed` 通知（`status: "failed"`），webhook 投递对 429/5xx/网络错误重试 3 次。
+
 自动模式会将 Decision Worker 会话持久化到状态目录。Pi 非正常重启后，`/supervise sessions`
 会显示 `recoverable` 任务；显式执行 `/supervise recover [--takeover] <task-id>` 会恢复 Decision Worker 上下文并
 重新启动 Claude Worker，不会静默恢复或重复执行任务。旧 Pi 进程已退出且租约确认旧 Worker
@@ -202,3 +203,56 @@ PTY 屏幕文字本身不是 Claude JSONL，不能把屏幕文字当作结构化
 Pull Request 必须通过聚合的 `CI / Quality gate`。Release Please 根据 Conventional Commits 创建版本 PR；维护者合并后，Release workflow 会针对精确 tag commit 重新验证，并通过受保护的 `npm` environment 使用 npm provenance 发布。
 
 详细内容见 [engineering-plan.md](docs/engineering-plan.md)、[autonomy-target.md](docs/autonomy-target.md)、[independent-review.md](docs/independent-review.md)、[architecture.md](docs/architecture.md)、[testing.md](docs/testing.md) 和 [releasing.md](docs/releasing.md)。
+
+## Token 消耗与成本控制
+
+以下数据来自一次真实的无人值守 review 任务（总耗时 29 分钟）：
+
+| 组成部分 | 轮次/调用次数 | Token | 花费 |
+| --- | --- | --- | --- |
+| Claude Code Worker | 70 轮 | 15.5M cache-read + 370k cache-write + 100k output | $18.46 |
+| Pi Decision Worker | 30 次模型调用 | 约 1.0M（91k 未缓存 + 914k cache-read） | $0.04 |
+
+花费几乎全部来自 Worker，而不是 Supervisor 自身的 Decision Worker 或 Reviewer 调用。这次运行中
+Worker 每轮平均消耗约 22 万 token 的上下文，原因是它以单个长期 `-p` session 运行在 1M token 窗口下，
+从未触发过 compact；一次普通的 Claude Code 轮次仅系统提示词就要消耗约 2.4 万 prompt token，
+与配置了哪些 MCP server 无关。30 次 Decision Worker 调用中有 28 次是权限请求，其中 24 次本可由
+确定性 policy 直接回答而无需模型调用；Decision Worker 推翻 policy 的情形只有 4 次（拒绝下载和
+任务目录之外的写入）——这正是默认 `permissionAuthority` 选择 `hybrid` 而不是 `policy` 的原因。
+
+各项开关及其默认值和取舍：
+
+- `PI_CLAUDE_SUPERVISOR_PERMISSION_AUTHORITY` / `autonomy.permissionAuthority`
+  （`policy` | `hybrid`，默认 | `decision-worker`）：`hybrid` 会让确定性 policy
+  （`src/policy.ts` 的 `isRoutinePermission`）直接回答任务目录内的常规文件编辑和本地
+  只读/开发类 shell 命令，其余请求以及任何 policy 拒绝仍会发给 Decision Worker。
+  它主要节省的是延迟和 Decision Worker 的上下文大小，而不是费用：上面的 30 次调用本身只花了 $0.04。
+- `PI_CLAUDE_SUPERVISOR_WORKER_MODEL` / `--model`：Opus 级和 Sonnet 级模型之间大约相差 5 倍价格，
+  是账单上最大的单一杠杆；这是操作者自己的选择，Supervisor 不会替你决定。
+- `PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS`（自动模式默认 200000；`0` 保留 Claude 自身默认值）：
+  限制每轮 Worker 的上下文大小，避免像本例一样持续累积到约 22 万 token/轮；能节省几十个百分点，
+  但会牺牲一些上下文质量。
+- `PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD` / `autonomy.maxWorkerCostUsd`：作为 `--max-budget-usd`
+  传给 Claude，并由 Supervisor 根据 Worker `result` 的累计花费再次核对；这是一个上限而不是节省手段，
+  达到上限的任务会连同证据一起被挂起。
+- `PI_CLAUDE_SUPERVISOR_WORKER_MCP_CONFIG`（`--strict-mcp-config --mcp-config`）：限制 Worker 只能
+  使用列出的 MCP server；它约束的是 Worker 能触达的范围，而不是普通轮次约 2.4 万 token 的固定开销。
+- `PI_CLAUDE_SUPERVISOR_DECISION_MODEL` / `PI_CLAUDE_SUPERVISOR_REVIEWER_MODEL`
+  （`provider/model-id`，例如 `anthropic/claude-haiku-4-5-20251001`）：Pi Decision Worker 和
+  Reviewer 使用的模型。本例中 Pi 侧花费本就只有几美分，换更便宜的模型主要是换取延迟，而不是显著省钱。
+- `PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS`（默认 60000；`0` 关闭）：当持久化的 Decision Worker
+  session 估算的上下文超过该阈值时主动 compact，并在 compact 之后的下一次 prompt 里重新发送一次
+  启动指令。
+
+Supervisor 记录的是实际花费，而不是事后估算：每条 Worker `result` 记录都会生成一条 `worker_usage`
+事件，每次 Decision Worker/Reviewer 模型调用都会生成一条 `pi_usage` 事件，二者都会累计进
+`session.usage`（`SupervisorTokenUsage`）。`/supervise status <task-id>` 会打印一行
+`cost=… workerTurns=… workerTokens=… piTokens=… decisionCalls=… reviewerCalls=…` 摘要；
+进度通知携带 `SupervisorProgress.costUsd`/`.piTokens`，候选通知则通过 `CandidateNotice.usage`
+携带同样的摘要（generic webhook 以数值型 `usage` 对象输出，WeCom 格式追加两行费用/tokens）。
+
+除了 Worker 模型和预算的选择之外，以上机制本身并不会改变任务的实际花费；Supervisor 侧的这些改动
+主要是削减 Decision Worker 的 token 消耗和延迟，而这部分原本就只有几美分。对成本敏感的无人值守
+场景，一个合理的起点是：`PI_CLAUDE_SUPERVISOR_WORKER_MODEL` 选择 Sonnet 级模型、为任务设置明确的
+`PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD`、保留默认的 `hybrid` permission authority，并将
+`PI_CLAUDE_SUPERVISOR_DECISION_MODEL` 设为 Haiku 级模型。
