@@ -124,6 +124,12 @@ export interface WorkerStatus {
   exitReason?: WorkerExitReason;
   /** Whether the detached process group or cgroup has been confirmed gone. */
   processGroupCleaned?: boolean;
+  /**
+   * The Worker was handed back to the operator (kept-open interactive session):
+   * it is still running, but the Supervisor owes no further cleanup for it and
+   * its cwd lease may be released.
+   */
+  detached?: boolean;
   /** Whether a Linux cgroup provided descendant cleanup for this worker. */
   cgroupCleaned?: boolean;
   /** Whether cgroup attachment was required for this worker. */
