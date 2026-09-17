@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented here.
 
+## [0.7.1](https://github.com/btnalit/pi-claude-supervisor/compare/v0.7.0...v0.7.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* **policy:** judge heredoc bodies by their consumer and separate statements on newlines ([ac69208](https://github.com/btnalit/pi-claude-supervisor/commit/ac692083d824b05b7665c2864aad9478f7b367a4))
+* **policy:** stop vetoing ordinary shell and scratchpad writes on the Worker's behalf ([eb72c8f](https://github.com/btnalit/pi-claude-supervisor/commit/eb72c8f267f77f4097f20c325c4087c925be5803))
+
 ## [0.7.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.6.0...v0.7.0) (2026-09-17)
 
 
