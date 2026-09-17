@@ -2,7 +2,9 @@ const sensitiveKeyPattern = /(password|secret|token|api[-_]?key|authorization|cr
 
 /** Recursively redact credential-shaped values before persistence or model prompts. */
 export function redactSensitive(value: unknown, key?: string): unknown {
-  if (key && sensitiveKeyPattern.test(key)) return "[REDACTED]";
+  // A credential is a string; a number or boolean under a sensitive-looking
+  // key (`totalTokens`, `contextTokens`, `maxTokens`) is a count, not a secret.
+  if (key && sensitiveKeyPattern.test(key) && typeof value === "string") return "[REDACTED]";
   if (typeof value === "string") {
     return value
       .replace(/\b(sk-ant-[A-Za-z0-9_-]+)\b/gu, "[REDACTED]")

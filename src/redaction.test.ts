@@ -28,3 +28,10 @@ test("dotted secrets are redacted whole rather than leaking their tail", () => {
   assert.equal(redactSensitive("password=hunterhunter"), "password=[REDACTED]");
   assert.equal(redactSensitive("token=ABCDEFGH"), "token=[REDACTED]");
 });
+
+test("token counts under a sensitive-looking key are numbers, not secrets", () => {
+  assert.deepEqual(
+    redactSensitive({ role: "decision", input: 3156, totalTokens: 3324, contextTokens: 8000, token: "abc123def456ghi789", tokens: ["abc123def456ghi789"] }),
+    { role: "decision", input: 3156, totalTokens: 3324, contextTokens: 8000, token: "[REDACTED]", tokens: ["[REDACTED]"] },
+  );
+});
