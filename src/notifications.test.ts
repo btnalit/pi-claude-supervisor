@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import http from "node:http";
 import test from "node:test";
 import { HumanWebhookNotifier } from "./notifications.ts";
 import type { CandidateNotice, HumanInterventionNotice } from "./supervisor.ts";
@@ -66,4 +67,43 @@ test("wecom human webhook sanitizes task and question text", async () => {
   }
   assert.doesNotMatch(body, /sk-ant-very-secret|sk-ant-question-secret|hidden-token|task-secret|reason-secret|question-secret|ghp_123456789012345678901234567890123456|github_pat_12345678901234567890|xoxb-12345678901234567890|npm_123456789012345678901234567890123456|AKIA1234567890ABCDEF|eyJhbGciOiJIUzI1NiJ9/u);
   assert.match(body, /\[REDACTED\]/u);
+});
+
+test("webhook retries a transient 503 and succeeds once the server recovers", async () => {
+  let requests = 0;
+  const server = http.createServer((_req, res) => {
+    requests += 1;
+    if (requests === 1) { res.writeHead(503); res.end(); return; }
+    res.writeHead(200); res.end("ok");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("test server failed to bind");
+  try {
+    await new HumanWebhookNotifier({ url: `http://127.0.0.1:${address.port}/hook`, maxAttempts: 3, retryDelaysMs: [1, 1] }).notify(notice);
+    assert.equal(requests, 2);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("webhook does not retry a non-retryable status", async () => {
+  let requests = 0;
+  const server = http.createServer((_req, res) => {
+    requests += 1;
+    res.writeHead(400);
+    res.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("test server failed to bind");
+  try {
+    await assert.rejects(
+      () => new HumanWebhookNotifier({ url: `http://127.0.0.1:${address.port}/hook`, maxAttempts: 3, retryDelaysMs: [1, 1] }).notify(notice),
+      /HTTP 400/u,
+    );
+    assert.equal(requests, 1);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });

