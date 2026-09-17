@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented here.
 
+## [0.7.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.6.0...v0.7.0) (2026-09-17)
+
+
+### Features
+
+* **config:** add Worker/Decision model and safety-limit knobs ([a12710a](https://github.com/btnalit/pi-claude-supervisor/commit/a12710a0579a03f8a836c56e85ea1a707f88621e))
+* **decision:** compact Decision Worker prompts, proactive compaction, and model/usage wiring ([a423515](https://github.com/btnalit/pi-claude-supervisor/commit/a423515d7b345edb9b265795c07ff11e0a869d19))
+* declare hook relay and interactive tmux contracts ([2a7db8d](https://github.com/btnalit/pi-claude-supervisor/commit/2a7db8d46ab8ee975f49a9808a37a92b7e0778a7))
+* declare token-accounting and permission-authority contracts ([73e77d9](https://github.com/btnalit/pi-claude-supervisor/commit/73e77d97157091452fdb953712790e4746727665))
+* **hooks:** Claude Code hook relay and Supervisor hook server ([92877f6](https://github.com/btnalit/pi-claude-supervisor/commit/92877f6b20ccaa825609ceb7fb33af7bd8997c28))
+* **index:** install the Claude Code hook relay automatically in interactive tmux mode ([a0f3923](https://github.com/btnalit/pi-claude-supervisor/commit/a0f39233c52335791f0f0dbc5d306c54996a9006))
+* **index:** wire token controls, cost status and docs ([bf4c341](https://github.com/btnalit/pi-claude-supervisor/commit/bf4c3411f3af3e72e003f5743ce29f2367204084))
+* let adapter preflight see the interactive flag ([7c93346](https://github.com/btnalit/pi-claude-supervisor/commit/7c93346196b3ee6aff35fa72d27c23125ee3a3e7))
+* permission phase and defer contracts for interactive sessions ([399683c](https://github.com/btnalit/pi-claude-supervisor/commit/399683cecdb6132c5544b0a20801b0014e261390))
+* **supervisor:** anchor automatic tasks to the baseline commit, not the branch ([7b75593](https://github.com/btnalit/pi-claude-supervisor/commit/7b75593792d124cff2a1acb3dcc7b2b88ff54587))
+* **supervisor:** route routine permissions through policy, account for Worker/Pi cost ([342b2c2](https://github.com/btnalit/pi-claude-supervisor/commit/342b2c2c0b94d26b9357ba436ee44d813ed07ee4))
+* **tmux:** hook-driven interactive Claude sessions ([e942911](https://github.com/btnalit/pi-claude-supervisor/commit/e9429112945090462307120958cf6b91bc37fb6c))
+* wire hook-driven interactive tmux supervision ([29eb6fe](https://github.com/btnalit/pi-claude-supervisor/commit/29eb6fedd9f69a19bdab11243e59320b36fd7d50))
+* WorkerStatus.detached contract for kept-open sessions ([a970d89](https://github.com/btnalit/pi-claude-supervisor/commit/a970d897b9a7446c085f158d014292710d4ec95c))
+
+
+### Bug Fixes
+
+* close post-review gaps in noop handling, redaction, reviewer abort and log rotation ([fb856d6](https://github.com/btnalit/pi-claude-supervisor/commit/fb856d6feed03183c1575f59f36f90380d1efe31))
+* **cwd-lease:** quarantine unreadable leases and remove nested cgroups ([d45da59](https://github.com/btnalit/pi-claude-supervisor/commit/d45da59349832a66fdea1d59287e4f3b628ebd99))
+* **decision:** surface Decision Worker and Reviewer API/abort failures ([5e1a9ea](https://github.com/btnalit/pi-claude-supervisor/commit/5e1a9ea2a88b5dfdc27d921780c74c6381b2f3e9))
+* **events:** make EventLog.append O(1) in log size and add rotation ([960ab8e](https://github.com/btnalit/pi-claude-supervisor/commit/960ab8edb08c17140477ba226c341ce8934f819d))
+* hand a kept-open interactive session back to the operator cleanly ([eaff8f3](https://github.com/btnalit/pi-claude-supervisor/commit/eaff8f30340599bb5d617fb997634d888a780440))
+* harden the routine-permission classifier and cost accounting after review ([81d8f7d](https://github.com/btnalit/pi-claude-supervisor/commit/81d8f7db5d623a49291ef87a9e956bd3acd0cf41))
+* **hooks:** keep the hook socket under the unix sun_path limit ([00a2ffd](https://github.com/btnalit/pi-claude-supervisor/commit/00a2ffdec7d59af135e3b54a53f5cfc4aa003b24))
+* **index:** wire review timeout and event-log rotation; align docs ([f2b81d4](https://github.com/btnalit/pi-claude-supervisor/commit/f2b81d43e26806161988e9836b5665e34c28e201))
+* **policy:** clarify deny reasons, narrow redaction, retry webhooks, raise evidence limits ([f9fcc0c](https://github.com/btnalit/pi-claude-supervisor/commit/f9fcc0c1acf6baf93de3c60ed6983f82a0b52a71))
+* **supervisor:** close lifecycle-event and shutdown safety gaps ([47b9a10](https://github.com/btnalit/pi-claude-supervisor/commit/47b9a10e04e228781720da1809135f3818834890))
+* **supervisor:** drive watchdog verification, tighten commit/evidence gates, replay deferred decisions ([b193441](https://github.com/btnalit/pi-claude-supervisor/commit/b1934415528231860a1f9e69db973896dcdde611))
+* **tmux:** distinct prompt-phase request ids, pid-anchored hook binding, precise relay matching ([d4f6bc7](https://github.com/btnalit/pi-claude-supervisor/commit/d4f6bc7dac2359db1915217512b3c1f1eb8897ee))
+* **tmux:** errored and idle turns, questions during takeover, quieter takeover notices ([d133f70](https://github.com/btnalit/pi-claude-supervisor/commit/d133f705c03601ee8df4c27bb47c1669b4f1e3ee))
+* **tmux:** recover launcher-wrapped interactive sessions and preflight interactive args ([d986253](https://github.com/btnalit/pi-claude-supervisor/commit/d986253467b56c51bfb310c51f0cefe64eacbae5))
+* **tmux:** type the task into an idle adopted interactive session ([acc8160](https://github.com/btnalit/pi-claude-supervisor/commit/acc8160ade5053f2affb719b782ddb119dfd510b))
+* **worker:** repair dead process-group detection and tmux guardian readiness ([ea7645e](https://github.com/btnalit/pi-claude-supervisor/commit/ea7645ef388066b626c7d06e996e8e765da45d4e))
+
 ## [0.6.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.5.5...v0.6.0) (2026-09-16)
 
 
