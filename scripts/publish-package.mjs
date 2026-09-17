@@ -40,10 +40,12 @@ if (published) {
   const archive = resolve("dist", manifest.filename);
   execFileSync("npm", ["publish", archive, "--access", "public", "--provenance", "--ignore-scripts", "--registry", registry], { stdio: "inherit" });
 
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    published = readPublished();
-    if (published) break;
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+  // npm now queues a fresh publish for processing ("may take a few minutes
+  // to become available"); the registry view can lag the publish by minutes.
+  // Poll for up to ten minutes before treating the verification as failed.
+  const deadline = Date.now() + 10 * 60_000;
+  while (!(published = readPublished()) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10_000));
   }
   assertPublished(published);
   console.log(`Published ${packageVersion} with verified integrity.`);
