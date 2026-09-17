@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { delimiter, join } from "node:path";
+import { statSync } from "node:fs";
+import { delimiter, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
@@ -12,6 +13,12 @@ import extension from "./index.ts";
 import { preflightCgroupContainment } from "./worker/process-adapter.ts";
 
 const requiredCgroupTestAvailable = process.platform === "linux" && await canUseRequiredCgroup();
+// assertSecureExecutablePath (src/worker/environment.ts) rejects any ancestor
+// directory of the resolved Claude executable that is group/world-writable or
+// owned by another user. A fixture executable copied under process.cwd() can
+// only pass that check when the checkout itself lives on a trusted path.
+const trustedCheckout = checkoutIsTrustedPath();
+const untrustedCheckoutSkipReason = "checkout is under a group/world-writable path; the trusted-executable check cannot pass here";
 
 // Ignore PI_CLAUDE_SUPERVISOR_* variables inherited from the shell so tests are hermetic.
 for (const name of Object.keys(process.env)) {
@@ -59,7 +66,7 @@ test("index rejects required cgroup mode for manual tmux instead of ignoring it"
   }
 });
 
-test("index recovers an idle Decision Worker without replaying the original task", { skip: !requiredCgroupTestAvailable, concurrency: false }, async () => {
+test("index recovers an idle Decision Worker without replaying the original task", { skip: !requiredCgroupTestAvailable || (!trustedCheckout && untrustedCheckoutSkipReason), concurrency: false }, async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-index-"));
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-state-"));
   const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-leases-"));
@@ -419,6 +426,97 @@ test("index releases a confirmed-clean failed worker cwd reservation", async () 
   }
 });
 
+test("index does not leak a cwd reservation when the Decision Worker model spec is invalid", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-badmodel-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-badmodel-state-"));
+  const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-badmodel-leases-"));
+  const previous = {
+    worker: process.env.PI_CLAUDE_SUPERVISOR_WORKER,
+    stateDir: process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR,
+    leaseDir: process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR,
+    transport: process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT,
+    cgroupMode: process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE,
+    mode: process.env.PI_CLAUDE_SUPERVISOR_MODE,
+    automation: process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION,
+    decisionModel: process.env.PI_CLAUDE_SUPERVISOR_DECISION_MODEL,
+  };
+  process.env.PI_CLAUDE_SUPERVISOR_WORKER = `${process.execPath} -e "setInterval(() => {}, 10000)"`;
+  process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
+  process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
+  process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "process-pipe";
+  process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "off";
+  process.env.PI_CLAUDE_SUPERVISOR_MODE = "manual";
+  process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "0";
+  // Malformed (missing "provider/") so resolvePiModel throws synchronously,
+  // before any ModelRuntime/network access, exercising the fail-closed path
+  // without a real Pi model runtime.
+  process.env.PI_CLAUDE_SUPERVISOR_DECISION_MODEL = "not-a-valid-spec";
+
+  const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
+  const messages: string[] = [];
+  const context: TestContext = {
+    cwd,
+    hasUI: true,
+    ui: { confirm: async () => false, notify: (message) => messages.push(message) },
+  };
+  let shutdownHandler: (() => Promise<void>) | undefined;
+  const fakePi = {
+    registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) {
+      registrations.commands.push({ name, definition });
+    },
+    on(name: string, handler: () => Promise<void>) {
+      registrations.events.push({ name, handler });
+    },
+  };
+
+  try {
+    extension(fakePi as never);
+    const command = registrations.commands.find(({ name }) => name === "supervise")?.definition;
+    const shutdown = registrations.events.find(({ name }) => name === "session_shutdown")?.handler;
+    assert.ok(command);
+    assert.ok(shutdown);
+    shutdownHandler = shutdown;
+
+    // The model spec is captured once at extension load, so it stays broken for
+    // the second attempt too; the point is that the first failure must not
+    // leak the cwd reservation it took before resolving the model.
+    await command.handler("start with a bad decision model spec", context);
+    assert.match(messages.at(-1) ?? "", /provider\/model-id/u);
+
+    await command.handler("start again in the same cwd", context);
+    const secondMessage = messages.at(-1) ?? "";
+    assert.match(secondMessage, /provider\/model-id/u);
+    assert.doesNotMatch(secondMessage, /overlapping cwd/u);
+  } finally {
+    if (shutdownHandler) {
+      try {
+        await shutdownHandler();
+      } catch (error) {
+        console.error(`index test cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (previous.worker === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_WORKER;
+    else process.env.PI_CLAUDE_SUPERVISOR_WORKER = previous.worker;
+    if (previous.stateDir === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR;
+    else process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = previous.stateDir;
+    if (previous.leaseDir === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR;
+    else process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = previous.leaseDir;
+    if (previous.transport === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
+    else process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = previous.transport;
+    if (previous.cgroupMode === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE;
+    else process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = previous.cgroupMode;
+    if (previous.mode === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_MODE;
+    else process.env.PI_CLAUDE_SUPERVISOR_MODE = previous.mode;
+    if (previous.automation === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION;
+    else process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = previous.automation;
+    if (previous.decisionModel === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_DECISION_MODEL;
+    else process.env.PI_CLAUDE_SUPERVISOR_DECISION_MODEL = previous.decisionModel;
+    await rm(cwd, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(leaseDir, { recursive: true, force: true });
+  }
+});
+
 async function canUseRequiredCgroup(): Promise<boolean> {
   try {
     await preflightCgroupContainment();
@@ -426,6 +524,32 @@ async function canUseRequiredCgroup(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Mirrors the ancestor-directory check in assertSecureExecutablePath
+ * (src/worker/environment.ts): a fixture executable copied under process.cwd()
+ * can only pass automatic-mode trust validation when every directory from the
+ * checkout root up to `/` is neither group/world-writable nor owned by
+ * another user. Does not weaken that check; only decides whether a test that
+ * depends on it can run here.
+ */
+function checkoutIsTrustedPath(): boolean {
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  let directory = process.cwd();
+  while (true) {
+    let info;
+    try {
+      info = statSync(directory);
+    } catch {
+      return false;
+    }
+    if ((info.mode & 0o022) !== 0 || (uid !== undefined && info.uid !== uid && info.uid !== 0)) return false;
+    const parent = dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  return true;
 }
 
 type TestContext = {

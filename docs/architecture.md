@@ -328,6 +328,47 @@ clean Worker exit proceeds to verification. Optional alert
 delivery remains independent from event-log persistence, but notification is not
 the control boundary.
 
+Permission requests are not all routed to the Decision Worker model. `autonomy.permissionAuthority`
+(`policy` | `hybrid`, default | `decision-worker`) chooses the authority: `policy` answers
+every request from the deterministic policy alone, `decision-worker` sends every
+request to the model, and the `hybrid` default answers a request from policy alone
+only when the policy already denies it or `isRoutinePermission` in `src/policy.ts`
+recognizes it as a routine in-cwd file edit or a local read-only/dev shell command
+it can fully account for; anything it does not recognize is not routine and still
+goes to the Decision Worker. A policy denial always wins regardless of authority; the
+classifier only ever narrows what reaches the model, never what the policy refuses.
+An explicit human takeover suspends this local fast path entirely, so every
+permission request stays pending for the human once takeover is active, even one
+the policy would otherwise have answered alone.
+
+The persistent Decision Worker session is kept small by construction, not by an
+after-the-fact trim: the task/spec/cwd live once in the startup instructions, and
+every subsequent prompt sends only a bounded event summary (`summarizeEvent` in
+`src/decision-worker.ts`, capping a `turn_completed` result or `permission_request`
+input that can otherwise run to tens of kilobytes) plus the small pieces of state
+that actually change turn to turn. On top of that, the session proactively calls
+`AgentSession.compact()` between decisions once its estimated context passes
+`PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS` (default 60,000 tokens; `0` disables
+it), asking Pi to preserve the task specification, the permission/boundary rules,
+the current state and the last three decisions with their reasons. A compaction
+failure never fails the decision that already succeeded. Because compaction can
+drop context a decision might otherwise assume, the next primary prompt after a
+successful compaction re-sends the startup instructions exactly once (tracked by an
+internal "instructions stale" flag), then reverts to the compact event summary.
+
+Every Worker `result` record and every Decision Worker/Reviewer model call is
+accounted for, not just logged: a `result` becomes a `worker_usage` event carrying
+its incremental and cumulative cost and token counts, and a Pi-side call becomes a
+`pi_usage` event; both accumulate into `session.usage` (`SupervisorTokenUsage`),
+which `/supervise status`, progress notifications (`SupervisorProgress.costUsd`/
+`.piTokens`) and candidate notifications (`CandidateNotice.usage`) all read from.
+`autonomy.maxWorkerCostUsd` (`PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD`) is
+enforced twice: it is passed to Claude as `--max-budget-usd` so the Worker can stop
+itself first (surfaced as the `result` subtype `error_max_budget_usd`), and the
+Supervisor independently parks the candidate once its own cumulative
+`workerCostUsd` crosses the same limit, so a Worker that does not honor its own cap
+is still bounded.
+
 ## Acceptance, review and repair loop
 
 A task may provide a structured `TaskSpec` with `goal`, `scope`, `constraints`,

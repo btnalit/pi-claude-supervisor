@@ -282,6 +282,75 @@ when the Supervisor disappears. A later `/supervise recover --takeover` may
 reclaim an automatic lease only after the guardian, process, cgroup and private
 tmux-session proofs pass. Use plan/read-only flags for live testing.
 
+## Token usage and cost controls
+
+Measured on one real unattended review task (29 minutes wall clock):
+
+| Component | Turns/calls | Tokens | Cost |
+| --- | --- | --- | --- |
+| Claude Code Worker | 70 turns | 15.5M cache-read + 370k cache-write + 100k output | $18.46 |
+| Pi Decision Worker | 30 model calls | ~1.0M (91k uncached + 914k cache-read) | $0.04 |
+
+Almost all of the money goes to the Worker, not the Supervisor's own Decision Worker
+or Reviewer calls. In this run the Worker averaged ~220k tokens of context per turn
+because it ran as a single long `-p` session under a 1M-token window that never
+compacted; a trivial Claude Code turn costs roughly 24k prompt tokens for its system
+prompt alone, regardless of which MCP servers are configured. Of the 30 Decision
+Worker calls, 28 were permission requests; the deterministic policy could have
+answered 24 of those without a model call, and the Decision Worker overrode the
+policy 4 times (denying downloads and writes outside the task directory) — this is
+why `hybrid` is the default `permissionAuthority`, not `policy`.
+
+Knobs, with their defaults and trade-offs:
+
+- `PI_CLAUDE_SUPERVISOR_PERMISSION_AUTHORITY` / `autonomy.permissionAuthority`
+  (`policy` | `hybrid`, default | `decision-worker`): `hybrid` answers routine
+  in-cwd file edits and local read-only/dev shell commands from the deterministic
+  policy alone (`isRoutinePermission` in `src/policy.ts`) and still sends every
+  ambiguous request, and every policy denial, to the Decision Worker. This mainly
+  buys latency and a smaller Decision Worker context, not dollars: the 30 calls
+  above already cost $0.04.
+- `PI_CLAUDE_SUPERVISOR_WORKER_MODEL` / `--model`: roughly a 5x price difference
+  between Opus- and Sonnet-class models. This is the single largest lever on the
+  actual bill, and it is the operator's choice; the Supervisor does not pick it
+  for you.
+- `PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS` (default 200000 in automatic
+  mode; `0` keeps Claude's own default): bounds context per Worker turn so a long
+  session does not keep accumulating ~220k-token turns. Worth tens of percent, at
+  the cost of some context quality.
+- `PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD` / `autonomy.maxWorkerCostUsd`: a
+  hard cap passed to Claude as `--max-budget-usd` and re-checked by the Supervisor
+  against the cumulative Worker `result` cost. It is a cap, not a saving; a task
+  that hits it is parked with its evidence.
+- `PI_CLAUDE_SUPERVISOR_WORKER_MCP_CONFIG` (`--strict-mcp-config --mcp-config`):
+  restricts the Worker to only the listed MCP servers. It bounds what the Worker
+  can reach, not the ~24k-token fixed overhead of an ordinary turn.
+- `PI_CLAUDE_SUPERVISOR_DECISION_MODEL` / `PI_CLAUDE_SUPERVISOR_REVIEWER_MODEL`
+  (`provider/model-id`, for example `anthropic/claude-haiku-4-5-20251001`): the
+  Pi Decision Worker and Reviewer models. Pi-side usage was already a few cents in
+  this run, so a cheaper model here mostly buys latency, not headline savings.
+- `PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS` (default 60000; `0` disables):
+  proactively compacts the persistent Decision Worker session once its estimated
+  context passes this threshold, and re-sends the startup instructions once on
+  the next prompt after compaction.
+
+The Supervisor records what it spends rather than estimating it after the fact:
+every Worker `result` record becomes a `worker_usage` event, every Decision
+Worker/Reviewer model call becomes a `pi_usage` event, and both accumulate into
+`session.usage` (`SupervisorTokenUsage`). `/supervise status <task-id>` prints a
+`cost=… workerTurns=… workerTokens=… piTokens=… decisionCalls=… reviewerCalls=…`
+summary; progress notifications carry `SupervisorProgress.costUsd`/`.piTokens`,
+and a candidate notification carries the same summary through `CandidateNotice.usage`,
+which the generic webhook serialises as a numeric `usage` object and the WeCom
+format renders as two extra lines.
+
+None of this changes what a task actually costs beyond the Worker model and budget
+choice; the Supervisor-side changes here mainly cut Decision Worker tokens and
+latency, which were cents to begin with. For a cost-sensitive unattended run, a
+reasonable starting point is a Sonnet-class `PI_CLAUDE_SUPERVISOR_WORKER_MODEL`, an
+explicit `PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD` per task, the default `hybrid`
+permission authority, and a Haiku-class `PI_CLAUDE_SUPERVISOR_DECISION_MODEL`.
+
 ## Development
 
 ```bash
