@@ -15,6 +15,7 @@ import type {
 } from "../types.ts";
 import { assertSafeWorkerCommand } from "../policy.ts";
 import { automaticWorkerEnvironment, workerEnvironment } from "./environment.ts";
+import { nodeScriptCommand } from "./runtime.ts";
 
 export interface ProcessWorkerAdapterOptions {
   /** Use Claude Code's documented stream-json stdin/stdout framing. */
@@ -917,7 +918,7 @@ child.once("exit", (code, signal) => {
 function guardedBootstrapLaunch(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv, cgroupPath: string | undefined, parentPid: number, parentStartTime: string, retainCgroup: boolean): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
   const encode = (value: string) => Buffer.from(value, "utf8").toString("base64");
   return {
-    command: process.execPath,
+    command: nodeScriptCommand(),
     args: ["-e", GUARDED_BOOTSTRAP_SCRIPT],
     env: {
       ...env,
@@ -1001,7 +1002,7 @@ export async function preflightCgroupContainment(parentPath?: string): Promise<v
     await stat(`${probePath}/cgroup.kill`);
     await stat(`${probePath}/cgroup.events`);
     const script = "const fs=require('node:fs'); fs.writeFileSync(process.env.PI_CLAUDE_SUPERVISOR_PREFLIGHT_CGROUP + '/cgroup.procs', String(process.pid) + String.fromCharCode(10)); setInterval(() => {}, 10000);";
-    probeChild = spawn(process.execPath, ["-e", script], {
+    probeChild = spawn(nodeScriptCommand(), ["-e", script], {
       env: { PATH: process.env.PATH ?? "", PI_CLAUDE_SUPERVISOR_PREFLIGHT_CGROUP: probePath },
       stdio: "ignore",
     });

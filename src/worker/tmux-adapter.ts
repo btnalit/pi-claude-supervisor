@@ -18,6 +18,7 @@ import { redactSensitive } from "../redaction.ts";
 import { automaticWorkerEnvironment, workerEnvironment } from "./environment.ts";
 import { claudeJsonlArgs, cleanupCgroup, currentCgroupPath, preflightCgroupContainment } from "./process-adapter.ts";
 import { isClaudeLauncherProcess, readProcess } from "./process-tree.ts";
+import { nodeScriptCommand } from "./runtime.ts";
 
 export interface TmuxWorkerAdapterOptions {
   /** Directory for launcher and output state. */
@@ -596,7 +597,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         if (!socketPath) throw new Error("owned tmux startup did not allocate a private socket");
         await this.#startGuardian(record, socketPath);
         if (record.cleanupError) throw record.cleanupError;
-        const paneBootstrap = [process.execPath, "-e", TMUX_PANE_BOOTSTRAP_SCRIPT];
+        const paneBootstrap = [nodeScriptCommand(), "-e", TMUX_PANE_BOOTSTRAP_SCRIPT];
         await this.#run(record, ["new-session", "-d", "-s", sessionName, "-x", "140", "-y", "40", "-c", input.cwd, "--", ...paneBootstrap], undefined, bridgeEnv);
         record.sessionCreated = true;
         await this.#rememberServerIdentity(record);
@@ -610,7 +611,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         // first generation frame cannot be lost before startup observes it.
         await this.#attachPipe(record);
         const launch = structured
-          ? [process.execPath, "-e", TMUX_BRIDGE_SCRIPT]
+          ? [nodeScriptCommand(), "-e", TMUX_BRIDGE_SCRIPT]
           : [input.command, ...workerArgs];
         await this.#run(record, ["respawn-pane", "-k", "-c", input.cwd, "-t", target, "--", ...launch], undefined, bridgeEnv);
         await this.#pinTarget(record);
@@ -1256,7 +1257,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       [GUARDIAN_KEYS.parentPid]: encode(String(process.pid)),
       [GUARDIAN_KEYS.parentStart]: encode(parent.startTime),
     };
-    const child = spawn(process.execPath, ["-e", TMUX_GUARDIAN_SCRIPT], { detached: true, stdio: "ignore", env });
+    const child = spawn(nodeScriptCommand(), ["-e", TMUX_GUARDIAN_SCRIPT], { detached: true, stdio: "ignore", env });
     await new Promise<void>((resolve, reject) => {
       child.once("spawn", () => resolve());
       child.once("error", reject);

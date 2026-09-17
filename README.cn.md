@@ -40,7 +40,12 @@
 
 ## 安装和使用
 
-需要 Pi 0.85+ 和 Node.js 22.19+：
+需要 Pi 0.85+ 和 Node.js 22.19+。
+
+Pi 发布的可执行文件可能是 Bun 编译版，因此 Linux cgroup 和 tmux helper
+脚本会从 `PATH` 解析真正的 `node`，不会假定 `process.execPath` 支持 `-e`。
+如果 Node 不在 Supervisor 的 `PATH` 中，可设置 `PI_CLAUDE_SUPERVISOR_NODE` 指定
+可执行文件路径。
 
 ```text
 pi install npm:pi-claude-supervisor

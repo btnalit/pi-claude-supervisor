@@ -570,8 +570,8 @@ async function cgroupHasProcesses(path: string): Promise<boolean> {
   try {
     const cgroupInfo = await lstat(cgroupPath);
     if (!cgroupInfo.isDirectory() || cgroupInfo.isSymbolicLink()) return true;
-    const canonicalPath = await realpath(cgroupPath);
-    if (canonicalPath !== cgroupPath || !canonicalPath.startsWith(`${cgroupRoot}/`)) return true;
+    const canonicalPath = await canonicalCgroupPath(cgroupPath);
+    if (!canonicalPath.startsWith(`${cgroupRoot}/`)) return true;
     const eventsPath = join(canonicalPath, "cgroup.events");
     const eventsInfo = await lstat(eventsPath);
     if (!eventsInfo.isFile() || eventsInfo.isSymbolicLink()) return true;
@@ -840,6 +840,24 @@ function isCgroupPath(path: string): boolean {
   return candidate !== root && candidate.startsWith(`${root}/`);
 }
 
+/**
+ * Bun's realpath implementation decodes systemd's literal `\\x2d` cgroup
+ * escapes and then reports ENOENT. Verify every cgroup component with lstat
+ * instead; this also rejects symlinked components without relying on realpath.
+ */
+async function canonicalCgroupPath(path: string): Promise<string> {
+  const root = resolve("/sys/fs/cgroup");
+  const candidate = resolve(path);
+  if (candidate === root || !candidate.startsWith(`${root}/`)) throw new Error("invalid cgroup path");
+  let current = root;
+  for (const component of candidate.slice(root.length + 1).split("/")) {
+    current = join(current, component);
+    const info = await lstat(current);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("cgroup path is not a real directory");
+  }
+  return candidate;
+}
+
 function matchesGeneratedCgroupName(path: string, transport: CwdLeaseTransport, workerId: string): boolean {
   const prefix = transport === "tmux" ? "pi-claude-supervisor-tmux-" : "pi-claude-supervisor-";
   return basename(resolve(path)) === `${prefix}${workerId}`;
@@ -847,11 +865,8 @@ function matchesGeneratedCgroupName(path: string, transport: CwdLeaseTransport, 
 
 async function readCgroupIdentity(path: string): Promise<{ device: string; inode: string }> {
   if (!isCgroupPath(path)) throw new Error("invalid cgroup path");
-  const candidate = resolve(path);
+  const candidate = await canonicalCgroupPath(path);
   const info = await lstat(candidate);
-  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("cgroup path is not a real directory");
-  const canonicalPath = await realpath(candidate);
-  if (canonicalPath !== candidate || !isCgroupPath(canonicalPath)) throw new Error("cgroup path is not canonical");
   return { device: String(info.dev), inode: String(info.ino) };
 }
 
