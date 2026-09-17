@@ -146,11 +146,12 @@ Pi Decision Worker. Setting `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux` selects the
 Supervisor-owned live bridge, which carries the same structured records through
 private framing on the PTY rather than an independent JSONL sidecar. Task autonomy
 defaults to unattended local work, a required
-local commit on a non-protected task branch and two bounded Decision Worker retries. Configure
+local commit on the task branch (any branch, anchored to the baseline commit) and two bounded Decision Worker retries. Configure
 `PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=0` or task `autonomy.requireLocalCommit`
 only to disable the local-commit deliverability check; automatic mode still requires a Git
-baseline and non-protected worktree. Adopted tmux sessions remain manual-only; the automatic bridge requires
-Supervisor ownership. `process-pipe` remains the manual compatibility mode. Candidate/failure notification is optional and outbound-only through
+baseline (any branch, including `main`; the candidate must descend from it). The tmux bridge
+requires Supervisor ownership; the interactive tmux mode (the default `TMUX_MODE`) also adopts an
+existing session through the user-level hook relay. `process-pipe` remains the manual compatibility mode. Candidate/failure notification is optional and outbound-only through
 `PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL`; it is not a synchronous approval
 callback. Approval callbacks are deliberately not accepted without a separately
 authenticated endpoint.
@@ -168,7 +169,7 @@ there is no injected sandbox or automatic tool allowlist. The only automatic CLI
 safety addition is a `default` permission mode when none was supplied; Bash
 preauthorization through `--allowedTools` or loaded settings is rejected so Bash
 requests remain visible to Supervisor policy. Automatic startup also requires
-a full existing Git baseline, non-bare non-protected worktree and the bare
+a full existing Git baseline, a non-bare worktree on any branch and the bare
 `claude`/`claude.exe` command name. It resolves and pins an
 operator-owned, non-writable executable path (or the path configured by
 `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE`), rejects explicit/custom executable paths, and
