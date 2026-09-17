@@ -185,6 +185,14 @@ Pi 会在 Claude 结束一轮对话时（`Stop`）、Claude 即将向你展示�
 （或转发一个 `AskUserQuestion`）；它从不干预普通的编辑、读取或本地命令——那些请求会
 直接进入你自己的权限模式，Pi 完全不做决策。
 
+**这对安全边界意味着什么。** 交互式模式有意不执行 headless 模式那条"拒绝设置中预授权
+`Bash` 或 `auto`/`bypassPermissions` 模式"的检查：你自己的 Claude 配置决定 Claude 无需询问
+就能做什么，和你亲自运行 Claude 时完全一样。凡是你的设置已经放行的操作都不会到达
+Decision Worker，它只在 Claude 本来要问*你*的地方做判断。硬边界（远程 push/merge/PR、
+远端 CLI 变更、`.git` 写入、受保护分支的破坏性改写）由 `PreToolUse` hook 强制执行，
+与权限模式无关——已在 Claude Code 2.1.273 的 `auto` 模式下实测——这也是该模式在你自己的
+设置之外唯一的保证。需要让每个 `Bash` 调用都经过 Supervisor 时，请使用 headless（`bridge`）模式。
+
 **人机协同。** 如果你在已 attach 的 session 中输入内容，自动化会暂停
 （`human_takeover`，以警告形式呈现），直到你执行 `/supervise resume-auto <task-id>`；
 你接管期间完成的那一轮会在此时重放给 Decision Worker，因此不会丢失已经完成的工作。

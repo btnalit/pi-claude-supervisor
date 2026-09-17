@@ -1156,7 +1156,7 @@ test("PermissionRequest maps to phase prompt with a derived requestId", { skip: 
     await waitFor(() => events.some((event) => event.type === "permission_request"));
     const request = events.find((event): event is Extract<WorkerEvent, { type: "permission_request" }> => event.type === "permission_request")!;
     assert.equal(request.request.phase, "prompt");
-    assert.match(request.request.requestId, /^prompt:[0-9a-f]{16}$/u);
+    assert.match(request.request.requestId, /^prompt:[0-9a-f]{16}:\d+$/u);
     await adapter.respondPermission(handle, request.request.requestId, request.request.toolUseId, { behavior: "allow" });
     const reply = await replyPromise;
     assert.equal(reply?.permissionDecision, "allow");
@@ -1173,7 +1173,10 @@ test("PermissionRequest maps to phase prompt with a derived requestId", { skip: 
     });
     await waitFor(() => events.filter((event) => event.type === "permission_request").length === 2);
     const secondRequest = events.filter((event): event is Extract<WorkerEvent, { type: "permission_request" }> => event.type === "permission_request")[1]!;
-    assert.equal(secondRequest.request.requestId, request.request.requestId);
+    // A byte-identical repeat (the same `npm test` after a repair round) must be a
+    // distinct request: the Supervisor dedupes worker events by requestId.
+    assert.notEqual(secondRequest.request.requestId, request.request.requestId);
+    assert.equal(secondRequest.request.requestId.split(":")[1], request.request.requestId.split(":")[1]);
     await adapter.respondPermission(handle, secondRequest.request.requestId, secondRequest.request.toolUseId, { behavior: "allow" });
     const secondReply = await secondReplyPromise;
     assert.equal(secondReply?.permissionDecision, "allow");
@@ -1253,10 +1256,21 @@ setInterval(() => {}, 10000);
     assert.match(handle.tmuxPaneId ?? "", /^%[0-9]+$/u);
     // A dispatch that resolves (rather than throwing "no hook subscription
     // for cwd") proves the adapter subscribed the hook source for the pane's cwd.
-    const reply = await hookSource.dispatch(stateDir, {
+    // A real hook's ppid is the pane's Claude process; a matching pane id alone
+    // is client-supplied and no longer binds once the pid anchor is known.
+    const spoofed = await hookSource.dispatch(stateDir, {
       version: 1,
       pid: 111_111,
       ppid: 222_222,
+      tmuxPane: handle.tmuxPaneId,
+      event: { hook_event_name: "Stop", session_id: "session-1", cwd: stateDir, last_assistant_message: "spoofed" },
+    });
+    assert.deepEqual(spoofed, {});
+    assert.equal(events.some((event) => event.type === "turn_completed"), false);
+    const reply = await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: 111_111,
+      ppid: handle.pid!,
       tmuxPane: handle.tmuxPaneId,
       event: { hook_event_name: "Stop", session_id: "session-1", cwd: stateDir, last_assistant_message: "adopted turn done" },
     });

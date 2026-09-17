@@ -18,6 +18,12 @@ const HOOK_EVENT_NAMES: readonly ClaudeHookEventName[] = [
 
 /** Substring that marks a hook command entry as ours, regardless of which stateDir produced it. */
 const RELAY_MARKER = "/hooks/relay.js";
+/** Only an entry that is exactly `<quoted node> <quoted .../hooks/relay.js>` is ours; a personal script that merely contains the substring is not. */
+const RELAY_COMMAND_PATTERN = /^(?:'[^']*'|"[^"]*"|\S+) (?:'([^']*\/hooks\/relay\.js)'|"([^"]*\/hooks\/relay\.js)"|(\S*\/hooks\/relay\.js))$/u;
+
+function isRelayEntry(command: unknown): command is string {
+  return typeof command === "string" && command.includes(RELAY_MARKER) && RELAY_COMMAND_PATTERN.test(command.trim());
+}
 
 interface HookEntry {
   type?: unknown;
@@ -89,7 +95,7 @@ function addRelayHooks(document: SettingsDocument, relayCommand: string): boolea
     for (const group of groups) {
       if (!Array.isArray(group.hooks)) continue;
       for (const entry of group.hooks) {
-        if (typeof entry.command !== "string" || !entry.command.includes(RELAY_MARKER)) continue;
+        if (!isRelayEntry(entry.command)) continue;
         matched = true;
         if (entry.type !== "command" || entry.command !== relayCommand || entry.timeout !== HOOK_TIMEOUT_SECONDS) {
           entry.type = "command";
@@ -120,7 +126,7 @@ function removeRelayHooks(document: SettingsDocument): boolean {
         nextGroups.push(group);
         continue;
       }
-      const nextEntries = group.hooks.filter((entry) => !(typeof entry.command === "string" && entry.command.includes(RELAY_MARKER)));
+      const nextEntries = group.hooks.filter((entry) => !isRelayEntry(entry.command));
       if (nextEntries.length !== group.hooks.length) changed = true;
       if (nextEntries.length > 0) nextGroups.push({ ...group, hooks: nextEntries });
     }

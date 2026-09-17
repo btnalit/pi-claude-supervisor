@@ -119,6 +119,21 @@ test("a symlinked settings file is written through, not replaced", async () => {
   });
 });
 
+test("an unrelated hook whose command merely mentions relay.js is left alone", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-cs-install-"));
+  const settingsPath = join(stateDir, "settings.json");
+  const foreign = { type: "command", command: "/home/me/bin/notify-me.sh --log /home/me/hooks/relay.js.log", timeout: 5 };
+  await writeFile(settingsPath, JSON.stringify({ hooks: { Stop: [{ hooks: [foreign] }] } }), "utf8");
+  await installUserHooks({ stateDir, settingsPath });
+  const installed = JSON.parse(await readFile(settingsPath, "utf8")) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> };
+  assert.ok(installed.hooks.Stop.some((group) => group.hooks.some((entry) => entry.command === foreign.command)), "foreign entry preserved by install");
+  await uninstallUserHooks({ stateDir, settingsPath });
+  const after = JSON.parse(await readFile(settingsPath, "utf8")) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> };
+  assert.ok(after.hooks.Stop.some((group) => group.hooks.some((entry) => entry.command === foreign.command)), "foreign entry preserved by uninstall");
+  assert.ok(!after.hooks.Stop.some((group) => group.hooks.some((entry) => /\/hooks\/relay\.js['"]?$/u.test(entry.command))), "our entry removed");
+  await rm(stateDir, { recursive: true, force: true });
+});
+
 test("installing under a settings directory that does not yet exist creates it", async () => {
   await withTempDir(async (dir) => {
     const settingsPath = join(dir, "nested", "claude", "settings.json");
