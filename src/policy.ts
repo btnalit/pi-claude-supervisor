@@ -20,7 +20,9 @@ export function evaluatePermission(toolName: string, input: unknown, cwd = proce
   if (toolName === "Edit" || toolName === "Write" || toolName === "NotebookEdit") {
     const paths = fileToolPaths(input);
     if (paths.length === 0) return { decision: "deny", reason: `${toolName} request has no recognizable file path` };
-    if (paths.some((path) => isGitMetadataPath(path, cwd))) return { decision: "deny", reason: "Worker cannot write Git metadata or protected branch refs" };
+    const violation = paths.map((path) => ({ path, classification: classifyWritePath(path, cwd) })).find((entry) => entry.classification !== undefined);
+    if (violation?.classification === "outside-cwd") return { decision: "deny", reason: `Worker cannot write outside the task working directory: ${violation.path}` };
+    if (violation?.classification === "git-metadata") return { decision: "deny", reason: "Worker cannot write Git metadata or protected branch refs" };
     return { decision: "allow", reason: `local Claude file tool is allowed by the task policy: ${toolName}` };
   }
   if (toolName !== "Bash") return { decision: "allow", reason: `local Claude tool is allowed by the task policy: ${toolName}` };
@@ -39,17 +41,19 @@ function fileToolPaths(input: unknown): string[] {
     .filter((path): path is string => typeof path === "string" && path.trim().length > 0);
 }
 
-function isGitMetadataPath(value: string, cwd: string): boolean {
-  if (value.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return true;
+type WritePathViolation = "outside-cwd" | "git-metadata";
+
+function classifyWritePath(value: string, cwd: string): WritePathViolation | undefined {
+  if (value.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return "git-metadata";
   let root: string;
   try { root = realpathSync(cwd); }
-  catch { return true; }
+  catch { return "git-metadata"; }
   const raw = value.replaceAll("\\", "/");
   const canonicalRoot = root.replaceAll("\\", "/").replace(/\/+$/u, "") || "/";
   let components: string[];
   if (isAbsolute(value)) {
     const prefix = canonicalRoot === "/" ? "/" : `${canonicalRoot}/`;
-    if (raw !== canonicalRoot && !raw.startsWith(prefix)) return true;
+    if (raw !== canonicalRoot && !raw.startsWith(prefix)) return "outside-cwd";
     components = raw === canonicalRoot ? [] : raw.slice(prefix.length).split("/");
   } else {
     components = raw.split("/");
@@ -58,18 +62,18 @@ function isGitMetadataPath(value: string, cwd: string): boolean {
   for (const segment of components) {
     if (!segment || segment === ".") continue;
     if (segment === "..") {
-      if (normalized.length === 0) return true;
+      if (normalized.length === 0) return "outside-cwd";
       normalized.pop();
       continue;
     }
-    if (segment.toLowerCase() === ".git") return true;
+    if (segment.toLowerCase() === ".git") return "git-metadata";
     const candidate = join(root, ...normalized, segment);
     try {
       const info = lstatSync(candidate);
-      if (info.isSymbolicLink()) return true;
+      if (info.isSymbolicLink()) return "git-metadata";
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT" && code !== "ENOTDIR") return true;
+      if (code !== "ENOENT" && code !== "ENOTDIR") return "git-metadata";
     }
     normalized.push(segment);
   }
@@ -78,14 +82,14 @@ function isGitMetadataPath(value: string, cwd: string): boolean {
     const info = statSync(absolute);
     // A regular file with multiple links may be an alias for a Git ref or
     // other metadata file even when its pathname contains no `.git` segment.
-    if (info.isFile() && info.nlink > 1) return true;
+    if (info.isFile() && info.nlink > 1) return "git-metadata";
     const resolved = realpathSync(absolute);
-    if (resolved.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return true;
+    if (resolved.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return "git-metadata";
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code !== "ENOENT" && code !== "ENOTDIR") return true;
+    if (code !== "ENOENT" && code !== "ENOTDIR") return "git-metadata";
   }
-  return false;
+  return undefined;
 }
 
 const deniedPatterns = [
@@ -155,7 +159,7 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   if (hasDynamicArgument) {
     return { decision: "deny", reason: "dynamic shell arguments cannot be capability-checked safely" };
   }
-  if (/\bgit\b[\s\S]*\b(?:push|merge|send-pack|receive-pack|update-ref)\b/iu.test(canonical)
+  if (/\bgit\b[\s\S]*\b(?:push|merge(?!-)|send-pack|receive-pack|update-ref)\b/iu.test(canonical)
     || /\bgit-(?:send|receive|upload)-pack\b/iu.test(canonical)
     || containsRemoteCliMutation(canonical)) {
     return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };

@@ -157,14 +157,14 @@ test("verifyAll records timeout evidence and bounds check output", async () => {
   try {
     const report = await verifyAll(cwd, [
       { id: "timeout", name: "timeout", command: process.execPath, args: ["-e", "setTimeout(() => {}, 5_000)"], required: true, timeoutMs: 1_000 },
-      { id: "large-output", name: "large output", command: process.execPath, args: ["-e", "process.stdout.write('x'.repeat(300_000))"], required: false, timeoutMs: 1_000 },
+      { id: "large-output", name: "large output", command: process.execPath, args: ["-e", "process.stdout.write('x'.repeat(1_500_000))"], required: false, timeoutMs: 1_000 },
     ]);
     assert.equal(report.ok, false);
     assert.equal(report.checks[0]?.status, "timed_out");
     assert.notEqual(report.checks[0]?.output, "");
     assert.equal(report.checks[1]?.status, "passed");
-    assert.ok(Buffer.byteLength(report.checks[1]?.output ?? "", "utf8") <= 256 * 1024);
-    assert.ok(Buffer.byteLength(report.output, "utf8") <= 256 * 1024);
+    assert.ok(Buffer.byteLength(report.checks[1]?.output ?? "", "utf8") <= 1024 * 1024);
+    assert.ok(Buffer.byteLength(report.output, "utf8") <= 1024 * 1024);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

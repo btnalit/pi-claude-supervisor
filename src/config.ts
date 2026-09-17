@@ -21,6 +21,8 @@ const allowed = new Set([
   "PI_CLAUDE_SUPERVISOR_UNATTENDED",
   "PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT",
   "PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES",
+  "PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS",
+  "PI_CLAUDE_SUPERVISOR_EVENT_LOG_MAX_BYTES",
 ]);
 
 export interface AutonomyDefaults {
@@ -35,6 +37,14 @@ export function autonomyDefaults(env: NodeJS.ProcessEnv = process.env): Autonomy
     requireLocalCommit: readBoolean(env.PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT, true),
     maxDecisionRetries: readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES, 2, 0, 10),
   };
+}
+
+export function reviewTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS, 600_000, 30_000, 3_600_000);
+}
+
+export function eventLogMaxBytes(env: NodeJS.ProcessEnv = process.env): number {
+  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_EVENT_LOG_MAX_BYTES, 64 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024);
 }
 
 export function loadSupervisorEnvironment(): string | undefined {
