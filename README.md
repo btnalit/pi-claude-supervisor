@@ -48,6 +48,11 @@ worker remains an explicitly started child process.
 
 Requires Pi 0.85+ and Node.js 22.19+.
 
+Pi's distributed executable may be Bun-compiled, so the Linux cgroup and tmux
+helper scripts resolve a real `node` executable from `PATH` instead of assuming
+`process.execPath` accepts `-e`. Set `PI_CLAUDE_SUPERVISOR_NODE` to an executable
+path when Node is not on the Supervisor's `PATH`.
+
 ```text
 pi install npm:pi-claude-supervisor
 ```
