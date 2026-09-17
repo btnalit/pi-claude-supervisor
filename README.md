@@ -25,7 +25,9 @@ worker remains an explicitly started child process.
 > **Autonomy status:** automatic mode continues local editing, testing, bounded repair,
 > acceptance, independent Review and local-commit enforcement without a synchronous human
 > callback. Unresolvable work is parked as a non-publishable candidate; optional outbound
-> notifications do not approve actions.
+> notifications do not approve actions. An unattended failure (an unexpected Worker exit,
+> a watchdog timeout or unconfirmed cleanup) also emits a `candidate_failed` notice with
+> status `failed`, and webhook delivery retries transient errors.
 
 ## Safety boundary
 
@@ -157,7 +159,14 @@ produces no local commit candidate, or set `autonomy.requireLocalCommit` in its 
 automatic mode still requires a valid Git baseline and non-protected worktree.
 `PI_CLAUDE_SUPERVISOR_UNATTENDED=0` opts a task out of automatic Decision Worker control;
 a required local commit is checked on a non-protected task branch;
-`PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES` bounds transient Decision Worker retries.
+`PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES` bounds retries of a Decision Worker
+request that times out or whose model/API call fails (429/529, network, auth);
+exhausted retries record `decision_worker_failed` and park the candidate, while
+an abort is never retried. `PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS` bounds the
+total independent Reviewer budget per round, including one retry on a provider
+error (default 10 minutes). `PI_CLAUDE_SUPERVISOR_EVENT_LOG_MAX_BYTES` rotates
+`events.jsonl` to timestamped siblings once it reaches this size, keeping 5
+rotated files (default 64 MiB).
 
 The `v0.5.0` automation milestone adds a structured acceptance pipeline:
 multiple argv-based checks, an independent read-only Reviewer, bounded structured

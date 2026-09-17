@@ -20,7 +20,9 @@
 >
 > **无人值守状态：** 自动模式会自主完成本地修改、测试、有限修复、验收、独立 Review
 > 和本地提交检查；无法形成候选时自动挂起为不可发布候选。可选出站通知不授予权限，
-> push 和 main/integration merge 仍必须经过独立边界。
+> push 和 main/integration merge 仍必须经过独立边界。无人值守场景下的失败（Worker 意外退出、
+> watchdog 超时、清理未确认）也会发出 `candidate_failed` 通知，状态为 `failed`；webhook 投递
+> 会对瞬时错误重试。
 
 ## 关键安全边界
 
@@ -60,6 +62,10 @@ export PI_CLAUDE_SUPERVISOR_WORKER='claude --permission-mode acceptEdits'
 export PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL='https://example.invalid/webhook'
 export PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_FORMAT=generic
 # export PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_SECRET='shared-secret'
+# 每轮独立 Reviewer 的总预算（毫秒），含一次针对 provider 错误的重试（默认 10 分钟）
+# export PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS=600000
+# events.jsonl 达到该大小（字节）后滚动为带时间戳的文件，保留 5 份（默认 64 MiB）
+# export PI_CLAUDE_SUPERVISOR_EVENT_LOG_MAX_BYTES=67108864
 ```
 
 自动模式支持 `claude-jsonl` 和 Supervisor 自有的 tmux bridge；JSONL 的 `result`、
@@ -119,6 +125,7 @@ export PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_FORMAT=generic
 ```
 
 当前 webhook 只是出站候选通知，不直接接受批准命令；显式 stop、takeover 等兼容控制仍通过 Pi。
+Worker 意外退出、watchdog 超时或清理未确认等无人值守失败会发出 `candidate_failed` 通知（`status: "failed"`），webhook 投递对 429/5xx/网络错误重试 3 次。
 自动模式会将 Decision Worker 会话持久化到状态目录。Pi 非正常重启后，`/supervise sessions`
 会显示 `recoverable` 任务；显式执行 `/supervise recover [--takeover] <task-id>` 会恢复 Decision Worker 上下文并
 重新启动 Claude Worker，不会静默恢复或重复执行任务。旧 Pi 进程已退出且租约确认旧 Worker

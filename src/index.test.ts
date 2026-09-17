@@ -13,6 +13,11 @@ import { preflightCgroupContainment } from "./worker/process-adapter.ts";
 
 const requiredCgroupTestAvailable = process.platform === "linux" && await canUseRequiredCgroup();
 
+// Ignore PI_CLAUDE_SUPERVISOR_* variables inherited from the shell so tests are hermetic.
+for (const name of Object.keys(process.env)) {
+  if (name.startsWith("PI_CLAUDE_SUPERVISOR_")) delete process.env[name];
+}
+
 test("index rejects an unknown worker transport instead of falling back", () => {
   const previous = process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
   process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "not-a-transport";

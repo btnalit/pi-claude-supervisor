@@ -12,7 +12,7 @@ import { TmuxWorkerAdapter, attachCommand } from "./worker/tmux-adapter.ts";
 import { Supervisor, type DecisionSessionClosedInfo, type SupervisorProgress } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
-import { autonomyDefaults, loadSupervisorEnvironment } from "./config.ts";
+import { autonomyDefaults, eventLogMaxBytes, loadSupervisorEnvironment, reviewTimeoutMs } from "./config.ts";
 import { DecisionSessionStore, type DecisionSessionRecord } from "./decision-session-store.ts";
 import { CwdLeaseStore, type CwdLeaseHandle, pathsOverlap, workerIdentity } from "./cwd-lease.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
@@ -61,10 +61,10 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   const leaseDir = process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR ?? join(homedir(), ".pi", "agent", "claude-supervisor", "cwd-leases");
   assertRuntimeDirectory(stateDir, "state");
   assertRuntimeDirectory(leaseDir, "lease");
-  const events = new EventLog(join(stateDir, "events.jsonl"));
+  const events = new EventLog(join(stateDir, "events.jsonl"), { maxBytes: eventLogMaxBytes() });
   const decisionStore = new DecisionSessionStore(join(stateDir, "decision-sessions"));
   const cwdLeaseStore = new CwdLeaseStore(leaseDir);
-  const reviewer = automation ? new PiReadOnlyReviewer() : undefined;
+  const reviewer = automation ? new PiReadOnlyReviewer({ timeoutMs: reviewTimeoutMs() }) : undefined;
   const sessions = new Map<string, Supervisor>();
   const cwdLeases = new Map<string, CwdLeaseHandle>();
   const cleanupRequiredTasks = new Set<string>();
@@ -705,6 +705,10 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         } else if (operation === "sessions") {
           const recoverable = await decisionStore.list({ activeOnly: true });
           message = formatSessions(sessions, recoverable);
+          const quarantined = await cwdLeaseStore.quarantined();
+          if (quarantined.length > 0) {
+            message += `\nQuarantined cwd lease records (${quarantined.length}) in ${leaseDir}/quarantine: ${redactText(quarantined.join(", "))}`;
+          }
         } else if (operation === "status") {
           const { session, sessionId } = resolveSession(sessions, activeTaskId, rest, true);
           message = session
