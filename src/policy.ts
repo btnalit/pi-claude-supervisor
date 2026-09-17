@@ -212,11 +212,10 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
 
   // An argument the lexer cannot see through matters only where it could reach
   // the boundary: a repository, package, network or remote-shell command, or an
-  // interpreter that would execute the expanded text. Dynamic text in an
-  // ordinary local command (`for f in …; echo "$f"`) is Claude's own business.
-  const dynamicSensitive = lower.some((value) => DYNAMIC_SENSITIVE_COMMANDS.has(value.split(/[\\/]/u).at(-1) ?? value))
-    || (lower.some((value) => (value.split(/[\\/]/u).at(-1) ?? value) === "find") && lower.some((value) => FIND_EXEC_ACTIONS.has(value)));
-  if (hasDynamicArgument && (hasGit || hasGhRemote || hasPackagePublication || dynamicSensitive || hasDynamicCommandName(tokens))) {
+  // interpreter that would execute the expanded text, in the same statement.
+  // Dynamic text in an ordinary local command (`for f in …; echo "$f"`) or in
+  // another statement (`npm test; echo "exit $?"`) is Claude's own business.
+  if ((hasDynamicArgument && hasDynamicCommandName(tokens)) || segmentsOf(tokens).some((segment) => hasDynamicSensitiveArgument(segment))) {
     return { decision: "deny", reason: "a repository, package, network or shell command with a dynamic argument cannot be capability-checked" };
   }
   if (/\bgit\b[\s\S]*\b(?:push|merge(?!-)|send-pack|receive-pack|update-ref)\b/iu.test(canonical)
@@ -248,6 +247,30 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
     return { decision: "deny", reason: "Worker cannot bypass Claude permission prompts" };
   }
   return undefined;
+}
+
+/** The statements of a command, split on `;`, `&&`, `||`, `|` and `&`. */
+function segmentsOf(tokens: readonly ShellToken[]): ShellToken[][] {
+  const segments: ShellToken[][] = [[]];
+  for (const token of tokens) {
+    if (token.operator && SEGMENT_SPLIT_OPERATORS.has(token.value)) segments.push([]);
+    else segments.at(-1)!.push(token);
+  }
+  return segments.filter((segment) => segment.length > 0);
+}
+
+/** True when one statement combines a dynamic word with a command whose dynamic argument could reach the boundary. */
+function hasDynamicSensitiveArgument(segment: readonly ShellToken[]): boolean {
+  if (!segment.some((token) => !token.operator && token.dynamic)) return false;
+  const values = segment.filter((token) => !token.operator).map((token) => token.value);
+  const lower = values.map((value) => value.toLowerCase());
+  const executables = lower.map((value) => value.split(/[\\/]/u).at(-1) ?? value);
+  const canonical = values.join(" ");
+  return values.some((value) => /(?:^|[\\/])git$/iu.test(value) || /^git-(?:send|receive|upload)-pack$/iu.test(value))
+    || containsRemoteCliMutation(canonical)
+    || (lower.some((value) => value === "npm" || value === "pnpm" || value === "yarn") && lower.includes("publish"))
+    || executables.some((executable) => DYNAMIC_SENSITIVE_COMMANDS.has(executable))
+    || (executables.includes("find") && lower.some((value) => FIND_EXEC_ACTIONS.has(value)));
 }
 
 /** A dynamic word in command position (`$CMD …`, `; $CMD`, `do . $file`) could name anything. */
