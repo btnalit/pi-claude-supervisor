@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented here.
 
+## [0.7.3](https://github.com/btnalit/pi-claude-supervisor/compare/v0.7.2...v0.7.3) (2026-09-17)
+
+
+### Bug Fixes
+
+* **policy:** a name bound to literal text is not an unseen argument ([b93bbf6](https://github.com/btnalit/pi-claude-supervisor/commit/b93bbf6ae019fb7137588f113c0e1113ee942be7))
+* **policy:** a tilde expands only at the start of a word ([9671b23](https://github.com/btnalit/pi-claude-supervisor/commit/9671b23cd6f112f28decc2e906c029c11f5f7d1c))
+* **tmux:** a subagent hand-back is Claude's own prompt, not a human's ([90d40ba](https://github.com/btnalit/pi-claude-supervisor/commit/90d40baf357c5390f1699502235459e2d4230d55))
+* **tmux:** remove a dead Worker's tmux socket and sweep leftovers at load ([db83d40](https://github.com/btnalit/pi-claude-supervisor/commit/db83d4016dc210739d386d038df220cd7c1c4479))
+
 ## [0.7.2](https://github.com/btnalit/pi-claude-supervisor/compare/v0.7.1...v0.7.2) (2026-09-17)
 
 
