@@ -1,10 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, lstat, mkdir, open, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, isAbsolute, join } from "node:path";
 import type {
+  PermissionDecision,
   WorkerAdapter,
   WorkerCapabilities,
   WorkerEventListener,
@@ -13,6 +14,8 @@ import type {
   WorkerStartInput,
   WorkerStatus,
 } from "../types.ts";
+import type { ClaudeHookEvent, HookEventSource, HookRelayReply, HookRelayRequest } from "../hooks/types.ts";
+import { HOOK_TIMEOUT_SECONDS } from "../hooks/types.ts";
 import { assertSafeWorkerCommand } from "../policy.ts";
 import { redactSensitive } from "../redaction.ts";
 import { automaticWorkerEnvironment, workerEnvironment } from "./environment.ts";
@@ -94,6 +97,18 @@ interface TmuxRecord {
   cgroupError?: Error;
   cgroupCleaned?: boolean;
   runtimeError?: Error;
+  /** Hook-driven interactive TUI mode (a subset of `structured`'s automatic parent). */
+  interactive: boolean;
+  hookUnsubscribe?: () => Promise<void>;
+  claudeSessionId?: string;
+  transcriptPath?: string;
+  /** Primary readiness signal for interactive startup: SessionStart observed. */
+  sessionStartReceived: boolean;
+  /** Messages the adapter itself pasted, awaiting UserPromptSubmit acknowledgement. */
+  pendingSentMessages: string[];
+  pendingPermissionRequests: Map<string, { phase: "pre" | "prompt"; resolve: (reply: HookRelayReply) => void }>;
+  /** Hook requests that did not bind to this pane's identity, for diagnostics. */
+  ignoredHookRequests: number;
 }
 
 interface TmuxPaneStatus {
@@ -374,6 +389,44 @@ const GUARDIAN_KEYS = {
   parentStart: "PI_CLAUDE_SUPERVISOR_TMUX_PARENT_START",
 } as const;
 
+const INTERACTIVE_KEYS = {
+  ...BRIDGE_KEYS,
+  settings: "PI_CLAUDE_SUPERVISOR_TMUX_SETTINGS",
+} as const;
+
+/**
+ * Owned interactive launch joins the cgroup exactly like the pane bootstrap
+ * script, then runs the real Claude TUI synchronously with `--settings`
+ * pointing at the Supervisor's hook configuration. Unlike the bridge, this
+ * process never touches stdin/stdout framing; the pane is Claude's own PTY.
+ */
+const TMUX_INTERACTIVE_LAUNCHER_SCRIPT = `
+const { spawnSync } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const decode = (key) => Buffer.from(process.env[key] || "", "base64").toString("utf8");
+const command = decode(${JSON.stringify(INTERACTIVE_KEYS.command)});
+const args = JSON.parse(decode(${JSON.stringify(INTERACTIVE_KEYS.args)}));
+const cwd = decode(${JSON.stringify(INTERACTIVE_KEYS.cwd)});
+const cgroup = decode(${JSON.stringify(INTERACTIVE_KEYS.cgroup)});
+const settings = decode(${JSON.stringify(INTERACTIVE_KEYS.settings)});
+const keys = ${JSON.stringify(Object.values(INTERACTIVE_KEYS))};
+if (cgroup) {
+  try { writeFileSync(cgroup + "/cgroup.procs", String(process.pid) + "\\n"); }
+  catch (error) {
+    process.stderr.write("tmux interactive launcher failed: " + (error instanceof Error ? error.message : String(error)) + "\\n");
+    process.exit(125);
+  }
+}
+const childEnv = { ...process.env };
+for (const key of keys) delete childEnv[key];
+const result = spawnSync(command, [...args, "--settings", settings], { cwd, env: childEnv, stdio: "inherit" });
+if (result.error) {
+  process.stderr.write("tmux interactive launcher spawn failed: " + result.error.message + "\\n");
+  process.exit(127);
+}
+process.exit(result.status === null ? (result.signal ? 128 : 1) : result.status);
+`;
+
 const GUARDIAN_READY_MARKER = "PI_CLAUDE_SUPERVISOR_GUARDIAN_READY";
 
 const TMUX_GUARDIAN_SCRIPT = `
@@ -429,6 +482,7 @@ const timer = setInterval(() => {
 export const TMUX_EMBEDDED_SCRIPTS = {
   paneBootstrap: TMUX_PANE_BOOTSTRAP_SCRIPT,
   bridge: TMUX_BRIDGE_SCRIPT,
+  interactiveLauncher: TMUX_INTERACTIVE_LAUNCHER_SCRIPT,
   guardian: TMUX_GUARDIAN_SCRIPT,
 } as const;
 
@@ -495,9 +549,14 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   async start(input: WorkerStartInput): Promise<WorkerHandle> {
     const id = randomUUID();
     const owned = !input.tmuxSession;
-    const structured = Boolean(input.automatic);
+    const interactive = Boolean(input.automatic && input.interactive);
+    const structured = Boolean(input.automatic) && !interactive;
     if (input.tmuxSession && input.sendInitialInput === true) throw new Error("adopted tmux sessions cannot replay the original task");
     if (structured && !owned) throw new Error("automatic tmux supervision requires a Supervisor-owned tmux bridge; adopted sessions are manual-only");
+    if (interactive) {
+      if (!input.hookSource) throw new Error("interactive tmux supervision requires a hook event source");
+      if (owned && !input.hookSettingsPath) throw new Error("owned interactive tmux supervision requires hookSettingsPath");
+    }
     const sendInitialInput = owned && input.sendInitialInput !== false;
     const sessionName = input.tmuxSession ?? `pi-supervisor-${id}`;
     if (!/^[A-Za-z0-9_.-]+$/u.test(sessionName)) throw new Error("tmux session names must contain only letters, numbers, dot, underscore or hyphen");
@@ -550,6 +609,11 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       startupToken: input.startupToken,
       released: false,
       cleanupComplete: false,
+      interactive,
+      sessionStartReceived: false,
+      pendingSentMessages: [],
+      pendingPermissionRequests: new Map(),
+      ignoredHookRequests: 0,
     };
     const abortListener = () => {
       record.abortRequested = true;
@@ -564,15 +628,15 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     try {
       await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
       await writeFile(logPath, "", { mode: 0o600 });
-      if (structured && owned) {
+      if ((structured || interactive) && owned) {
         handle.cgroupPath = await this.#plannedCgroupPath(id);
         if (input.retainCgroupUntilLeaseRelease) handle.retainCgroupUntilLeaseRelease = true;
         await input.onWorkerStartup?.(handle);
       }
       if (owned) {
         if (process.platform !== "linux") throw new Error("owned tmux supervision requires a Linux parent-death guardian");
-        if (structured && this.#cgroupMode === "off") throw new Error("automatic tmux supervision requires cgroup containment");
-        if (structured) {
+        if ((structured || interactive) && this.#cgroupMode === "off") throw new Error("automatic tmux supervision requires cgroup containment");
+        if (structured || interactive) {
           try {
             record.cgroupPath = await this.#createCgroup(id, record.handle.cgroupPath);
             record.handle.cgroupPath = record.cgroupPath;
@@ -590,7 +654,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
             throw new Error(`automatic tmux cgroup setup failed: ${record.cgroupError.message}`, { cause: error });
           }
         }
-        const env = structured
+        const env = (structured || interactive)
           ? automaticWorkerEnvironment(input.env)
           : workerEnvironment(process.env, input.env);
         const workerArgs = structured ? claudeJsonlArgs(input.args) : (input.args ?? []);
@@ -598,7 +662,9 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         assertNoCredentialArguments(input.command, workerArgs);
         const bridgeEnv = structured
           ? bridgeEnvironment(env, input.cwd, input.command, workerArgs, record.cgroupPath)
-          : env;
+          : interactive
+            ? bridgeEnvironment(env, input.cwd, input.command, workerArgs, record.cgroupPath, input.hookSettingsPath)
+            : env;
         // Arm the guardian before creating the session. If the Supervisor dies
         // in the tmux startup window, the guardian removes any server created
         // after it and kills the automatic bridge cgroup, leaving an empty
@@ -609,6 +675,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         const paneBootstrap = [nodeScriptCommand(), "-e", TMUX_PANE_BOOTSTRAP_SCRIPT];
         await this.#run(record, ["new-session", "-d", "-s", sessionName, "-x", "140", "-y", "40", "-c", input.cwd, "--", ...paneBootstrap], undefined, bridgeEnv);
         record.sessionCreated = true;
+        if (interactive) record.hookUnsubscribe = await input.hookSource!.subscribe(input.cwd, (request) => this.#handleHookRequest(record, request));
         await this.#rememberServerIdentity(record);
         // Persist the server identity while pendingStartup is still present;
         // a crash before the final pre-spawn callback can then use normal
@@ -619,9 +686,11 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         // Attach the output pipe before respawn-pane starts the bridge so its
         // first generation frame cannot be lost before startup observes it.
         await this.#attachPipe(record);
-        const launch = structured
-          ? [nodeScriptCommand(), "-e", TMUX_BRIDGE_SCRIPT]
-          : [input.command, ...workerArgs];
+        const launch = interactive
+          ? [nodeScriptCommand(), "-e", TMUX_INTERACTIVE_LAUNCHER_SCRIPT]
+          : structured
+            ? [nodeScriptCommand(), "-e", TMUX_BRIDGE_SCRIPT]
+            : [input.command, ...workerArgs];
         await this.#run(record, ["respawn-pane", "-k", "-c", input.cwd, "-t", target, "--", ...launch], undefined, bridgeEnv);
         await this.#pinTarget(record);
         const ownedPane = await this.#paneStatus(record);
@@ -637,11 +706,15 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       } else {
         await this.#assertExistingSession(record, input.cwd, input.approval);
         await this.#rememberServerIdentity(record);
+        if (interactive) record.hookUnsubscribe = await input.hookSource!.subscribe(input.cwd, (request) => this.#handleHookRequest(record, request));
         const pipe = await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_pipe}"]);
         if (pipe.stdout.trim() === "1") throw new Error("cannot adopt a tmux pane that already has an output pipe");
         await this.#attachPipe(record);
       }
-      if (sendInitialInput || !input.tmuxSession) await this.#waitForReady(record);
+      if (sendInitialInput || !input.tmuxSession) {
+        if (interactive && owned) await this.#waitForInteractiveReady(record, input.cwd);
+        else await this.#waitForReady(record);
+      }
       if (structured) await this.#waitForBridgeGeneration(record);
       if (owned) {
         const readyPane = await this.#paneStatus(record);
@@ -783,8 +856,23 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     await this.#send(record, message, idempotencyKey);
   }
 
-  async respondPermission(handle: WorkerHandle, requestId: string, toolUseId: string, decision: { behavior: "allow" | "deny"; message?: string }, updatedInput?: unknown): Promise<void> {
+  async respondPermission(handle: WorkerHandle, requestId: string, toolUseId: string, decision: PermissionDecision, updatedInput?: unknown): Promise<void> {
     const record = this.#record(handle);
+    if (record.interactive) {
+      if (record.permissionResponses.has(requestId)) return;
+      const pending = record.pendingPermissionRequests.get(requestId);
+      if (!pending) throw new Error(`unknown tmux hook permission request: ${requestId}`);
+      record.pendingPermissionRequests.delete(requestId);
+      record.permissionResponses.add(requestId);
+      record.lastInputAt = new Date().toISOString();
+      if (decision.defer) { pending.resolve({}); return; }
+      if (decision.behavior === "deny") {
+        pending.resolve({ permissionDecision: "deny", permissionDecisionReason: decision.message ?? "permission denied by supervisor" });
+        return;
+      }
+      pending.resolve({ permissionDecision: "allow", permissionDecisionReason: decision.message });
+      return;
+    }
     if (!record.structured) throw new Error("permission responses require the automated tmux bridge");
     if (record.permissionResponses.has(requestId)) return;
     if (record.released || record.stopping) throw new Error("tmux worker is no longer supervised");
@@ -849,6 +937,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     } catch (error) {
       record.cleanupError ??= asError(error);
     } finally {
+      await this.#unsubscribeHooks(record);
       await this.#detachPipe(record);
       try { await this.#flushOutput(record); }
       catch (error) { record.cleanupError ??= asError(error); }
@@ -874,6 +963,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       try { await this.#stopGuardian(record); }
       catch (error) { record.cleanupError ??= asError(error); }
     }
+    await this.#unsubscribeHooks(record);
     record.listeners.clear();
     try { await this.#collectOutput(record); }
     catch (error) { record.cleanupError ??= asError(error); }
@@ -952,11 +1042,19 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       record.readyStreak = 0;
       record.turnObservedOutput = false;
       record.inputAt = Date.now();
+      if (record.interactive) {
+        record.pendingSentMessages.push(message);
+        while (record.pendingSentMessages.length > 50) record.pendingSentMessages.shift();
+      }
       try {
         await this.#sendRaw(record, message);
         record.sentKeys.add(idempotencyKey);
         record.lastInputAt = new Date().toISOString();
       } catch (error) {
+        if (record.interactive) {
+          const index = record.pendingSentMessages.lastIndexOf(message);
+          if (index >= 0) record.pendingSentMessages.splice(index, 1);
+        }
         record.activeRequests = 0;
         record.readyStreak = 0;
         throw error;
@@ -1067,6 +1165,12 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         this.#emit(record, { type: "exited", handle: record.handle, exitCode: record.exitCode, signal: record.signal });
         return;
       }
+      if (record.interactive) {
+        // Hooks are authoritative for activeRequests/turn_completed in
+        // interactive mode; the poll loop here is only pane-death detection
+        // and log collection, both already handled above.
+        return;
+      }
       const screen = await this.#capture(record);
       if (record.structured) {
         if (record.activeRequests === 0 && hasBridgePromptInput(screen)) {
@@ -1134,6 +1238,38 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     }
     this.#assertNotAborted(record);
     throw new Error(`tmux Claude session did not reach an input prompt before startup timeout; attach with ${attachCommand(record)}`);
+  }
+
+  /**
+   * Owned interactive startup waits for two independent signals: the hook
+   * source's SessionStart (primary; proves Claude's own process is alive and
+   * has registered) and a stable ready screen (secondary; the human/Supervisor
+   * paste path is safe). A fresh cwd may show Claude's one-time workspace
+   * trust dialog first; accept it once so startup is not stuck behind a
+   * prompt only a human would normally answer.
+   */
+  async #waitForInteractiveReady(record: TmuxRecord, cwd: string): Promise<void> {
+    const deadline = Date.now() + this.#startupTimeoutMs;
+    let trustDialogHandled = false;
+    while (Date.now() < deadline) {
+      this.#assertNotAborted(record);
+      const screen = await this.#capture(record);
+      if (!trustDialogHandled && /Yes, I trust this folder/u.test(stripAnsi(screen))) {
+        let paneCwd: string | undefined;
+        try { paneCwd = (await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_current_path}"])).stdout.trim(); }
+        catch { paneCwd = undefined; }
+        if (paneCwd === cwd) {
+          await this.#run(record, ["send-keys", "-t", record.target, "Down"]);
+          await this.#run(record, ["send-keys", "-t", record.target, "Enter"]);
+          trustDialogHandled = true;
+          this.#logOutput(record, "[supervisor] accepted the workspace trust dialog\n");
+        }
+      }
+      if (record.sessionStartReceived && isReadyScreen(screen)) return;
+      await delay(Math.min(this.#pollIntervalMs, Math.max(1, deadline - Date.now())));
+    }
+    this.#assertNotAborted(record);
+    throw new Error(`tmux Claude interactive session did not reach an input prompt before startup timeout; attach with ${attachCommand(record)}`);
   }
 
   async #waitForPaneExit(record: TmuxRecord, timeoutMs: number): Promise<void> {
@@ -1338,6 +1474,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     // permanently poison a successful retry. The caller preserves errors from
     // the current stop attempt around this boundary.
     record.cleanupError = undefined;
+    await this.#unsubscribeHooks(record);
     if (!record.owned) {
       if (record.monitor) clearInterval(record.monitor);
       record.monitor = undefined;
@@ -1367,7 +1504,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     if (!record.serverKilled) await this.#ensurePaneGone(record);
     if (record.cgroupPath) {
       try {
-        await cleanupCgroup(record.cgroupPath, this.#terminationGraceMs, Boolean(record.structured && record.handle.retainCgroupUntilLeaseRelease));
+        await cleanupCgroup(record.cgroupPath, this.#terminationGraceMs, Boolean((record.structured || record.interactive) && record.handle.retainCgroupUntilLeaseRelease));
         record.cgroupCleaned = true;
       } catch (error) {
         record.cgroupError ??= asError(error);
@@ -1377,6 +1514,18 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     try { await rm(record.runtimeDir, { recursive: true, force: true }); }
     catch (error) { record.cleanupError ??= asError(error); }
     record.cleanupComplete = !record.cleanupError && (record.serverKilled || !record.sessionCreated) && (!record.cgroupPath || record.cgroupCleaned === true);
+  }
+
+  async #unsubscribeHooks(record: TmuxRecord): Promise<void> {
+    const unsubscribe = record.hookUnsubscribe;
+    record.hookUnsubscribe = undefined;
+    for (const [requestId, pending] of record.pendingPermissionRequests) {
+      record.pendingPermissionRequests.delete(requestId);
+      pending.resolve({});
+    }
+    if (!unsubscribe) return;
+    try { await unsubscribe(); }
+    catch (error) { record.cleanupError ??= asError(error); }
   }
 
   async #ensurePaneGone(record: TmuxRecord): Promise<void> {
@@ -1430,7 +1579,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   async #run(record: TmuxRecord, args: string[], input?: string, env = workerEnvironment(process.env), ignoreAbort = false): Promise<{ stdout: string; stderr: string }> {
     if (record.abortRequested && !ignoreAbort) throw new Error("tmux worker startup was aborted");
     const tmuxArgs = record.socketPath
-      ? [...(record.structured ? ["-f", "/dev/null"] : []), "-S", record.socketPath, ...args]
+      ? [...((record.structured || record.interactive) ? ["-f", "/dev/null"] : []), "-S", record.socketPath, ...args]
       : args;
     const result = await runCommand(this.#tmuxBinary, tmuxArgs, input, env, this.#commandTimeoutMs);
     if (record.abortRequested && !ignoreAbort) throw new Error("tmux worker startup was aborted");
@@ -1615,6 +1764,137 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     }
   }
 
+  #logOutput(record: TmuxRecord, text: string): void {
+    const at = new Date().toISOString();
+    this.#appendOutput(record, { stream: "stdout", text, at });
+    record.lastOutputAt = at;
+  }
+
+  /**
+   * A hook relay's `ppid` is the Claude Code process pid; an owned launch
+   * runs Claude as a child of the pane's launcher process, so the pane pid is
+   * an ancestor, not the direct parent. Walk the `/proc` ppid chain (bounded)
+   * the way process-tree.ts does rather than requiring an exact pid match.
+   */
+  async #ppidDescendsFrom(pid: number, ancestorPid: number): Promise<boolean> {
+    let current = pid;
+    for (let depth = 0; depth < 32; depth += 1) {
+      if (current === ancestorPid) return true;
+      const entry = await readProcess(current);
+      if (!entry || entry.ppid <= 1 || entry.ppid === current) return false;
+      current = entry.ppid;
+    }
+    return false;
+  }
+
+  async #bindsToRecord(record: TmuxRecord, request: HookRelayRequest): Promise<boolean> {
+    if (record.handle.tmuxPaneId && request.tmuxPane && request.tmuxPane === record.handle.tmuxPaneId) return true;
+    if (record.panePid !== undefined) return this.#ppidDescendsFrom(request.ppid, record.panePid);
+    // The pane identity is not established yet (owned startup window); a cwd
+    // has at most one subscribed Supervisor session at a time, so accept.
+    return true;
+  }
+
+  async #handleHookRequest(record: TmuxRecord, request: HookRelayRequest): Promise<HookRelayReply | undefined> {
+    if (!(await this.#bindsToRecord(record, request))) {
+      record.ignoredHookRequests += 1;
+      return {};
+    }
+    record.lastOutputAt = new Date().toISOString();
+    const event = request.event;
+    switch (event.hook_event_name) {
+      case "SessionStart": {
+        record.claudeSessionId ??= event.session_id;
+        record.handle.sessionId = event.session_id;
+        if (event.transcript_path) record.transcriptPath = event.transcript_path;
+        record.sessionStartReceived = true;
+        return {};
+      }
+      case "UserPromptSubmit": {
+        const prompt = event.prompt ?? "";
+        const matchedIndex = record.pendingSentMessages.findIndex((pending) => matchesPendingMessage(pending, prompt));
+        if (matchedIndex >= 0) {
+          record.pendingSentMessages.splice(matchedIndex, 1);
+          return {};
+        }
+        this.#emit(record, { type: "human_input", handle: record.handle, text: boundTextHead(prompt, 4_096) });
+        record.activeRequests = 1;
+        record.inputAt = Date.now();
+        record.lastInputAt = new Date().toISOString();
+        return {};
+      }
+      case "PreToolUse":
+        return this.#awaitPermissionDecision(record, event, "pre", event.tool_use_id ?? randomUUID());
+      case "PermissionRequest": {
+        const digest = createHash("sha256").update(`${event.session_id}${event.tool_name ?? ""}${JSON.stringify(event.tool_input ?? null)}`).digest("hex").slice(0, 16);
+        return this.#awaitPermissionDecision(record, event, "prompt", `prompt:${digest}`);
+      }
+      case "Stop": {
+        record.activeRequests = 0;
+        record.lastOutputAt = new Date().toISOString();
+        record.turnSequence += 1;
+        this.#emit(record, {
+          type: "turn_completed",
+          handle: record.handle,
+          sequence: record.turnSequence,
+          result: { subtype: "stop", result: event.last_assistant_message ?? "", stop_hook_active: Boolean(event.stop_hook_active) },
+        });
+        return {};
+      }
+      case "Notification": {
+        if (event.notification_type === "permission_prompt") {
+          const hasPendingPrompt = [...record.pendingPermissionRequests.values()].some((pending) => pending.phase === "prompt");
+          if (!hasPendingPrompt) this.#logOutput(record, "[supervisor] Claude is waiting at a permission prompt the hook did not intercept\n");
+        }
+        return {};
+      }
+      case "SessionEnd":
+        // The existing pane-death poll emits `exited`; do not emit a second one.
+        return {};
+      default:
+        return {};
+    }
+  }
+
+  async #awaitPermissionDecision(record: TmuxRecord, event: ClaudeHookEvent, phase: "pre" | "prompt", requestId: string): Promise<HookRelayReply> {
+    const existing = record.pendingPermissionRequests.get(requestId);
+    if (existing) {
+      record.pendingPermissionRequests.delete(requestId);
+      existing.resolve({});
+    }
+    // A PermissionRequest id is a deterministic digest of session/tool/input,
+    // so the same tool invoked twice in a session reuses it. A fresh request
+    // supersedes any prior answer, or the second occurrence would dedupe
+    // itself away in respondPermission and hang the relay.
+    record.permissionResponses.delete(requestId);
+    const toolUseId = event.tool_use_id ?? requestId;
+    this.#emit(record, {
+      type: "permission_request",
+      handle: record.handle,
+      request: {
+        requestId,
+        toolUseId,
+        toolName: event.tool_name ?? "unknown",
+        input: event.tool_input,
+        raw: event as unknown as Record<string, unknown>,
+        phase,
+      },
+    });
+    return new Promise<HookRelayReply>((resolve) => {
+      const timeoutMs = Math.max(0, (HOOK_TIMEOUT_SECONDS - 10) * 1_000);
+      const timer = setTimeout(() => {
+        record.pendingPermissionRequests.delete(requestId);
+        this.#logOutput(record, `[supervisor] permission request ${requestId} timed out waiting for a Supervisor decision\n`);
+        resolve({});
+      }, timeoutMs);
+      timer.unref?.();
+      record.pendingPermissionRequests.set(requestId, {
+        phase,
+        resolve: (reply) => { clearTimeout(timer); resolve(reply); },
+      });
+    });
+  }
+
   #status(record: TmuxRecord, running: boolean): WorkerStatus {
     return {
       handle: record.handle,
@@ -1653,15 +1933,17 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   }
 }
 
-function bridgeEnvironment(env: NodeJS.ProcessEnv, cwd: string, command: string, args: readonly string[], cgroupPath?: string): NodeJS.ProcessEnv {
+function bridgeEnvironment(env: NodeJS.ProcessEnv, cwd: string, command: string, args: readonly string[], cgroupPath?: string, hookSettingsPath?: string): NodeJS.ProcessEnv {
   const encode = (value: string) => Buffer.from(value, "utf8").toString("base64");
-  return {
+  const result: NodeJS.ProcessEnv = {
     ...env,
     [BRIDGE_KEYS.command]: encode(command),
     [BRIDGE_KEYS.args]: encode(JSON.stringify(args)),
     [BRIDGE_KEYS.cwd]: encode(cwd),
     [BRIDGE_KEYS.cgroup]: encode(cgroupPath ?? ""),
   };
+  if (hookSettingsPath !== undefined) result[INTERACTIVE_KEYS.settings] = encode(hookSettingsPath);
+  return result;
 }
 
 export function attachCommand(handle: Pick<WorkerHandle, "tmuxSocket" | "sessionName">): string {
@@ -1785,6 +2067,30 @@ function partialFramePrefixLength(value: string, prefix: string): number {
 function boundText(value: string, maxBytes: number): string {
   const bytes = Buffer.from(value, "utf8");
   return bytes.byteLength <= maxBytes ? value : bytes.subarray(-maxBytes).toString("utf8");
+}
+
+function boundTextHead(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  return bytes.byteLength <= maxBytes ? value : bytes.subarray(0, maxBytes).toString("utf8");
+}
+
+function normalizeForMatch(value: string): string {
+  return value.trim().replace(/\s+/gu, " ");
+}
+
+/**
+ * A UserPromptSubmit hook reports the prompt as Claude's TUI captured it,
+ * which can reflow long pasted text. Treat it as the adapter's own send when
+ * it matches exactly (after whitespace normalization) or shares the same
+ * first 200 characters.
+ */
+function matchesPendingMessage(pending: string, prompt: string): boolean {
+  const normalizedPending = normalizeForMatch(pending);
+  const normalizedPrompt = normalizeForMatch(prompt);
+  if (!normalizedPending || !normalizedPrompt) return false;
+  if (normalizedPending === normalizedPrompt) return true;
+  const prefixLength = 200;
+  return normalizedPending.slice(0, prefixLength) === normalizedPrompt.slice(0, prefixLength);
 }
 
 function shellQuote(value: string): string {
