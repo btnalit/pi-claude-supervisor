@@ -2281,9 +2281,14 @@ function normalizeForMatch(value: string): string {
   return value.trim().replace(/\s+/gu, " ");
 }
 
-/** True for a prompt Claude Code injected itself (`<task-notification>`, `<system-reminder>`), which a human never typed. */
+/**
+ * True for a prompt Claude Code injected itself, which a human never typed:
+ * `<task-notification>`, `<system-reminder>`, `<agent-message …>` and the
+ * other hyphenated runtime wrappers it frames delivered content with. A
+ * person's own message does not begin with such a tag.
+ */
 function isClaudeRuntimePrompt(prompt: string): boolean {
-  return /^\s*<(?:task-notification|system-reminder)\b/u.test(prompt);
+  return /^\s*<[a-z]+(?:-[a-z]+)+(?:\s|>)/u.test(prompt);
 }
 
 /**
