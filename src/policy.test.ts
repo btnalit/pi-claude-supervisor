@@ -137,6 +137,20 @@ test("a quoted heredoc body means what its consumer makes of it", () => {
   assert.equal(evaluateCommand("cat > .git/refs/heads/main <<'EOF'\nabc\nEOF").decision, "deny");
 });
 
+test("a dynamic argument counts only in the statement that holds the sensitive command", () => {
+  // Shapes a fix Worker actually ran: the exit-status echo is a separate statement from `npm`.
+  assert.equal(evaluateCommand("npm run typecheck >/dev/null 2>&1; echo \"typecheck exit $?\"").decision, "allow");
+  assert.equal(evaluateCommand("npm test && echo \"$?\" && python3 - <<'EOF'\nprint(1)\nEOF").decision, "allow");
+  assert.equal(evaluateCommand("git status; echo \"$x\"").decision, "allow");
+  assert.equal(evaluateCommand("x=$(ls); git status").decision, "allow");
+  assert.equal(evaluateCommand("echo \"$x\" | git apply --check").decision, "allow");
+  // The same statement still cannot be checked.
+  assert.equal(evaluateCommand("git status; git add \"$x\"").decision, "deny");
+  assert.equal(evaluateCommand("echo ok && npm run $script").decision, "deny");
+  assert.equal(evaluateCommand("cd x; $CMD").decision, "deny");
+  assert.equal(evaluateCommand("ls | xargs $tool").decision, "deny");
+});
+
 test("newlines separate statements and comments are ignored", () => {
   assert.equal(evaluateCommand("echo start\n$CMD --flag").decision, "deny");
   assert.equal(evaluateCommand("cd x\n$CMD").decision, "deny");
