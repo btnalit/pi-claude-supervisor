@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented here.
 
+## [0.8.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.7.3...v0.8.0) (2026-09-19)
+
+
+### Features
+
+* **recover:** extend an expired task's budget from now, and discard records nobody will recover ([0bbf07f](https://github.com/btnalit/pi-claude-supervisor/commit/0bbf07f8a44eb5f9cfb3542a8b01115aa2c3703a))
+* **supervisor:** turn the wall-clock deadline into a warned, graceful close-out ([4b5f92a](https://github.com/btnalit/pi-claude-supervisor/commit/4b5f92a61c99d9f1448d3c994975826897326ced))
+
+
+### Bug Fixes
+
+* **recover:** point an adopted task's discard at re-adoption, guard the owed re-ask ([0fef7d8](https://github.com/btnalit/pi-claude-supervisor/commit/0fef7d850b3934543feb664b954f5d4cb92c63e0))
+* **supervisor:** address the review of the deadline close-out ([721b0b8](https://github.com/btnalit/pi-claude-supervisor/commit/721b0b8d2c62f81811ad67bf42c396a1c0550903))
+
 ## [0.7.3](https://github.com/btnalit/pi-claude-supervisor/compare/v0.7.2...v0.7.3) (2026-09-17)
 
 
