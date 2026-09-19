@@ -9,7 +9,7 @@ import { redactSensitive } from "./redaction.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
 import { automaticWorkerEnvironment } from "./worker/environment.ts";
 import { TmuxWorkerAdapter, attachCommand, sweepDeadTmuxSockets } from "./worker/tmux-adapter.ts";
-import { Supervisor, type DecisionSessionClosedInfo, type HumanInterventionNotice, type SupervisorProgress, type SupervisorTokenUsage } from "./supervisor.ts";
+import { Supervisor, extendedDeadlineMs, type DecisionSessionClosedInfo, type HumanInterventionNotice, type SupervisorProgress, type SupervisorTokenUsage } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
 import { autoInstallHooks, autonomyDefaults, closeWorkerOnCompletion, deadlineGraceMs, deadlineMs, deadlineWarningMs, decisionCompactionTokens, decisionModel, decisionSessionRetentionDays, eventLogMaxBytes, formatDurationMs, loadSupervisorEnvironment, noOutputTimeoutMs, parseDurationMs, progressHeartbeatMs, reviewTimeoutMs, reviewerModel, tmuxMode, workerAutocompactTokens, workerMcpConfigPath, workerModel } from "./config.ts";
@@ -644,9 +644,13 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             pendingCwds.delete(cwdKey);
           }
         } else if (operation === "recover") {
+          const usage = "Usage: /supervise recover [--takeover] [--extend <duration>] <task-id>";
+          const extendOption = takeOption(rest, "--extend");
           const takeover = rest.includes("--takeover");
           const taskId = rest.find((value) => value !== "--takeover");
-          if (!taskId || rest.some((value) => value !== "--takeover" && value !== taskId)) throw new Error("Usage: /supervise recover [--takeover] <task-id>");
+          if (!taskId || rest.some((value) => value !== "--takeover" && value !== taskId)) throw new Error(usage);
+          const extendMs = extendOption === undefined ? undefined : parseDurationMs(extendOption);
+          if (extendOption !== undefined && extendMs === undefined) throw new Error(`--extend expects a duration such as 30m, 2h or 0 (close out now): ${extendOption}`);
           if (shuttingDown) throw new Error("Pi session is shutting down");
           if (sessions.has(taskId)) throw new Error(`Task session is already loaded: ${taskId}`);
           const record = await decisionStore.load(taskId);
@@ -655,7 +659,15 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           if (staleRecovery && !takeover) throw new Error(`Decision Worker recovery is stale (${record.recoveryState}); retry with --takeover only after verifying the old Worker is gone: ${taskId}`);
           if (!await decisionStore.sessionFileExists(taskId)) throw new Error(`Decision Worker session file is missing or unsafe: ${taskId}`);
           if (record.maxTurns > 0 && record.turn >= record.maxTurns) throw new Error(`Cannot recover task after its turn budget was exhausted: ${taskId}`);
-          if (record.deadlineMs > 0 && Date.now() - Date.parse(record.startedAt) >= record.deadlineMs) throw new Error(`Cannot recover task after its wall-clock deadline: ${taskId}`);
+          if (extendMs !== undefined && record.deadlineMs <= 0) throw new Error(`Task has no wall-clock deadline to extend: ${taskId}`);
+          const elapsedMs = Math.max(0, Date.now() - Date.parse(record.startedAt));
+          // A task past its budget is not lost: `--extend` grants a fresh budget
+          // from now (0 opens the close-out at once, verifying the repository as
+          // it stands), which the recovered Supervisor persists as the deadline.
+          const recoveryDeadlineMs = extendMs === undefined ? record.deadlineMs : extendedDeadlineMs(record.deadlineMs, elapsedMs, extendMs);
+          if (recoveryDeadlineMs > 0 && elapsedMs >= recoveryDeadlineMs) {
+            throw new Error(`Cannot recover task after its wall-clock deadline (${formatDurationMs(elapsedMs - recoveryDeadlineMs)} ago); pass --extend <duration> to grant a close-out budget from now, or /supervise discard ${taskId} to drop the record`);
+          }
           const cwdKey = await canonicalCwd(record.cwd);
           await releaseSettledReservations();
           if (shuttingDown) throw new Error("Pi session is shutting down");
@@ -787,7 +799,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                   : undefined,
                 ...(automaticRecovery && record.resolvedExecutable ? { expectedClaudeExecutable: record.resolvedExecutable } : {}),
                 maxTurns: record.maxTurns,
-                deadlineMs: record.deadlineMs,
+                deadlineMs: recoveryDeadlineMs,
                 deadlineGraceMs: deadlineGraceMs(),
                 deadlineWarningMs: deadlineWarningMs(),
                 noOutputTimeoutMs: record.noOutputTimeoutMs,
@@ -909,6 +921,17 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             pendingStartSessions.delete(session);
             pendingCwds.delete(cwdKey);
           }
+        } else if (operation === "discard") {
+          const [taskId, ...extra] = rest;
+          if (!taskId || extra.length > 0) throw new Error("Usage: /supervise discard <task-id>");
+          if (sessions.has(taskId)) throw new Error(`Task session is loaded in this Pi; use /supervise stop ${taskId} instead`);
+          const record = await decisionStore.load(taskId);
+          if (!record || record.state !== "active") throw new Error(`No recoverable Decision Worker session: ${taskId}`);
+          // "starting"/"registered"/"recovered_idle" mean another Pi owns a
+          // recovery of this task; only a settled record may be dropped here.
+          if (!["ready", "interrupted"].includes(record.recoveryState)) throw new Error(`Decision Worker recovery is in progress elsewhere (${record.recoveryState}); discard only after that Pi has released it: ${taskId}`);
+          await decisionStore.close(taskId);
+          message = `Discarded recoverable task ${taskId} (cwd ${redactText(record.cwd)}); its Decision Worker session file is kept until retention pruning`;
         } else if (operation === "sessions") {
           const recoverable = await decisionStore.list({ activeOnly: true });
           message = formatSessions(sessions, recoverable, tmuxModeLabel());
@@ -969,7 +992,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           } else if (operation === "resume-auto") {
             await session.resumeAutomation(); message = `Automatic decisions resumed: ${sessionId}.`;
           } else {
-            throw new Error("Usage: /supervise start [--spec <file>] [--deadline <duration>]|adopt-tmux [--spec <file>] [--deadline <duration>]|recover [--takeover]|sessions|status|poll [all|taskId]|send [taskId]|pause [taskId]|resume [taskId]|stop [taskId]|verify [taskId]|approve [taskId] <allow|deny>|takeover [taskId]|resume-auto [taskId]|capabilities|install-hooks|uninstall-hooks");
+            throw new Error("Usage: /supervise start [--spec <file>] [--deadline <duration>]|adopt-tmux [--spec <file>] [--deadline <duration>]|recover [--takeover] [--extend <duration>]|discard <task-id>|sessions|status|poll [all|taskId]|send [taskId]|pause [taskId]|resume [taskId]|stop [taskId]|verify [taskId]|approve [taskId] <allow|deny>|takeover [taskId]|resume-auto [taskId]|capabilities|install-hooks|uninstall-hooks");
           }
         }
         if (hookInstallNotice) { notify(ctx, hookInstallNotice); hookInstallNotice = undefined; }
@@ -1083,6 +1106,13 @@ function parseTaskDeadline(value: string): number {
   return parsed;
 }
 
+/** A recoverable record's budget: how much is left, or how long ago it expired (recover then needs `--extend`). */
+function formatRecordDeadline(record: DecisionSessionRecord): string {
+  if (record.deadlineMs <= 0) return "";
+  const remaining = record.deadlineMs - (Date.now() - Date.parse(record.startedAt));
+  return remaining > 0 ? ` deadline=${formatDurationMs(remaining)} left` : ` deadline=expired ${formatDurationMs(-remaining)} ago (recover --extend)`;
+}
+
 function formatDeadline(deadline: Supervisor["deadline"]): string {
   if (!deadline) return "";
   if (!deadline.closeOut) return ` deadline=${formatDurationMs(deadline.remainingMs)} left`;
@@ -1095,7 +1125,7 @@ function formatSessions(sessions: Map<string, Supervisor>, recoverable: Decision
     .map(([taskId, session]) => `${taskId} state=${session.state} cwd=${session.task?.cwd ?? "-"} worker=${session.handle?.id ?? "-"}${modeSuffix}`);
   const pending = recoverable
     .filter((record) => !sessions.has(record.taskId))
-    .map((record) => `${record.taskId} state=recoverable recovery=${record.recoveryState} cwd=${record.cwd} worker=${record.recoveryWorker?.id ?? "-"}${modeSuffix}`);
+    .map((record) => `${record.taskId} state=recoverable recovery=${record.recoveryState} cwd=${record.cwd} worker=${record.recoveryWorker?.id ?? "-"}${modeSuffix}${formatRecordDeadline(record)}`);
   return [...active, ...pending].join("\n") || "No task sessions.";
 }
 

@@ -2278,6 +2278,16 @@ function removeFlagWithValue(args: readonly string[], flag: string): string[] {
   return result;
 }
 
+/**
+ * The deadline (in ms since the task started) that grants `extendMs` more
+ * from now: measured from the later of the current deadline and the present,
+ * so extending an expired task by 30 minutes means 30 minutes from now, and
+ * extending by 0 opens its close-out immediately.
+ */
+export function extendedDeadlineMs(currentDeadlineMs: number, elapsedMs: number, extendMs: number): number {
+  return Math.max(currentDeadlineMs, elapsedMs) + Math.max(0, extendMs);
+}
+
 function isProtectedBranch(branch: string): boolean {
   return /^(?:main|master|trunk|integration|develop)$/iu.test(branch) || /(?:^|\/)(?:main|master|integration)$/iu.test(branch);
 }

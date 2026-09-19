@@ -290,6 +290,13 @@ Worker,它不会静默恢复或重复执行任务。只有在租约证明旧 Wor
 的 `TRANSPORT`/`TMUX_MODE` 配置来判断,因此在启动任务和恢复任务之间请不要
 改变这两个配置。
 
+因总时限到期而停止的任务会以 `deadline=expired … ago` 列出。普通 `recover`
+会拒绝它;`recover --takeover --extend <duration> <task-id>` 从现在起再给这么
+多预算(恢复后的 Supervisor 会把新时限持久化),`--extend 0` 则立即进入收尾:
+新 Worker 的第一个 watchdog tick 就会对仓库现状做验收和 review,修复轮会告诉
+它还剩多少时间。确定不再恢复的记录用 `/supervise discard <task-id>` 丢弃
+(会话文件保留到保留期清理为止)。
+
 每个任务在 `CWD_LEASE_DIR` 下持有一个 cwd 租约;并发任务需要各自独立的
 worktree。无法读取的租约记录(损坏的 JSON、异常的结构)会被隔离到 quarantine
 目录,而不会阻塞其他查找;`/supervise sessions` 会列出当前被隔离的记录,方便

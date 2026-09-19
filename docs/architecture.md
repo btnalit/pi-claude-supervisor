@@ -421,7 +421,11 @@ A zero grace window restores the immediate stop at the deadline. For an adopted
 interactive session the outright stop is a release (the adapter never kills a
 session it does not own), so the Claude process keeps running unsupervised; the
 close-out exists so that a task which merely ran long still ends with a verified
-candidate instead of a silent hand-back.
+candidate instead of a silent hand-back. A record left behind by the outright
+stop (`recoverable_failure`, so `active/interrupted`) is not a dead end either:
+`recover --extend <duration>` re-persists a deadline measured from now
+(`extendedDeadlineMs`), `--extend 0` recovers straight into the close-out, and
+`discard` closes a record nobody will recover.
 Input writes are serialized with stop and are acknowledged through the stream
 write callback before their idempotency key is consumed. Writes have a bounded
 timeout, and `stop()` preempts a queued lifecycle operation by initiating adapter

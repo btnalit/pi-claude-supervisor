@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import type { SupervisorEvent } from "./events.ts";
 import type { PiUsageSample, WorkerAdapter, WorkerEvent, WorkerHandle, WorkerOutputChunk, WorkerStartInput, WorkerStatus } from "./types.ts";
 import type { DecisionWorkerFactory } from "./decision-worker.ts";
-import { Supervisor } from "./supervisor.ts";
+import { Supervisor, extendedDeadlineMs } from "./supervisor.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
 import { TmuxWorkerAdapter } from "./worker/tmux-adapter.ts";
 
@@ -2983,4 +2983,15 @@ test("an idle adopted Worker that never completed a turn is still classified and
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+});
+
+test("extendedDeadlineMs grants the extension from now for an expired task and from the deadline otherwise", () => {
+  const hour = 60 * 60_000;
+  // Expired 5 hours in: 30 more minutes means 30 minutes from now.
+  assert.equal(extendedDeadlineMs(4 * hour, 5 * hour, 30 * 60_000), 5 * hour + 30 * 60_000);
+  // Extending by 0 puts the deadline at the present, i.e. the close-out opens at once.
+  assert.equal(extendedDeadlineMs(4 * hour, 5 * hour, 0), 5 * hour);
+  // Not yet expired: the extension is added to the remaining budget.
+  assert.equal(extendedDeadlineMs(4 * hour, 1 * hour, 30 * 60_000), 4 * hour + 30 * 60_000);
+  assert.equal(extendedDeadlineMs(4 * hour, 1 * hour, -5), 4 * hour);
 });

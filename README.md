@@ -340,6 +340,15 @@ interactive — it derives that from the current `TRANSPORT`/`TMUX_MODE`
 configuration at recovery time, so do not change either between starting a
 task and recovering it.
 
+A task that stopped at its wall-clock deadline is listed with `deadline=expired
+… ago`. Plain `recover` refuses it; `recover --takeover --extend <duration>
+<task-id>` grants that much budget from now (the recovered Supervisor persists
+the new deadline), and `--extend 0` opens the close-out at once, so the fresh
+Worker's first watchdog tick verifies and reviews the repository as it stands
+and any repair round tells it how long it has. A record nobody will recover is
+dropped with `/supervise discard <task-id>` (its session file is kept until
+retention pruning).
+
 Every task holds one cwd lease under `CWD_LEASE_DIR`; concurrent tasks need
 separate worktrees. A lease record that cannot be read (corrupt JSON,
 unexpected shape) is quarantined instead of blocking other lookups, and
