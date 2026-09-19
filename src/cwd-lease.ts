@@ -651,6 +651,11 @@ async function cgroupHasProcesses(path: string): Promise<boolean> {
   }
 }
 
+/** True while the Pi process that acquired the lease is still alive (pid and start time both match). */
+export async function leaseOwnerLive(lease: CwdLeaseRecord): Promise<boolean> {
+  return processIdentityLive(lease.ownerPid, lease.ownerStartTime);
+}
+
 async function canTakeoverLease(lease: CwdLeaseRecord): Promise<TakeoverProof | undefined> {
   // The old supervisor owner must be gone. A dead owner is not enough when
   // the detached Worker itself is still alive. Compare start time as well as

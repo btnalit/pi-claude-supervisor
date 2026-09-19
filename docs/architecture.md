@@ -417,7 +417,10 @@ remains; `worker_watchdog_timeout` (`worker deadline exceeded`) stops the Worker
 only once the close-out window has also elapsed. The deadline never verifies
 underneath a decision that is still in flight for the last turn, and a repeated
 `wait` for the same turn re-arms the wait timer rather than being deduplicated.
-A zero grace window restores the immediate stop at the deadline. For an adopted
+A zero grace window restores the immediate stop at the deadline, and a manual
+task (no Decision Worker to drive a close-out) always behaves that way; a repair
+round is refused once less than a minute of the window is left, so the findings
+stay on a blocked candidate instead of being cut short by the stop. For an adopted
 interactive session the outright stop is a release (the adapter never kills a
 session it does not own), so the Claude process keeps running unsupervised; the
 close-out exists so that a task which merely ran long still ends with a verified
@@ -425,7 +428,9 @@ candidate instead of a silent hand-back. A record left behind by the outright
 stop (`recoverable_failure`, so `active/interrupted`) is not a dead end either:
 `recover --extend <duration>` re-persists a deadline measured from now
 (`extendedDeadlineMs`), `--extend 0` recovers straight into the close-out, and
-`discard` closes a record nobody will recover.
+`discard` closes a record nobody will recover — refused while the task's cwd
+lease exists, since a live owner means the task is running in another Pi and a
+dead owner's lease is reclaimed only through `recover --takeover`'s cleanup proof.
 Input writes are serialized with stop and are acknowledged through the stream
 write callback before their idempotency key is consumed. Writes have a bounded
 timeout, and `stop()` preempts a queued lifecycle operation by initiating adapter

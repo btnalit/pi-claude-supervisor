@@ -833,7 +833,20 @@ test("start accepts a per-task --deadline, rejects malformed or tiny ones, and s
     await command.handler("start --deadline soon task", context);
     assert.match(messages.at(-1) ?? "", /--deadline expects a duration/u);
     await command.handler("start --deadline 1m task", context);
-    assert.match(messages.at(-1) ?? "", /at least 5m/u);
+    assert.match(messages.at(-1) ?? "", /between 5m and 7d/u);
+    await command.handler("start --deadline 400d task", context);
+    assert.match(messages.at(-1) ?? "", /between 5m and 7d/u);
+    // Options may come in any order; a value never hides the option after it.
+    const specPath = join(cwd, "spec.json");
+    await writeFile(specPath, JSON.stringify({ goal: "UNIQUE_SPEC_GOAL", acceptance: [] }));
+    await command.handler(`start --deadline 8h --spec ${specPath} ignored text`, context);
+    assert.match(messages.at(-1) ?? "", /^Worker started:/u);
+    await command.handler("status", context);
+    assert.match(messages.at(-1) ?? "", /deadline=(?:8h|7h59m) left/u);
+    const started = (await readFile(join(stateDir, "events.jsonl"), "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line) as { type: string; data?: { spec?: { goal?: string } } })
+      .filter((event) => event.type === "task_started");
+    assert.equal(started.at(-1)?.data?.spec?.goal, "UNIQUE_SPEC_GOAL", "the spec after --deadline <value> is honored");
+    await command.handler("stop", context);
 
     await command.handler("start --deadline 8h implement the --deadline option", context);
     assert.match(messages.at(-1) ?? "", /^Worker started:/u);
@@ -930,6 +943,19 @@ test("an expired recoverable record is listed as expired, refused by recover wit
     assert.match(messages.at(-1) ?? "", /Cannot recover task after its wall-clock deadline \((?:1h|59m)[^)]* ago\); pass --extend <duration>/u);
     await command.handler(`recover --takeover --extend later ${taskId}`, context);
     assert.match(messages.at(-1) ?? "", /--extend expects a duration/u);
+    // --extend 0 is the close-out-now path: it must get past the deadline guard
+    // (and then fail here only because this record has no pinned executable).
+    await command.handler(`recover --takeover --extend 0 ${taskId}`, context);
+    assert.doesNotMatch(messages.at(-1) ?? "", /wall-clock deadline/u);
+    assert.match(messages.at(-1) ?? "", /automatic recovery requires a persisted resolved Claude executable identity/u);
+
+    // While this Pi holds the task's cwd lease, the record is somebody's live task.
+    const leaseStore = new CwdLeaseStore(leaseDir);
+    const lease = await leaseStore.acquire(cwd, taskId, "process-pipe");
+    await command.handler(`discard ${taskId}`, context);
+    assert.match(messages.at(-1) ?? "", new RegExp(`still owned by a live Pi \\(pid ${process.pid}\\)`, "u"));
+    assert.equal((await decisionStore.load(taskId))?.state, "active");
+    await lease.release();
 
     await command.handler("discard", context);
     assert.match(messages.at(-1) ?? "", /Usage: \/supervise discard <task-id>/u);

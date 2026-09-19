@@ -323,16 +323,24 @@ timeout. A completed turn or a permission request always requires a concrete act
 
 function deadlineInstructions(deadline: DecisionDeadlineContext | undefined): string {
   if (!deadline) return "";
-  return `Wall-clock budget: ${formatMinutes(deadline.totalMs)} for the whole task, then a ${formatMinutes(deadline.graceMs)} close-out window before the Supervisor stops the Worker.\n`;
+  const closeOut = deadline.graceMs > 0
+    ? `then a ${formatMinutes(deadline.graceMs)} close-out window before the Supervisor stops the Worker`
+    : "with no close-out window: the Supervisor stops the Worker at the deadline";
+  return `Wall-clock budget: ${formatMinutes(deadline.totalMs)} for the whole task, ${closeOut}.\n`;
 }
 
 function deadlinePolicy(deadline: DecisionDeadlineContext | undefined): string {
   if (!deadline) return "";
-  return `
+  const wrapUp = `
 Time budget: CURRENT CONTEXT reports deadlineRemainingMinutes. While it is small (roughly the
 length of one build-and-test cycle), stop waiting on long background work: use continue or
 redirect to tell Claude Code to integrate what is finished, run the required checks, commit,
-and stop, so the candidate can be verified before the deadline. Once closeOut is true the
+and stop, so the candidate can be verified before the deadline.`;
+  if (deadline.graceMs <= 0) {
+    return `${wrapUp} There is no close-out window: a Worker still running at the deadline is
+stopped outright, so choose verify as soon as the result is committed rather than waiting.`;
+  }
+  return `${wrapUp} Once closeOut is true the
 deadline has passed and only closeOutRemainingMinutes are left before the Worker is stopped:
 choose verify as soon as the Worker is idle, or one concise continue/redirect that tells it to
 commit what is complete and stop; wait is no longer available during close-out and an idle

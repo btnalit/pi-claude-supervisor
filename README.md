@@ -244,8 +244,11 @@ Supervisor being able to see it, or when you don't need to attach.
   honored, and a repair round tells the Worker how long it has left. Only when
   the close-out window has also elapsed is the Worker stopped outright
   (`worker_watchdog_timeout`), and on an adopted interactive session that stop
-  is a release: Claude keeps running, unsupervised. A 20-minute no-output
-  watchdog (`NO_OUTPUT_TIMEOUT_MS`) still stops a silent Worker at any time.
+  is a release: Claude keeps running, unsupervised. The close-out belongs to
+  automatic tasks; a manual task is stopped at the deadline as before, and
+  `DEADLINE_GRACE_MS=0` restores that for automatic ones too. A 20-minute
+  no-output watchdog (`NO_OUTPUT_TIMEOUT_MS`) still stops a silent Worker at
+  any time.
 - Acceptance checks, evidence collection, and the Reviewer share an abort
   signal, so a stop or shutdown does not wait for a full command or model
   timeout.
@@ -320,8 +323,8 @@ Environment variables (or `~/.config/pi-claude-supervisor/env`), all prefixed
 | `EVIDENCE_MAX_BYTES` | `1048576` (1 MiB) | Maximum repository evidence bytes collected per task |
 | `EVIDENCE_MAX_UNTRACKED_FILES` | `512` | Maximum untracked files collected as evidence per task |
 | `REVIEW_TIMEOUT_MS` | `600000` (10 min) | Total independent Reviewer budget per round, including one retry on a provider error |
-| `DEADLINE_MS` | `4h` | Cumulative wall-clock budget per task (`8h`, `90m`, `2h30m` or ms; 5m–7d); `0` disables it; `--deadline` overrides it per task |
-| `DEADLINE_GRACE_MS` | `30m` | Close-out window after the deadline: an idle Worker is verified instead of stopped; `0` restores the immediate stop |
+| `DEADLINE_MS` | `4h` | Cumulative wall-clock budget per task (`8h`, `90m`, `2h30m` or ms; 5m–7d); `0` (or `0m`) disables it; `--deadline` overrides it per task |
+| `DEADLINE_GRACE_MS` | `30m` | Close-out window after the deadline for automatic tasks: an idle Worker is verified instead of stopped; `0` restores the immediate stop |
 | `DEADLINE_WARNING_MS` | `15m` | How long before the deadline the Decision Worker is warned and re-asked; `0` disables the warning |
 | `NO_OUTPUT_TIMEOUT_MS` | `20m` | Stop a Worker that has produced no output for this long; `0` disables the check |
 | `EVENT_LOG_MAX_BYTES` | `67108864` (64 MiB) | Rotates `events.jsonl` at this size; 5 rotated files are kept |

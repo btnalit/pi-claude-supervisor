@@ -14,7 +14,7 @@ import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
 import { autoInstallHooks, autonomyDefaults, closeWorkerOnCompletion, deadlineGraceMs, deadlineMs, deadlineWarningMs, decisionCompactionTokens, decisionModel, decisionSessionRetentionDays, eventLogMaxBytes, formatDurationMs, loadSupervisorEnvironment, noOutputTimeoutMs, parseDurationMs, progressHeartbeatMs, reviewTimeoutMs, reviewerModel, tmuxMode, workerAutocompactTokens, workerMcpConfigPath, workerModel } from "./config.ts";
 import { DecisionSessionStore, type DecisionSessionRecord } from "./decision-session-store.ts";
-import { CwdLeaseStore, type CwdLeaseHandle, pathsOverlap, workerIdentity } from "./cwd-lease.ts";
+import { CwdLeaseStore, type CwdLeaseHandle, leaseOwnerLive, pathsOverlap, workerIdentity } from "./cwd-lease.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { PiReadOnlyReviewer } from "./reviewer.ts";
 import { resolvePiModel } from "./pi-model.ts";
@@ -645,7 +645,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           }
         } else if (operation === "recover") {
           const usage = "Usage: /supervise recover [--takeover] [--extend <duration>] <task-id>";
-          const extendOption = takeOption(rest, "--extend");
+          const extendOption = takeOption(rest, "--extend", ["--takeover"]);
           const takeover = rest.includes("--takeover");
           const taskId = rest.find((value) => value !== "--takeover");
           if (!taskId || rest.some((value) => value !== "--takeover" && value !== taskId)) throw new Error(usage);
@@ -665,7 +665,9 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           // from now (0 opens the close-out at once, verifying the repository as
           // it stands), which the recovered Supervisor persists as the deadline.
           const recoveryDeadlineMs = extendMs === undefined ? record.deadlineMs : extendedDeadlineMs(record.deadlineMs, elapsedMs, extendMs);
-          if (recoveryDeadlineMs > 0 && elapsedMs >= recoveryDeadlineMs) {
+          // With --extend the new deadline is measured from now by construction
+          // (`--extend 0` deliberately lands on it, so the close-out opens at once).
+          if (extendMs === undefined && recoveryDeadlineMs > 0 && elapsedMs >= recoveryDeadlineMs) {
             throw new Error(`Cannot recover task after its wall-clock deadline (${formatDurationMs(elapsedMs - recoveryDeadlineMs)} ago); pass --extend <duration> to grant a close-out budget from now, or /supervise discard ${taskId} to drop the record`);
           }
           const cwdKey = await canonicalCwd(record.cwd);
@@ -930,6 +932,16 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           // "starting"/"registered"/"recovered_idle" mean another Pi owns a
           // recovery of this task; only a settled record may be dropped here.
           if (!["ready", "interrupted"].includes(record.recoveryState)) throw new Error(`Decision Worker recovery is in progress elsewhere (${record.recoveryState}); discard only after that Pi has released it: ${taskId}`);
+          // The cwd lease is the ownership record: a live owner means the task
+          // is running in another Pi ("ready" is also its normal state); a dead
+          // owner's lease still guards the cwd against a possibly-live detached
+          // Worker and is only reclaimed through recover --takeover's cleanup
+          // proof, which needs this record. Neither may be discarded from here.
+          const lease = (await cwdLeaseStore.list()).find((candidate) => candidate.taskId === taskId);
+          if (lease) {
+            if (await leaseOwnerLive(lease)) throw new Error(`Task is still owned by a live Pi (pid ${lease.ownerPid}); stop it there instead of discarding it: ${taskId}`);
+            throw new Error(`Task still holds the cwd lease for ${redactText(lease.cwd)} (owner pid ${lease.ownerPid} is gone); run /supervise recover --takeover --extend 0 ${taskId} to prove the old Worker is gone and close the task out, then stop it if needed`);
+          }
           await decisionStore.close(taskId);
           message = `Discarded recoverable task ${taskId} (cwd ${redactText(record.cwd)}); its Decision Worker session file is kept until retention pruning`;
         } else if (operation === "sessions") {
@@ -1086,23 +1098,28 @@ function requiresWorkerCleanup(error: unknown): boolean {
 }
 
 /**
- * Remove a leading `--name value` or `--name=value` option and return its
- * value. Only the options ahead of the first positional argument count, so a
- * task description that mentions `--deadline` is left alone.
+ * Remove a `--name value` or `--name=value` option and return its value.
+ * `--name value` is recognised only in the leading option block (walking
+ * over other options and their values; `flags` take no value), so a task
+ * description that mentions `--deadline` is left alone; `--name=value` is
+ * accepted anywhere, as `--spec=` always was.
  */
-function takeOption(rest: string[], name: string): string | undefined {
+function takeOption(rest: string[], name: string, flags: readonly string[] = []): string | undefined {
   for (let index = 0; index < rest.length && rest[index].startsWith("--"); index += 1) {
     if (rest[index] === name) return rest.splice(index, 2)[1];
     if (rest[index].startsWith(`${name}=`)) return rest.splice(index, 1)[0]?.slice(name.length + 1);
+    // Another option: its value (when it has one and it is not inline) is the next token.
+    if (!flags.includes(rest[index]) && !rest[index].includes("=")) index += 1;
   }
-  return undefined;
+  const inline = rest.findIndex((value) => value.startsWith(`${name}=`));
+  return inline >= 0 ? rest.splice(inline, 1)[0]?.slice(name.length + 1) : undefined;
 }
 
-/** `--deadline` accepts `8h`, `90m`, `2h30m`, plain milliseconds, or `0` to disable the deadline for this task. */
+/** `--deadline` accepts `8h`, `90m`, `2h30m`, plain milliseconds, or `0` to disable the deadline for this task; the same 5m–7d range as `DEADLINE_MS`. */
 function parseTaskDeadline(value: string): number {
   const parsed = parseDurationMs(value);
   if (parsed === undefined) throw new Error(`--deadline expects a duration such as 8h, 90m or 0 (disabled): ${value}`);
-  if (parsed !== 0 && parsed < 5 * 60_000) throw new Error("--deadline must be at least 5m, or 0 to disable the deadline");
+  if (parsed !== 0 && (parsed < 5 * 60_000 || parsed > 7 * 24 * 60 * 60_000)) throw new Error("--deadline must be between 5m and 7d, or 0 to disable the deadline");
   return parsed;
 }
 

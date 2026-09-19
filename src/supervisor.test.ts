@@ -2886,29 +2886,189 @@ test("a busy Worker keeps its turn at the deadline and its completed turn is dec
   }
 });
 
-test("the Worker is stopped outright once the close-out window has also elapsed, immediately with no grace", async () => {
-  for (const graceMs of [1_000, 0]) {
+test("a manual task is stopped at its deadline whatever the grace: the close-out belongs to automation", async () => {
+  for (const graceMs of [60_000, 0]) {
     const fixture = closeOutFixture("/tmp");
     const events = new FlakyEventLog("never-fail");
-    const candidates: string[] = [];
-    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { onCandidate: (notice) => { candidates.push(notice.status); } });
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1]);
     await supervisor.start({
-      task: "hard stop",
+      task: "manual hard stop",
       cwd: "/tmp",
       command: "fixture",
-      startedAt: new Date(Date.now() - 2_500).toISOString(),
+      startedAt: new Date(Date.now() - 1_500).toISOString(),
       deadlineMs: 1_000,
       deadlineGraceMs: graceMs,
       deadlineWarningMs: 0,
       noOutputTimeoutMs: 0,
     });
+    assert.equal(supervisor.deadline?.graceMs, 0, `grace=${graceMs}: a manual task reports no close-out window`);
     await waitFor(() => supervisor.state === "stopped");
     const timeout = events.events.find((event) => event.type === "worker_watchdog_timeout");
     assert.equal(timeout?.data?.reason, "worker deadline exceeded", `grace=${graceMs}`);
-    assert.ok(events.events.some((event) => event.type === "worker_stopped"));
-    if (graceMs > 0) assert.ok(events.events.some((event) => event.type === "worker_deadline_reached"), "the deadline notice precedes the outright stop");
-    else assert.ok(!events.events.some((event) => event.type === "worker_deadline_reached"), "no close-out is announced when there is no grace window");
+    assert.ok(!events.events.some((event) => event.type === "worker_deadline_reached"), `grace=${graceMs}: no close-out is announced for a manual task`);
   }
+});
+
+test("an automatic Worker is stopped outright once the close-out window has also elapsed, with the deadline notice first", async () => {
+  const fixture = closeOutFixture(process.cwd());
+  fixture.state.activeRequests = 1;
+  const events = new FlakyEventLog("never-fail");
+  const candidates: string[] = [];
+  const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer(), onCandidate: (notice) => { candidates.push(notice.status); } });
+  await supervisor.start({
+    task: "hard stop after grace",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    spec: automaticSpec(),
+    startedAt: new Date(Date.now() - 2_500).toISOString(),
+    deadlineMs: 1_000,
+    deadlineGraceMs: 1_000,
+    deadlineWarningMs: 0,
+    noOutputTimeoutMs: 0,
+    decisionWorkerFactory: fixture.decisionWorkerFactory,
+  });
+  await waitFor(() => supervisor.state === "stopped");
+  const types = events.events.map((event) => event.type);
+  assert.ok(types.indexOf("worker_deadline_reached") >= 0 && types.indexOf("worker_deadline_reached") < types.indexOf("worker_watchdog_timeout"), "the deadline notice precedes the outright stop");
+  assert.equal(events.events.find((event) => event.type === "worker_watchdog_timeout")?.data?.reason, "worker deadline exceeded");
+  assert.deepEqual(candidates, ["failed"]);
+});
+
+test("with no grace window a wait right after the deadline is not turned into a close-out; the stop follows", async () => {
+  const fixture = closeOutFixture(process.cwd());
+  const events = new FlakyEventLog("never-fail");
+  const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "no grace, no close-out",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    spec: automaticSpec(),
+    startedAt: new Date(Date.now() - 1_200).toISOString(),
+    deadlineMs: 1_000,
+    deadlineGraceMs: 0,
+    deadlineWarningMs: 0,
+    noOutputTimeoutMs: 0,
+    decisionWorkerFactory: fixture.decisionWorkerFactory,
+  });
+  assert.equal(supervisor.deadline?.closeOut, false, "no grace window means no close-out state, even past the deadline");
+  const turn = fixture.turn(1);
+  fixture.state.listener?.(turn);
+  await supervisor.poll();
+  await fixture.state.onAction?.({ action: "wait", reason: "agents still running" }, turn);
+  assert.ok(!events.events.some((event) => event.type === "decision_overridden"));
+  assert.ok(!events.events.some((event) => event.type === "worker_deadline_reached"));
+  await waitFor(() => supervisor.state === "stopped");
+  assert.ok(!events.events.some((event) => event.type === "acceptance_started"));
+});
+
+test("a repair round that cannot finish inside the close-out window blocks the candidate instead", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-close-out-repair-"));
+  try {
+    await initializeGitRepository(cwd, "worker/close-out-repair");
+    const fixture = closeOutFixture(cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: string[] = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer(), onCandidate: (notice) => { candidates.push(notice.status); } });
+    await supervisor.start({
+      task: "close out with a failing check",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: {
+        ...automaticSpec(),
+        maxRepairRounds: 3,
+        acceptance: [{ id: "always-fails", name: "always fails", command: process.execPath, args: ["-e", "process.exit(1)"], required: true, timeoutMs: 30_000 }],
+      },
+      // Deadline passed 1.5s ago with a 30s window: under a minute left, so no repair can fit.
+      startedAt: new Date(Date.now() - 2_500).toISOString(),
+      deadlineMs: 1_000,
+      deadlineGraceMs: 30_000,
+      deadlineWarningMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    await waitFor(() => supervisor.state === "blocked");
+    const blocked = events.events.find((event) => event.type === "candidate_blocked");
+    assert.match(String(blocked?.data?.reason), /close-out window is exhausted/u);
+    assert.ok(!events.events.some((event) => event.type === "repair_requested"));
+    assert.deepEqual(fixture.state.sent, []);
+    assert.deepEqual(candidates, ["blocked"]);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a Decision Worker without replay support never leaves a decision pending, so the close-out still verifies", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-close-out-noreplay-"));
+  try {
+    await initializeGitRepository(cwd, "worker/close-out-noreplay");
+    const fixture = closeOutFixture(cwd);
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "no replay",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      startedAt: new Date(Date.now() - 500).toISOString(),
+      deadlineMs: 3_000,
+      deadlineGraceMs: 60_000,
+      deadlineWarningMs: 0,
+      noOutputTimeoutMs: 0,
+      waitTimeoutMs: 60,
+      decisionWorkerFactory: (options) => {
+        fixture.state.onAction = options.onAction;
+        return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} };
+      },
+    });
+    const turn = fixture.turn(1);
+    fixture.state.listener?.(turn);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "wait", reason: "agents still running" }, turn);
+    // The wait timer fires and finds nothing to replay to; that must not mark a decision pending.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await waitFor(() => supervisor.state === "completed");
+    assert.ok(events.events.some((event) => event.type === "deadline_close_out"));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a warning that fires while a decision is in flight is re-asked when that decision turns out to be a wait", async () => {
+  const fixture = closeOutFixture(process.cwd());
+  const events = new FlakyEventLog("never-fail");
+  const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "owed warning",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    spec: automaticSpec(),
+    startedAt: new Date(Date.now() - 1_500).toISOString(),
+    deadlineMs: 60_000,
+    deadlineGraceMs: 60_000,
+    deadlineWarningMs: 59_000,
+    noOutputTimeoutMs: 0,
+    waitTimeoutMs: 0,
+    decisionWorkerFactory: fixture.decisionWorkerFactory,
+  });
+  const turn = fixture.turn(1);
+  fixture.state.listener?.(turn);
+  await supervisor.poll();
+  // The decision for this turn is in flight when the warning fires: no replay yet.
+  await waitFor(() => events.events.some((event) => event.type === "worker_deadline_approaching"));
+  assert.equal(fixture.state.replays.length, 0);
+  // Its answer was made from a pre-warning clock: a wait is re-asked once with the current one.
+  await fixture.state.onAction?.({ action: "wait", reason: "made without the clock" }, turn);
+  assert.equal(fixture.state.replays.length, 1);
+  assert.equal(supervisor.state, "waiting");
+  // The re-asked wait is honored as an ordinary wait.
+  await fixture.state.onAction?.({ action: "wait", reason: "still waiting, knowingly" }, turn);
+  assert.equal(fixture.state.replays.length, 1);
+  await supervisor.stop("test complete");
 });
 
 test("the deadline warning re-asks the Decision Worker while the Worker idles under a wait, and a repeated wait re-arms", async () => {
