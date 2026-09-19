@@ -220,8 +220,9 @@ function readBoundedIntegerWithZeroOptOut(value: string | undefined, fallback: n
 /** Like readBoundedIntegerWithZeroOptOut, but also accepts a duration suffix (`8h`, `90m`); out-of-range values keep the fallback. */
 function readBoundedDurationWithZeroOptOut(value: string | undefined, fallback: number, minimum: number, maximum: number): number {
   if (value === undefined) return fallback;
-  if (value.trim() === "0") return 0;
   const parsed = parseDurationMs(value);
+  // "0", "0m", "0h": any zero duration is the opt-out, not a below-minimum typo.
+  if (parsed === 0) return 0;
   return parsed !== undefined && parsed >= minimum && parsed <= maximum ? parsed : fallback;
 }
 

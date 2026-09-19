@@ -137,6 +137,8 @@ test("deadline budgets default, accept durations and honor the zero opt-out", ()
   assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "8h" }), 8 * 60 * 60_000);
   assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "28800000" }), 8 * 60 * 60_000);
   assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "0" }), 0);
+  assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "0h" }), 0, "any zero duration is the opt-out");
+  assert.equal(deadlineGraceMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_GRACE_MS: "0m" }), 0);
   assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "1m" }), 4 * 60 * 60_000, "below the 5-minute floor keeps the default");
   assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "8d" }), 4 * 60 * 60_000, "above the 7-day ceiling keeps the default");
   assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "soon" }), 4 * 60 * 60_000);

@@ -201,7 +201,9 @@ stream-json` 的方式运行 Claude,完全没有终端界面;一旦设置
   验收和 review 而不是被停止,`wait` 决策不再生效,修复轮会告诉 Worker 还剩多少
   时间。只有收尾窗口也耗尽,Worker 才会被硬停(`worker_watchdog_timeout`);对
   接管的交互式会话来说这个硬停只是 release:Claude 继续运行,但不再受监督。
-  20 分钟无输出 watchdog(`NO_OUTPUT_TIMEOUT_MS`)随时会停止沉默的 Worker。
+  收尾窗口只属于自动模式任务;手动任务仍在到期时停止,`DEADLINE_GRACE_MS=0`
+  让自动任务也恢复这一行为。20 分钟无输出 watchdog(`NO_OUTPUT_TIMEOUT_MS`)
+  随时会停止沉默的 Worker。
 - 验收命令、证据收集和 Reviewer 共用一个 abort signal,因此 stop 或 shutdown
   不必等待完整的命令或模型超时。
 - 每个任务只持有一个 cwd 租约;并发任务需要各自独立的 worktree。
@@ -273,8 +275,8 @@ stream-json` 的方式运行 Claude,完全没有终端界面;一旦设置
 | `EVIDENCE_MAX_BYTES` | `1048576`(1 MiB) | 每个任务收集的最大仓库证据字节数 |
 | `EVIDENCE_MAX_UNTRACKED_FILES` | `512` | 每个任务作为证据收集的最大未跟踪文件数 |
 | `REVIEW_TIMEOUT_MS` | `600000`(10 分钟) | 每轮独立 Reviewer 的总预算,含一次针对 provider 错误的重试 |
-| `DEADLINE_MS` | `4h` | 每个任务的累计总时限(`8h`、`90m`、`2h30m` 或毫秒;5 分钟到 7 天);`0` 关闭;`--deadline` 可按任务覆盖 |
-| `DEADLINE_GRACE_MS` | `30m` | 到期后的收尾窗口:空闲的 Worker 会被验收而不是停止;`0` 恢复到期立即停止 |
+| `DEADLINE_MS` | `4h` | 每个任务的累计总时限(`8h`、`90m`、`2h30m` 或毫秒;5 分钟到 7 天);`0`(或 `0m`)关闭;`--deadline` 可按任务覆盖 |
+| `DEADLINE_GRACE_MS` | `30m` | 自动任务到期后的收尾窗口:空闲的 Worker 会被验收而不是停止;`0` 恢复到期立即停止 |
 | `DEADLINE_WARNING_MS` | `15m` | 到期前多久提醒并重新询问 Decision Worker;`0` 关闭提醒 |
 | `NO_OUTPUT_TIMEOUT_MS` | `20m` | Worker 多久没有输出就停止;`0` 关闭该检查 |
 | `EVENT_LOG_MAX_BYTES` | `67108864`(64 MiB) | `events.jsonl` 达到该大小后滚动,保留 5 份滚动文件 |

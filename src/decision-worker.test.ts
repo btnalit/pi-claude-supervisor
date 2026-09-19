@@ -517,3 +517,17 @@ test("without a deadline the prompts carry no time budget at all", async () => {
   assert.doesNotMatch(prompts[promptsAfterStart]!, /deadlineRemainingMinutes|closeOut/u);
   await worker.close();
 });
+
+test("with no close-out window the instructions say the Worker is stopped at the deadline", async () => {
+  const { session, prompts } = createFakeSession([{ stopReason: "stop", text: "ack" }]);
+  const worker = new PiDecisionWorker(baseOptions({
+    onAction: () => {},
+    sessionFactory: async () => ({ session }),
+    context: { ...baseOptions().context, deadline: { totalMs: 2 * 60 * 60_000, graceMs: 0, remainingMs: 60 * 60_000, closeOut: false } },
+  }));
+  await worker.start();
+  assert.match(prompts[0]!, /Wall-clock budget: 2 hours for the whole task, with no close-out window: the Supervisor stops the Worker at the deadline/u);
+  assert.match(prompts[0]!, /There is no close-out window/u);
+  assert.doesNotMatch(prompts[0]!, /Once closeOut is true/u);
+  await worker.close();
+});
