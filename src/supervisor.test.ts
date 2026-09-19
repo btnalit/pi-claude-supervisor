@@ -2703,3 +2703,284 @@ test("a completed interactive task with keepWorkerOnCompletion releases instead 
   assert.equal(killProcessGroupCalls, 1);
   assert.equal(stopCalls, 0);
 });
+
+/**
+ * A persistent, adopted-style Worker whose stop is a release: the process
+ * keeps running after the Supervisor lets go, exactly like an adopted
+ * interactive tmux session. `activeRequests` models whether Claude is mid-turn.
+ */
+function closeOutFixture(cwd: string) {
+  const handle: WorkerHandle = { id: "close-out-worker", startedAt: new Date().toISOString(), cwd, ownership: "adopted" };
+  const state = { activeRequests: 0, released: false, stopReasons: [] as string[], sent: [] as string[], replays: [] as WorkerEvent[], contexts: [] as Array<Record<string, unknown>>, listener: undefined as WorkerStartInput["eventListener"], onAction: undefined as Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined };
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true, repairableSession: true }),
+    start: async (input) => { state.listener = input.eventListener; return handle; },
+    // Like the tmux adapter's release of an adopted session: the Worker keeps
+    // running, and the Supervisor's own cleanup obligations are what "cleaned" reports.
+    getStatus: async () => ({ handle, running: true, activeRequests: state.activeRequests, processGroupCleaned: state.released }),
+    readOutput: async () => [],
+    send: async (_handle, message) => { state.sent.push(message); },
+    pause: async () => {},
+    resume: async () => {},
+    stop: async (_handle, reason) => { state.released = true; state.stopReasons.push(reason); },
+    release: async (_handle, reason) => { state.released = true; state.stopReasons.push(`release: ${reason}`); },
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+  };
+  const decisionWorkerFactory: DecisionWorkerFactory = (options) => {
+    state.onAction = options.onAction;
+    return {
+      start: async () => {},
+      updateContext: (patch) => { state.contexts.push(patch as Record<string, unknown>); },
+      notify: () => {},
+      replay: (event) => { state.replays.push(event); },
+      close: async () => {},
+    };
+  };
+  const turn = (sequence: number): WorkerEvent => ({ type: "turn_completed", handle, result: { subtype: "stop", result: "background agents still running" }, sequence });
+  return { handle, adapter, state, decisionWorkerFactory, turn };
+}
+
+async function waitFor(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("condition not met in time");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+test("the deadline opens a close-out that verifies an idle Worker instead of stopping it", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-close-out-idle-"));
+  try {
+    await initializeGitRepository(cwd, "worker/close-out-idle");
+    const fixture = closeOutFixture(cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: string[] = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push(notice.status); },
+    });
+    await supervisor.start({
+      task: "close out at the deadline",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      // The deadline lands a couple of seconds from now; the close-out window is wide open.
+      startedAt: new Date(Date.now() - 500).toISOString(),
+      deadlineMs: 3_000,
+      deadlineGraceMs: 60_000,
+      deadlineWarningMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    assert.equal(supervisor.deadline?.closeOut, false);
+    assert.ok((supervisor.deadline?.remainingMs ?? 0) > 0);
+    const turn = fixture.turn(1);
+    fixture.state.listener?.(turn);
+    await supervisor.poll();
+    assert.equal(supervisor.state, "waiting");
+    // Decided before the deadline: an ordinary wait, nothing is sent.
+    await fixture.state.onAction?.({ action: "wait", reason: "agents are still running" }, turn);
+    assert.equal(supervisor.state, "waiting");
+    await waitFor(() => supervisor.state === "completed");
+    assert.equal(supervisor.deadline?.closeOut, true);
+    assert.equal(supervisor.deadline?.remainingMs, 0);
+    const types = events.events.map((event) => event.type);
+    assert.ok(types.includes("worker_deadline_reached"));
+    assert.ok(types.includes("deadline_close_out"));
+    assert.ok(types.includes("verification_passed"));
+    assert.ok(!types.includes("worker_watchdog_timeout"), "the close-out must not be reported as a watchdog stop");
+    assert.ok(!types.includes("candidate_failed"));
+    assert.deepEqual(candidates, ["ready"]);
+    const reached = events.events.find((event) => event.type === "worker_deadline_reached");
+    assert.equal(reached?.data?.deadlineMs, 3_000);
+    assert.equal(reached?.data?.graceMs, 60_000);
+    assert.equal(fixture.state.stopReasons.at(-1), "verification passed");
+    assert.ok(fixture.state.contexts.some((patch) => (patch.deadline as { closeOut?: boolean } | undefined)?.closeOut === true), "the Decision Worker sees the close-out");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a wait decision during close-out is overridden into verification, and never underneath an in-flight decision", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-close-out-wait-"));
+  try {
+    await initializeGitRepository(cwd, "worker/close-out-wait");
+    const fixture = closeOutFixture(cwd);
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "close out overrides wait",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      startedAt: new Date(Date.now() - 3_000).toISOString(),
+      deadlineMs: 2_000,
+      deadlineGraceMs: 60_000,
+      deadlineWarningMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const turn = fixture.turn(1);
+    fixture.state.listener?.(turn);
+    await supervisor.poll();
+    assert.equal(supervisor.state, "waiting");
+    // The decision for this turn is still in flight: the watchdog records the
+    // deadline but leaves the next step to that decision.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    assert.equal(supervisor.state, "waiting");
+    assert.ok(events.events.some((event) => event.type === "worker_deadline_reached"));
+    assert.ok(!events.events.some((event) => event.type === "deadline_close_out"));
+    await fixture.state.onAction?.({ action: "wait", reason: "still waiting on agents" }, turn);
+    assert.equal(supervisor.state, "completed");
+    const overridden = events.events.find((event) => event.type === "decision_overridden");
+    assert.equal(overridden?.data?.action, "wait");
+    assert.equal(overridden?.data?.override, "verify");
+    assert.ok(events.events.some((event) => event.type === "verification_passed"));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a busy Worker keeps its turn at the deadline and its completed turn is decided under close-out", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-close-out-busy-"));
+  try {
+    await initializeGitRepository(cwd, "worker/close-out-busy");
+    const fixture = closeOutFixture(cwd);
+    fixture.state.activeRequests = 1;
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "close out waits for the turn",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      startedAt: new Date(Date.now() - 3_000).toISOString(),
+      deadlineMs: 2_000,
+      deadlineGraceMs: 60_000,
+      deadlineWarningMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    await waitFor(() => events.events.some((event) => event.type === "worker_deadline_reached"));
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    assert.equal(supervisor.state, "running", "a Worker mid-turn is neither verified nor stopped inside the grace window");
+    assert.ok(!events.events.some((event) => event.type === "deadline_close_out"));
+    assert.deepEqual(fixture.state.sent, []);
+    // The turn ends: the Decision Worker is asked with closeOut in its context.
+    fixture.state.activeRequests = 0;
+    const turn = fixture.turn(1);
+    fixture.state.listener?.(turn);
+    await supervisor.poll();
+    assert.equal(supervisor.state, "waiting");
+    const latest = fixture.state.contexts.at(-1)?.deadline as { closeOut?: boolean; closeOutRemainingMs?: number } | undefined;
+    assert.equal(latest?.closeOut, true);
+    assert.ok((latest?.closeOutRemainingMs ?? 0) > 0);
+    await fixture.state.onAction?.({ action: "verify", reason: "the Worker reported completion" }, turn);
+    assert.equal(supervisor.state, "completed");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("the Worker is stopped outright once the close-out window has also elapsed, immediately with no grace", async () => {
+  for (const graceMs of [1_000, 0]) {
+    const fixture = closeOutFixture("/tmp");
+    const events = new FlakyEventLog("never-fail");
+    const candidates: string[] = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { onCandidate: (notice) => { candidates.push(notice.status); } });
+    await supervisor.start({
+      task: "hard stop",
+      cwd: "/tmp",
+      command: "fixture",
+      startedAt: new Date(Date.now() - 2_500).toISOString(),
+      deadlineMs: 1_000,
+      deadlineGraceMs: graceMs,
+      deadlineWarningMs: 0,
+      noOutputTimeoutMs: 0,
+    });
+    await waitFor(() => supervisor.state === "stopped");
+    const timeout = events.events.find((event) => event.type === "worker_watchdog_timeout");
+    assert.equal(timeout?.data?.reason, "worker deadline exceeded", `grace=${graceMs}`);
+    assert.ok(events.events.some((event) => event.type === "worker_stopped"));
+    if (graceMs > 0) assert.ok(events.events.some((event) => event.type === "worker_deadline_reached"), "the deadline notice precedes the outright stop");
+    else assert.ok(!events.events.some((event) => event.type === "worker_deadline_reached"), "no close-out is announced when there is no grace window");
+  }
+});
+
+test("the deadline warning re-asks the Decision Worker while the Worker idles under a wait, and a repeated wait re-arms", async () => {
+  const fixture = closeOutFixture(process.cwd());
+  const events = new FlakyEventLog("never-fail");
+  const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "deadline warning",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    spec: automaticSpec(),
+    startedAt: new Date(Date.now() - 1_500).toISOString(),
+    deadlineMs: 60_000,
+    deadlineGraceMs: 60_000,
+    deadlineWarningMs: 59_000,
+    noOutputTimeoutMs: 0,
+    waitTimeoutMs: 0,
+    decisionWorkerFactory: fixture.decisionWorkerFactory,
+  });
+  const turn = fixture.turn(1);
+  fixture.state.listener?.(turn);
+  await supervisor.poll();
+  await fixture.state.onAction?.({ action: "wait", reason: "agents still running" }, turn);
+  await waitFor(() => fixture.state.replays.length === 1);
+  const warning = events.events.find((event) => event.type === "worker_deadline_approaching");
+  assert.ok(warning);
+  assert.ok((warning?.data?.remainingMs as number) > 0 && (warning?.data?.remainingMs as number) <= 59_000);
+  const latest = fixture.state.contexts.at(-1)?.deadline as { closeOut?: boolean; remainingMs?: number } | undefined;
+  assert.equal(latest?.closeOut, false);
+  assert.ok((latest?.remainingMs ?? 0) > 0);
+  assert.equal(supervisor.state, "waiting", "a warning never verifies or stops anything by itself");
+  // The re-asked decision may still be `wait`: it is applied again, not
+  // silently deduped, so the wait timer is re-armed each time.
+  await fixture.state.onAction?.({ action: "wait", reason: "still waiting" }, turn);
+  assert.equal(events.events.filter((event) => event.type === "decision_made" && event.data?.action === "wait").length, 2);
+  // The warning is emitted once per task.
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  assert.equal(events.events.filter((event) => event.type === "worker_deadline_approaching").length, 1);
+  assert.equal(fixture.state.replays.length, 1);
+  await supervisor.stop("test complete");
+});
+
+test("an idle adopted Worker that never completed a turn is still classified and verified at the deadline", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-close-out-unpolled-"));
+  try {
+    await initializeGitRepository(cwd, "worker/close-out-unpolled");
+    const fixture = closeOutFixture(cwd);
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "close out an unpolled Worker",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      startedAt: new Date(Date.now() - 3_000).toISOString(),
+      deadlineMs: 2_000,
+      deadlineGraceMs: 60_000,
+      deadlineWarningMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    // No turn, no poll: the Supervisor still believes the Worker is running.
+    assert.equal(supervisor.state, "running");
+    await waitFor(() => supervisor.state === "completed");
+    const types = events.events.map((event) => event.type);
+    assert.ok(types.includes("worker_waiting"));
+    assert.ok(types.includes("deadline_close_out"));
+    assert.ok(types.includes("verification_passed"));
+    assert.ok(!types.includes("worker_watchdog_timeout"));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});

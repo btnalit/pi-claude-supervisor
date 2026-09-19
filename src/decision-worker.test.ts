@@ -466,3 +466,54 @@ test("model option reaches the session factory", async () => {
   assert.equal(capturedModel, fakeModel);
   await worker.close();
 });
+
+test("the deadline reaches the startup instructions and every event prompt in minutes", async () => {
+  const { session, prompts } = createFakeSession([
+    { stopReason: "stop", text: "ack" },
+    { stopReason: "stop", text: JSON.stringify({ action: "wait", reason: "x" }) },
+    { stopReason: "stop", text: JSON.stringify({ action: "verify", reason: "y" }) },
+  ]);
+  const worker = new PiDecisionWorker(baseOptions({
+    onAction: () => {},
+    sessionFactory: async () => ({ session }),
+    context: {
+      ...baseOptions().context,
+      deadline: { totalMs: 4 * 60 * 60_000, graceMs: 30 * 60_000, remainingMs: 6.4 * 60_000, closeOut: false },
+    },
+  }));
+  await worker.start();
+  const instructions = prompts[0]!;
+  assert.match(instructions, /Wall-clock budget: 4 hours for the whole task, then a 30 minutes close-out window/u);
+  assert.match(instructions, /wait is no longer available during close-out/u);
+  const promptsAfterStart = prompts.length;
+  worker.notify(turnCompletedEvent(1));
+  while (prompts.length === promptsAfterStart) await flush();
+  const beforeDeadline = prompts[promptsAfterStart]!;
+  assert.match(beforeDeadline, /"deadlineRemainingMinutes": 6\b/u);
+  assert.match(beforeDeadline, /"closeOut": false/u);
+  assert.doesNotMatch(beforeDeadline, /closeOutRemainingMinutes/u);
+  // The Supervisor refreshes the clock before each notification; close-out adds the remaining grace.
+  worker.updateContext({ deadline: { totalMs: 4 * 60 * 60_000, graceMs: 30 * 60_000, remainingMs: 0, closeOut: true, closeOutRemainingMs: 24 * 60_000 } });
+  worker.notify(turnCompletedEvent(2));
+  while (prompts.length === promptsAfterStart + 1) await flush();
+  const duringCloseOut = prompts[promptsAfterStart + 1]!;
+  assert.match(duringCloseOut, /"deadlineRemainingMinutes": 0\b/u);
+  assert.match(duringCloseOut, /"closeOut": true/u);
+  assert.match(duringCloseOut, /"closeOutRemainingMinutes": 24\b/u);
+  await worker.close();
+});
+
+test("without a deadline the prompts carry no time budget at all", async () => {
+  const { session, prompts } = createFakeSession([
+    { stopReason: "stop", text: "ack" },
+    { stopReason: "stop", text: JSON.stringify({ action: "verify", reason: "y" }) },
+  ]);
+  const worker = new PiDecisionWorker(baseOptions({ onAction: () => {}, sessionFactory: async () => ({ session }) }));
+  await worker.start();
+  assert.doesNotMatch(prompts[0]!, /Wall-clock budget|Time budget/u);
+  const promptsAfterStart = prompts.length;
+  worker.notify(turnCompletedEvent(1));
+  while (prompts.length === promptsAfterStart) await flush();
+  assert.doesNotMatch(prompts[promptsAfterStart]!, /deadlineRemainingMinutes|closeOut/u);
+  await worker.close();
+});

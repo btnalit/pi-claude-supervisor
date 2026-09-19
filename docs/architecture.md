@@ -401,6 +401,27 @@ not. JSONL sends are rejected while a request is active, and a valid terminal
 result moves the session to `waiting`; only then may the next turn be sent. A paused
 Worker does not consume its no-output budget; resume establishes a fresh no-output
 baseline while the cumulative wall-clock deadline remains active.
+
+The wall-clock deadline is a budget, not a kill switch. The watchdog drives it
+through three phases, each recorded once per task: `worker_deadline_approaching`
+(`deadlineWarningMs` before the deadline) refreshes the Decision Worker's clock
+(`deadline.remainingMs` in its context and `deadlineRemainingMinutes` in every
+event prompt) and, if the Worker idles under a `wait`, replays the last completed
+turn so the Decision Worker can steer the Worker to integrate, commit and stop;
+`worker_deadline_reached` opens the close-out window (`deadlineGraceMs`), during
+which an idle automatic Worker is verified at once (`deadline_close_out`), a
+`wait` decision on an idle Worker is applied as verify (`decision_overridden`), a
+Worker mid-turn keeps its turn and its completed turn is decided with
+`closeOut: true`, and a repair round tells the Worker how much of the window
+remains; `worker_watchdog_timeout` (`worker deadline exceeded`) stops the Worker
+only once the close-out window has also elapsed. The deadline never verifies
+underneath a decision that is still in flight for the last turn, and a repeated
+`wait` for the same turn re-arms the wait timer rather than being deduplicated.
+A zero grace window restores the immediate stop at the deadline. For an adopted
+interactive session the outright stop is a release (the adapter never kills a
+session it does not own), so the Claude process keeps running unsupervised; the
+close-out exists so that a task which merely ran long still ends with a verified
+candidate instead of a silent hand-back.
 Input writes are serialized with stop and are acknowledged through the stream
 write callback before their idempotency key is consumed. Writes have a bounded
 timeout, and `stop()` preempts a queued lifecycle operation by initiating adapter

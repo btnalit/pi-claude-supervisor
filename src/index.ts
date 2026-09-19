@@ -12,7 +12,7 @@ import { TmuxWorkerAdapter, attachCommand, sweepDeadTmuxSockets } from "./worker
 import { Supervisor, type DecisionSessionClosedInfo, type HumanInterventionNotice, type SupervisorProgress, type SupervisorTokenUsage } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
-import { autoInstallHooks, autonomyDefaults, closeWorkerOnCompletion, decisionCompactionTokens, decisionModel, decisionSessionRetentionDays, eventLogMaxBytes, loadSupervisorEnvironment, progressHeartbeatMs, reviewTimeoutMs, reviewerModel, tmuxMode, workerAutocompactTokens, workerMcpConfigPath, workerModel } from "./config.ts";
+import { autoInstallHooks, autonomyDefaults, closeWorkerOnCompletion, deadlineGraceMs, deadlineMs, deadlineWarningMs, decisionCompactionTokens, decisionModel, decisionSessionRetentionDays, eventLogMaxBytes, formatDurationMs, loadSupervisorEnvironment, noOutputTimeoutMs, parseDurationMs, progressHeartbeatMs, reviewTimeoutMs, reviewerModel, tmuxMode, workerAutocompactTokens, workerMcpConfigPath, workerModel } from "./config.ts";
 import { DecisionSessionStore, type DecisionSessionRecord } from "./decision-session-store.ts";
 import { CwdLeaseStore, type CwdLeaseHandle, pathsOverlap, workerIdentity } from "./cwd-lease.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
@@ -369,12 +369,9 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         const [operation = "status", ...rest] = tokens;
         let message = "";
         if (operation === "start" || operation === "adopt-tmux") {
-          let specPath: string | undefined;
-          if (rest[0] === "--spec") specPath = rest.splice(0, 2)[1];
-          else {
-            const specIndex = rest.findIndex((value) => value.startsWith("--spec="));
-            if (specIndex >= 0) specPath = rest.splice(specIndex, 1)[0]?.slice("--spec=".length);
-          }
+          const specPath = takeOption(rest, "--spec");
+          const deadlineOption = takeOption(rest, "--deadline");
+          const taskDeadlineMs = deadlineOption === undefined ? deadlineMs() : parseTaskDeadline(deadlineOption);
           const tmuxSession = operation === "adopt-tmux" ? rest.shift() : undefined;
           const task = rest.join(" ").trim();
           const fileSpec = specPath ? await readTaskSpecFile(specPath, ctx.cwd) : undefined;
@@ -387,7 +384,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           // own events through hooks exactly like an owned one.
           const taskAutomation = (operation !== "adopt-tmux" || tmuxMode() === "interactive") && automation && spec.autonomy.unattended;
           const interactive = taskAutomation && adapter.capabilities().transport === "tmux" && tmuxMode() === "interactive";
-          if (!goal) throw new Error(operation === "adopt-tmux" ? "Usage: /supervise adopt-tmux [--spec <file>] <tmux-session> <task>" : "Usage: /supervise start [--spec <file>] <task>");
+          if (!goal) throw new Error(operation === "adopt-tmux" ? "Usage: /supervise adopt-tmux [--spec <file>] [--deadline <duration>] <tmux-session> <task>" : "Usage: /supervise start [--spec <file>] [--deadline <duration>] <task>");
           if (operation === "adopt-tmux" && adapter.capabilities().transport !== "tmux") throw new Error("/supervise adopt-tmux requires PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux");
           if (operation === "adopt-tmux" && interactive && !await userHooksInstalled(claudeUserSettingsPath())) {
             await hookServerReady?.catch(() => {});
@@ -458,6 +455,10 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 approval,
                 automation: taskAutomation,
                 interactive,
+                deadlineMs: taskDeadlineMs,
+                deadlineGraceMs: deadlineGraceMs(),
+                deadlineWarningMs: deadlineWarningMs(),
+                noOutputTimeoutMs: noOutputTimeoutMs(),
                 hookSource: interactive ? hookServer : undefined,
                 hookSettingsPath,
                 keepWorkerOnCompletion: interactive ? !closeWorkerOnCompletion() : undefined,
@@ -787,6 +788,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 ...(automaticRecovery && record.resolvedExecutable ? { expectedClaudeExecutable: record.resolvedExecutable } : {}),
                 maxTurns: record.maxTurns,
                 deadlineMs: record.deadlineMs,
+                deadlineGraceMs: deadlineGraceMs(),
+                deadlineWarningMs: deadlineWarningMs(),
                 noOutputTimeoutMs: record.noOutputTimeoutMs,
                 startedAt: record.startedAt,
                 baseCommit: record.baseCommit,
@@ -916,7 +919,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         } else if (operation === "status") {
           const { session, sessionId } = resolveSession(sessions, activeTaskId, rest, true);
           message = session
-            ? `task=${sessionId} state=${session.state} worker=${session.handle?.id ?? "none"}${tmuxModeLabel() ? ` mode=${tmuxModeLabel()}` : ""} ${formatUsageDetail(session.usage)}`
+            ? `task=${sessionId} state=${session.state} worker=${session.handle?.id ?? "none"}${tmuxModeLabel() ? ` mode=${tmuxModeLabel()}` : ""}${formatDeadline(session.deadline)} ${formatUsageDetail(session.usage)}`
             : formatSessions(sessions, await decisionStore.list({ activeOnly: true }), tmuxModeLabel());
         } else if (operation === "capabilities") {
           message = JSON.stringify(adapter.capabilities(), null, 2);
@@ -966,7 +969,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           } else if (operation === "resume-auto") {
             await session.resumeAutomation(); message = `Automatic decisions resumed: ${sessionId}.`;
           } else {
-            throw new Error("Usage: /supervise start|adopt-tmux|recover [--takeover]|sessions|status|poll [all|taskId]|send [taskId]|pause [taskId]|resume [taskId]|stop [taskId]|verify [taskId]|approve [taskId] <allow|deny>|takeover [taskId]|resume-auto [taskId]|capabilities|install-hooks|uninstall-hooks");
+            throw new Error("Usage: /supervise start [--spec <file>] [--deadline <duration>]|adopt-tmux [--spec <file>] [--deadline <duration>]|recover [--takeover]|sessions|status|poll [all|taskId]|send [taskId]|pause [taskId]|resume [taskId]|stop [taskId]|verify [taskId]|approve [taskId] <allow|deny>|takeover [taskId]|resume-auto [taskId]|capabilities|install-hooks|uninstall-hooks");
           }
         }
         if (hookInstallNotice) { notify(ctx, hookInstallNotice); hookInstallNotice = undefined; }
@@ -1057,6 +1060,33 @@ async function canonicalCwd(cwd: string): Promise<string> {
 
 function requiresWorkerCleanup(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && (error as { workerCleanupRequired?: unknown }).workerCleanupRequired === true);
+}
+
+/**
+ * Remove a leading `--name value` or `--name=value` option and return its
+ * value. Only the options ahead of the first positional argument count, so a
+ * task description that mentions `--deadline` is left alone.
+ */
+function takeOption(rest: string[], name: string): string | undefined {
+  for (let index = 0; index < rest.length && rest[index].startsWith("--"); index += 1) {
+    if (rest[index] === name) return rest.splice(index, 2)[1];
+    if (rest[index].startsWith(`${name}=`)) return rest.splice(index, 1)[0]?.slice(name.length + 1);
+  }
+  return undefined;
+}
+
+/** `--deadline` accepts `8h`, `90m`, `2h30m`, plain milliseconds, or `0` to disable the deadline for this task. */
+function parseTaskDeadline(value: string): number {
+  const parsed = parseDurationMs(value);
+  if (parsed === undefined) throw new Error(`--deadline expects a duration such as 8h, 90m or 0 (disabled): ${value}`);
+  if (parsed !== 0 && parsed < 5 * 60_000) throw new Error("--deadline must be at least 5m, or 0 to disable the deadline");
+  return parsed;
+}
+
+function formatDeadline(deadline: Supervisor["deadline"]): string {
+  if (!deadline) return "";
+  if (!deadline.closeOut) return ` deadline=${formatDurationMs(deadline.remainingMs)} left`;
+  return ` deadline=close-out (${formatDurationMs(deadline.closeOutRemainingMs ?? 0)} left)`;
 }
 
 function formatSessions(sessions: Map<string, Supervisor>, recoverable: DecisionSessionRecord[] = [], tmuxModeLabel?: string): string {

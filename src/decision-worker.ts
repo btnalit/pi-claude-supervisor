@@ -26,6 +26,21 @@ export interface DecisionContext {
   maxTurns: number;
   repairRound?: number;
   spec?: TaskSpec;
+  /** Wall-clock budget of the task; absent when no deadline is configured. */
+  deadline?: DecisionDeadlineContext;
+}
+
+export interface DecisionDeadlineContext {
+  /** Cumulative wall-clock budget for the task's Worker turns. */
+  totalMs: number;
+  /** Close-out window after the deadline before the Supervisor stops the Worker; 0 means the stop is immediate. */
+  graceMs: number;
+  /** Time left before the deadline; 0 once it has passed. */
+  remainingMs: number;
+  /** True once the deadline has passed and the task is in its close-out window. */
+  closeOut: boolean;
+  /** During close-out: time left before the Supervisor stops the Worker outright. */
+  closeOutRemainingMs?: number;
 }
 
 export interface DecisionWorkerLike {
@@ -277,7 +292,7 @@ Task id: ${redactText(context.taskId)}
 Working directory: ${redactText(context.cwd)}
 Maximum automatic turns: ${context.maxTurns}
 Current repair round: ${context.repairRound ?? 0}
-Task specification: ${boundedJson(context.spec ?? { goal: context.task })}
+${deadlineInstructions(context.deadline)}Task specification: ${boundedJson(context.spec ?? { goal: context.task })}
 
 Return exactly one JSON object and no markdown:
 {"action":"continue|redirect|answer|allow_permission|deny_permission|verify|retry|stop|park|wait|noop",...}
@@ -303,7 +318,31 @@ wait for a human to be online. For an exited event choose verify, park or stop; 
 verify. Choose wait when the Worker's result says it is waiting for its own background agents,
 tasks or monitors: their completion re-invokes the Worker automatically, a message would only
 interrupt it, and the Supervisor asks you again if the Worker has not resumed within the wait
-timeout. A completed turn or a permission request always requires a concrete action.`;
+timeout. A completed turn or a permission request always requires a concrete action.${deadlinePolicy(context.deadline)}`;
+}
+
+function deadlineInstructions(deadline: DecisionDeadlineContext | undefined): string {
+  if (!deadline) return "";
+  return `Wall-clock budget: ${formatMinutes(deadline.totalMs)} for the whole task, then a ${formatMinutes(deadline.graceMs)} close-out window before the Supervisor stops the Worker.\n`;
+}
+
+function deadlinePolicy(deadline: DecisionDeadlineContext | undefined): string {
+  if (!deadline) return "";
+  return `
+Time budget: CURRENT CONTEXT reports deadlineRemainingMinutes. While it is small (roughly the
+length of one build-and-test cycle), stop waiting on long background work: use continue or
+redirect to tell Claude Code to integrate what is finished, run the required checks, commit,
+and stop, so the candidate can be verified before the deadline. Once closeOut is true the
+deadline has passed and only closeOutRemainingMinutes are left before the Worker is stopped:
+choose verify as soon as the Worker is idle, or one concise continue/redirect that tells it to
+commit what is complete and stop; wait is no longer available during close-out and an idle
+Worker is verified instead.`;
+}
+
+function formatMinutes(ms: number): string {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes >= 120 && minutes % 60 === 0) return `${minutes / 60} hours`;
+  return `${minutes} minutes`;
 }
 
 /**
@@ -318,7 +357,19 @@ async function askDecision(
   timeoutMs: number,
   options: { instructionsPrefix?: string; onUsage?: (usage: PiUsageSample) => void } = {},
 ): Promise<string> {
-  const currentContext = { state: context.state, turn: context.turn, maxTurns: context.maxTurns, repairRound: context.repairRound ?? 0 };
+  const currentContext = {
+    state: context.state,
+    turn: context.turn,
+    maxTurns: context.maxTurns,
+    repairRound: context.repairRound ?? 0,
+    ...(context.deadline ? {
+      deadlineRemainingMinutes: Math.round(context.deadline.remainingMs / 60_000),
+      closeOut: context.deadline.closeOut,
+      ...(context.deadline.closeOut && context.deadline.closeOutRemainingMs !== undefined
+        ? { closeOutRemainingMinutes: Math.round(context.deadline.closeOutRemainingMs / 60_000) }
+        : {}),
+    } : {}),
+  };
   const prompt = `${options.instructionsPrefix ?? ""}UNTRUSTED SUPERVISOR EVENT:\n${boundedEventJson(event)}\n\nCURRENT CONTEXT:\n${boundedJson(currentContext)}\n\nChoose one action now.`;
   return promptForText(session, prompt, timeoutMs, "Decision Worker request", MAX_DECISION_RESPONSE_BYTES, { role: "decision", onUsage: options.onUsage });
 }

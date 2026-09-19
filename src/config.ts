@@ -39,6 +39,10 @@ const allowed = new Set([
   "PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES",
   "PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS",
   "PI_CLAUDE_SUPERVISOR_EVENT_LOG_MAX_BYTES",
+  "PI_CLAUDE_SUPERVISOR_DEADLINE_MS",
+  "PI_CLAUDE_SUPERVISOR_DEADLINE_GRACE_MS",
+  "PI_CLAUDE_SUPERVISOR_DEADLINE_WARNING_MS",
+  "PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS",
 ]);
 
 export interface AutonomyDefaults {
@@ -109,6 +113,71 @@ export function evidenceMaxUntrackedFiles(env: NodeJS.ProcessEnv = process.env):
   return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES, 512, 16, 10_000);
 }
 
+export const DEFAULT_DEADLINE_MS = 4 * 60 * 60_000;
+export const DEFAULT_DEADLINE_GRACE_MS = 30 * 60_000;
+export const DEFAULT_DEADLINE_WARNING_MS = 15 * 60_000;
+export const DEFAULT_NO_OUTPUT_TIMEOUT_MS = 20 * 60_000;
+
+/**
+ * Cumulative wall-clock budget for a task's Worker turns (5 minutes to 7 days);
+ * "0" disables the deadline. A duration suffix (`8h`, `90m`, `2h30m`) is
+ * accepted as well as plain milliseconds.
+ */
+export function deadlineMs(env: NodeJS.ProcessEnv = process.env): number {
+  return readBoundedDurationWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_DEADLINE_MS, DEFAULT_DEADLINE_MS, 5 * 60_000, 7 * 24 * 60 * 60_000);
+}
+
+/**
+ * Close-out window after the deadline: the Worker is asked to finish and the
+ * candidate is verified instead of the Worker being stopped outright. "0"
+ * restores the immediate stop at the deadline. Up to 24 hours.
+ */
+export function deadlineGraceMs(env: NodeJS.ProcessEnv = process.env): number {
+  return readBoundedDurationWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_DEADLINE_GRACE_MS, DEFAULT_DEADLINE_GRACE_MS, 60_000, 24 * 60 * 60_000);
+}
+
+/** How long before the deadline the Decision Worker is warned (up to 24 hours); "0" disables the warning. */
+export function deadlineWarningMs(env: NodeJS.ProcessEnv = process.env): number {
+  return readBoundedDurationWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_DEADLINE_WARNING_MS, DEFAULT_DEADLINE_WARNING_MS, 60_000, 24 * 60 * 60_000);
+}
+
+/** Stop a Worker that has produced no output for this long (1 minute to 24 hours); "0" disables the check. */
+export function noOutputTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  return readBoundedDurationWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS, DEFAULT_NO_OUTPUT_TIMEOUT_MS, 60_000, 24 * 60 * 60_000);
+}
+
+const DURATION_UNITS_MS: Record<string, number> = { ms: 1, s: 1_000, m: 60_000, h: 60 * 60_000, d: 24 * 60 * 60_000 };
+
+/**
+ * Parse a duration such as `8h`, `90m`, `2h30m`, `45s` or plain milliseconds
+ * into milliseconds; undefined for anything else (including negative values).
+ */
+export function parseDurationMs(value: string | undefined): number | undefined {
+  const trimmed = value?.trim().toLowerCase();
+  if (!trimmed) return undefined;
+  if (/^\d+$/u.test(trimmed)) {
+    const parsed = Number(trimmed);
+    return Number.isSafeInteger(parsed) ? parsed : undefined;
+  }
+  if (!/^(?:\d+(?:\.\d+)?(?:ms|s|m|h|d))+$/u.test(trimmed)) return undefined;
+  let total = 0;
+  for (const match of trimmed.matchAll(/(\d+(?:\.\d+)?)(ms|s|m|h|d)/gu)) {
+    total += Number(match[1]) * DURATION_UNITS_MS[match[2]];
+  }
+  return Number.isSafeInteger(total) ? total : undefined;
+}
+
+/** Format milliseconds as a compact duration (`2h13m`, `45s`, `0s`) for status lines and notices. */
+export function formatDurationMs(ms: number): string {
+  const total = Math.max(0, Math.round(ms / 1_000));
+  const hours = Math.floor(total / 3_600);
+  const minutes = Math.floor((total % 3_600) / 60);
+  const seconds = total % 60;
+  if (hours > 0) return minutes > 0 ? `${hours}h${minutes}m` : `${hours}h`;
+  if (minutes > 0) return seconds > 0 && total < 600 ? `${minutes}m${seconds}s` : `${minutes}m`;
+  return `${seconds}s`;
+}
+
 export function loadSupervisorEnvironment(): string | undefined {
   const path = process.env.PI_CLAUDE_SUPERVISOR_ENV_FILE ?? join(homedir(), ".config", "pi-claude-supervisor", "env");
   if (!existsSync(path)) return undefined;
@@ -146,6 +215,14 @@ function readBoundedInteger(value: string | undefined, fallback: number, minimum
 function readBoundedIntegerWithZeroOptOut(value: string | undefined, fallback: number, minimum: number, maximum: number): number {
   if (value !== undefined && value.trim() === "0") return 0;
   return readBoundedInteger(value, fallback, minimum, maximum);
+}
+
+/** Like readBoundedIntegerWithZeroOptOut, but also accepts a duration suffix (`8h`, `90m`); out-of-range values keep the fallback. */
+function readBoundedDurationWithZeroOptOut(value: string | undefined, fallback: number, minimum: number, maximum: number): number {
+  if (value === undefined) return fallback;
+  if (value.trim() === "0") return 0;
+  const parsed = parseDurationMs(value);
+  return parsed !== undefined && parsed >= minimum && parsed <= maximum ? parsed : fallback;
 }
 
 function readTrimmedString(value: string | undefined): string | undefined {

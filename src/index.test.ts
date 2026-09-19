@@ -800,3 +800,76 @@ type TestContext = {
   hasUI: boolean;
   ui: { confirm: () => Promise<boolean>; notify: (message: string) => void };
 };
+
+test("start accepts a per-task --deadline, rejects malformed or tiny ones, and status reports the remaining budget", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-index-deadline-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-state-"));
+  const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-leases-"));
+  const saved = new Map<string, string | undefined>();
+  const setEnv = (name: string, value: string) => { saved.set(name, process.env[name]); process.env[name] = value; };
+  setEnv("PI_CLAUDE_SUPERVISOR_WORKER", `${process.execPath} -e "setInterval(() => {}, 1000)"`);
+  setEnv("PI_CLAUDE_SUPERVISOR_STATE_DIR", stateDir);
+  setEnv("PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR", leaseDir);
+  setEnv("PI_CLAUDE_SUPERVISOR_TRANSPORT", "process-pipe");
+  setEnv("PI_CLAUDE_SUPERVISOR_CGROUP_MODE", "off");
+  setEnv("PI_CLAUDE_SUPERVISOR_MODE", "manual");
+  setEnv("PI_CLAUDE_SUPERVISOR_AUTOMATION", "0");
+  setEnv("PI_CLAUDE_SUPERVISOR_DEADLINE_MS", "2h");
+
+  const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
+  const messages: string[] = [];
+  const context: TestContext = { cwd, hasUI: true, ui: { confirm: async () => false, notify: (message) => messages.push(message) } };
+  const fakePi = {
+    registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) { registrations.commands.push({ name, definition }); },
+    on(name: string, handler: () => Promise<void>) { registrations.events.push({ name, handler }); },
+  };
+  let shutdownHandler: (() => Promise<void>) | undefined;
+  try {
+    extension(fakePi as never);
+    const command = registrations.commands.find(({ name }) => name === "supervise")?.definition;
+    shutdownHandler = registrations.events.find(({ name }) => name === "session_shutdown")?.handler;
+    assert.ok(command);
+
+    await command.handler("start --deadline soon task", context);
+    assert.match(messages.at(-1) ?? "", /--deadline expects a duration/u);
+    await command.handler("start --deadline 1m task", context);
+    assert.match(messages.at(-1) ?? "", /at least 5m/u);
+
+    await command.handler("start --deadline 8h implement the --deadline option", context);
+    assert.match(messages.at(-1) ?? "", /^Worker started:/u);
+    await command.handler("status", context);
+    assert.match(messages.at(-1) ?? "", /deadline=(?:8h|7h59m) left/u);
+    await command.handler("stop", context);
+
+    // A second cwd is needed for a second task; reuse a sibling directory.
+    const second = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-index-deadline-2-"));
+    try {
+      await command.handler("start --deadline=0 no deadline at all", { ...context, cwd: second });
+      assert.match(messages.at(-1) ?? "", /^Worker started:/u);
+      await command.handler("status", context);
+      assert.doesNotMatch(messages.at(-1) ?? "", /deadline=/u);
+      await command.handler("stop", context);
+
+      // Without the option the environment default applies.
+      await command.handler("start env default deadline", { ...context, cwd: second });
+      assert.match(messages.at(-1) ?? "", /^Worker started:/u);
+      await command.handler("status", context);
+      assert.match(messages.at(-1) ?? "", /deadline=(?:2h|1h59m) left/u);
+      await command.handler("stop", context);
+    } finally {
+      await rm(second, { recursive: true, force: true });
+    }
+  } finally {
+    if (shutdownHandler) {
+      try { await shutdownHandler(); }
+      catch (error) { console.error(`index test cleanup failed: ${error instanceof Error ? error.message : String(error)}`); }
+    }
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    await rm(cwd, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(leaseDir, { recursive: true, force: true });
+  }
+});

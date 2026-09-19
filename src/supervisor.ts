@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { EventLog, type SupervisorEvent } from "./events.ts";
 import { SupervisorStateMachine } from "./state.ts";
 import { evaluatePermission, isRoutinePermission } from "./policy.ts";
-import { PiDecisionWorker, type DecisionAction, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
+import { PiDecisionWorker, type DecisionAction, type DecisionContext, type DecisionDeadlineContext, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
+import { formatDurationMs } from "./config.ts";
 import { collectRepositoryEvidence, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryIsAncestor, repositoryWorkTree, verifyAll, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { redactSensitive } from "./redaction.ts";
@@ -28,6 +29,10 @@ import type {
 } from "./types.ts";
 
 const DEFAULT_REVIEW_TIMEOUT_MS = 600_000;
+const DEFAULT_DEADLINE_MS = 4 * 60 * 60_000;
+const DEFAULT_DEADLINE_GRACE_MS = 30 * 60_000;
+const DEFAULT_DEADLINE_WARNING_MS = 15 * 60_000;
+const DEFAULT_NO_OUTPUT_TIMEOUT_MS = 20 * 60_000;
 
 export interface DecisionSessionReadyInfo {
   taskId: string;
@@ -96,6 +101,15 @@ export interface SupervisorStartOptions {
   maxTurns?: number;
   /** Maximum wall-clock runtime; defaults to 4 hours for long development tasks. Set to 0 to disable. */
   deadlineMs?: number;
+  /**
+   * Close-out window after the deadline: the Decision Worker is told the
+   * budget is spent, an idle Worker is verified instead of stopped, and the
+   * Worker is stopped outright only once this window has also elapsed.
+   * Defaults to 30 minutes; 0 stops the Worker at the deadline as before.
+   */
+  deadlineGraceMs?: number;
+  /** Warn the Decision Worker this long before the deadline; defaults to 15 minutes. Set to 0 to disable. */
+  deadlineWarningMs?: number;
   /** Maximum time without worker output; defaults to 20 minutes. Set to 0 to disable. */
   noOutputTimeoutMs?: number;
   /** After a `wait` decision, how long the Worker may stay silent before the Decision Worker is asked again; defaults to 10 minutes. Set to 0 to disable. */
@@ -198,6 +212,8 @@ export class Supervisor {
   #workerOutput = "";
   #lastWorkerResult?: Record<string, unknown>;
   #lastTurnCompleted?: WorkerEvent;
+  /** Key of the completed turn whose decision is still in flight; the deadline must not verify underneath it. */
+  #pendingDecisionKey?: string;
   /** Armed by a `wait` decision: re-asks the Decision Worker if the Worker never resumes on its own. */
   #waitTimer?: NodeJS.Timeout;
   #waitTimeoutMs = 10 * 60_000;
@@ -210,8 +226,12 @@ export class Supervisor {
   #lifecycleTail: Promise<void> = Promise.resolve();
   #pendingEvents: Array<Omit<SupervisorEvent, "seq" | "at">> = [];
   #preemptiveStop?: Promise<void>;
-  #deadlineMs = 4 * 60 * 60_000;
-  #noOutputTimeoutMs = 20 * 60_000;
+  #deadlineMs = DEFAULT_DEADLINE_MS;
+  #deadlineGraceMs = DEFAULT_DEADLINE_GRACE_MS;
+  #deadlineWarningMs = DEFAULT_DEADLINE_WARNING_MS;
+  /** Each deadline notice is emitted once per task; the close-out itself is derived from elapsed time. */
+  #deadlineNotices = { approaching: false, reached: false };
+  #noOutputTimeoutMs = DEFAULT_NO_OUTPUT_TIMEOUT_MS;
   #noOutputBaselineAt?: number;
   #verificationAbortController?: AbortController;
   #progressPhase?: SupervisorProgressPhase;
@@ -274,6 +294,8 @@ export class Supervisor {
   get candidateParked() { return this.#candidateParked; }
   /** True after the persistent worker was detached from this Supervisor. */
   get released() { return this.#released; }
+  /** Wall-clock budget of the active task, or undefined when no deadline is configured. */
+  get deadline(): DecisionDeadlineContext | undefined { return this.#deadlineContext(); }
   /** Structural copy of the Worker + Pi-side token/cost accounting for this task. */
   get usage(): SupervisorTokenUsage {
     return {
@@ -301,6 +323,7 @@ export class Supervisor {
     this.#workerOutput = "";
     this.#lastWorkerResult = undefined;
     this.#lastTurnCompleted = undefined;
+    this.#pendingDecisionKey = undefined;
     this.#preemptiveStop = undefined;
     this.#automation = (options.automation ?? false) && spec.autonomy.unattended;
     this.#onDecisionSessionProgress = options.onDecisionSessionProgress;
@@ -327,8 +350,11 @@ export class Supervisor {
     this.#repairRound = options.initialRepairRound ?? 0;
     this.#lastFindingSignature = options.initialFindingSignature;
     this.#turn = options.initialTurn ?? 0;
-    this.#deadlineMs = options.deadlineMs ?? 4 * 60 * 60_000;
-    this.#noOutputTimeoutMs = options.noOutputTimeoutMs ?? 20 * 60_000;
+    this.#deadlineMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
+    this.#deadlineGraceMs = Math.max(0, options.deadlineGraceMs ?? DEFAULT_DEADLINE_GRACE_MS);
+    this.#deadlineWarningMs = Math.max(0, options.deadlineWarningMs ?? DEFAULT_DEADLINE_WARNING_MS);
+    this.#deadlineNotices = { approaching: false, reached: false };
+    this.#noOutputTimeoutMs = options.noOutputTimeoutMs ?? DEFAULT_NO_OUTPUT_TIMEOUT_MS;
     this.#waitTimeoutMs = options.waitTimeoutMs ?? 10 * 60_000;
     this.#noOutputBaselineAt = undefined;
     this.#verificationAbortController = undefined;
@@ -421,7 +447,7 @@ export class Supervisor {
       if (this.#automation) {
         const createDecisionWorker: DecisionWorkerFactory = options.decisionWorkerFactory ?? ((decisionOptions) => new PiDecisionWorker(decisionOptions));
         this.#decision = createDecisionWorker({
-          context: { taskId, task: spec.goal, cwd: options.cwd, state: this.#machine.state, turn: this.#turn, maxTurns: this.#task.maxTurns, repairRound: this.#repairRound, spec },
+          context: { taskId, task: spec.goal, cwd: options.cwd, state: this.#machine.state, turn: this.#turn, maxTurns: this.#task.maxTurns, repairRound: this.#repairRound, spec, ...(this.#deadlineContext() ? { deadline: this.#deadlineContext() } : {}) },
           sessionFile: options.decisionSessionFile,
           sessionDir: options.decisionSessionDir ? join(options.decisionSessionDir, taskId) : undefined,
           model: this.#decisionModel,
@@ -733,8 +759,7 @@ export class Supervisor {
       // recorded above so resumeAutomation can replay it once automation resumes.
       const suppressTurnCompletedForHuman = this.#humanRequired && event.type === "turn_completed";
       if (this.#decision && !skipDecisionNotify && !suppressTurnCompletedForHuman && (event.type === "permission_request" || event.type === "turn_completed" || event.type === "exited")) {
-        this.#decision.updateContext({ state: this.#machine.state, turn: this.#turn, repairRound: this.#repairRound });
-        this.#decision.notify(event);
+        this.#notifyDecision(event);
       }
       this.#handledEvents.add(key);
       this.#deferredWorkerEvents.delete(key);
@@ -822,6 +847,7 @@ export class Supervisor {
 
   async #decisionFailure(event: WorkerEvent, error: unknown): Promise<void> {
     return this.#exclusive(async () => {
+      this.#settlePendingDecision(event);
       if (this.#releasing || this.#released) {
         await this.#appendDecisionIgnored(event, undefined);
         return;
@@ -847,6 +873,7 @@ export class Supervisor {
 
   async #applyDecision(action: DecisionAction, event: WorkerEvent): Promise<void> {
     return this.#exclusive(async () => {
+      this.#settlePendingDecision(event);
       const task = this.#task;
       const handle = this.#handle;
       if (this.#releasing || this.#released) {
@@ -858,9 +885,14 @@ export class Supervisor {
         await this.#appendEvent({ type: "decision_deferred", taskId: task.taskId, workerId: handle.id, data: { action: action.action, reason: action.reason, eventType: event.type } }).catch(() => {});
         return;
       }
+      // A repeated `wait` for the same event (the wait timer's re-ask, or a
+      // deadline-phase replay) must re-arm the timer, so it is never deduped;
+      // every other action is applied once per event.
       const actionKey = `${workerEventKey(event)}:${action.action}`;
-      if (this.#handledEvents.has(actionKey)) return;
-      this.#handledEvents.add(actionKey);
+      if (action.action !== "wait") {
+        if (this.#handledEvents.has(actionKey)) return;
+        this.#handledEvents.add(actionKey);
+      }
       await this.#appendEvent({ type: "decision_made", taskId: task.taskId, workerId: handle.id, data: { action: action.action, reason: action.reason, confidence: action.confidence } });
       if (action.action === "allow_permission" || action.action === "deny_permission") {
         if (event.type !== "permission_request" || !this.#adapter.respondPermission) {
@@ -914,23 +946,23 @@ export class Supervisor {
         return;
       }
       if (action.action === "wait") {
+        // Once the deadline has passed there is nothing left to wait for: an
+        // idle Worker is verified now, before the close-out window runs out.
+        // A Worker that has resumed on its own keeps its turn; its next
+        // completed turn is decided under close-out as usual.
+        if (this.#inCloseOut() && this.#machine.state === "waiting" && await this.#workerIdle(handle)) {
+          await this.#noteDeadlineReached();
+          await this.#appendEvent({ type: "decision_overridden", taskId: task.taskId, workerId: handle.id, data: { action: "wait", override: "verify", reason: "task deadline reached; wait is unavailable during close-out", eventType: event.type } });
+          await this.#startVerification(handle, event, "deadline close-out");
+          return;
+        }
         // The Worker will be re-invoked by its own background work; send
         // nothing, but re-ask if it stays silent for the wait timeout.
         this.#armWaitTimer(event);
         return;
       }
       if (action.action === "verify") {
-        if (this.#machine.state === "waiting" && canRepairInPlace(this.#adapter)) {
-          this.#machine.transition("verifying");
-          await this.#verifyInternal();
-          return;
-        }
-        if (this.#machine.state === "waiting") {
-          await this.#adapter.stop(handle, "Decision Worker requested verification");
-          await this.#pollInternal(true);
-        }
-        if (this.#machine.state === "verifying") await this.#verifyInternal();
-        else await this.#parkCandidate(`Decision Worker requested verification from state ${this.#machine.state}`, event);
+        await this.#startVerification(handle, event, "Decision Worker");
         return;
       }
       if (action.action === "noop") {
@@ -958,6 +990,45 @@ export class Supervisor {
         await this.#sendInternal(action.message);
       }
     });
+  }
+
+  /**
+   * Move an idle Worker into verification the way a `verify` decision does:
+   * in place when the transport supports it, otherwise by stopping the
+   * Worker first. `origin` names who asked, for the stop reason and the park
+   * message.
+   */
+  async #startVerification(handle: WorkerHandle, event: WorkerEvent | undefined, origin: string): Promise<void> {
+    if (this.#machine.state === "waiting" && canRepairInPlace(this.#adapter)) {
+      this.#machine.transition("verifying");
+      await this.#verifyInternal();
+      return;
+    }
+    if (this.#machine.state === "waiting") {
+      await this.#adapter.stop(handle, `${origin} requested verification`);
+      await this.#pollInternal(true);
+    }
+    if (this.#machine.state === "verifying") await this.#verifyInternal();
+    else await this.#parkCandidate(`${origin} requested verification from state ${this.#machine.state}`, event);
+  }
+
+  /** Refresh the Decision Worker's context and deliver (or re-deliver) an event; a completed turn is then pending a decision. */
+  #notifyDecision(event: WorkerEvent, replay = false): void {
+    if (!this.#decision) return;
+    this.#decision.updateContext(this.#decisionContextPatch());
+    if (event.type === "turn_completed") this.#pendingDecisionKey = workerEventKey(event);
+    if (replay) this.#decision.replay?.(event);
+    else this.#decision.notify(event);
+  }
+
+  #settlePendingDecision(event: WorkerEvent): void {
+    if (this.#pendingDecisionKey && this.#pendingDecisionKey === workerEventKey(event)) this.#pendingDecisionKey = undefined;
+  }
+
+  /** True when the adapter reports no active Worker turn; a status failure counts as busy. */
+  async #workerIdle(handle: WorkerHandle): Promise<boolean> {
+    const status = await this.#adapter.getStatus(handle).catch(() => undefined);
+    return Boolean(status) && !status!.activeRequests;
   }
 
   /**
@@ -992,8 +1063,7 @@ export class Supervisor {
         const status = await this.#adapter.getStatus(handle).catch(() => undefined);
         if (status?.activeRequests) return;
         await this.#appendEvent({ type: "wait_expired", taskId: this.#task?.taskId, workerId: handle.id, data: { waitTimeoutMs: this.#waitTimeoutMs } }).catch(() => {});
-        this.#decision.updateContext({ state: this.#machine.state, turn: this.#turn, repairRound: this.#repairRound });
-        this.#decision.replay?.(event);
+        this.#notifyDecision(event, true);
       }).catch(() => { /* the watchdog still covers a silent Worker */ });
     }, this.#waitTimeoutMs);
     this.#waitTimer.unref?.();
@@ -1134,8 +1204,7 @@ export class Supervisor {
         // it has resumed on its own, its next Stop brings a fresh turn.
         const status = await this.#adapter.getStatus(this.#handle).catch(() => undefined);
         if (status?.activeRequests) return;
-        this.#decision.updateContext({ state: this.#machine.state, turn: this.#turn, repairRound: this.#repairRound });
-        this.#decision.replay?.(this.#lastTurnCompleted);
+        this.#notifyDecision(this.#lastTurnCompleted, true);
       }
     });
   }
@@ -1617,8 +1686,15 @@ export class Supervisor {
     }
     this.#repairRound += 1;
     task.repairRound = this.#repairRound;
-    const instruction = repairInstruction(result, reason, this.#repairRound);
-    await this.#appendEvent({ type: "repair_requested", taskId: task.taskId, workerId: handle.id, data: { round: this.#repairRound, reason, instruction } });
+    // After the deadline a repair round races the close-out window: tell the
+    // Worker how long it has so it commits what is complete instead of
+    // starting more work the outright stop would discard.
+    const deadline = this.#deadlineContext();
+    const closeOutHint = deadline?.closeOut && deadline.closeOutRemainingMs !== undefined
+      ? ` The task's wall-clock budget is spent: you have about ${formatDurationMs(deadline.closeOutRemainingMs)} before the Supervisor stops this session. Address only what is required above, commit what is complete, and stop.`
+      : "";
+    const instruction = repairInstruction(result, reason, this.#repairRound) + closeOutHint;
+    await this.#appendEvent({ type: "repair_requested", taskId: task.taskId, workerId: handle.id, data: { round: this.#repairRound, reason, instruction, ...(deadline?.closeOut ? { closeOutRemainingMs: deadline.closeOutRemainingMs } : {}) } });
     this.#reportProgress("repair", `sending repair round ${this.#repairRound}`, true);
     if (this.#machine.state === "verifying") this.#machine.transition("running");
     this.#repairSendInProgress = true;
@@ -1826,7 +1902,7 @@ export class Supervisor {
     }
     this.#reportProgress("worker", `Worker ${this.#machine.state}; heartbeat`, false);
     const now = Date.now();
-    const taskStartedAt = Date.parse(this.#task.startedAt);
+    const elapsed = this.#deadlineElapsedMs(now);
     // The deadline is cumulative across recovery, but the no-output timer
     // starts when this worker process starts. Otherwise a slow Decision Worker
     // startup or a recovered task can be stopped on its first watchdog tick
@@ -1834,12 +1910,24 @@ export class Supervisor {
     const workerStartedAt = Date.parse(this.#handle.startedAt);
     const observedLastOutputAt = status.lastOutputAt ? Date.parse(status.lastOutputAt) : workerStartedAt;
     const lastOutputAt = Math.max(observedLastOutputAt, this.#noOutputBaselineAt ?? 0);
-    const reason = this.#deadlineMs > 0 && now - taskStartedAt >= this.#deadlineMs
+    const deadlineReached = this.#deadlineMs > 0 && elapsed >= this.#deadlineMs;
+    // The deadline itself opens a close-out window; the outright stop waits
+    // for the grace period as well (an empty grace keeps the old immediate stop).
+    const reason = deadlineReached && elapsed >= this.#deadlineMs + this.#deadlineGraceMs
       ? "worker deadline exceeded"
       : this.#machine.state !== "paused" && this.#noOutputTimeoutMs > 0 && now - lastOutputAt >= this.#noOutputTimeoutMs
         ? "worker produced no output before timeout"
         : undefined;
-    if (!reason) return;
+    if (!reason) {
+      if (deadlineReached) await this.#enterCloseOut(status, elapsed);
+      else if (this.#deadlineMs > 0 && this.#deadlineWarningMs > 0 && !this.#deadlineNotices.approaching && this.#deadlineMs - elapsed <= this.#deadlineWarningMs) {
+        await this.#warnDeadlineApproaching(status, this.#deadlineMs - elapsed);
+      }
+      return;
+    }
+    // A close-out window that was skipped entirely (a task recovered past its
+    // budget) still leaves the deadline notice ahead of the stop in the log.
+    if (deadlineReached && this.#deadlineGraceMs > 0) await this.#noteDeadlineReached(elapsed).catch(() => {});
     let timeoutEventError: unknown;
     try {
       await this.#appendEvent({ type: "worker_watchdog_timeout", taskId: this.#task.taskId, workerId: this.#handle.id, data: { reason } });
@@ -1854,6 +1942,92 @@ export class Supervisor {
       await this.#notifyFailure(`watchdog: ${reason}`);
     }
     if (timeoutEventError) throw timeoutEventError;
+  }
+
+  #deadlineElapsedMs(now = Date.now()): number {
+    return this.#task ? Math.max(0, now - Date.parse(this.#task.startedAt)) : 0;
+  }
+
+  /** True once the task's wall-clock deadline has passed (whether or not a grace window remains). */
+  #inCloseOut(now = Date.now()): boolean {
+    return Boolean(this.#task) && this.#deadlineMs > 0 && this.#deadlineElapsedMs(now) >= this.#deadlineMs;
+  }
+
+  #deadlineContext(now = Date.now()): DecisionDeadlineContext | undefined {
+    if (!this.#task || this.#deadlineMs <= 0) return undefined;
+    const elapsed = this.#deadlineElapsedMs(now);
+    const closeOut = elapsed >= this.#deadlineMs;
+    return {
+      totalMs: this.#deadlineMs,
+      graceMs: this.#deadlineGraceMs,
+      remainingMs: Math.max(0, this.#deadlineMs - elapsed),
+      closeOut,
+      ...(closeOut ? { closeOutRemainingMs: Math.max(0, this.#deadlineMs + this.#deadlineGraceMs - elapsed) } : {}),
+    };
+  }
+
+  /** The per-event context refresh sent to the Decision Worker before every notification or replay. */
+  #decisionContextPatch(): Partial<DecisionContext> {
+    const deadline = this.#deadlineContext();
+    return { state: this.#machine.state, turn: this.#turn, repairRound: this.#repairRound, ...(deadline ? { deadline } : {}) };
+  }
+
+  /**
+   * The deadline is near: record it once, refresh the Decision Worker's view
+   * of the clock and, if the Worker is idle under a `wait`, ask the Decision
+   * Worker again so it can steer the Worker toward a wrap-up while there is
+   * still time to verify the result.
+   */
+  async #warnDeadlineApproaching(status: WorkerStatus, remainingMs: number): Promise<void> {
+    if (!this.#task || !this.#handle) return;
+    this.#deadlineNotices.approaching = true;
+    await this.#appendEvent({ type: "worker_deadline_approaching", taskId: this.#task.taskId, workerId: this.#handle.id, data: { deadlineMs: this.#deadlineMs, graceMs: this.#deadlineGraceMs, remainingMs } });
+    this.#reportProgress("worker", `deadline in ${formatDurationMs(remainingMs)}; close-out window ${formatDurationMs(this.#deadlineGraceMs)}`, true);
+    if (!this.#decision) return;
+    this.#decision.updateContext(this.#decisionContextPatch());
+    if (this.#humanRequired || this.#candidateParked || this.#pendingDecisionKey || this.#machine.state !== "waiting" || !this.#lastTurnCompleted || status.activeRequests) return;
+    this.#clearWaitTimer();
+    this.#notifyDecision(this.#lastTurnCompleted, true);
+  }
+
+  /** Record the deadline once, whichever path notices it first (the watchdog tick or a decision applied under close-out). */
+  async #noteDeadlineReached(elapsed = this.#deadlineElapsedMs()): Promise<void> {
+    if (this.#deadlineNotices.reached || !this.#task || !this.#handle) return;
+    this.#deadlineNotices.reached = true;
+    const closeOutRemainingMs = Math.max(0, this.#deadlineMs + this.#deadlineGraceMs - elapsed);
+    await this.#appendEvent({ type: "worker_deadline_reached", taskId: this.#task.taskId, workerId: this.#handle.id, data: { deadlineMs: this.#deadlineMs, graceMs: this.#deadlineGraceMs, elapsedMs: elapsed, closeOutRemainingMs } });
+    this.#reportProgress("worker", `deadline reached after ${formatDurationMs(elapsed)}; closing out within ${formatDurationMs(closeOutRemainingMs)}`, true);
+    this.#decision?.updateContext(this.#decisionContextPatch());
+  }
+
+  /**
+   * The deadline has passed. Record it once, then drive the close-out: an
+   * idle automatic Worker is verified now; a busy one is decided under
+   * close-out when its turn completes; the outright stop waits for the grace
+   * window. Without automation the notice is the operator's cue to verify.
+   */
+  async #enterCloseOut(status: WorkerStatus, elapsed: number): Promise<void> {
+    const task = this.#task;
+    const handle = this.#handle;
+    if (!task || !handle) return;
+    await this.#noteDeadlineReached(elapsed);
+    if (!this.#automation || !this.#decision || this.#humanRequired || this.#candidateParked) return;
+    // An idle Worker that never completed a turn under this Supervisor (an
+    // adopted session, or one recovered past its budget) still reports
+    // `running`: the running -> waiting classification lives in #pollInternal,
+    // which nothing else calls while the Worker is alive.
+    if (this.#machine.state === "running" && !status.activeRequests) await this.#pollInternal();
+    // A decision still in flight for the last turn owns the next step: it is
+    // applied under close-out (a `wait` becomes verify) once it arrives.
+    if (this.#pendingDecisionKey || this.#machine.state !== "waiting" || this.#verificationAbortController || status.activeRequests) return;
+    this.#clearWaitTimer();
+    await this.#appendEvent({ type: "deadline_close_out", taskId: task.taskId, workerId: handle.id, data: { action: "verify", reason: "task deadline reached with an idle Worker" } });
+    try {
+      await this.#startVerification(handle, this.#lastTurnCompleted, "deadline close-out");
+    } catch (error) {
+      // Verification failures are parked inside #verifyInternal; audit the rest.
+      await this.#appendEvent({ type: "worker_event_error", taskId: task.taskId, workerId: handle.id, data: { error: safeMessage(error), eventType: "deadline_close_out" } }).catch(() => {});
+    }
   }
 
   /**
