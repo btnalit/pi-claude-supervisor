@@ -873,3 +873,85 @@ test("start accepts a per-task --deadline, rejects malformed or tiny ones, and s
     await rm(leaseDir, { recursive: true, force: true });
   }
 });
+
+test("an expired recoverable record is listed as expired, refused by recover without --extend, and dropped by discard", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-index-expired-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-state-"));
+  const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-leases-"));
+  const saved = new Map<string, string | undefined>();
+  const setEnv = (name: string, value: string) => { saved.set(name, process.env[name]); process.env[name] = value; };
+  setEnv("PI_CLAUDE_SUPERVISOR_STATE_DIR", stateDir);
+  setEnv("PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR", leaseDir);
+  setEnv("PI_CLAUDE_SUPERVISOR_TRANSPORT", "process-pipe");
+  setEnv("PI_CLAUDE_SUPERVISOR_CGROUP_MODE", "off");
+  setEnv("PI_CLAUDE_SUPERVISOR_MODE", "manual");
+  setEnv("PI_CLAUDE_SUPERVISOR_AUTOMATION", "0");
+  const taskId = randomUUID();
+  const decisionStore = new DecisionSessionStore(join(stateDir, "decision-sessions"));
+  const sessionDirectory = decisionStore.sessionDirectory(taskId);
+  await mkdir(sessionDirectory, { recursive: true });
+  const decisionSessionFile = join(sessionDirectory, "session.jsonl");
+  await writeFile(decisionSessionFile, `${JSON.stringify({ type: "session", version: 3, id: randomUUID(), timestamp: new Date().toISOString(), cwd })}\n`);
+  await decisionStore.save({
+    taskId,
+    task: "expired task",
+    cwd,
+    command: "claude",
+    args: [],
+    decisionSessionFile,
+    maxTurns: 100,
+    deadlineMs: 4 * 60 * 60_000,
+    noOutputTimeoutMs: 20 * 60_000,
+    // Started five hours ago against a four-hour budget.
+    startedAt: new Date(Date.now() - 5 * 60 * 60_000).toISOString(),
+    turn: 0,
+    state: "active",
+    recoveryState: "interrupted",
+  });
+
+  const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
+  const messages: string[] = [];
+  const context: TestContext = { cwd, hasUI: true, ui: { confirm: async () => false, notify: (message) => messages.push(message) } };
+  const fakePi = {
+    registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) { registrations.commands.push({ name, definition }); },
+    on(name: string, handler: () => Promise<void>) { registrations.events.push({ name, handler }); },
+  };
+  let shutdownHandler: (() => Promise<void>) | undefined;
+  try {
+    extension(fakePi as never);
+    const command = registrations.commands.find(({ name }) => name === "supervise")?.definition;
+    shutdownHandler = registrations.events.find(({ name }) => name === "session_shutdown")?.handler;
+    assert.ok(command);
+
+    await command.handler("sessions", context);
+    assert.match(messages.at(-1) ?? "", new RegExp(`${taskId} state=recoverable recovery=interrupted .*deadline=expired (?:1h|59m)[^ ]* ago \\(recover --extend\\)`, "u"));
+
+    await command.handler(`recover --takeover ${taskId}`, context);
+    assert.match(messages.at(-1) ?? "", /Cannot recover task after its wall-clock deadline \((?:1h|59m)[^)]* ago\); pass --extend <duration>/u);
+    await command.handler(`recover --takeover --extend later ${taskId}`, context);
+    assert.match(messages.at(-1) ?? "", /--extend expects a duration/u);
+
+    await command.handler("discard", context);
+    assert.match(messages.at(-1) ?? "", /Usage: \/supervise discard <task-id>/u);
+    await command.handler(`discard ${randomUUID()}`, context);
+    assert.match(messages.at(-1) ?? "", /No recoverable Decision Worker session/u);
+    await command.handler(`discard ${taskId}`, context);
+    assert.match(messages.at(-1) ?? "", /^Discarded recoverable task/u);
+    assert.equal((await decisionStore.load(taskId))?.state, "closed");
+    assert.deepEqual(await decisionStore.list({ activeOnly: true }), []);
+    await command.handler(`recover --takeover --extend 30m ${taskId}`, context);
+    assert.match(messages.at(-1) ?? "", /No recoverable Decision Worker session/u);
+  } finally {
+    if (shutdownHandler) {
+      try { await shutdownHandler(); }
+      catch (error) { console.error(`index test cleanup failed: ${error instanceof Error ? error.message : String(error)}`); }
+    }
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    await rm(cwd, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(leaseDir, { recursive: true, force: true });
+  }
+});
