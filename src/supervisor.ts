@@ -957,7 +957,7 @@ export class Supervisor {
         // The deadline warning fired while this decision was in flight, so it
         // was made from a pre-warning view of the clock: ask once more with
         // the current clock before settling for a wait.
-        if (this.#deadlineNotices.approaching && !this.#deadlineNotices.warningReplayed && !this.#inCloseOut()
+        if (this.#deadlineNotices.approaching && !this.#deadlineNotices.warningReplayed && !this.#inCloseOut() && this.#decision?.replay
           && this.#machine.state === "waiting" && event.type === "turn_completed" && await this.#workerIdle(handle)) {
           this.#deadlineNotices.warningReplayed = true;
           this.#clearWaitTimer();

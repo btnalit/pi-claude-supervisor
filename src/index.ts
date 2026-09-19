@@ -940,6 +940,12 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           const lease = (await cwdLeaseStore.list()).find((candidate) => candidate.taskId === taskId);
           if (lease) {
             if (await leaseOwnerLive(lease)) throw new Error(`Task is still owned by a live Pi (pid ${lease.ownerPid}); stop it there instead of discarding it: ${taskId}`);
+            // An adopted session's tmux server is the user's own and stays
+            // alive, so a takeover can never prove the Worker gone; adopting
+            // the session again hands the dead owner's lease over in place.
+            if (lease.worker?.ownership === "adopted" && lease.worker.sessionName) {
+              throw new Error(`Task still holds the cwd lease for ${redactText(lease.cwd)} (owner pid ${lease.ownerPid} is gone); adopt the session again with /supervise adopt-tmux ${lease.worker.sessionName} <task> to take the lease over, then discard this record`);
+            }
             throw new Error(`Task still holds the cwd lease for ${redactText(lease.cwd)} (owner pid ${lease.ownerPid} is gone); run /supervise recover --takeover --extend 0 ${taskId} to prove the old Worker is gone and close the task out, then stop it if needed`);
           }
           await decisionStore.close(taskId);
