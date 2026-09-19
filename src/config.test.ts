@@ -2,12 +2,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   autonomyDefaults,
+  deadlineGraceMs,
+  deadlineMs,
+  deadlineWarningMs,
   decisionCompactionTokens,
   decisionModel,
   decisionSessionRetentionDays,
   evidenceMaxBytes,
   evidenceMaxUntrackedFiles,
   eventLogMaxBytes,
+  formatDurationMs,
+  noOutputTimeoutMs,
+  parseDurationMs,
   progressHeartbeatMs,
   reviewerModel,
   reviewTimeoutMs,
@@ -96,4 +102,56 @@ test("evidenceMaxBytes and evidenceMaxUntrackedFiles default and reject out-of-r
   assert.equal(evidenceMaxUntrackedFiles({ PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES: "100" }), 100);
   assert.equal(evidenceMaxUntrackedFiles({ PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES: "1" }), 512);
   assert.equal(evidenceMaxUntrackedFiles({ PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES: "99999" }), 512);
+});
+
+test("parseDurationMs accepts unit suffixes, compounds and plain milliseconds", () => {
+  assert.equal(parseDurationMs("8h"), 8 * 60 * 60_000);
+  assert.equal(parseDurationMs("90m"), 90 * 60_000);
+  assert.equal(parseDurationMs("2h30m"), 150 * 60_000);
+  assert.equal(parseDurationMs("45s"), 45_000);
+  assert.equal(parseDurationMs("1.5h"), 90 * 60_000);
+  assert.equal(parseDurationMs("250ms"), 250);
+  assert.equal(parseDurationMs(" 1d "), 24 * 60 * 60_000);
+  assert.equal(parseDurationMs("14400000"), 14_400_000);
+  assert.equal(parseDurationMs("0"), 0);
+  assert.equal(parseDurationMs(""), undefined);
+  assert.equal(parseDurationMs(undefined), undefined);
+  assert.equal(parseDurationMs("-5m"), undefined);
+  assert.equal(parseDurationMs("5 m"), undefined);
+  assert.equal(parseDurationMs("five"), undefined);
+  assert.equal(parseDurationMs("1h30"), undefined);
+});
+
+test("formatDurationMs renders compact durations", () => {
+  assert.equal(formatDurationMs(0), "0s");
+  assert.equal(formatDurationMs(45_000), "45s");
+  assert.equal(formatDurationMs(6 * 60_000 + 30_000), "6m30s");
+  assert.equal(formatDurationMs(24 * 60_000 + 30_000), "24m");
+  assert.equal(formatDurationMs(2 * 60 * 60_000 + 13 * 60_000), "2h13m");
+  assert.equal(formatDurationMs(4 * 60 * 60_000), "4h");
+  assert.equal(formatDurationMs(-1), "0s");
+});
+
+test("deadline budgets default, accept durations and honor the zero opt-out", () => {
+  assert.equal(deadlineMs({}), 4 * 60 * 60_000);
+  assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "8h" }), 8 * 60 * 60_000);
+  assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "28800000" }), 8 * 60 * 60_000);
+  assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "0" }), 0);
+  assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "1m" }), 4 * 60 * 60_000, "below the 5-minute floor keeps the default");
+  assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "8d" }), 4 * 60 * 60_000, "above the 7-day ceiling keeps the default");
+  assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "soon" }), 4 * 60 * 60_000);
+
+  assert.equal(deadlineGraceMs({}), 30 * 60_000);
+  assert.equal(deadlineGraceMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_GRACE_MS: "1h" }), 60 * 60_000);
+  assert.equal(deadlineGraceMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_GRACE_MS: "0" }), 0);
+  assert.equal(deadlineGraceMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_GRACE_MS: "2d" }), 30 * 60_000);
+
+  assert.equal(deadlineWarningMs({}), 15 * 60_000);
+  assert.equal(deadlineWarningMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_WARNING_MS: "30m" }), 30 * 60_000);
+  assert.equal(deadlineWarningMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_WARNING_MS: "0" }), 0);
+
+  assert.equal(noOutputTimeoutMs({}), 20 * 60_000);
+  assert.equal(noOutputTimeoutMs({ PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS: "45m" }), 45 * 60_000);
+  assert.equal(noOutputTimeoutMs({ PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS: "0" }), 0);
+  assert.equal(noOutputTimeoutMs({ PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS: "10s" }), 20 * 60_000, "below the 1-minute floor keeps the default");
 });

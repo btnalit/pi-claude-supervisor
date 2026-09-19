@@ -194,8 +194,14 @@ stream-json` 的方式运行 Claude,完全没有终端界面;一旦设置
   `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` 显式固定)。
 - Linux 上,cgroup v2 边界会清理每一个后代进程,包括 `setsid()` 后代;
   `required` 模式会 fail closed,而不是回退到其他清理方式。
-- 默认 4 小时总时限、20 分钟无输出 watchdog 会停止 Worker;嵌入方调用可以修改或
-  关闭任一项(`deadlineMs`、`noOutputTimeoutMs`)。
+- 每个任务有一个总时限(默认 4 小时,可用 `--deadline 8h` 按任务指定或用
+  `DEADLINE_MS` 全局设置)。到期不会直接杀掉工作:到期前
+  `DEADLINE_WARNING_MS`(默认 15 分钟)会提醒 Decision Worker 引导 Worker 收尾;
+  到期后进入 `DEADLINE_GRACE_MS`(默认 30 分钟)的收尾窗口,空闲的 Worker 会被直接
+  验收和 review 而不是被停止,`wait` 决策不再生效,修复轮会告诉 Worker 还剩多少
+  时间。只有收尾窗口也耗尽,Worker 才会被硬停(`worker_watchdog_timeout`);对
+  接管的交互式会话来说这个硬停只是 release:Claude 继续运行,但不再受监督。
+  20 分钟无输出 watchdog(`NO_OUTPUT_TIMEOUT_MS`)随时会停止沉默的 Worker。
 - 验收命令、证据收集和 Reviewer 共用一个 abort signal,因此 stop 或 shutdown
   不必等待完整的命令或模型超时。
 - 每个任务只持有一个 cwd 租约;并发任务需要各自独立的 worktree。
@@ -267,6 +273,10 @@ stream-json` 的方式运行 Claude,完全没有终端界面;一旦设置
 | `EVIDENCE_MAX_BYTES` | `1048576`(1 MiB) | 每个任务收集的最大仓库证据字节数 |
 | `EVIDENCE_MAX_UNTRACKED_FILES` | `512` | 每个任务作为证据收集的最大未跟踪文件数 |
 | `REVIEW_TIMEOUT_MS` | `600000`(10 分钟) | 每轮独立 Reviewer 的总预算,含一次针对 provider 错误的重试 |
+| `DEADLINE_MS` | `4h` | 每个任务的累计总时限(`8h`、`90m`、`2h30m` 或毫秒;5 分钟到 7 天);`0` 关闭;`--deadline` 可按任务覆盖 |
+| `DEADLINE_GRACE_MS` | `30m` | 到期后的收尾窗口:空闲的 Worker 会被验收而不是停止;`0` 恢复到期立即停止 |
+| `DEADLINE_WARNING_MS` | `15m` | 到期前多久提醒并重新询问 Decision Worker;`0` 关闭提醒 |
+| `NO_OUTPUT_TIMEOUT_MS` | `20m` | Worker 多久没有输出就停止;`0` 关闭该检查 |
 | `EVENT_LOG_MAX_BYTES` | `67108864`(64 MiB) | `events.jsonl` 达到该大小后滚动,保留 5 份滚动文件 |
 
 ## 恢复、租约与状态
