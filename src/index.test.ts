@@ -24,6 +24,14 @@ const untrustedCheckoutSkipReason = "checkout is under a group/world-writable pa
 for (const name of Object.keys(process.env)) {
   if (name.startsWith("PI_CLAUDE_SUPERVISOR_")) delete process.env[name];
 }
+// The shell is not the only source: every `extension()` call runs
+// `loadSupervisorEnvironment()`, which reads the operator's real
+// ~/.config/pi-claude-supervisor/env and re-injects whatever it holds. On a
+// machine where the Supervisor is actually configured (MODE=auto,
+// TRANSPORT=tmux, AUTO_INSTALL_HOOKS=1) that turned the manual-mode
+// assertions below into failures and left hook relays open so the file never
+// exited. Point the loader at a path that does not exist so it is a no-op.
+process.env.PI_CLAUDE_SUPERVISOR_ENV_FILE = join(tmpdir(), `pi-claude-supervisor-no-env-${randomUUID()}`);
 
 test("index rejects an unknown worker transport instead of falling back", () => {
   const previous = process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
