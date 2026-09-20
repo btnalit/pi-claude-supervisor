@@ -268,16 +268,30 @@ does — and the Supervisor then confirms it read-only (`git ls-remote`, and
 the pull request URL. A publish that cannot be confirmed blocks the candidate,
 which stays deliverable locally.
 
-The grant is deliberately unforgiving. It admits exactly `git [-C <dir>] push
-[-u] <remote> <branch>` with the branch named literally, and `gh pr create` for
-`pr`. Everything else is refused, grant or not: `--force`, `--force-with-lease`,
-`--delete`, `--mirror`, `--all`, `--tags`, `--no-verify`, `--push-option`, a
-`HEAD` refspec, another remote or branch, a protected branch, a shell-wrapped or
-dynamic command, a second statement, `gh pr merge`, `gh api`, `gh release` and
-`npm publish`. It exists only between the passing verdict and the publish turn
-settling, and a Worker that changes the tree during that turn voids it and is
-re-verified in full. Before verification a refused push says so, rather than
-leaving the Worker to guess.
+The grant is deliberately unforgiving, and both commands are matched by
+**option allowlist** — an option nobody reviewed is refused rather than assumed
+harmless. It admits `git [-C <task cwd>] push [-u] <remote> <branch>` with the
+branch named literally, and for `pr` a `gh pr create` limited to title, body,
+base, head (pinned to the candidate branch), draft, assignee and label.
+
+Refused with or without a grant: every other push option (`--force`,
+`--force-with-lease`, `--delete`, `--mirror`, `--all`, `--tags`, `--no-verify`,
+`--push-option`, `--receive-pack`, …), a `HEAD` refspec, a bare `git push`,
+another remote or branch, a protected branch, `-C` naming any directory but the
+task's own, a shell wrapper (`sh -c`, and a heredoc piped into a shell), a
+dynamic word, a second statement, `gh pr create --body-file/-F/--template`
+(which would post the contents of an arbitrary local file), `--web`, `--repo`,
+`gh pr merge`, `gh api`, `gh release` and `npm publish`. Changing the
+repository's remotes (`git remote set-url|add|rename|…`) is denied outright, so
+the granted remote name cannot be repointed underneath the confirmation.
+
+The grant is **one-shot**: it is revoked the moment the publish turn completes,
+not when the next decision arrives, and it is pinned to the remote's URL as well
+as its name. A Worker that changes the tree during that turn voids it and is
+re-verified in full. Before verification a refused push says the grant is coming
+rather than leaving the Worker to guess, and a task that ends without a
+confirmed publish says so in its candidate notice instead of reporting a bare
+"ready".
 
 ## Task specs
 

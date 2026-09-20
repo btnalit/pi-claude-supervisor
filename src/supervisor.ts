@@ -5,7 +5,7 @@ import { SupervisorStateMachine } from "./state.ts";
 import { evaluatePermission, isRoutinePermission, type RemoteGrant } from "./policy.ts";
 import { PiDecisionWorker, type DecisionAction, type DecisionContext, type DecisionDeadlineContext, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
 import { DEFAULT_DEADLINE_GRACE_MS, DEFAULT_DEADLINE_MS, DEFAULT_DEADLINE_WARNING_MS, DEFAULT_NO_OUTPUT_TIMEOUT_MS, formatDurationMs } from "./config.ts";
-import { collectRepositoryEvidence, remoteBranchHead, runReadOnly, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryIsAncestor, repositoryWorkTree, verifyAll, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
+import { collectRepositoryEvidence, remoteBranchHead, remoteUrl, runReadOnly, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryIsAncestor, repositoryWorkTree, verifyAll, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { redactSensitive } from "./redaction.ts";
 import { assertAutomaticClaudePermissionConfiguration, assertTrustedAutomaticClaudeExecutable, automaticClaudeArgs, automaticWorkerEnvironment, type AutomaticClaudeArgOptions } from "./worker/environment.ts";
@@ -221,10 +221,17 @@ export class Supervisor {
    * passed" and "the publish turn settled", and only for `#verifiedHead` on
    * the candidate's own branch, so an unverified Worker never reaches a remote.
    */
+  /** The live authority the policy sees; revoked as soon as the publish turn completes. */
   #remoteGrant?: RemoteGrant;
+  /** What was granted, kept past the revocation so the publish can still be confirmed. */
+  #publishTarget?: RemoteGrant;
   #verifiedHead?: string;
+  /** The URL the granted remote resolved to when the grant was issued. */
+  #publishRemoteUrl?: string;
   #publishState: "none" | "requested" | "settled" = "none";
   #prUrl?: string;
+  /** Why a granted task ended without a confirmed publish; folded into the candidate notice so it is never silent. */
+  #publishShortfall?: string;
   /** Armed by a `wait` decision: re-asks the Decision Worker if the Worker never resumes on its own. */
   #waitTimer?: NodeJS.Timeout;
   #waitTimeoutMs = 10 * 60_000;
@@ -341,9 +348,12 @@ export class Supervisor {
     this.#lastTurnCompleted = undefined;
     this.#pendingDecisionKey = undefined;
     this.#remoteGrant = undefined;
+    this.#publishTarget = undefined;
     this.#verifiedHead = undefined;
+    this.#publishRemoteUrl = undefined;
     this.#publishState = "none";
     this.#prUrl = undefined;
+    this.#publishShortfall = undefined;
     this.#preemptiveStop = undefined;
     this.#automation = (options.automation ?? false) && spec.autonomy.unattended;
     this.#onDecisionSessionProgress = options.onDecisionSessionProgress;
@@ -665,7 +675,17 @@ export class Supervisor {
       let skipDecisionNotify = false;
       // Any fresh Worker activity supersedes a pending wait.
       this.#clearWaitTimer();
-      if (event.type === "turn_completed") { this.#lastWorkerResult = event.result; this.#lastTurnCompleted = event; }
+      if (event.type === "turn_completed") {
+        this.#lastWorkerResult = event.result;
+        this.#lastTurnCompleted = event;
+        // The grant covers the publish turn and nothing after it. Revoking here
+        // rather than at the next `verify` means a Decision Worker that answers
+        // `continue` cannot leave a live grant for a later, unverified push.
+        if (this.#remoteGrant) {
+          this.#remoteGrant = undefined;
+          await this.#appendEvent({ type: "publish_grant_revoked", taskId, workerId: handle.id, data: { reason: "the publish turn completed" } }).catch(() => {});
+        }
+      }
       // Do not call #pollInternal from within a deferred retry: it would
       // recurse back into #retryDeferredWorkerEvents through #pollInternal's
       // callers and reprocess this same event twice.
@@ -708,12 +728,12 @@ export class Supervisor {
             this.#pendingPermissions.delete(event.request.requestId);
             skipDecisionNotify = true;
           } else {
-            const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd, { writeRoots: event.request.writeRoots, ...(this.#remoteGrant ? { remote: this.#remoteGrant } : {}) });
+            const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd, this.#permissionOptions(event.request.writeRoots));
             if (policy.decision === "deny") {
               if (this.#adapter.respondPermission) {
                 await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, {
                   behavior: "deny",
-                  message: `${policy.reason}${this.#publishHint()}; denied by supervisor policy`,
+                  message: `${policy.reason}${this.#publishHint(policy.reason)}; denied by supervisor policy`,
                 });
                 this.#pendingPermissions.delete(event.request.requestId);
                 await this.#appendEvent({
@@ -739,14 +759,14 @@ export class Supervisor {
           skipDecisionNotify = true;
         } else if (this.#automation && !this.#humanRequired) {
           const authority = task.spec.autonomy.permissionAuthority;
-          const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd, { writeRoots: event.request.writeRoots, ...(this.#remoteGrant ? { remote: this.#remoteGrant } : {}) });
+          const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd, this.#permissionOptions(event.request.writeRoots));
           const answerLocally = authority === "policy"
             || (authority === "hybrid" && (policy.decision === "deny" || isRoutinePermission(event.request.toolName, event.request.input, task.cwd, { writeRoots: event.request.writeRoots })));
           if (answerLocally && this.#adapter.respondPermission) {
             const behavior: "allow" | "deny" = policy.decision === "deny" ? "deny" : "allow";
             await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, {
               behavior,
-              message: behavior === "deny" ? `${policy.reason}; denied by supervisor policy` : undefined,
+              message: behavior === "deny" ? `${policy.reason}${this.#publishHint(policy.reason)}; denied by supervisor policy` : undefined,
             }, behavior === "allow" ? event.request.input : undefined);
             this.#pendingPermissions.delete(event.request.requestId);
             await this.#appendEvent({
@@ -866,9 +886,17 @@ export class Supervisor {
    * Told to a Worker refused a remote action while the task still has remote
    * authority to give: the grant is coming, it just has to finish first.
    */
-  #publishHint(): string {
+  /** Permission options for one request; the single place the live grant is attached. */
+  #permissionOptions(writeRoots?: readonly string[]): { writeRoots?: readonly string[]; remote?: RemoteGrant } {
+    return { ...(writeRoots ? { writeRoots } : {}), ...(this.#remoteGrant ? { remote: this.#remoteGrant } : {}) };
+  }
+
+  #publishHint(policyReason: string): string {
     if (this.#publishState !== "none") return "";
     if ((this.#task?.spec.autonomy.remoteAuthority ?? "none") === "none") return "";
+    // Only where it answers the refusal: this explains a remote denial, not an
+    // outside-cwd write that happens to be refused in the same session.
+    if (!/remote repository or main\/integration merge authority/u.test(policyReason)) return "";
     return "; remote authority unlocks after this candidate's acceptance and review pass — finish and commit locally, and the Supervisor will ask you to publish";
   }
 
@@ -938,7 +966,7 @@ export class Supervisor {
         // checked before the generic policy-deny reason, or the Decision
         // Worker's chosen answer would never reach Claude.
         const isAskUserQuestionAnswer = event.request.toolName === "AskUserQuestion" && action.action === "deny_permission";
-        const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd, { writeRoots: event.request.writeRoots, ...(this.#remoteGrant ? { remote: this.#remoteGrant } : {}) });
+        const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd, this.#permissionOptions(event.request.writeRoots));
         const behavior = policy.decision === "deny" ? "deny" : action.action === "allow_permission" ? "allow" : "deny";
         const message = behavior !== "deny"
           ? undefined
@@ -947,7 +975,7 @@ export class Supervisor {
             // Decision Worker's chosen option and rationale there.
             ? `Supervisor answer: ${action.reason}`
             : policy.decision === "deny"
-              ? `${policy.reason}; denied by supervisor policy`
+              ? `${policy.reason}${this.#publishHint(policy.reason)}; denied by supervisor policy`
               : `denied by supervisor: ${action.reason}`;
         await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, { behavior, message }, behavior === "allow" ? event.request.input : undefined);
         this.#pendingPermissions.delete(event.request.requestId);
@@ -1218,7 +1246,7 @@ export class Supervisor {
       const request = requestId ? this.#pendingPermissions.get(requestId) : [...this.#pendingPermissions.values()].at(-1);
       if (!request) throw new Error("no pending permission request");
       if (this.#humanRequired && this.#humanGate !== "permission") throw new Error("automatic decisions are held by a separate human gate; use resume-auto explicitly");
-      const policy = evaluatePermission(request.toolName, request.input, task.cwd, { writeRoots: request.writeRoots, ...(this.#remoteGrant ? { remote: this.#remoteGrant } : {}) });
+      const policy = evaluatePermission(request.toolName, request.input, task.cwd, this.#permissionOptions(request.writeRoots));
       if (policy.decision === "deny" && behavior === "allow") throw new Error(`permission denied by policy: ${policy.reason}`);
       await this.#adapter.respondPermission(handle, request.requestId, request.toolUseId, { behavior: policy.decision === "deny" ? "deny" : behavior }, behavior === "allow" ? request.input : undefined);
       this.#pendingPermissions.delete(request.requestId);
@@ -1515,7 +1543,8 @@ export class Supervisor {
       // void and the new tree has to earn its own verification.
       this.#publishState = "settled";
       this.#remoteGrant = undefined;
-      await this.#appendEvent({ type: "publish_abandoned", taskId: this.#task.taskId, workerId: this.#handle?.id, data: { reason: "the candidate changed during the publish turn; re-verifying", verifiedHead: this.#verifiedHead, head } }).catch(() => {});
+      this.#publishShortfall = "the candidate changed during the publish turn, so the publish grant was voided and the new tree re-verified; nothing was published";
+      await this.#appendEvent({ type: "publish_abandoned", taskId: this.#task.taskId, workerId: this.#handle?.id, data: { reason: this.#publishShortfall, verifiedHead: this.#verifiedHead, head } }).catch(() => {});
     }
     this.#reportProgress("acceptance", "running acceptance checks", true);
 
@@ -1705,24 +1734,40 @@ export class Supervisor {
     if (!task || !handle || !this.#automation || authority === "none") return false;
     if (this.#publishState !== "none" || this.#humanRequired || this.#stopRequested !== undefined) return false;
     if (!canRepairInPlace(this.#adapter)) return false;
+    // A publish turn the deadline stop would cut short leaves a half-finished
+    // push and a stopped task, where a plain verified candidate would have completed.
+    const closeOut = this.#deadlineContext();
+    if (closeOut?.closeOut && (closeOut.closeOutRemainingMs ?? 0) < MIN_CLOSE_OUT_REPAIR_MS) {
+      await this.#notePublishShortfall(handle.id, { reason: `the task's close-out window is exhausted (${formatDurationMs(closeOut.closeOutRemainingMs ?? 0)} left), so no publish turn was started` });
+      return false;
+    }
     const branch = this.#lastObservedBranch;
     if (!branch || isProtectedBranch(branch)) {
-      await this.#appendEvent({ type: "publish_skipped", taskId: task.taskId, workerId: handle.id, data: { reason: branch ? `the candidate sits on the protected branch ${branch}` : "the candidate branch is unknown" } }).catch(() => {});
+      await this.#notePublishShortfall(handle.id, { reason: branch ? `the candidate sits on the protected branch ${branch}` : "the candidate branch is unknown" });
       return false;
     }
     const head = await repositoryHead(task.cwd, signal);
     if (!head) {
-      await this.#appendEvent({ type: "publish_skipped", taskId: task.taskId, workerId: handle.id, data: { reason: "the candidate HEAD could not be read" } }).catch(() => {});
+      await this.#notePublishShortfall(handle.id, { reason: "the candidate HEAD could not be read" });
       return false;
     }
     const status = await this.#adapter.getStatus(handle).catch(() => undefined);
     if (!status?.running || status.activeRequests) {
-      await this.#appendEvent({ type: "publish_skipped", taskId: task.taskId, workerId: handle.id, data: { reason: "the Worker is no longer idle and available to publish" } }).catch(() => {});
+      await this.#notePublishShortfall(handle.id, { reason: "the Worker is no longer idle and available to publish" });
       return false;
     }
     const remoteName = task.spec.autonomy.remoteName;
+    // Pin the destination, not just the name: a remote can be repointed, and
+    // the confirmation below resolves the same name it was pushed to.
+    const url = await remoteUrl(task.cwd, remoteName, signal);
+    if (!url) {
+      await this.#notePublishShortfall(handle.id, { reason: `the remote ${remoteName} has no URL to publish to` });
+      return false;
+    }
     this.#verifiedHead = head;
-    this.#remoteGrant = { authority, remoteName, branch };
+    this.#publishRemoteUrl = url;
+    this.#remoteGrant = { authority, remoteName, branch, cwd: task.cwd };
+    this.#publishTarget = this.#remoteGrant;
     this.#publishState = "requested";
     await this.#appendEvent({ type: "publish_requested", taskId: task.taskId, workerId: handle.id, data: { authority, remoteName, branch, head } });
     this.#reportProgress("candidate", `verified; asking the Worker to publish ${branch} to ${remoteName}`, true);
@@ -1737,12 +1782,18 @@ export class Supervisor {
     } catch (error) {
       this.#publishState = "settled";
       this.#remoteGrant = undefined;
-      await this.#appendEvent({ type: "publish_skipped", taskId: task.taskId, workerId: handle.id, data: { reason: `the publish instruction could not be sent: ${safeMessage(error)}` } }).catch(() => {});
+      await this.#notePublishShortfall(handle.id, { reason: `the publish instruction could not be sent: ${safeMessage(error)}` });
       if (this.#machine.state === "running") this.#machine.transition("verifying");
       return false;
     } finally {
       this.#repairSendInProgress = false;
     }
+  }
+
+  /** Record why a task with remote authority is finishing without a confirmed publish. */
+  async #notePublishShortfall(workerId: string | undefined, data: { reason: string }): Promise<void> {
+    this.#publishShortfall = data.reason;
+    await this.#appendEvent({ type: "publish_skipped", taskId: this.#task?.taskId, workerId, data }).catch(() => {});
   }
 
   /**
@@ -1753,11 +1804,14 @@ export class Supervisor {
    */
   async #settlePublish(result: AcceptanceReport, signal?: AbortSignal): Promise<AcceptanceReport> {
     const task = this.#task!;
-    const grant = this.#remoteGrant;
+    const grant = this.#publishTarget;
     this.#publishState = "settled";
     this.#remoteGrant = undefined;
     if (!grant) return this.#finalizeVerification(result);
-    const remoteHead = await remoteBranchHead(task.cwd, grant.remoteName, grant.branch, signal);
+    // The remote must still be the one the grant was issued against.
+    const currentUrl = await remoteUrl(task.cwd, grant.remoteName, signal);
+    const sameRemote = Boolean(currentUrl && this.#publishRemoteUrl && currentUrl === this.#publishRemoteUrl);
+    const remoteHead = sameRemote ? await remoteBranchHead(task.cwd, grant.remoteName, grant.branch, signal) : undefined;
     const pushed = Boolean(remoteHead && remoteHead === this.#verifiedHead);
     const prUrl = pushed && grant.authority === "pr" ? await this.#findPullRequest(task.cwd, grant.branch, signal) : undefined;
     this.#prUrl = prUrl;
@@ -1765,8 +1819,11 @@ export class Supervisor {
       type: pushed && (grant.authority !== "pr" || prUrl) ? "publish_confirmed" : "publish_unconfirmed",
       taskId: task.taskId,
       workerId: this.#handle?.id,
-      data: { remoteName: grant.remoteName, branch: grant.branch, expected: this.#verifiedHead, ...(remoteHead ? { remoteHead } : {}), ...(prUrl ? { prUrl } : {}) },
+      data: { remoteName: grant.remoteName, branch: grant.branch, expected: this.#verifiedHead, ...(remoteHead ? { remoteHead } : {}), ...(prUrl ? { prUrl } : {}), ...(sameRemote ? {} : { remoteChanged: true }) },
     }).catch(() => {});
+    if (!sameRemote) {
+      return this.#finalizeVerification(result, "blocked", `the remote ${grant.remoteName} no longer points where the publish was granted; nothing was confirmed and the local candidate is unchanged`);
+    }
     if (!pushed) {
       return this.#finalizeVerification(result, "blocked", `the candidate was verified but ${grant.remoteName}/${grant.branch} does not point at ${String(this.#verifiedHead).slice(0, 12)}; the local candidate is unchanged and still deliverable`);
     }
@@ -1776,12 +1833,19 @@ export class Supervisor {
     return this.#finalizeVerification(result);
   }
 
-  /** The pull request for a branch, read-only via the GitHub CLI; undefined when there is none or `gh` is unavailable. */
+  /**
+   * The open pull request whose head is the verified commit, read-only via the
+   * GitHub CLI. `--state open` and the head check matter: a reused branch name
+   * can carry an older merged pull request, which would otherwise be reported
+   * as proof that this task published one.
+   */
   async #findPullRequest(cwd: string, branch: string, signal?: AbortSignal): Promise<string | undefined> {
     try {
-      const { stdout } = await runReadOnly("gh", ["pr", "list", "--head", branch, "--state", "all", "--limit", "1", "--json", "url"], cwd, signal);
-      const parsed = JSON.parse(stdout) as Array<{ url?: unknown }>;
-      const url = Array.isArray(parsed) ? parsed[0]?.url : undefined;
+      const { stdout } = await runReadOnly("gh", ["pr", "list", "--head", branch, "--state", "open", "--limit", "10", "--json", "url,headRefOid"], cwd, signal);
+      const parsed = JSON.parse(stdout) as Array<{ url?: unknown; headRefOid?: unknown }>;
+      if (!Array.isArray(parsed)) return undefined;
+      const match = parsed.find((entry) => typeof entry.headRefOid === "string" && entry.headRefOid === this.#verifiedHead);
+      const url = match?.url;
       return typeof url === "string" && /^https:\/\//u.test(url) ? url : undefined;
     } catch {
       return undefined;
@@ -1967,7 +2031,9 @@ export class Supervisor {
         workerId: this.#handle?.id,
         cwd: task?.cwd ?? "",
         task: task?.task ?? "",
-        reason: verificationSucceeded ? (releasedInteractive ? "candidate is ready; the interactive session stays open (/supervise stop closes it)" : "candidate is ready") : candidateReason,
+        reason: verificationSucceeded
+          ? `${releasedInteractive ? "candidate is ready; the interactive session stays open (/supervise stop closes it)" : "candidate is ready"}${this.#prUrl ? `; pull request ${this.#prUrl}` : ""}${this.#publishShortfall ? `; not published: ${this.#publishShortfall}` : ""}`
+          : candidateReason,
         status: verificationSucceeded ? "ready" : "blocked",
         deliverable: verificationSucceeded,
         usage: this.usage,

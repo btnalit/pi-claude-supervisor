@@ -503,8 +503,8 @@ test("a write root is honored before it exists and through a symlinked ancestor"
 
 test("a publish grant admits exactly one shape and nothing else", () => {
   const branch = "s6/console-completion";
-  const push = { authority: "push" as const, remoteName: "origin", branch };
-  const pr = { authority: "pr" as const, remoteName: "origin", branch };
+  const push = { authority: "push" as const, remoteName: "origin", branch, cwd: "/repo" };
+  const pr = { authority: "pr" as const, remoteName: "origin", branch, cwd: "/repo" };
 
   for (const command of [
     "git push -u origin s6/console-completion",
@@ -551,13 +551,47 @@ test("a publish grant admits exactly one shape and nothing else", () => {
   assert.equal(evaluateCommand("git commit -m x").decision, "allow");
 
   // A protected candidate branch is never publishable, grant or not.
-  assert.equal(evaluateCommand("git push origin main", [], { authority: "push", remoteName: "origin", branch: "main" }).decision, "deny");
+  assert.equal(evaluateCommand("git push origin main", [], { authority: "push", remoteName: "origin", branch: "main", cwd: "/repo" }).decision, "deny");
 
   // The grant covers the direct invocation only. A shell wrapper is still
   // denied: the outer command is not the permitted shape, and admitting it
   // would mean trusting a nested parse to have seen everything.
-  assert.equal(evaluateCommand("sh -c 'git push origin s6/console-completion'", [], push).decision, "deny");
-  assert.equal(evaluateCommand("bash -lc 'git push origin s6/console-completion'", [], push).decision, "deny");
+  for (const wrapper of [
+    "sh -c 'git push origin s6/console-completion'",
+    "bash -lc 'git push origin s6/console-completion'",
+    "bash <<'EOF'\ngit push origin s6/console-completion\nEOF",
+    "sh -s <<'EOF'\ngit push origin s6/console-completion\nEOF",
+    "cat <<'EOF' | bash\ngit push origin s6/console-completion\nEOF",
+  ]) assert.equal(evaluateCommand(wrapper, [], push).decision, "deny", wrapper);
+
+  // `-C` may name the task directory and nothing else.
+  assert.equal(evaluateCommand("git -C /repo push origin s6/console-completion", [], push).decision, "allow");
+  assert.equal(evaluateCommand("git -C /tmp/evil push origin s6/console-completion", [], push).decision, "deny");
+  assert.equal(evaluateCommand("git -C /repo/sub push origin s6/console-completion", [], push).decision, "deny");
+
+  // Repointing a remote would make the grant's remote name meaningless.
+  for (const command of [
+    "git remote set-url origin https://evil.example/x.git",
+    "git remote add evil https://evil.example/x.git",
+    "git remote rename origin upstream",
+  ]) assert.equal(evaluateCommand(command).decision, "deny", command);
+
+  // gh pr create is an option allowlist: short forms and file-reading options
+  // are refused, not just the three long ones a blocklist would name.
+  for (const command of [
+    "gh pr create -H other-branch",
+    "gh pr create -w",
+    "gh pr create --body-file /home/u/.ssh/id_rsa",
+    "gh pr create -F /etc/passwd",
+    "gh pr create --template /etc/passwd",
+    "gh pr create --head=other-branch",
+  ]) assert.equal(evaluateCommand(command, [], pr).decision, "deny", command);
+  for (const command of [
+    "gh pr create --title x --body y",
+    "gh pr create -t x -b y --base main --draft",
+    "gh pr create -H s6/console-completion",
+    "gh pr create --head=s6/console-completion",
+  ]) assert.equal(evaluateCommand(command, [], pr).decision, "allow", command);
 
   // evaluatePermission threads the grant from the permission options.
   assert.equal(evaluatePermission("Bash", { command: "git push origin s6/console-completion" }, "/repo", { remote: push }).decision, "allow");

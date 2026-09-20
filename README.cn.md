@@ -218,13 +218,24 @@ Worker 推自己的分支;`pr` 还允许它开 PR。**push 由 Worker 自己执�
 才把任务标记完成,候选通知里带上 PR 链接。核实不到则把候选标为 blocked,本地候选
 依然可交付。
 
-这个授权刻意严苛:只认 `git [-C <dir>] push [-u] <remote> <branch>`(分支必须字面
-写出)和 `pr` 下的 `gh pr create`。其余一律拒绝,有没有授权都一样:`--force`、
-`--force-with-lease`、`--delete`、`--mirror`、`--all`、`--tags`、`--no-verify`、
-`--push-option`、`HEAD` refspec、别的 remote 或分支、保护分支、被 shell 包装或带
-动态参数的命令、第二条语句、`gh pr merge`、`gh api`、`gh release`、`npm publish`。
-它只存在于"通过判定"到"发布轮结束"之间;Worker 若在该轮里改动了工作树,授权立即
-作废并重新完整验收。验证之前被拒的 push 会明确告知原因,而不是让 Worker 去猜。
+这个授权刻意严苛,而且两条命令都按**选项白名单**匹配——没被审过的选项一律拒绝,
+而不是默认无害。它只认 `git [-C <任务目录>] push [-u] <remote> <branch>`(分支必须
+字面写出),`pr` 下另加受限的 `gh pr create`(只允许 title / body / base / head(且
+必须等于候选分支)/ draft / assignee / label)。
+
+有没有授权都拒绝:其余所有 push 选项(`--force`、`--force-with-lease`、`--delete`、
+`--mirror`、`--all`、`--tags`、`--no-verify`、`--push-option`、`--receive-pack` 等)、
+`HEAD` refspec、裸 `git push`、别的 remote 或分支、保护分支、`-C` 指向任务目录以外
+的任何目录、被 shell 包装(含 heredoc 管进 shell)、带动态参数、第二条语句、
+`gh pr create --body-file/-F/--template`(会把任意本地文件内容发到 PR 上)、
+`--web`、`--repo`、`gh pr merge`、`gh api`、`gh release`、`npm publish`。改动仓库
+remote(`git remote set-url|add|rename|…`)一律拒绝,否则授权认的 remote 名会被偷换,
+连 supervisor 的核实也会被骗过。
+
+授权是**一次性**的:发布轮一结束就收回(不等下一个决策),并且同时绑定 remote 的 URL
+而不只是名字。Worker 若在该轮里改动了工作树,授权立即作废并重新完整验收。验证之前
+被拒的 push 会说明授权稍后会来,而不是让 Worker 去猜;没能确认发布的任务会在候选
+通知里写明原因,而不是只报一句 "ready"。
 
 ## 任务 spec
 

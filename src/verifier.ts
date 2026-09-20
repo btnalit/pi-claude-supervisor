@@ -80,25 +80,20 @@ export async function repositoryHead(cwd: string, signal?: AbortSignal): Promise
 }
 
 /**
- * The commit a remote branch points at, or undefined when the ref is absent or
- * unreachable. Read-only: `ls-remote` never mutates, and the prompt is disabled
- * so a credential-less remote fails fast instead of hanging.
+ * Environment for confirming a publish. Unlike a Worker command this is a
+ * read-only inspection the Supervisor runs itself, and it has to reach the same
+ * remote the Worker just pushed to: the restricted Worker environment drops
+ * `SSH_AUTH_SOCK` and the forge tokens, which would report every ssh- or
+ * token-authenticated push as unconfirmed. The prompt stays disabled so a
+ * remote we cannot read fails fast instead of hanging.
  */
-export async function remoteBranchHead(cwd: string, remote: string, branch: string, signal?: AbortSignal): Promise<string | undefined> {
-  try {
-    const result = await execFileAsync("git", ["ls-remote", "--heads", "--", remote, branch], {
-      cwd,
-      timeout: 60_000,
-      maxBuffer: 64 * 1024,
-      signal,
-      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
-    });
-    const line = String(result.stdout).split("\n").map((entry) => entry.trim()).find((entry) => entry.endsWith(`refs/heads/${branch}`));
-    const sha = line?.split(/\s+/u)[0] ?? "";
-    return /^[0-9a-f]{40,64}$/u.test(sha) ? sha : undefined;
-  } catch {
-    return undefined;
+function remoteReadEnvironment(): NodeJS.ProcessEnv {
+  const inherited = workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "" });
+  for (const name of ["SSH_AUTH_SOCK", "GH_TOKEN", "GITHUB_TOKEN", "GH_HOST", "GH_CONFIG_DIR", "XDG_CONFIG_HOME", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "SSH_AGENT_PID"]) {
+    const value = process.env[name];
+    if (value !== undefined) inherited[name] = value;
   }
+  return inherited;
 }
 
 /**
@@ -111,9 +106,35 @@ export async function runReadOnly(command: string, args: readonly string[], cwd:
     timeout: 60_000,
     maxBuffer: 256 * 1024,
     signal,
-    env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
+    env: remoteReadEnvironment(),
   });
   return { stdout: String(result.stdout) };
+}
+
+/** The URL a remote name currently resolves to, so a grant can be pinned to a destination rather than a name. */
+export async function remoteUrl(cwd: string, remote: string, signal?: AbortSignal): Promise<string | undefined> {
+  try {
+    const { stdout } = await runReadOnly("git", ["remote", "get-url", "--", remote], cwd, signal);
+    const url = stdout.trim();
+    return url === "" ? undefined : url;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The commit a remote branch points at, or undefined when the ref is absent or
+ * unreachable. Read-only: `ls-remote` never mutates.
+ */
+export async function remoteBranchHead(cwd: string, remote: string, branch: string, signal?: AbortSignal): Promise<string | undefined> {
+  try {
+    const { stdout } = await runReadOnly("git", ["ls-remote", "--heads", "--", remote, branch], cwd, signal);
+    const line = stdout.split("\n").map((entry) => entry.trim()).find((entry) => entry.endsWith(`refs/heads/${branch}`));
+    const sha = line?.split(/\s+/u)[0] ?? "";
+    return /^[0-9a-f]{40,64}$/u.test(sha) ? sha : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Verify that a full commit object is still present without invoking a shell. */

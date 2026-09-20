@@ -3299,3 +3299,76 @@ test("without remote authority the task still completes at the verified candidat
     await repo.cleanup();
   }
 });
+
+test("the publish grant dies with its turn, so a later unverified push is refused", async () => {
+  const branch = "worker/publish-oneshot";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-oneshot-", branch);
+  try {
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "the grant is one-shot",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const first = fixture.turn(1);
+    fixture.state.listener?.(first);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done" }, first);
+    assert.ok(events.events.some((event) => event.type === "publish_requested"));
+
+    // The publish turn ends. Whatever the Decision Worker decides next, the
+    // authority is already gone — it does not wait for a `verify`.
+    fixture.state.listener?.(fixture.turn(2));
+    await supervisor.poll();
+    assert.ok(events.events.some((event) => event.type === "publish_grant_revoked"));
+    assert.equal(supervisor.deadline, undefined);
+    // A push attempted on a later turn is refused exactly as before the grant.
+    const later = await import("./policy.ts");
+    assert.equal(later.evaluatePermission("Bash", { command: `git push origin ${branch}` }, repo.cwd).decision, "deny");
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test("a task granted remote authority never reports ready without saying the publish did not happen", async () => {
+  const branch = "main";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-skip-", branch);
+  try {
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: Array<{ status: string; reason: string }> = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push({ status: notice.status, reason: notice.reason }); },
+    });
+    await supervisor.start({
+      task: "the candidate sits on a protected branch",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      // The candidate is on `main`, which is never publishable.
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const turn = fixture.turn(1);
+    fixture.state.listener?.(turn);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done" }, turn);
+
+    assert.equal(supervisor.state, "completed");
+    assert.ok(events.events.some((event) => event.type === "publish_skipped"));
+    // Completing silently would tell the operator a PR exists when none does.
+    assert.match(String(candidates.at(-1)?.reason), /not published: .*protected branch/u);
+  } finally {
+    await repo.cleanup();
+  }
+});

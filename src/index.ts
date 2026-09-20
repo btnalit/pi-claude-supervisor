@@ -429,7 +429,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             decisionModel: decisionPiModel,
             decisionCompactionTokens: decisionCompactionTokens(),
             onCandidate: async (notice) => {
-              if (ctx.hasUI) notify(ctx, `Candidate ${notice.status}: ${notice.reason}${formatUsageSuffix(notice.usage)}`, notice.status === "ready" ? "info" : "warning");
+              if (ctx.hasUI) notify(ctx, `Candidate ${notice.status}: ${notice.reason}${notice.prUrl ? ` (${notice.prUrl})` : ""}${formatUsageSuffix(notice.usage)}`, notice.status === "ready" ? "info" : "warning");
               if (humanWebhook.enabled) {
                 try { await humanWebhook.notifyCandidate(notice); }
                 catch (error) { console.error(`pi-claude-supervisor candidate webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`); }
@@ -727,7 +727,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             decisionModel: decisionPiModel,
             decisionCompactionTokens: decisionCompactionTokens(),
             onCandidate: async (notice) => {
-              if (ctx.hasUI) notify(ctx, `Candidate ${notice.status}: ${notice.reason}${formatUsageSuffix(notice.usage)}`, notice.status === "ready" ? "info" : "warning");
+              if (ctx.hasUI) notify(ctx, `Candidate ${notice.status}: ${notice.reason}${notice.prUrl ? ` (${notice.prUrl})` : ""}${formatUsageSuffix(notice.usage)}`, notice.status === "ready" ? "info" : "warning");
               if (humanWebhook.enabled) {
                 try { await humanWebhook.notifyCandidate(notice); }
                 catch (error) { console.error(`pi-claude-supervisor candidate webhook failed: ${redactText(error instanceof Error ? error.message : String(error))}`); }

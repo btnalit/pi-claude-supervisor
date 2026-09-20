@@ -34,15 +34,21 @@ export interface RemoteGrant {
   remoteName: string;
   /** The candidate branch; a push must name it literally. */
   branch: string;
+  /** The task working directory; `git -C` may name only this, so the grant cannot be spent on another repository. */
+  cwd: string;
 }
 
-/** Push flags that change or destroy remote history, or smuggle server-side actions. */
-const FORBIDDEN_PUSH_FLAGS = new Set([
-  "-f", "--force", "--force-with-lease", "--force-if-includes",
-  "-d", "--delete", "--mirror", "--all", "--tags", "--follow-tags",
-  "--prune", "-o", "--push-option", "--no-verify", "--recurse-submodules",
-  "--receive-pack", "--exec", "-c", "--config",
-]);
+/** The only options a granted `git push` may carry. Anything else is refused, so a new git flag is denied until it is reviewed. */
+const ALLOWED_PUSH_OPTIONS = new Set(["-u", "--set-upstream"]);
+/**
+ * The only options a granted `gh pr create` may carry. An allowlist, because an
+ * unlisted option is how a grant leaks: `--body-file`/`-F`/`--template` post the
+ * contents of an arbitrary local file, `-H` retargets the head branch, and `-w`
+ * is `--web`.
+ */
+const ALLOWED_PR_CREATE_OPTIONS = new Set(["-t", "--title", "-b", "--body", "-B", "--base", "--draft", "-d", "--fill", "--fill-first", "-a", "--assignee", "-l", "--label", "-H", "--head"]);
+/** `gh pr create` options that take a value; the value is the next word. */
+const PR_CREATE_VALUE_OPTIONS = new Set(["-t", "--title", "-b", "--body", "-B", "--base", "-a", "--assignee", "-l", "--label", "-H", "--head"]);
 
 export function evaluatePermission(toolName: string, input: unknown, cwd = process.cwd(), options: PermissionPolicyOptions = {}): PolicyResult {
   if (toolName === "AskUserQuestion") return { decision: "deny", reason: "interactive questions are converted to ordinary Worker text" };
@@ -203,17 +209,27 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
   if (words.length === 0) return undefined;
   const name = (words[0] ?? "").split(/[\\/]/u).at(-1)?.toLowerCase();
   if (protectedBranches.has(grant.branch.toLowerCase())) return undefined;
+  const optionName = (word: string): string => word.split("=")[0] ?? word;
 
   if (name === "git") {
     let index = 1;
-    // `git -C <dir>` is the only pre-subcommand option a publish may carry.
-    while (words[index] === "-C" && words[index + 1] !== undefined) index += 2;
+    // `-C` may name the task directory and nothing else: otherwise the grant
+    // could be spent pushing an unrelated repository the Worker just created.
+    while (words[index] === "-C") {
+      const directory = words[index + 1];
+      if (directory === undefined || resolve(directory) !== resolve(grant.cwd)) return undefined;
+      index += 2;
+    }
     if (words[index] !== "push") return undefined;
-    index += 1;
-    const rest = words.slice(index);
-    if (rest.some((word) => word.startsWith("-") && !["-u", "--set-upstream"].includes(word))) return undefined;
-    if (rest.some((word) => FORBIDDEN_PUSH_FLAGS.has(word.split("=")[0] ?? word))) return undefined;
-    const positional = rest.filter((word) => !word.startsWith("-"));
+    const rest = words.slice(index + 1);
+    const positional: string[] = [];
+    for (const word of rest) {
+      if (word.startsWith("-")) {
+        if (!ALLOWED_PUSH_OPTIONS.has(optionName(word)) || word.includes("=")) return undefined;
+        continue;
+      }
+      positional.push(word);
+    }
     if (positional.length !== 2) return undefined;
     const [remote, refspec] = positional as [string, string];
     if (remote !== grant.remoteName) return undefined;
@@ -224,11 +240,18 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
   if (name === "gh" && grant.authority === "pr") {
     if (words[1] !== "pr" || words[2] !== "create") return undefined;
     const rest = words.slice(3);
-    if (rest.some((word) => ["-R", "--repo", "--web"].includes(word.split("=")[0] ?? word))) return undefined;
-    const headIndex = rest.findIndex((word) => word === "--head" || word.startsWith("--head="));
-    if (headIndex >= 0) {
-      const head = rest[headIndex] === "--head" ? rest[headIndex + 1] : rest[headIndex]!.slice("--head=".length);
-      if (head !== grant.branch) return undefined;
+    for (let cursor = 0; cursor < rest.length; cursor += 1) {
+      const word = rest[cursor]!;
+      if (!word.startsWith("-")) return undefined;
+      const option = optionName(word);
+      if (!ALLOWED_PR_CREATE_OPTIONS.has(option)) return undefined;
+      const inlineValue = word.includes("=");
+      const value = inlineValue ? word.slice(option.length + 1) : rest[cursor + 1];
+      if (PR_CREATE_VALUE_OPTIONS.has(option)) {
+        if (value === undefined) return undefined;
+        if ((option === "-H" || option === "--head") && value !== grant.branch) return undefined;
+        if (!inlineValue) cursor += 1;
+      }
     }
     return { decision: "allow", reason: `publish grant: open a pull request for ${grant.branch}` };
   }
@@ -301,7 +324,7 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   const hasGitAliasConfiguration = hasGit && lower.some((value) => /^alias\.[^=]*(?:=|$)/u.test(value));
   if (depth < 4) {
     for (const nested of nestedShellCommands(lower, values)) {
-      const nestedResult = evaluateCommandInternal(nested, depth + 1, grant);
+      const nestedResult = evaluateCommandInternal(nested, depth + 1);
       if (nestedResult.decision === "deny") return nestedResult;
     }
   }
@@ -330,6 +353,11 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   }
   if (hasGit && (hasRemoteOperation || hasGitTransport) || hasGhRemote) {
     return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
+  }
+  // Repointing a remote would make the grant's remote *name* meaningless and
+  // would fool the Supervisor's own confirmation, which resolves the same name.
+  if (hasGit && lower.includes("remote") && lower.some((value) => ["set-url", "add", "rename", "remove", "rm", "prune", "set-branches", "set-head"].includes(value))) {
+    return { decision: "deny", reason: "Worker cannot change the repository's remotes" };
   }
   if (hasGitAliasConfiguration) {
     return { decision: "deny", reason: "Worker cannot redefine Git command aliases" };
@@ -446,7 +474,10 @@ function evaluateTokens(rawTokens: readonly ShellToken[], depth: number, grant?:
   const tokens = resolveLiteralBindings(dataResolved);
   if (depth < 4) {
     for (const body of embedded) {
-      const nestedResult = evaluateCommandInternal(body, depth + 1, grant);
+      // Never with the grant: a nested result is consulted only when it denies,
+      // so a grant here could only suppress a denial -- a heredoc-wrapped push
+      // would pass while the direct form is the only shape that was reviewed.
+      const nestedResult = evaluateCommandInternal(body, depth + 1);
       if (nestedResult.decision === "deny") return nestedResult;
     }
   }
