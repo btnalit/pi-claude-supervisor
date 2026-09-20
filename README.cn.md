@@ -218,23 +218,33 @@ Worker 推自己的分支;`pr` 还允许它开 PR。**push 由 Worker 自己执�
 才把任务标记完成,候选通知里带上 PR 链接。核实不到则把候选标为 blocked,本地候选
 依然可交付。
 
-这个授权刻意严苛,而且两条命令都按**选项白名单**匹配——没被审过的选项一律拒绝,
-而不是默认无害。它只认 `git -C <任务目录> push [-u] <remote> <branch>`(分支必须字面写出)。**`-C`
-是必需的**,且两侧都按内核解析后比较——因为 Claude 的 Bash 工具会在多次调用之间
-保留工作目录,而 `cd` 属于普通本地操作,没有 `-C` 的话授权可能被花在任何别的克隆上,`pr` 下另加受限的 `gh pr create`(只允许 title / body / base / head(且
-必须等于候选分支)/ draft / assignee / label)。
+这个授权刻意严苛,而且两条命令都按字面匹配——没被审过的选项一律拒绝,而不是默认
+无害。它只认 `git -C '<任务目录>' push <remote> <已验证 commit>:refs/heads/<branch>`,
+不带任何选项。refspec 写的是**已验证的 commit** 而不是分支:git 只会推送这一个对象,
+Worker 在发布轮里再提交的内容会留在本地("Everything up-to-date"),搭不上这次授权。
+**`-C` 是必需的且必须是绝对路径**,两侧都按内核解析后比较——因为 Claude 的 Bash 工具
+会在多次调用之间保留工作目录,而 `cd` 属于普通本地操作,没有 `-C` 的话授权可能被花在
+任何别的克隆上;相对写法 `-C .` 则会按 Supervisor 进程而不是 Worker 的 shell 解析。
+`pr` 下另加受限的 `gh pr create`(只允许 title / body / base / head(且必须等于候选分支)/
+draft / assignee / label)。
 
-有没有授权都拒绝:其余所有 push 选项(`--force`、`--force-with-lease`、`--delete`、
+有没有授权都拒绝:任何 push 选项(`-u`、`--force`、`--force-with-lease`、`--delete`、
 `--mirror`、`--all`、`--tags`、`--no-verify`、`--push-option`、`--receive-pack` 等)、
-`HEAD` refspec、裸 `git push`、别的 remote 或分支、保护分支、不带 `-C` 的 `git push`、`-C` 指向任务目录以外、不带
-`--head <候选分支>` 的 `gh pr create`(否则 gh 会用当前 checkout 的分支)、被 shell 包装(含 heredoc 管进 shell)、带动态参数、第二条语句、
-`gh pr create --body-file/-F/--template`(会把任意本地文件内容发到 PR 上)、
-`--web`、`--repo`、`gh pr merge`、`gh api`、`gh release`、`npm publish`。改动仓库
-remote(`git remote set-url|add|rename|…`)一律拒绝,否则授权认的 remote 名会被偷换,
-连 supervisor 的核实也会被骗过。
+以分支或 `HEAD` 作为 refspec 来源、裸 `git push`、别的 remote、分支或 commit、保护分支、
+被 shell 包装(含 heredoc 管进 shell)、带动态参数、第二条语句、不带 `-C` 的 `git push`、
+`-C` 指向任务目录以外或写成相对路径、不带 `--head <候选分支>` 的 `gh pr create`(否则 gh
+会用当前 checkout 的分支——被别的选项当作值吞掉的 `--head` 不算)、
+`gh pr create --body-file/-F/--template`(会把任意本地文件内容发到 PR 上)、`--web`、
+`--repo`、`gh pr merge`、`gh api`、`gh release`、`npm publish`。改动仓库 remote
+(`git remote set-url|add|rename|…`)一律拒绝;改动 push 去向或 push 期间会执行什么也一律
+拒绝——`git config` 写 `remote.*`、`url.*.insteadOf`、`push.*`、`credential.*`、`http.*`、
+`core.sshCommand`、`core.hooksPath`,以及任何对 `.git/config`、`.git/hooks/` 的写入——
+否则授权认的 remote 会被偷换,连 Supervisor 的核实也会被骗过;核实同时钉住 fetch 和 push
+两个 URL。
 
 授权是**一次性**的:发布轮一结束就收回(不等下一个决策),并且同时绑定 remote 的 URL
-而不只是名字。Worker 若在该轮里改动了工作树,授权立即作废并重新完整验收。验证之前
+而不只是名字。Worker 若在该轮里改动了工作树,授权立即作废并重新完整验收;因为授权写的是
+commit,通知能说清已验证的 commit 是否在工作树变动之前就已经推上去了。验证之前
 被拒的 push 会说明授权稍后会来,而不是让 Worker 去猜;没能确认发布的任务会在候选
 通知里写明原因,而不是只报一句 "ready"。
 

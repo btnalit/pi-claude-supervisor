@@ -53,6 +53,30 @@ test("candidate webhook is an optional status notification, not an approval requ
   assert.doesNotMatch(body, /approve_or_deny_permission/u);
 });
 
+test("a pull request URL survives both notice formats unescaped", async () => {
+  const originalFetch = globalThis.fetch;
+  let genericBody = "";
+  let wecomBody = "";
+  globalThis.fetch = (async (_input, init) => {
+    const body = String(init?.body ?? "");
+    if (body.includes("msgtype")) wecomBody = body; else genericBody = body;
+    return new Response("ok", { status: 200 });
+  }) as typeof fetch;
+  // An `_` in the organization or repository is ordinary; Markdown-escaping it
+  // (`my\_org`) broke the link in the WeCom card while the reason line kept it.
+  const prUrl = "https://github.com/my_org/my_repo/pull/12";
+  const candidate: CandidateNotice = { taskId: "task-pr", cwd: "/tmp/work", task: "publish", reason: `candidate is ready; pull request ${prUrl}`, status: "ready", deliverable: true, prUrl };
+  try {
+    await new HumanWebhookNotifier({ url: "https://example.test/hook" }).notifyCandidate(candidate);
+    await new HumanWebhookNotifier({ url: "https://example.test/hook", format: "wecom" }).notifyCandidate(candidate);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.match(genericBody, /"prUrl":"https:\/\/github\.com\/my_org\/my_repo\/pull\/12"/u);
+  assert.match(wecomBody, /PR: https:\/\/github\.com\/my_org\/my_repo\/pull\/12/u);
+  assert.doesNotMatch(wecomBody, /my\\\\_org/u);
+});
+
 test("wecom human webhook sanitizes task and question text", async () => {
   const originalFetch = globalThis.fetch;
   let body = "";

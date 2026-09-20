@@ -80,20 +80,16 @@ export async function repositoryHead(cwd: string, signal?: AbortSignal): Promise
 }
 
 /**
- * Environment for confirming a publish. Unlike a Worker command this is a
- * read-only inspection the Supervisor runs itself, and it has to reach the same
- * remote the Worker just pushed to: the restricted Worker environment drops
- * `SSH_AUTH_SOCK` and the forge tokens, which would report every ssh- or
- * token-authenticated push as unconfirmed. The prompt stays disabled so a
- * remote we cannot read fails fast instead of hanging.
+ * Environment for confirming a publish: the Supervisor's own read-only
+ * inspection, not a Worker command, so it inherits the process environment
+ * rather than the restricted one `repositoryHead` uses for local reads. It has
+ * to reach whatever remote the Worker just pushed to, and an allowlist cannot
+ * keep up with that — proxies, CA bundles, enterprise tokens, credential
+ * helpers — where every omission reports a real publish as unconfirmed. Only
+ * the prompts are forced off, so an unreadable remote fails fast instead of
+ * hanging.
  */
 function remoteReadEnvironment(): NodeJS.ProcessEnv {
-  // The Supervisor's own read-only inspection, not a Worker command: it has to
-  // reach whatever remote the Worker just pushed to. An allowlist cannot keep
-  // up with that — proxies, CA bundles, enterprise tokens, credential helpers —
-  // and every omission reports a real publish as unconfirmed. Inherit the
-  // environment and only force the prompts off, so an unreadable remote fails
-  // fast instead of hanging.
   return { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "" };
 }
 
@@ -112,12 +108,25 @@ export async function runReadOnly(command: string, args: readonly string[], cwd:
   return { stdout: String(result.stdout) };
 }
 
-/** The URL a remote name currently resolves to, so a grant can be pinned to a destination rather than a name. */
-export async function remoteUrl(cwd: string, remote: string, signal?: AbortSignal): Promise<string | undefined> {
+/** Where a remote name currently fetches from and pushes to, so a grant can be pinned to destinations rather than a name. */
+export interface RemoteDestination {
+  /** The fetch URL, which `ls-remote` reads through. */
+  fetch: string;
+  /** The push URL, which the granted push travels through; equals `fetch` unless a `pushurl` or `pushInsteadOf` diverts it. */
+  push: string;
+}
+
+/**
+ * The URLs a remote name resolves to. Both sides are pinned because they can
+ * diverge independently: `remote.<name>.pushurl` and `url.*.pushInsteadOf`
+ * redirect the push while the fetch URL the confirmation reads through stays
+ * put, and `git remote get-url` reports each after any `insteadOf` rewrite.
+ */
+export async function remoteUrl(cwd: string, remote: string, signal?: AbortSignal): Promise<RemoteDestination | undefined> {
   try {
-    const { stdout } = await runReadOnly("git", ["remote", "get-url", "--", remote], cwd, signal);
-    const url = stdout.trim();
-    return url === "" ? undefined : url;
+    const fetch = (await runReadOnly("git", ["remote", "get-url", "--", remote], cwd, signal)).stdout.trim();
+    const push = (await runReadOnly("git", ["remote", "get-url", "--push", "--", remote], cwd, signal)).stdout.trim();
+    return fetch === "" || push === "" ? undefined : { fetch, push };
   } catch {
     return undefined;
   }

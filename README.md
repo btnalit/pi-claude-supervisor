@@ -268,32 +268,42 @@ does — and the Supervisor then confirms it read-only (`git ls-remote`, and
 the pull request URL. A publish that cannot be confirmed blocks the candidate,
 which stays deliverable locally.
 
-The grant is deliberately unforgiving, and both commands are matched by
-**option allowlist** — an option nobody reviewed is refused rather than assumed
-harmless. It admits `git -C <task directory> push [-u] <remote> <branch>` with the branch
-named literally — `-C` is **required** and both sides are resolved through the
-kernel, because Claude's Bash tool keeps its working directory between calls and
-`cd` is ordinary local work, so without it the grant could be spent in any other
-clone, and for `pr` a `gh pr create` limited to title, body,
-base, head (pinned to the candidate branch), draft, assignee and label.
+The grant is deliberately unforgiving, and both commands are matched literally —
+an option nobody reviewed is refused rather than assumed harmless. It admits
+exactly `git -C '<task directory>' push <remote> <verified commit>:refs/heads/<branch>`,
+with no option at all. The refspec names the **verified commit**, not the branch:
+git pushes exactly that object, so a commit the Worker makes during the publish
+turn stays local ("Everything up-to-date") instead of riding the grant. `-C` is
+**required and absolute**, and both sides are resolved through the kernel,
+because Claude's Bash tool keeps its working directory between calls and `cd` is
+ordinary local work — without it the grant could be spent in any other clone,
+and a relative `-C .` would resolve against the Supervisor's process rather than
+the Worker's shell. For `pr` a `gh pr create` limited to title, body, base,
+head (pinned to the candidate branch), draft, assignee and label.
 
-Refused with or without a grant: every other push option (`--force`,
+Refused with or without a grant: every push option (`-u`, `--force`,
 `--force-with-lease`, `--delete`, `--mirror`, `--all`, `--tags`, `--no-verify`,
-`--push-option`, `--receive-pack`, …), a `HEAD` refspec, a bare `git push`,
-another remote or branch, a protected branch, `-C` naming any directory but the
-task's own, a shell wrapper (`sh -c`, and a heredoc piped into a shell), a
-dynamic word, a second statement, `git push` without `-C`, a `-C` naming anything but the task directory,
-`gh pr create` without `--head <candidate branch>` (gh would otherwise use
-whatever branch is checked out), `gh pr create --body-file/-F/--template`
-(which would post the contents of an arbitrary local file), `--web`, `--repo`,
-`gh pr merge`, `gh api`, `gh release` and `npm publish`. Changing the
-repository's remotes (`git remote set-url|add|rename|…`) is denied outright, so
-the granted remote name cannot be repointed underneath the confirmation.
+`--push-option`, `--receive-pack`, …), a branch or `HEAD` as the refspec source,
+a bare `git push`, another remote, branch or commit, a protected branch, a
+shell wrapper (`sh -c`, and a heredoc piped into a shell), a dynamic word, a
+second statement, `git push` without `-C`, a `-C` naming anything but the task
+directory or spelled relatively, `gh pr create` without `--head <candidate
+branch>` (gh would otherwise use whatever branch is checked out — and a
+`--head` swallowed as another option's value does not count), `gh pr create
+--body-file/-F/--template` (which would post the contents of an arbitrary local
+file), `--web`, `--repo`, `gh pr merge`, `gh api`, `gh release` and `npm
+publish`. Changing the repository's remotes (`git remote set-url|add|rename|…`)
+is denied outright, and so is reconfiguring where a push goes or what runs
+during it — `git config` writes to `remote.*`, `url.*.insteadOf`, `push.*`,
+`credential.*`, `http.*`, `core.sshCommand` or `core.hooksPath`, and any write
+to `.git/config` or `.git/hooks/` — so the granted remote cannot be repointed
+underneath the confirmation, which pins both the fetch and the push URL.
 
 The grant is **one-shot**: it is revoked the moment the publish turn completes,
 not when the next decision arrives, and it is pinned to the remote's URL as well
 as its name. A Worker that changes the tree during that turn voids it and is
-re-verified in full. Before verification a refused push says the grant is coming
+re-verified in full; because the grant named the commit, the notice can say
+whether the verified commit landed before the tree moved on. Before verification a refused push says the grant is coming
 rather than leaving the Worker to guess, and a task that ends without a
 confirmed publish says so in its candidate notice instead of reporting a bare
 "ready".

@@ -442,17 +442,26 @@ memory directory on first write) and through a symlinked ancestor.
 
 When a task is granted remote authority (`autonomy.remoteAuthority`, default
 `none`), verification does not end it. `#requestPublish` records the verified
-HEAD, issues a `RemoteGrant` for that candidate's own branch and asks the Worker
-to publish: the Worker runs the push and any `gh pr create`, the Supervisor never
-does. The returning turn skips acceptance and the Reviewer when HEAD is unchanged
-— they already passed on that tree — and `#settlePublish` confirms the result
-read-only (`git ls-remote`, plus `gh pr list` for `pr`) before completing, or
-blocks the still-deliverable local candidate when it cannot. A tree that changed
-during the publish turn voids the grant and is re-verified in full. The grant is
-cleared on every terminal path, so it never outlives the turn it was issued for,
-and `permittedRemoteCommand` admits a single literal shape — no force, delete,
-mirror, tags, push-options, `HEAD` refspec, other remote or branch, shell
-wrapper, dynamic word or second statement.
+HEAD, issues a `RemoteGrant` naming that commit, the candidate's own branch, the
+remote and the task directory, and asks the Worker to publish: the Worker runs
+the push and any `gh pr create`, the Supervisor never does. Under hybrid
+authority the granted command is answered by the policy (`PolicyResult.granted`)
+rather than escalated to the Decision Worker. The returning turn skips
+acceptance and the Reviewer when HEAD is unchanged — they already passed on that
+tree — and `#settlePublish` confirms the result read-only (`#confirmPublish`:
+both pinned remote URLs unchanged, `git ls-remote` carrying the verified commit,
+plus `gh pr list` for `pr`) before completing, or blocks the candidate when it
+cannot; that candidate keeps `deliverable: true`, since it passed and is intact
+on its branch. A tree that changed during the publish turn voids the grant and
+is re-verified in full, with the same confirmation deciding whether the notice
+says the verified commit landed first. The grant is cleared on every terminal
+path, so it never outlives the turn it was issued for, and
+`permittedRemoteCommand` admits a single literal shape —
+`git -C '<task dir>' push <remote> <commit>:refs/heads/<branch>` with no option
+— so no force, delete, mirror, tags, push-options, branch or `HEAD` source,
+other remote or branch, relative `-C`, shell wrapper, dynamic word or second
+statement. `git config` writes to transport-affecting keys and direct writes to
+`.git/config` or `.git/hooks/` are refused alongside `git remote` mutations.
 
 A record left behind by the outright
 stop (`recoverable_failure`, so `active/interrupted`) is not a dead end either:

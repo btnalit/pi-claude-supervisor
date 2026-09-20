@@ -6,6 +6,12 @@ export type PolicyDecision = "allow" | "review" | "deny";
 export interface PolicyResult {
   decision: PolicyDecision;
   reason: string;
+  /**
+   * Set only when a live publish grant admitted the command. The Supervisor
+   * issued that grant itself, so the request is answered locally rather than
+   * routed to a Decision Worker whose standing rule is to refuse a push.
+   */
+  granted?: true;
 }
 
 /**
@@ -32,14 +38,17 @@ export interface RemoteGrant {
   authority: "push" | "pr";
   /** The single remote the grant covers, e.g. `origin`. */
   remoteName: string;
-  /** The candidate branch; a push must name it literally. */
+  /** The candidate branch the verified commit is published to; a pull request must name it with `--head`. */
   branch: string;
-  /** The task working directory; a granted push must name it with `-C`, so the grant cannot be spent in another clone. */
+  /**
+   * The verified commit. A granted push must name it as the refspec source
+   * (`<head>:refs/heads/<branch>`), so a commit made after verification can
+   * never ride the grant: git pushes exactly that object or nothing.
+   */
+  head: string;
+  /** The task working directory; a granted push must name it with an absolute `-C`, so the grant cannot be spent in another clone. */
   cwd: string;
 }
-
-/** The only options a granted `git push` may carry. Anything else is refused, so a new git flag is denied until it is reviewed. */
-const ALLOWED_PUSH_OPTIONS = new Set(["-u", "--set-upstream"]);
 /**
  * The only options a granted `gh pr create` may carry. An allowlist, because an
  * unlisted option is how a grant leaks: `--body-file`/`-F`/`--template` post the
@@ -196,17 +205,27 @@ interface ShellToken {
 const protectedBranches = new Set(["main", "master", "trunk", "integration", "develop"]);
 
 /**
- * The one shape a granted publish may take. Everything is matched literally:
- * the policy is static, so it cannot resolve `HEAD`, a variable or a second
- * statement, and refuses rather than guess. Returns undefined when the command
- * is not a permitted publish, leaving the ordinary denials to answer.
+ * Branch names that are never published: the integration names themselves and
+ * any `<prefix>/main|master|integration`. One predicate for both layers — the
+ * Supervisor consults it before issuing a grant, and the policy consults it
+ * again before honoring one — so neither can admit what the other refuses.
  */
+export function isProtectedBranch(branch: string): boolean {
+  return /^(?:main|master|trunk|integration|develop)$/iu.test(branch) || /(?:^|\/)(?:main|master|integration)$/iu.test(branch);
+}
+
 /** True when both paths name the same directory once the kernel has resolved them. */
 function sameResolvedDirectory(first: string, second: string): boolean {
   try { return realpathSync(first) === realpathSync(second); }
   catch { return false; }
 }
 
+/**
+ * The one shape a granted publish may take. Everything is matched literally:
+ * the policy is static, so it cannot resolve `HEAD`, a variable or a second
+ * statement, and refuses rather than guess. Returns undefined when the command
+ * is not a permitted publish, leaving the ordinary denials to answer.
+ */
 function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGrant): PolicyResult | undefined {
   // A single statement only: `git push origin x && rm -rf /` must never pass.
   if (tokens.some((token) => token.operator)) return undefined;
@@ -214,42 +233,46 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
   const words = tokens.map((token) => token.value);
   if (words.length === 0) return undefined;
   const name = (words[0] ?? "").split(/[\\/]/u).at(-1)?.toLowerCase();
-  if (protectedBranches.has(grant.branch.toLowerCase())) return undefined;
+  if (isProtectedBranch(grant.branch)) return undefined;
+  if (!/^[0-9a-f]{40,64}$/u.test(grant.head)) return undefined;
   const optionName = (word: string): string => word.split("=")[0] ?? word;
 
   if (name === "git") {
     // `-C <task directory>` is *required*, not merely tolerated. Claude's Bash
     // tool keeps its working directory between calls and `cd` is ordinary local
     // work, so without an explicit directory the grant could be spent in any
-    // clone the Worker had wandered into. The comparison resolves both sides
-    // through the kernel, the way git will, so `<cwd>/link/..` cannot pass.
+    // clone the Worker had wandered into. The directory must be absolute: a
+    // relative one (`.`, `''`, `src/..`) would resolve against *this* process,
+    // not the Worker's shell, and pass while git ran somewhere else. Both sides
+    // then resolve through the kernel, the way git will, so `<cwd>/link/..`
+    // cannot pass either.
     if (words[1] !== "-C") return undefined;
     const directory = words[2];
-    if (directory === undefined || !sameResolvedDirectory(directory, grant.cwd)) return undefined;
+    if (directory === undefined || !isAbsolute(directory) || !sameResolvedDirectory(directory, grant.cwd)) return undefined;
     if (words[3] !== "push") return undefined;
+    // No option at all: `-u` did nothing with a commit as the source, and an
+    // allowlist of one no-op is only surface. The refspec names the verified
+    // commit, so git pushes exactly that object; a commit made during the
+    // publish turn stays local ("Everything up-to-date") instead of riding
+    // the grant. `refs/heads/` is spelled out because a bare destination is
+    // refused by git when the remote branch does not exist yet.
     const rest = words.slice(4);
-    const positional: string[] = [];
-    for (const word of rest) {
-      if (word.startsWith("-")) {
-        if (!ALLOWED_PUSH_OPTIONS.has(optionName(word)) || word.includes("=")) return undefined;
-        continue;
-      }
-      positional.push(word);
-    }
-    if (positional.length !== 2) return undefined;
-    const [remote, refspec] = positional as [string, string];
+    if (rest.length !== 2 || rest.some((word) => word.startsWith("-"))) return undefined;
+    const [remote, refspec] = rest as [string, string];
     if (remote !== grant.remoteName) return undefined;
-    if (refspec !== grant.branch && refspec !== `${grant.branch}:${grant.branch}`) return undefined;
-    return { decision: "allow", reason: `publish grant: push ${grant.branch} to ${grant.remoteName}` };
+    if (refspec !== `${grant.head}:refs/heads/${grant.branch}`) return undefined;
+    return { decision: "allow", reason: `publish grant: push ${grant.head.slice(0, 12)} to ${grant.remoteName}/${grant.branch}`, granted: true };
   }
 
   if (name === "gh" && grant.authority === "pr") {
     if (words[1] !== "pr" || words[2] !== "create") return undefined;
     const rest = words.slice(3);
-    // `--head` is mandatory: without it gh uses whatever branch is checked out,
-    // and `git checkout` is ordinary local work, so a bare `gh pr create` could
-    // open a pull request for a branch nothing verified.
-    if (!rest.some((word) => word === "-H" || word === "--head" || word.startsWith("--head=") || word.startsWith("-H="))) return undefined;
+    // `--head <candidate branch>` is mandatory: without it gh uses whatever
+    // branch is checked out, and `git checkout` is ordinary local work, so a
+    // bare `gh pr create` could open a pull request for a branch nothing
+    // verified. It counts only as the option the loop itself parses, never as
+    // a word another option swallowed: `--title --head` sets the title.
+    let sawHead = false;
     for (let cursor = 0; cursor < rest.length; cursor += 1) {
       const word = rest[cursor]!;
       if (!word.startsWith("-")) return undefined;
@@ -259,11 +282,15 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
       const value = inlineValue ? word.slice(option.length + 1) : rest[cursor + 1];
       if (PR_CREATE_VALUE_OPTIONS.has(option)) {
         if (value === undefined) return undefined;
-        if ((option === "-H" || option === "--head") && value !== grant.branch) return undefined;
+        if (option === "-H" || option === "--head") {
+          if (value !== grant.branch) return undefined;
+          sawHead = true;
+        }
         if (!inlineValue) cursor += 1;
       }
     }
-    return { decision: "allow", reason: `publish grant: open a pull request for ${grant.branch}` };
+    if (!sawHead) return undefined;
+    return { decision: "allow", reason: `publish grant: open a pull request for ${grant.branch}`, granted: true };
   }
   return undefined;
 }
@@ -372,6 +399,14 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   if (segmentsOf(tokens).some((segment) => mutatesRemotes(segment))) {
     return { decision: "deny", reason: "Worker cannot change the repository's remotes" };
   }
+  // The same boundary through `git config`: `remote.<name>.pushurl`,
+  // `url.<x>.insteadOf`, `push.*`, `core.sshCommand`, `core.hooksPath` and the
+  // credential/http keys change where a push goes, what travels with it or
+  // what runs during it, without touching the remote's name. Reads stay
+  // ordinary local work; only a write of one of these keys is refused.
+  if (segmentsOf(tokens).some((segment) => configuresRemoteTransport(segment))) {
+    return { decision: "deny", reason: "Worker cannot reconfigure the repository's remotes, URL rewrites, push behavior, credentials or hooks" };
+  }
   if (hasGitAliasConfiguration) {
     return { decision: "deny", reason: "Worker cannot redefine Git command aliases" };
   }
@@ -383,6 +418,15 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   if (/\.git[\\/](?:HEAD|packed-refs|refs[\\/]heads[\\/])/iu.test(canonical)
     || (directRefWrite && hasProtectedBranch && /refs[\\/]heads[\\/]/iu.test(canonical))) {
     return { decision: "deny", reason: "Worker cannot write protected Git branch refs directly" };
+  }
+  // `.git/config` is the `git config` boundary above by another door, and a
+  // hook in `.git/hooks/` runs during the granted push where no policy sees
+  // it. Written through a redirection or a file-writing command, `ln` or
+  // `chmod` included, since a hook has to be created and made executable.
+  // The Write and Edit tools already refuse every `.git` path.
+  const metadataWrite = directRefWrite || ["chmod", "dd", "ln", "rsync", "curl", "wget"].includes(lower[0] ?? "");
+  if (metadataWrite && /\.git[\\/](?:config|hooks[\\/])/iu.test(canonical)) {
+    return { decision: "deny", reason: "Worker cannot write the repository's Git configuration or hooks directly" };
   }
   if (hasPackagePublication) {
     return { decision: "deny", reason: "package publication belongs to the protected release workflow" };
@@ -408,6 +452,39 @@ function mutatesRemotes(segment: readonly ShellToken[]): boolean {
   if (words[index]?.toLowerCase() !== "remote") return false;
   const action = words[index + 1]?.toLowerCase();
   return action !== undefined && REMOTE_MUTATIONS.has(action);
+}
+
+/**
+ * Configuration keys that decide where a push goes, what travels with it or
+ * what runs during it. `remote.*` covers `pushurl`; `url.*` the `insteadOf`
+ * rewrites; `push.*` follow-tags and push options; the rest credentials,
+ * transport and hook locations.
+ */
+const REMOTE_TRANSPORT_CONFIG_KEY = /^(?:remote\.|url\.|push\.|credential\.|http\.|https\.|core\.(?:sshcommand|hookspath|gitproxy|askpass|alternaterefscommand)$)/iu;
+/** `git config` flags and verbs that only read; a key next to one of them is a query, not a change. */
+const GIT_CONFIG_READ_FLAGS = new Set(["--get", "--get-all", "--get-regexp", "--get-urlmatch", "-l", "--list", "--show-origin", "--show-scope", "--name-only"]);
+const GIT_CONFIG_WRITE_FLAGS = new Set(["--add", "--replace-all", "--unset", "--unset-all", "--remove-section", "--rename-section", "--edit", "-e"]);
+
+/** True when this one statement is `git [options] config` writing a transport-affecting key. */
+function configuresRemoteTransport(segment: readonly ShellToken[]): boolean {
+  const words = segment.filter((token) => !token.operator).map((token) => token.value);
+  const first = words[0]?.split(/[\\/]/u).at(-1)?.toLowerCase();
+  if (first !== "git") return false;
+  let index = 1;
+  while (index < words.length && words[index]!.startsWith("-")) index += words[index] === "-C" || words[index] === "-c" ? 2 : 1;
+  if (words[index]?.toLowerCase() !== "config") return false;
+  const rest = words.slice(index + 1);
+  if (!rest.some((word) => REMOTE_TRANSPORT_CONFIG_KEY.test(word))) return false;
+  const lower = rest.map((word) => word.toLowerCase());
+  const positional = rest.filter((word) => !word.startsWith("-"));
+  const verb = positional[0]?.toLowerCase();
+  // `git config <key>` alone reads it, as do the query flags and the newer
+  // `git config get <key>` form; anything that names a value or a write verb
+  // is a change.
+  if (lower.some((word) => GIT_CONFIG_READ_FLAGS.has(word)) || verb === "get" || verb === "list") return false;
+  const writes = lower.some((word) => GIT_CONFIG_WRITE_FLAGS.has(word))
+    || verb === "set" || verb === "unset" || verb === "remove-section" || verb === "rename-section" || verb === "edit";
+  return writes || positional.length >= 2;
 }
 
 /** The statements of a command, split on `;`, `&&`, `||`, `|` and `&`. */
@@ -834,6 +911,10 @@ const FIND_WRITE_ACTIONS = new Set(["-delete", "-exec", "-execdir", "-ok", "-okd
 export function isRoutinePermission(toolName: string, input: unknown, cwd: string, options: PermissionPolicyOptions = {}): boolean {
   const policyResult = evaluatePermission(toolName, input, cwd, options);
   if (policyResult.decision === "deny") return false;
+  // A granted publish is the Supervisor's own decision, already made: under
+  // hybrid authority it is answered here, not escalated to a Decision Worker
+  // that was never told the grant exists and whose standing rule is to refuse.
+  if (policyResult.granted) return true;
   if (toolName === "Edit" || toolName === "Write" || toolName === "NotebookEdit") return true;
   if (toolName === "Read" || toolName === "Glob" || toolName === "Grep" || toolName === "LS" || toolName === "TodoWrite") return true;
   if (toolName === "Bash") {

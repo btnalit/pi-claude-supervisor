@@ -3181,10 +3181,11 @@ test("with push authority the verified candidate is handed back to publish, and 
       onCandidate: (notice) => { candidates.push({ status: notice.status, reason: notice.reason }); },
     });
     // The Worker "publishes" when the Supervisor asks: the instruction arriving
-    // is what triggers the real push here.
+    // is what triggers the real push here, in the one shape the grant admits.
+    const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repo.cwd })).stdout.trim();
     fixture.adapter.send = async (_handle, message) => {
       fixture.state.sent.push(message);
-      if (message.includes("Publish it")) await execFileAsync("git", ["push", "-u", "origin", branch], { cwd: repo.cwd });
+      if (message.includes("Publish it")) await execFileAsync("git", ["-C", repo.cwd, "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
     };
     await supervisor.start({
       task: "publish the verified candidate",
@@ -3207,8 +3208,8 @@ test("with push authority the verified candidate is handed back to publish, and 
     assert.ok(requested, "the verified candidate is handed back to publish");
     assert.equal(requested?.data?.branch, branch);
     assert.equal(supervisor.state, "running");
-    assert.ok(fixture.state.sent.some((message) => message.includes(`git -C ${repo.cwd} push -u origin ${branch}`)),
-      "the instruction spells out the one shape the grant admits, including -C");
+    assert.ok(fixture.state.sent.some((message) => message.includes(`git -C '${repo.cwd}' push origin ${head}:refs/heads/${branch}`)),
+      "the instruction spells out the one shape the grant admits: an absolute -C and the verified commit as the refspec source");
     assert.equal(candidates.length, 0, "no candidate is announced until the publish settles");
 
     // The publish turn comes back; acceptance is not re-run on the unchanged tree.
@@ -3224,7 +3225,70 @@ test("with push authority the verified candidate is handed back to publish, and 
     assert.deepEqual(candidates.map((candidate) => candidate.status), ["ready"]);
     // The remote really carries the verified commit.
     const { stdout } = await execFileAsync("git", ["ls-remote", "--heads", "origin", branch], { cwd: repo.cwd });
-    assert.match(stdout, new RegExp(`refs/heads/${branch}`, "u"));
+    assert.match(stdout, new RegExp(`^${head}\\s+refs/heads/${branch}`, "u"));
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test("a commit made during the publish turn cannot ride the grant: the verified commit is published and the notice says which tree is where", async () => {
+  const branch = "worker/publish-then-commit";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-drift-", branch);
+  try {
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: Array<{ status: string; reason: string; prUrl?: string }> = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push({ status: notice.status, reason: notice.reason, ...(notice.prUrl ? { prUrl: notice.prUrl } : {}) }); },
+    });
+    const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repo.cwd })).stdout.trim();
+    // The Worker pushes the granted commit, then — against the instruction —
+    // commits again. The refspec names the commit, so the second one stays local.
+    fixture.adapter.send = async (_handle, message) => {
+      fixture.state.sent.push(message);
+      if (!message.includes("Publish it")) return;
+      await execFileAsync("git", ["-C", repo.cwd, "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
+      await writeFile(join(repo.cwd, "after-publish.txt"), "unverified\n");
+      await execFileAsync("git", ["add", "after-publish.txt"], { cwd: repo.cwd });
+      await execFileAsync("git", ["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "after publish"], { cwd: repo.cwd });
+    };
+    await supervisor.start({
+      task: "publish, then keep committing",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const first = fixture.turn(1);
+    fixture.state.listener?.(first);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done" }, first);
+    assert.ok(events.events.some((event) => event.type === "publish_requested"));
+    const acceptanceRuns = events.events.filter((event) => event.type === "acceptance_started").length;
+
+    const second = fixture.turn(2);
+    fixture.state.listener?.(second);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "pushed and tidied up" }, second);
+
+    // The changed tree earned its own verification and the grant was not reissued.
+    assert.equal(events.events.filter((event) => event.type === "acceptance_started").length, acceptanceRuns + 1, "the changed tree is re-verified");
+    assert.equal(events.events.filter((event) => event.type === "publish_requested").length, 1, "the grant is one-shot");
+    const abandoned = events.events.find((event) => event.type === "publish_abandoned");
+    assert.equal(abandoned?.data?.published, true, "the confirmation found the verified commit on the remote");
+    assert.equal(supervisor.state, "completed");
+    assert.match(String(candidates.at(-1)?.reason), /was published to origin\/worker\/publish-then-commit/u);
+    assert.match(String(candidates.at(-1)?.reason), /new tree is not published/u);
+    assert.equal(candidates.at(-1)?.prUrl, undefined, "the notice's pull request field means this candidate, not the one that left");
+    // The remote holds exactly the verified commit, not the later one.
+    const { stdout } = await execFileAsync("git", ["ls-remote", "--heads", "origin", branch], { cwd: repo.cwd });
+    assert.match(stdout, new RegExp(`^${head}\\s+refs/heads/${branch}`, "u"));
+    const local = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repo.cwd })).stdout.trim();
+    assert.notEqual(local, head);
   } finally {
     await repo.cleanup();
   }
@@ -3267,6 +3331,10 @@ test("a publish the Worker never performed blocks the candidate instead of compl
     assert.ok(events.events.some((event) => event.type === "publish_unconfirmed"));
     assert.equal(candidates.at(-1)?.status, "blocked");
     assert.match(String(candidates.at(-1)?.reason), /does not point at/u);
+    // `status` is the task outcome; `deliverable` is the candidate: it passed
+    // acceptance and review and is intact on its branch, so the operator can
+    // publish it by hand — which is exactly what the notice is for.
+    assert.equal(candidates.at(-1)?.deliverable, true);
   } finally {
     await repo.cleanup();
   }
@@ -3318,11 +3386,30 @@ test("the publish grant dies with its turn, so a later unverified push is refuse
       noOutputTimeoutMs: 0,
       decisionWorkerFactory: fixture.decisionWorkerFactory,
     });
+    const responded: Array<{ requestId: string; behavior: string; message?: string }> = [];
+    fixture.adapter.respondPermission = async (_handle, requestId, _toolUseId, response) => { responded.push({ requestId, behavior: response.behavior, ...(response.message ? { message: response.message } : {}) }); };
     const first = fixture.turn(1);
     fixture.state.listener?.(first);
     await supervisor.poll();
     await fixture.state.onAction?.({ action: "verify", reason: "done" }, first);
     assert.ok(events.events.some((event) => event.type === "publish_requested"));
+
+    // The granted push, requested under the default hybrid authority, is the
+    // Supervisor's own decision: answered by the policy, never escalated to a
+    // Decision Worker whose standing rule is to refuse a push.
+    const head = String(events.events.find((event) => event.type === "publish_requested")?.data?.head);
+    const granted = { requestId: "req-granted-push", toolUseId: "tool-granted-push", toolName: "Bash", input: { command: `git -C '${repo.cwd}' push origin ${head}:refs/heads/${branch}` }, raw: {} };
+    fixture.state.listener?.({ type: "permission_request", handle: fixture.handle, request: granted });
+    await supervisor.poll();
+    assert.deepEqual(responded.map((entry) => [entry.requestId, entry.behavior]), [["req-granted-push", "allow"]]);
+    const decision = events.events.find((event) => event.type === "permission_decision" && event.data?.requestId === "req-granted-push");
+    assert.equal(decision?.data?.actor, "policy");
+    assert.equal(decision?.data?.behavior, "allow");
+    // The same grant does not stretch to a differently shaped push.
+    fixture.state.listener?.({ type: "permission_request", handle: fixture.handle, request: { ...granted, requestId: "req-branch-push", input: { command: `git -C '${repo.cwd}' push origin ${branch}` } } });
+    await supervisor.poll();
+    assert.equal(responded.at(-1)?.behavior, "deny");
+    assert.match(String(responded.at(-1)?.message), /publish grant is live but only admits/u);
 
     // The publish turn ends. Whatever the Decision Worker decides next, the
     // authority is already gone — it does not wait for a `verify`.
@@ -3330,9 +3417,13 @@ test("the publish grant dies with its turn, so a later unverified push is refuse
     await supervisor.poll();
     assert.ok(events.events.some((event) => event.type === "publish_grant_revoked"));
     assert.equal(supervisor.deadline, undefined);
-    // A push attempted on a later turn is refused exactly as before the grant.
-    const later = await import("./policy.ts");
-    assert.equal(later.evaluatePermission("Bash", { command: `git push origin ${branch}` }, repo.cwd).decision, "deny");
+    // The very command the grant admitted a moment ago is refused now, through
+    // the same permission path, not by asking the policy without a grant.
+    fixture.state.listener?.({ type: "permission_request", handle: fixture.handle, request: { ...granted, requestId: "req-late-push" } });
+    await supervisor.poll();
+    assert.equal(responded.at(-1)?.requestId, "req-late-push");
+    assert.equal(responded.at(-1)?.behavior, "deny");
+    assert.match(String(responded.at(-1)?.message), /no remote repository/u);
   } finally {
     await repo.cleanup();
   }
