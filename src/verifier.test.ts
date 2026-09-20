@@ -1,0 +1,60 @@
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { promisify } from "node:util";
+import { remoteBranchHead, repositorySlug } from "./verifier.ts";
+
+const execFileAsync = promisify(execFile);
+
+test("a remote URL becomes the host/owner/repo gh accepts, or nothing", async () => {
+  for (const [url, expected] of [
+    ["https://github.com/acme/console.git", "github.com/acme/console"],
+    ["https://github.com/acme/console", "github.com/acme/console"],
+    ["git@github.com:acme/console.git", "github.com/acme/console"],
+    ["ssh://git@github.com/acme/console.git", "github.com/acme/console"],
+    ["ssh://git@ghe.corp:2222/org/repo.git", "ghe.corp/org/repo"],
+    ["https://user:token@GitHub.com/acme/console.git", "github.com/acme/console"],
+    // gh accepts none of these as a repository.
+    ["../remote.git", undefined],
+    ["/srv/git/x.git", undefined],
+    ["file:///srv/git/x.git", undefined],
+    ["https://github.com/acme", undefined],
+    ["https://github.com/acme/console/extra", undefined],
+    ["git@github.com:acme/con sole.git", undefined],
+  ] as const) {
+    assert.equal(await repositorySlug(url), expected, url);
+  }
+  // An SSH-config host alias is kept as the host when `ssh -G` has no
+  // translation for it (the machine running this test has no such alias);
+  // with one, the real hostname replaces it the way gh does.
+  assert.equal(await repositorySlug("pi-claude-supervisor-no-such-alias:acme/console.git"), "pi-claude-supervisor-no-such-alias/acme/console");
+});
+
+test("a remote branch lookup tells an absent branch from a remote that cannot be asked", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lookup-"));
+  try {
+    const remote = join(base, "remote.git");
+    const cwd = join(base, "work");
+    await execFileAsync("git", ["init", "-q", "--bare", remote]);
+    await execFileAsync("git", ["init", "-q", "-b", "main", cwd]);
+    await execFileAsync("git", ["-C", cwd, "remote", "add", "origin", remote]);
+    await execFileAsync("git", ["-C", cwd, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "one"]);
+    const head = (await execFileAsync("git", ["-C", cwd, "rev-parse", "HEAD"])).stdout.trim();
+
+    assert.deepEqual(await remoteBranchHead(cwd, "origin", "feat/x"), { outcome: "absent" });
+    await execFileAsync("git", ["-C", cwd, "push", "-q", "origin", `${head}:refs/heads/feat/x`]);
+    assert.deepEqual(await remoteBranchHead(cwd, "origin", "feat/x"), { outcome: "found", head });
+
+    // The remote is gone: that is not a fact about the branch.
+    await rm(remote, { recursive: true, force: true });
+    const lookup = await remoteBranchHead(cwd, "origin", "feat/x");
+    assert.equal(lookup.outcome, "unreachable");
+    assert.ok(lookup.outcome === "unreachable" && lookup.error.length > 0);
+    assert.deepEqual(await remoteBranchHead(cwd, "no-such-remote", "feat/x").then((result) => result.outcome), "unreachable");
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});

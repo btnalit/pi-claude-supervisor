@@ -7,7 +7,7 @@ import { chmod, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs
 import { EventLog } from "./events.ts";
 import { redactSensitive } from "./redaction.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
-import { automaticWorkerEnvironment } from "./worker/environment.ts";
+import { automaticWorkerEnvironment, claudeConfigDir } from "./worker/environment.ts";
 import { TmuxWorkerAdapter, attachCommand, sweepDeadTmuxSockets } from "./worker/tmux-adapter.ts";
 import { Supervisor, extendedDeadlineMs, type DecisionSessionClosedInfo, type HumanInterventionNotice, type SupervisorProgress, type SupervisorTokenUsage } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
@@ -29,7 +29,7 @@ import type { TaskSpec, WorkerHandle } from "./types.ts";
 const RELAY_HOOK_MARKER = "/hooks/relay.js";
 
 function claudeUserSettingsPath(): string {
-  return join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"), "settings.json");
+  return join(claudeConfigDir(), "settings.json");
 }
 
 /** `src/hooks/install.ts` does not export its relay-script writer; this mirrors it for an owned launch's static relay path. */

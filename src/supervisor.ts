@@ -5,7 +5,7 @@ import { SupervisorStateMachine } from "./state.ts";
 import { evaluatePermission, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, type PermissionPolicyOptions, type RemoteGrant } from "./policy.ts";
 import { PiDecisionWorker, type DecisionAction, type DecisionContext, type DecisionDeadlineContext, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
 import { DEFAULT_DEADLINE_GRACE_MS, DEFAULT_DEADLINE_MS, DEFAULT_DEADLINE_WARNING_MS, DEFAULT_NO_OUTPUT_TIMEOUT_MS, formatDurationMs } from "./config.ts";
-import { collectRepositoryEvidence, remoteBranchHead, remoteUrl, runReadOnly, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryIsAncestor, repositoryWorkTree, verifyAll, type RemoteDestination, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
+import { collectRepositoryEvidence, remoteBranchHead, remoteUrl, runReadOnly, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryIsAncestor, repositoryWorkTree, verifyAll, repositorySlug, type RemoteBranchLookup, type RemoteDestination, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { redactSensitive } from "./redaction.ts";
 import { assertAutomaticClaudePermissionConfiguration, assertTrustedAutomaticClaudeExecutable, automaticClaudeArgs, automaticWorkerEnvironment, type AutomaticClaudeArgOptions } from "./worker/environment.ts";
@@ -910,7 +910,16 @@ export class Supervisor {
       const create = grant.authority === "pr" ? ` and \`${pullRequestCommand(grant)} …\`` : "";
       return `; the publish grant is live but only admits \`${publishCommand(grant)}\`${create}, spelled literally — no other option, no shell variable, no redirection, no extra statement`;
     }
+    if (this.#publishState === "requested") {
+      // The grant died with the publish turn; a retry on a later turn cannot
+      // succeed, and a bare denial reads as "no authority at all".
+      return "; the one-shot publish grant expired when the publish turn ended — report what happened so the Supervisor can confirm the remote or re-verify, rather than retrying the push";
+    }
     if (this.#publishState !== "none") return "";
+    // The publish turn exists only for an automatic task on a transport that
+    // can take one; promising it elsewhere leaves the Worker waiting for a
+    // turn that never comes.
+    if (!this.#automation || !canRepairInPlace(this.#adapter)) return "; remote authority is exercised after verification, not by the Worker: finish and commit locally, and the verified candidate is published from there";
     return "; remote authority unlocks after this candidate's acceptance and review pass — finish and commit locally, and the Supervisor will ask you to publish";
   }
 
@@ -1807,7 +1816,12 @@ export class Supervisor {
     }
     const uncommitted = evidence.status.trim();
     if (uncommitted !== "" && uncommitted !== "(none)") {
-      await this.#notePublishShortfall(handle.id, { reason: "the verified working tree has uncommitted or untracked changes, so HEAD is not the tree that passed; commit everything that belongs to the candidate and remove the rest" });
+      // Not a dead end: the Worker can still commit what belongs to the
+      // candidate, and the repaired tree earns its own verification before a
+      // grant. Only when no repair round is possible does the task end here.
+      const reason = "the verified working tree has uncommitted or untracked changes, so HEAD is not the tree that passed; commit everything that belongs to the candidate and remove the rest before it can be published";
+      if (await this.#requestRepair(result, reason)) return true;
+      await this.#notePublishShortfall(handle.id, { reason: `${reason} (no repair round was available)` });
       return false;
     }
     if (evidence.head !== undefined && evidence.head !== head) {
@@ -1827,6 +1841,14 @@ export class Supervisor {
       await this.#notePublishShortfall(handle.id, { reason: `the remote ${remoteName} has no URL to publish to` });
       return false;
     }
+    // A pull request needs a repository gh can name with `--repo`; a remote
+    // whose URL is not one (a local path, an alias `ssh -G` cannot translate)
+    // gets no `pr` grant rather than an instruction gh would refuse.
+    const repository = await repositorySlug(url.fetch, signal);
+    if (authority === "pr" && !repository) {
+      await this.#notePublishShortfall(handle.id, { reason: `the remote ${remoteName} (${url.fetch}) does not name a repository gh can open a pull request in; use push authority or a canonical remote URL` });
+      return false;
+    }
     if (this.#machine.state !== "verifying") {
       await this.#notePublishShortfall(handle.id, { reason: `the Supervisor was in ${this.#machine.state}, not verifying, when the publish turn was due` });
       return false;
@@ -1837,27 +1859,39 @@ export class Supervisor {
     // shapes, and they come from the same module that parses them: an
     // absolute `-C`, the hooks path pinned, the verified commit as the refspec
     // source, and `--repo`/`--head` for a pull request.
-    const grant: RemoteGrant = { authority, remoteName, branch, head, cwd: task.cwd, repository: url.fetch };
+    const grant: RemoteGrant = { authority, remoteName, branch, head, cwd: task.cwd, ...(repository ? { repository } : {}) };
     const pushCommand = publishCommand(grant);
     const instruction = authority === "pr"
       ? `Independent acceptance and review passed for this candidate. Publish it with exactly these two commands, one per Bash call: \`${pushCommand}\` then \`${pullRequestCommand(grant)} --title <title> --body <body>\`. Any other form is refused: no push option, force-push, delete, tags, merge, release, --web, --body-file or another repository, and do not commit anything more — the grant names commit ${head} and nothing else will be pushed. Report the pull request URL when done.`
       : `Independent acceptance and review passed for this candidate. Publish it with exactly this command: \`${pushCommand}\`. Any other form is refused: no push option, force-push, delete, tags, pull request, merge or release, and do not commit anything more — the grant names commit ${head} and nothing else will be pushed. Report when the push succeeded.`;
     this.#machine.transition("running");
     this.#repairSendInProgress = true;
+    // Armed before the send: an instruction that reaches the Worker must find
+    // its grant live, and `#sendInternal` can still throw after delivery (an
+    // event-log write). A failure *before* delivery — the turn counter did not
+    // advance — revokes everything again below, so no grant outlives a publish
+    // turn that never started.
+    const turnBefore = this.#turn;
+    this.#verifiedHead = head;
+    this.#publishRemote = url;
+    this.#remoteGrant = grant;
+    this.#publishTarget = this.#remoteGrant;
+    this.#publishState = "requested";
     try {
       await this.#sendInternal(instruction);
-      // Armed only once the instruction is really on its way: an exception
-      // above must never leave a live push grant with no publish turn.
-      this.#verifiedHead = head;
-      this.#publishRemote = url;
-      this.#remoteGrant = grant;
-      this.#publishTarget = this.#remoteGrant;
-      this.#publishState = "requested";
       return true;
     } catch (error) {
+      if (this.#turn > turnBefore) {
+        // Delivered; only the bookkeeping failed. The publish turn is running
+        // with its grant, and the audit gets the failure instead of the task.
+        await this.#appendEvent({ type: "publish_send_unrecorded", taskId: task.taskId, workerId: handle.id, data: { error: safeMessage(error) } }).catch(() => {});
+        return true;
+      }
       this.#publishState = "settled";
       this.#remoteGrant = undefined;
       this.#publishTarget = undefined;
+      this.#publishRemote = undefined;
+      this.#verifiedHead = undefined;
       await this.#notePublishShortfall(handle.id, { reason: `the publish instruction could not be sent: ${safeMessage(error)}` });
       // The transition above already moved the machine; read it without the
       // narrowing the guard at the top of this method introduced.
@@ -1886,10 +1920,19 @@ export class Supervisor {
     this.#publishState = "settled";
     this.#remoteGrant = undefined;
     if (!grant) return this.#finalizeVerification(result);
-    const { sameRemote, pushed, prUrl } = await this.#confirmPublish(grant, signal);
+    const { sameRemote, remoteReadable, lookup, pushed, prUrl } = await this.#confirmPublish(grant, signal);
     // The pull request field on the notice means "this candidate"; it is set
     // only here, where the candidate is the verified commit that was published.
     this.#prUrl = prUrl;
+    // An unreachable remote is not a fact about the branch: say the publish
+    // could not be confirmed, not that the commit is missing or the remote
+    // was repointed.
+    if (!remoteReadable) {
+      return this.#finalizeVerification(result, "blocked", `the remote ${grant.remoteName} could not be read to confirm the publish; the local candidate is unchanged on its branch`, { publishOnly: true });
+    }
+    if (lookup?.outcome === "unreachable") {
+      return this.#finalizeVerification(result, "blocked", `${grant.remoteName} could not be reached to confirm the publish (${lookup.error.split("\n")[0]}); the local candidate is unchanged on its branch`, { publishOnly: true });
+    }
     if (!sameRemote) {
       return this.#finalizeVerification(result, "blocked", `the remote ${grant.remoteName} no longer points where the publish was granted; nothing was confirmed; the local candidate is unchanged on its branch`, { publishOnly: true });
     }
@@ -1910,21 +1953,32 @@ export class Supervisor {
    * `pushInsteadOf` can divert the push while the fetch URL `ls-remote` reads
    * through stays put, so both are compared.
    */
-  async #confirmPublish(grant: RemoteGrant, signal?: AbortSignal): Promise<{ sameRemote: boolean; remoteHead?: string; pushed: boolean; prUrl?: string }> {
+  async #confirmPublish(grant: RemoteGrant, signal?: AbortSignal): Promise<{ sameRemote: boolean; remoteReadable: boolean; lookup?: RemoteBranchLookup; pushed: boolean; prUrl?: string }> {
     const task = this.#task!;
     const current = await remoteUrl(task.cwd, grant.remoteName, signal);
     const pinned = this.#publishRemote;
+    const remoteReadable = current !== undefined;
     const sameRemote = Boolean(current && pinned && current.fetch === pinned.fetch && current.push === pinned.push);
-    const remoteHead = sameRemote ? await remoteBranchHead(task.cwd, grant.remoteName, grant.branch, signal) : undefined;
+    const lookup = sameRemote ? await remoteBranchHead(task.cwd, grant.remoteName, grant.branch, signal) : undefined;
+    const remoteHead = lookup?.outcome === "found" ? lookup.head : undefined;
     const pushed = Boolean(remoteHead && remoteHead === this.#verifiedHead);
-    const prUrl = pushed && grant.authority === "pr" ? await this.#findPullRequest(task.cwd, grant.branch, signal) : undefined;
+    const prUrl = pushed && grant.authority === "pr" ? await this.#findPullRequest(task.cwd, grant, signal) : undefined;
     await this.#appendEvent({
       type: pushed && (grant.authority !== "pr" || prUrl) ? "publish_confirmed" : "publish_unconfirmed",
       taskId: task.taskId,
       workerId: this.#handle?.id,
-      data: { remoteName: grant.remoteName, branch: grant.branch, expected: this.#verifiedHead, ...(remoteHead ? { remoteHead } : {}), ...(prUrl ? { prUrl } : {}), ...(sameRemote ? {} : { remoteChanged: true }) },
+      data: {
+        remoteName: grant.remoteName,
+        branch: grant.branch,
+        expected: this.#verifiedHead,
+        ...(remoteHead ? { remoteHead } : {}),
+        ...(prUrl ? { prUrl } : {}),
+        ...(remoteReadable ? {} : { remoteUnreadable: true }),
+        ...(remoteReadable && !sameRemote ? { remoteChanged: true } : {}),
+        ...(lookup?.outcome === "unreachable" ? { unreachable: lookup.error.split("\n")[0] } : {}),
+      },
     }).catch(() => {});
-    return { sameRemote, ...(remoteHead ? { remoteHead } : {}), pushed, ...(prUrl ? { prUrl } : {}) };
+    return { sameRemote, remoteReadable, ...(lookup ? { lookup } : {}), pushed, ...(prUrl ? { prUrl } : {}) };
   }
 
   /**
@@ -1933,12 +1987,13 @@ export class Supervisor {
    * can carry an older merged pull request, which would otherwise be reported
    * as proof that this task published one.
    */
-  async #findPullRequest(cwd: string, branch: string, signal?: AbortSignal): Promise<string | undefined> {
+  async #findPullRequest(cwd: string, grant: RemoteGrant, signal?: AbortSignal): Promise<string | undefined> {
     try {
-      // Pin the repository: gh resolves a base repo from the remotes (preferring
+      // Pin the repository — the same `host/owner/repo` the grant made the
+      // Worker name: gh resolves a base repo from the remotes (preferring
       // `upstream`), which on a fork is not the one the grant was issued for.
-      const repository = this.#publishRemote?.fetch;
-      const { stdout } = await runReadOnly("gh", ["pr", "list", ...(repository ? ["--repo", repository] : []), "--head", branch, "--state", "open", "--limit", "10", "--json", "url,headRefOid"], cwd, signal);
+      const repository = grant.repository;
+      const { stdout } = await runReadOnly("gh", ["pr", "list", ...(repository ? ["--repo", repository] : []), "--head", grant.branch, "--state", "open", "--limit", "10", "--json", "url,headRefOid"], cwd, signal);
       const parsed = JSON.parse(stdout) as Array<{ url?: unknown; headRefOid?: unknown }>;
       if (!Array.isArray(parsed)) return undefined;
       const match = parsed.find((entry) => typeof entry.headRefOid === "string" && entry.headRefOid === this.#verifiedHead);

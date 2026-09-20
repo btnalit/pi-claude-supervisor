@@ -445,8 +445,11 @@ When a task is granted remote authority (`autonomy.remoteAuthority`, default
 HEAD *is* the verified tree — the evidence the Reviewer judged shows a clean
 working tree and carries the same `head` — then issues a `RemoteGrant` naming
 that commit, the candidate's own branch, the remote, the task directory and the
-remote's pinned fetch URL, and asks the Worker to publish: the Worker runs the
-push and any `gh pr create`, the Supervisor never does. The instruction is built
+remote's repository (`host/owner/repo` from its fetch URL, an SSH alias
+translated through `ssh -G`), and asks the Worker to publish: the Worker runs
+the push and any `gh pr create`, the Supervisor never does. A dirty tree costs a
+repair round first; the grant is armed before the instruction is sent and
+revoked only if the send failed before delivery (the turn counter tells). The instruction is built
 by `publishCommand`/`pullRequestCommand` in `policy.ts`, beside the parser that
 admits it, and a test round-trips one through the other. Under every permission
 authority the granted command is answered by the policy (`PolicyResult.granted`)
@@ -456,7 +459,9 @@ tree — and `#settlePublish` confirms the result read-only (`#confirmPublish`:
 both pinned remote URLs unchanged, `git ls-remote` carrying the verified commit,
 plus `gh pr list` for `pr`) before completing, or blocks the candidate when it
 cannot; that candidate keeps `deliverable: true`, since it passed and is intact
-on its branch. A tree that changed during the publish turn voids the grant and
+on its branch, and an unreachable remote is reported as *unconfirmed*
+(`RemoteBranchLookup` tells `absent` from `unreachable`), never as a missing
+commit or a repointed remote. A tree that changed during the publish turn voids the grant and
 is re-verified in full, with the same confirmation deciding whether the notice
 says the verified commit landed first. The grant is cleared on every terminal
 path, so it never outlives the turn it was issued for, and
@@ -467,9 +472,14 @@ with no other option, and `gh pr create --repo <pinned URL> --head <branch> …`
 source, other remote, branch or repository, relative `-C`, shell wrapper,
 dynamic word or second statement; the pinned hooks path keeps any installed
 `pre-push` out of the granted command. `git config` writes to
-transport-affecting keys (including `include.*`) and direct writes to
-`.git/config` or `.git/hooks/` are refused alongside `git remote` mutations,
-and git's own `--git-dir`/`--work-tree` options cannot hide either.
+transport-affecting keys (including `include.*` and `init.*`), `git config
+--edit`, `git init --template`, and any statement naming `.git/config` or
+`.git/hooks` that does not plainly only read are refused alongside `git remote`
+mutations; git's own `--git-dir`/`--work-tree` options and `remote`'s own `-v`
+cannot hide either. For an adopted tmux session the memory write root is
+located under the *adopted process's* configuration directory, read from
+`/proc/<pid>/environ` at adoption, so a Claude started with another
+`CLAUDE_CONFIG_DIR` keeps its memory.
 
 A record left behind by the outright
 stop (`recoverable_failure`, so `active/interrupted`) is not a dead end either:

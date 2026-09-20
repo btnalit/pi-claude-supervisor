@@ -147,15 +147,67 @@ export async function remoteUrl(cwd: string, remote: string, signal?: AbortSigna
 }
 
 /**
- * The commit a remote branch points at, or undefined when the ref is absent or
- * unreachable. Read-only: `ls-remote` never mutates.
+ * What a remote branch points at. `absent` is a fact the remote reported;
+ * `unreachable` means the remote could not be asked (network, timeout, a
+ * refused credential), which the caller must not report as a fact about the
+ * branch. Read-only: `ls-remote` never mutates.
  */
-export async function remoteBranchHead(cwd: string, remote: string, branch: string, signal?: AbortSignal): Promise<string | undefined> {
+export type RemoteBranchLookup = { outcome: "found"; head: string } | { outcome: "absent" } | { outcome: "unreachable"; error: string };
+
+export async function remoteBranchHead(cwd: string, remote: string, branch: string, signal?: AbortSignal): Promise<RemoteBranchLookup> {
   try {
     const { stdout } = await runReadOnly("git", ["ls-remote", "--heads", "--", remote, branch], cwd, signal);
     const line = stdout.split("\n").map((entry) => entry.trim()).find((entry) => entry.endsWith(`refs/heads/${branch}`));
     const sha = line?.split(/\s+/u)[0] ?? "";
-    return /^[0-9a-f]{40,64}$/u.test(sha) ? sha : undefined;
+    return /^[0-9a-f]{40,64}$/u.test(sha) ? { outcome: "found", head: sha } : { outcome: "absent" };
+  } catch (error) {
+    return { outcome: "unreachable", error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * A remote URL as the `host/owner/repo` gh accepts for `--repo`, or undefined
+ * when the URL does not name one. gh parses `https://`, `ssh://` and
+ * `git@host:owner/repo` forms itself but not an SSH-config host alias
+ * (`gh-work:owner/repo.git`, the usual multi-account setup); the alias is
+ * translated here the way gh translates a remote, through `ssh -G`, so a `pr`
+ * grant can be pinned to a repository gh can actually open.
+ */
+export async function repositorySlug(url: string, signal?: AbortSignal): Promise<string | undefined> {
+  const parsed = parseRemoteUrl(url.trim());
+  if (!parsed) return undefined;
+  let host = parsed.host;
+  if (parsed.sshAlias) host = (await resolveSshHostname(parsed.host, signal)) ?? parsed.host;
+  return `${host.toLowerCase()}/${parsed.owner}/${parsed.repo}`;
+}
+
+function parseRemoteUrl(url: string): { host: string; owner: string; repo: string; sshAlias: boolean } | undefined {
+  const path = (value: string): [string, string] | undefined => {
+    const parts = value.replace(/^\/+/u, "").replace(/\/+$/u, "").replace(/\.git$/u, "").split("/");
+    return parts.length === 2 && parts.every((part) => /^[A-Za-z0-9._-]+$/u.test(part)) ? [parts[0]!, parts[1]!] : undefined;
+  };
+  const scheme = url.match(/^(?:https?|ssh|git):\/\/(?:[^@\/]+@)?([^\/:]+)(?::\d+)?\/(.+)$/u);
+  if (scheme) {
+    const parts = path(scheme[2]!);
+    return parts ? { host: scheme[1]!, owner: parts[0], repo: parts[1], sshAlias: false } : undefined;
+  }
+  // scp-like: `user@host:owner/repo` or `alias:owner/repo`. Without a user the
+  // host is most likely an SSH-config alias; with one it may still be.
+  const scp = url.match(/^(?:([^@\/:]+)@)?([A-Za-z0-9._-]+):(.+)$/u);
+  if (scp && !scp[3]!.startsWith("/")) {
+    const parts = path(scp[3]!);
+    return parts ? { host: scp[2]!, owner: parts[0], repo: parts[1], sshAlias: true } : undefined;
+  }
+  return undefined;
+}
+
+/** The real hostname behind an SSH-config alias (`ssh -G` prints `hostname <real>`), or undefined. */
+async function resolveSshHostname(alias: string, signal?: AbortSignal): Promise<string | undefined> {
+  try {
+    const result = await execFileAsync("ssh", ["-G", "--", alias], { timeout: 10_000, maxBuffer: 64 * 1024, signal, env: { ...process.env, SSH_ASKPASS: "" } });
+    const line = String(result.stdout).split("\n").find((entry) => entry.startsWith("hostname "));
+    const host = line?.slice("hostname ".length).trim();
+    return host && /^[A-Za-z0-9.-]+$/u.test(host) ? host : undefined;
   } catch {
     return undefined;
   }

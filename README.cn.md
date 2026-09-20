@@ -230,11 +230,16 @@ Worker 在发布轮里再提交的内容会留在本地("Everything up-to-date")
 `pr` 下另加 `gh pr create --repo <钉住的 remote URL> --head <候选分支> …`(只允许
 title / body / base / draft / assignee / label):PR 只会开在授权 remote 对应的仓库里——
 不带 `--repo` 的话,gh 会从 remotes 里自己挑一个 base 仓库(fork 上是 `upstream`),
-那不是授权点名的仓库,核实也不会去查它。
+那不是授权点名的仓库,核实也不会去查它。仓库取 remote URL 背后的 `host/owner/repo`
+(SSH config 里的 host 别名会像 gh 那样经 `ssh -G` 翻译);URL 不是仓库的 remote(本地路径、
+翻译不了的别名)不会拿到 `pr` 授权。授权提供的每个词都做了 shell 引用,分支叫 `feat/$ticket`
+也能原样通过策略。
 
 授权只会发给"就是已验证工作树"的那个 commit:工作树必须干净(含未跟踪文件——新文件也可能
-是被验证行为的一部分),且 HEAD 自 Reviewer 评审的证据被读取以来没有移动过。任一不满足,
-任务以本地候选结束并在通知里写明 `not published:` 原因,而不是发授权。
+是被验证行为的一部分),且 HEAD 自 Reviewer 评审的证据被读取以来没有移动过。工作树不干净
+会先花一轮修复让 Worker 把属于候选的内容提交掉;只有修复轮用尽或 HEAD 移动过,任务才以本地
+候选结束并在通知里写明 `not published:` 原因,而不是发授权。核实时 remote 连不上,发布只是
+"未确认"(候选仍可交付),绝不会被说成"没推上去"。
 
 有没有授权都拒绝:任何 push 选项(`-u`、`--force`、`--force-with-lease`、`--delete`、
 `--mirror`、`--all`、`--tags`、`--no-verify`、`--push-option`、`--receive-pack` 等)、
@@ -244,12 +249,15 @@ title / body / base / draft / assignee / label):PR 只会开在授权 remote 对
 `--repo <钉住的 URL>` 或不带 `--head <候选分支>` 的 `gh pr create`(被别的选项当作值吞掉的
 `--head` 不算)、`gh pr create --body-file/-F/--template`(会把任意本地文件内容发到 PR 上)、
 `--web`、别的 `--repo`、`gh pr merge`、`gh api`、`gh release`、`npm publish`。改动仓库
-remote(`git remote set-url|add|rename|…`,藏在 git 自己的 `--git-dir`/`--work-tree`
-选项后面也一样)一律拒绝;改动 push 去向或 push 期间会执行什么也一律拒绝——`git config` 写
-`remote.*`、`url.*.insteadOf`、`push.*`、`credential.*`、`http.*`、`include.path`/`includeIf.*`、
-`core.sshCommand`、`core.hooksPath`,以及任何对 `.git/config`、`.git/hooks/` 的写入——
-否则授权认的 remote 会被偷换,连 Supervisor 的核实也会被骗过;核实同时钉住 fetch 和 push
-两个 URL。
+remote(`git remote set-url|add|rename|…`,藏在 git 自己的 `--git-dir`/`--work-tree` 选项
+或 `remote` 自己的 `-v` 后面也一样)一律拒绝;改动 push 去向或 push 期间会执行什么也一律
+拒绝——`git config` 写 `remote.*`、`url.*.insteadOf`、`push.*`、`credential.*`、`http.*`、
+`include.path`/`includeIf.*`、`init.*`、`core.sshCommand`、`core.hooksPath`,`git config --edit`、
+`git init --template=…`,以及任何提到 `.git/config` 或 `.git/hooks` 的语句(除非它显然只读:
+`cat`、`grep`、`ls` 等)——否则授权认的 remote 会被偷换,连 Supervisor 的核实也会被骗过;
+核实同时钉住 fetch 和 push 两个 URL,并从自己的环境里剔除 `GIT_DIR`/`GIT_CONFIG_*`。这是一层
+作用于命令文本的策略:Worker 自己写一个脚本再运行,策略看不见——如
+[autonomy-target.md](docs/autonomy-target.md) 对所有文本级规则所说,绝对隔离是 host 边界的事。
 
 授权是**一次性**的:发布轮一结束就收回(不等下一个决策),并且同时绑定 remote 的 URL
 而不只是名字。Worker 若在该轮里改动了工作树,授权立即作废并重新完整验收;因为授权写的是

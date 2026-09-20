@@ -285,13 +285,21 @@ Worker's credentials. For `pr` a `gh pr create --repo <pinned remote URL>
 --head <candidate branch> …` limited to title, body, base, draft, assignee and
 label: the pull request opens in the granted remote's repository, full stop —
 without `--repo`, gh picks a base repository from the remotes (`upstream` on a
-fork) that the grant never named and the confirmation never reads.
+fork) that the grant never named and the confirmation never reads. The
+repository is the `host/owner/repo` behind the remote's URL (an SSH-config host
+alias is translated through `ssh -G`, as gh does); a remote whose URL is not
+one — a local path, an alias with no translation — gets no `pr` grant. Every
+word the grant supplies is shell-quoted, so a branch named `feat/$ticket` still
+round-trips through the policy.
 
 The grant is only issued for a commit that *is* the verified tree: the working
 tree must be clean (untracked files included — a new file may be part of the
 verified behavior), and HEAD must not have moved since the evidence the Reviewer
-judged was read. Either failure ends the task at the local candidate with a
-`not published:` reason instead of a grant.
+judged was read. A dirty tree first costs a repair round asking the Worker to
+commit what belongs to the candidate; only when none is left, or when HEAD
+moved, does the task end at the local candidate with a `not published:` reason
+instead of a grant. A remote that cannot be reached at confirmation time leaves
+the publish *unconfirmed* (the candidate stays deliverable), never "refuted".
 
 Refused with or without a grant: every push option (`-u`, `--force`,
 `--force-with-lease`, `--delete`, `--mirror`, `--all`, `--tags`, `--no-verify`,
@@ -305,13 +313,18 @@ branch>` (a `--head` swallowed as another option's value does not count),
 `gh pr create --body-file/-F/--template` (which would post the contents of an
 arbitrary local file), `--web`, another `--repo`, `gh pr merge`, `gh api`,
 `gh release` and `npm publish`. Changing the repository's remotes (`git remote
-set-url|add|rename|…`, behind any of git's own `--git-dir`/`--work-tree`
-options too) is denied outright, and so is reconfiguring where a push goes or
-what runs during it — `git config` writes to `remote.*`, `url.*.insteadOf`,
-`push.*`, `credential.*`, `http.*`, `include.path`/`includeIf.*`,
-`core.sshCommand` or `core.hooksPath`, and any write to `.git/config` or
-`.git/hooks/` — so the granted remote cannot be repointed underneath the
-confirmation, which pins both the fetch and the push URL.
+set-url|add|rename|…`, behind git's own `--git-dir`/`--work-tree` options or
+`remote`'s own `-v` too) is denied outright, and so is reconfiguring where a
+push goes or what runs during it — `git config` writes to `remote.*`,
+`url.*.insteadOf`, `push.*`, `credential.*`, `http.*`, `include.path`/
+`includeIf.*`, `init.*`, `core.sshCommand` or `core.hooksPath`, `git config
+--edit`, `git init --template=…`, and any statement that names `.git/config` or
+`.git/hooks` unless it plainly only reads (`cat`, `grep`, `ls`, …) — so the
+granted remote cannot be repointed underneath the confirmation, which pins both
+the fetch and the push URL and scrubs `GIT_DIR`/`GIT_CONFIG_*` from its own
+environment. This is a policy over the command text: a script the Worker writes
+and runs is outside what it can see, as [autonomy-target.md](docs/autonomy-target.md)
+says of every text-level rule; absolute isolation is the host boundary's job.
 
 The grant is **one-shot**: it is revoked the moment the publish turn completes,
 not when the next decision arrives, and it is pinned to the remote's URL as well

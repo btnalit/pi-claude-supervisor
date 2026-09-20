@@ -1584,4 +1584,9 @@ test("writeRoots carry the scratchpad and the project memory directory", () => {
   assert.deepEqual(writeRootsOf({ handle, transcriptPath }, configDir), ["/home/u/.claude/projects/-mnt-work-Repo/memory"]);
   assert.deepEqual(writeRootsOf({ handle, scratchpadDir }, configDir), [scratchpadDir]);
   assert.deepEqual(writeRootsOf({ handle }, configDir), []);
+  // An adopted session that Claude started with another CLAUDE_CONFIG_DIR keeps
+  // its memory there; the record carries the directory read from that process.
+  const relocated = "/home/u/.claude-work/projects/-mnt-work-Repo/1.jsonl";
+  assert.deepEqual(writeRootsOf({ handle, transcriptPath: relocated, claudeConfigDir: "/home/u/.claude-work" }), ["/home/u/.claude-work/projects/-mnt-work-Repo/memory"]);
+  assert.deepEqual(writeRootsOf({ handle, transcriptPath: relocated }, configDir), [], "without it, another configuration directory is not this Claude's");
 });
