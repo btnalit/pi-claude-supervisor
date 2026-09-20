@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
-import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS, sameDirectory, sweepDeadTmuxSockets } from "./tmux-adapter.ts";
+import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS, sameDirectory, sweepDeadTmuxSockets, writeRootsOf } from "./tmux-adapter.ts";
 import { preflightCgroupContainment } from "./process-adapter.ts";
 import type { HookEventSource, HookRelayReply, HookRelayRequest } from "../hooks/types.ts";
 import type { WorkerEvent } from "../types.ts";
@@ -1553,4 +1553,19 @@ test("sameDirectory compares directory identity, not the spelling of the path", 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("writeRoots cover the session's scratchpad and Claude's own project memory directory", () => {
+  const transcriptPath = "/home/u/.claude/projects/-repo-slug/1234.jsonl";
+  const scratchpadDir = "/tmp/claude-1000/-repo-slug/abc/scratchpad";
+
+  // The memory directory is derived from the transcript Claude itself reports,
+  // so it always belongs to this session's project and is never guessed.
+  assert.deepEqual(writeRootsOf({ transcriptPath }), ["/home/u/.claude/projects/-repo-slug/memory"]);
+  assert.deepEqual(writeRootsOf({ scratchpadDir, transcriptPath }), [scratchpadDir, "/home/u/.claude/projects/-repo-slug/memory"]);
+
+  // An adopted session that never replayed SessionStart has no scratchpad yet;
+  // the memory root still applies once any hook reports a transcript path.
+  assert.deepEqual(writeRootsOf({ scratchpadDir }), [scratchpadDir]);
+  assert.deepEqual(writeRootsOf({}), []);
 });

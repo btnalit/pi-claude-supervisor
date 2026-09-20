@@ -247,7 +247,8 @@ test("file tools reject outside-cwd and hard-link Git aliases", async () => {
     assert.equal(evaluatePermission("Write", { file_path: "main-alias", content: "moved\n" }, root).decision, "deny");
     const outside = evaluatePermission("Write", { file_path: "../outside.txt", content: "outside\n" }, root);
     assert.equal(outside.decision, "deny");
-    assert.equal(outside.reason, "Worker cannot write outside the task working directory: ../outside.txt");
+    assert.match(outside.reason, /^Worker cannot write outside the task working directory: \.\.\/outside\.txt;/u);
+    assert.match(outside.reason, /scratchpad or memory directory/u, "the denial tells the Worker where scratch work may go");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -464,4 +465,15 @@ test("file tools may write inside an extra write root such as Claude's scratchpa
 test("remote and destructive commands remain denied even with a legacy approval", () => {
   assert.throws(() => assertSafeWorkerCommand("git", ["push"], { actor: "human", reason: "release approved" }), /blocked by policy \(deny\)/u);
   assert.throws(() => assertSafeWorkerCommand("rm", ["-rf", "/"], { actor: "human", reason: "approved" }), /blocked by policy \(deny\)/u);
+});
+
+test("denials that a Worker can act on name the tool or place to use instead", () => {
+  // A dynamic argument on a repository/package command is genuinely
+  // uncheckable; the denial must name the checked alternative, or the Worker
+  // burns turns investigating the hook instead of switching tools.
+  const dynamic = evaluateCommand("git commit -m $MSG");
+  assert.equal(dynamic.decision, "deny");
+  assert.match(dynamic.reason, /cannot be capability-checked/u);
+  assert.match(dynamic.reason, /Write\/Edit tools/u);
+  assert.match(dynamic.reason, /heredoc or stdin/u);
 });
