@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented here.
 
+## [0.8.1](https://github.com/btnalit/pi-claude-supervisor/compare/v0.8.0...v0.8.1) (2026-09-20)
+
+
+### Bug Fixes
+
+* **policy:** let a Worker keep its own memory, and make denials actionable ([605fb58](https://github.com/btnalit/pi-claude-supervisor/commit/605fb5860b38ee9023ad980b3101708cadd39fb2))
+* **policy:** make the memory write root actually reachable, and drop the cwd-identity relaxation ([8a1bfc5](https://github.com/btnalit/pi-claude-supervisor/commit/8a1bfc55f97421997b0a8c87f0b1ae9cd7c94ba9))
+* **tmux:** accept an adopted pane whose cwd path went stale but is the same directory ([207219c](https://github.com/btnalit/pi-claude-supervisor/commit/207219c1fec218d1eecf1920c5ba9a2806935a8f))
+
 ## [0.8.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.7.3...v0.8.0) (2026-09-19)
 
 
