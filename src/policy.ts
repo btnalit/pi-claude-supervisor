@@ -48,6 +48,38 @@ export interface RemoteGrant {
   head: string;
   /** The task working directory; a granted push must name it with an absolute `-C`, so the grant cannot be spent in another clone. */
   cwd: string;
+  /**
+   * The granted remote's fetch URL, pinned when the grant was issued. Under
+   * `pr` a pull request must name it with `--repo`: gh otherwise resolves a
+   * base repository from the remotes and prefers `upstream` on a fork, which
+   * is not the repository the grant named and not the one the confirmation
+   * reads. A pull request opens in the granted remote's repository, full stop.
+   */
+  repository?: string;
+}
+
+/** The hooks path the granted push must carry, so no hook a Worker could have installed runs inside the one granted command. */
+export const GRANTED_HOOKS_PATH = "/dev/null";
+
+/** A word single-quoted for the Worker's shell, the form the lexer reads back as one token. */
+function shellQuoteWord(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * The one push a grant admits, spelled the way `permittedRemoteCommand` reads
+ * it. Kept beside the parser so the instruction the Supervisor sends and the
+ * shape the policy accepts cannot drift apart: the directory is quoted so a
+ * space survives the shell as one word, the hooks path is pinned so no
+ * `pre-push` runs, and the verified commit is the refspec source.
+ */
+export function publishCommand(grant: RemoteGrant): string {
+  return `git -C ${shellQuoteWord(grant.cwd)} -c core.hooksPath=${GRANTED_HOOKS_PATH} push ${grant.remoteName} ${grant.head}:refs/heads/${grant.branch}`;
+}
+
+/** The one `gh pr create` prefix a `pr` grant admits; the Worker appends its title and body. */
+export function pullRequestCommand(grant: RemoteGrant): string {
+  return `gh pr create --repo ${shellQuoteWord(grant.repository ?? "")} --head ${grant.branch}`;
 }
 /**
  * The only options a granted `gh pr create` may carry. An allowlist, because an
@@ -55,9 +87,9 @@ export interface RemoteGrant {
  * contents of an arbitrary local file, `-H` retargets the head branch, and `-w`
  * is `--web`.
  */
-const ALLOWED_PR_CREATE_OPTIONS = new Set(["-t", "--title", "-b", "--body", "-B", "--base", "--draft", "-d", "--fill", "--fill-first", "-a", "--assignee", "-l", "--label", "-H", "--head"]);
+const ALLOWED_PR_CREATE_OPTIONS = new Set(["-t", "--title", "-b", "--body", "-B", "--base", "--draft", "-d", "--fill", "--fill-first", "-a", "--assignee", "-l", "--label", "-H", "--head", "-R", "--repo"]);
 /** `gh pr create` options that take a value; the value is the next word. */
-const PR_CREATE_VALUE_OPTIONS = new Set(["-t", "--title", "-b", "--body", "-B", "--base", "-a", "--assignee", "-l", "--label", "-H", "--head"]);
+const PR_CREATE_VALUE_OPTIONS = new Set(["-t", "--title", "-b", "--body", "-B", "--base", "-a", "--assignee", "-l", "--label", "-H", "--head", "-R", "--repo"]);
 
 export function evaluatePermission(toolName: string, input: unknown, cwd = process.cwd(), options: PermissionPolicyOptions = {}): PolicyResult {
   if (toolName === "AskUserQuestion") return { decision: "deny", reason: "interactive questions are converted to ordinary Worker text" };
@@ -279,14 +311,20 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
     if (words[1] !== "-C") return undefined;
     const directory = words[2];
     if (directory === undefined || !isAbsolute(directory) || !sameResolvedDirectory(directory, grant.cwd)) return undefined;
-    if (words[3] !== "push") return undefined;
-    // No option at all: `-u` did nothing with a commit as the source, and an
-    // allowlist of one no-op is only surface. The refspec names the verified
-    // commit, so git pushes exactly that object; a commit made during the
-    // publish turn stays local ("Everything up-to-date") instead of riding
+    // `-c core.hooksPath=/dev/null` is required too: a `pre-push` hook runs
+    // inside the granted push with the Worker's credentials where no policy
+    // sees it, and hooks can arrive by more doors than a write denial can
+    // enumerate (`git init --template=`, an archive). Pinning the hooks path
+    // on the one granted command makes it immune instead.
+    if (words[3] !== "-c" || words[4] !== `core.hooksPath=${GRANTED_HOOKS_PATH}`) return undefined;
+    if (words[5] !== "push") return undefined;
+    // No push option at all: `-u` did nothing with a commit as the source, and
+    // an allowlist of one no-op is only surface. The refspec names the
+    // verified commit, so git pushes exactly that object; a commit made during
+    // the publish turn stays local ("Everything up-to-date") instead of riding
     // the grant. `refs/heads/` is spelled out because a bare destination is
     // refused by git when the remote branch does not exist yet.
-    const rest = words.slice(4);
+    const rest = words.slice(6);
     if (rest.length !== 2 || rest.some((word) => word.startsWith("-"))) return undefined;
     const [remote, refspec] = rest as [string, string];
     if (remote !== grant.remoteName) return undefined;
@@ -295,14 +333,19 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
   }
 
   if (name === "gh" && grant.authority === "pr") {
+    if (!grant.repository) return undefined;
     if (words[1] !== "pr" || words[2] !== "create") return undefined;
     const rest = words.slice(3);
     // `--head <candidate branch>` is mandatory: without it gh uses whatever
     // branch is checked out, and `git checkout` is ordinary local work, so a
     // bare `gh pr create` could open a pull request for a branch nothing
-    // verified. It counts only as the option the loop itself parses, never as
-    // a word another option swallowed: `--title --head` sets the title.
+    // verified. `--repo <pinned URL>` is mandatory for the same reason one
+    // level up: without it gh picks a base repository from the remotes
+    // (`upstream` on a fork, or whatever clone the Worker's shell sits in).
+    // Each counts only as the option the loop itself parses, never as a word
+    // another option swallowed: `--title --head` sets the title.
     let sawHead = false;
+    let sawRepo = false;
     for (let cursor = 0; cursor < rest.length; cursor += 1) {
       const word = rest[cursor]!;
       if (!word.startsWith("-")) return undefined;
@@ -316,10 +359,14 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
           if (value !== grant.branch) return undefined;
           sawHead = true;
         }
+        if (option === "-R" || option === "--repo") {
+          if (value !== grant.repository) return undefined;
+          sawRepo = true;
+        }
         if (!inlineValue) cursor += 1;
       }
     }
-    if (!sawHead) return undefined;
+    if (!sawHead || !sawRepo) return undefined;
     return { decision: "allow", reason: `publish grant: open a pull request for ${grant.branch}`, granted: true };
   }
   return undefined;
@@ -410,7 +457,8 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   // interpreter that would execute the expanded text, in the same statement.
   // Dynamic text in an ordinary local command (`for f in …; echo "$f"`) or in
   // another statement (`npm test; echo "exit $?"`) is Claude's own business.
-  if ((hasDynamicArgument && hasDynamicCommandName(tokens)) || segmentsOf(tokens).some((segment) => hasDynamicSensitiveArgument(segment))) {
+  const segments = segmentsOf(tokens);
+  if ((hasDynamicArgument && hasDynamicCommandName(tokens)) || segments.some((segment) => hasDynamicSensitiveArgument(segment))) {
     return { decision: "deny", reason: "a repository, package, network or shell command with a dynamic argument cannot be capability-checked; substitute the literal value for the shell variable so the command can be read, or use the Write/Edit tools when the intent is to change a file" };
   }
   if (/\bgit\b[\s\S]*\b(?:push|merge(?!-)|send-pack|receive-pack|update-ref)\b/iu.test(canonical)
@@ -426,7 +474,7 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   // Scoped to one statement with `remote` in git's subcommand position and the
   // action right after it: matching the words anywhere denied `git remote -v &&
   // git add -A` and even `git add remote`, which are ordinary local work.
-  if (segmentsOf(tokens).some((segment) => mutatesRemotes(segment))) {
+  if (segments.some((segment) => mutatesRemotes(segment))) {
     return { decision: "deny", reason: "Worker cannot change the repository's remotes" };
   }
   // The same boundary through `git config`: `remote.<name>.pushurl`,
@@ -434,7 +482,7 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   // credential/http keys change where a push goes, what travels with it or
   // what runs during it, without touching the remote's name. Reads stay
   // ordinary local work; only a write of one of these keys is refused.
-  if (segmentsOf(tokens).some((segment) => configuresRemoteTransport(segment))) {
+  if (segments.some((segment) => configuresRemoteTransport(segment))) {
     return { decision: "deny", reason: "Worker cannot reconfigure the repository's remotes, URL rewrites, push behavior, credentials or hooks" };
   }
   if (hasGitAliasConfiguration) {
@@ -471,15 +519,31 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
 
 const REMOTE_MUTATIONS = new Set(["set-url", "add", "rename", "remove", "rm", "prune", "set-branches", "set-head"]);
 
+/** git's own pre-subcommand options that take the next word as their value when not written `--opt=value`. */
+const GIT_GLOBAL_VALUE_OPTIONS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source"]);
+
+/**
+ * The index of git's subcommand in one statement's words, or -1 when the
+ * statement is not a git invocation. Skips the pre-subcommand options,
+ * including the space-separated value forms: `git --git-dir .git remote …`
+ * has its subcommand at index 3, not 2, and a locator that only knew `-C`
+ * and `-c` let `remote set-url` and `config remote.*` hide behind `--git-dir`.
+ */
+function gitSubcommandIndex(words: readonly string[]): number {
+  const first = words[0]?.split(/[\\/]/u).at(-1)?.toLowerCase();
+  if (first !== "git") return -1;
+  let index = 1;
+  while (index < words.length && words[index]!.startsWith("-")) {
+    index += GIT_GLOBAL_VALUE_OPTIONS.has(words[index]!) ? 2 : 1;
+  }
+  return index < words.length ? index : -1;
+}
+
 /** True when this one statement is `git [options] remote <mutating action>`. */
 function mutatesRemotes(segment: readonly ShellToken[]): boolean {
   const words = segment.filter((token) => !token.operator).map((token) => token.value);
-  const first = words[0]?.split(/[\\/]/u).at(-1)?.toLowerCase();
-  if (first !== "git") return false;
-  // Skip git's own pre-subcommand options (`-C <dir>`, `-c k=v`, `--git-dir=…`).
-  let index = 1;
-  while (index < words.length && words[index]!.startsWith("-")) index += words[index] === "-C" || words[index] === "-c" ? 2 : 1;
-  if (words[index]?.toLowerCase() !== "remote") return false;
+  const index = gitSubcommandIndex(words);
+  if (index < 0 || words[index]?.toLowerCase() !== "remote") return false;
   const action = words[index + 1]?.toLowerCase();
   return action !== undefined && REMOTE_MUTATIONS.has(action);
 }
@@ -487,10 +551,11 @@ function mutatesRemotes(segment: readonly ShellToken[]): boolean {
 /**
  * Configuration keys that decide where a push goes, what travels with it or
  * what runs during it. `remote.*` covers `pushurl`; `url.*` the `insteadOf`
- * rewrites; `push.*` follow-tags and push options; the rest credentials,
- * transport and hook locations.
+ * rewrites; `push.*` follow-tags and push options; `include.*`/`includeIf.*`
+ * would pull any of the others in from a file the Worker wrote; the rest are
+ * credentials, transport and hook locations.
  */
-const REMOTE_TRANSPORT_CONFIG_KEY = /^(?:remote\.|url\.|push\.|credential\.|http\.|https\.|core\.(?:sshcommand|hookspath|gitproxy|askpass|alternaterefscommand)$)/iu;
+const REMOTE_TRANSPORT_CONFIG_KEY = /^(?:remote\.|url\.|push\.|credential\.|http\.|https\.|include\.|includeif\.|core\.(?:sshcommand|hookspath|gitproxy|askpass|alternaterefscommand)$)/iu;
 /** `git config` flags and verbs that only read; a key next to one of them is a query, not a change. */
 const GIT_CONFIG_READ_FLAGS = new Set(["--get", "--get-all", "--get-regexp", "--get-urlmatch", "-l", "--list", "--show-origin", "--show-scope", "--name-only"]);
 const GIT_CONFIG_WRITE_FLAGS = new Set(["--add", "--replace-all", "--unset", "--unset-all", "--remove-section", "--rename-section", "--edit", "-e"]);
@@ -498,11 +563,8 @@ const GIT_CONFIG_WRITE_FLAGS = new Set(["--add", "--replace-all", "--unset", "--
 /** True when this one statement is `git [options] config` writing a transport-affecting key. */
 function configuresRemoteTransport(segment: readonly ShellToken[]): boolean {
   const words = segment.filter((token) => !token.operator).map((token) => token.value);
-  const first = words[0]?.split(/[\\/]/u).at(-1)?.toLowerCase();
-  if (first !== "git") return false;
-  let index = 1;
-  while (index < words.length && words[index]!.startsWith("-")) index += words[index] === "-C" || words[index] === "-c" ? 2 : 1;
-  if (words[index]?.toLowerCase() !== "config") return false;
+  const index = gitSubcommandIndex(words);
+  if (index < 0 || words[index]?.toLowerCase() !== "config") return false;
   const rest = words.slice(index + 1);
   if (!rest.some((word) => REMOTE_TRANSPORT_CONFIG_KEY.test(word))) return false;
   const lower = rest.map((word) => word.toLowerCase());

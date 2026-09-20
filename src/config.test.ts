@@ -163,9 +163,12 @@ test("remote authority never defaults on and only accepts the two grants", () =>
   assert.equal(autonomyDefaults({}).remoteName, "origin");
   assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY: "push" }).remoteAuthority, "push");
   assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY: "PR" }).remoteAuthority, "pr");
-  // Anything unrecognised keeps the Worker local rather than guessing.
-  assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY: "merge" }).remoteAuthority, "none");
-  assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY: "1" }).remoteAuthority, "none");
+  assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY: "none" }).remoteAuthority, "none");
+  assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY: "  " }).remoteAuthority, "none");
+  // Anything unrecognised throws, like a malformed remote name: a typo must
+  // not silently switch the publish phase off behind a bare "candidate is ready".
+  assert.throws(() => autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY: "merge" }), /must be none, push or pr: merge/u);
+  assert.throws(() => autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY: "pull-request" }), /must be none, push or pr/u);
   assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_NAME: "upstream" }).remoteName, "upstream");
   assert.throws(() => autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_NAME: "bad name;rm" }), /must be a plain remote name/u);
 });

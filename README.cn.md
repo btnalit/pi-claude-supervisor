@@ -219,25 +219,34 @@ Worker 推自己的分支;`pr` 还允许它开 PR。**push 由 Worker 自己执�
 依然可交付。
 
 这个授权刻意严苛,而且两条命令都按字面匹配——没被审过的选项一律拒绝,而不是默认
-无害。它只认 `git -C '<任务目录>' push <remote> <已验证 commit>:refs/heads/<branch>`,
-不带任何选项。refspec 写的是**已验证的 commit** 而不是分支:git 只会推送这一个对象,
+无害。它只认 `git -C '<任务目录>' -c core.hooksPath=/dev/null push <remote> <已验证 commit>:refs/heads/<branch>`,
+不带其他任何选项。refspec 写的是**已验证的 commit** 而不是分支:git 只会推送这一个对象,
 Worker 在发布轮里再提交的内容会留在本地("Everything up-to-date"),搭不上这次授权。
 **`-C` 是必需的且必须是绝对路径**,两侧都按内核解析后比较——因为 Claude 的 Bash 工具
 会在多次调用之间保留工作目录,而 `cd` 属于普通本地操作,没有 `-C` 的话授权可能被花在
 任何别的克隆上;相对写法 `-C .` 则会按 Supervisor 进程而不是 Worker 的 shell 解析。
-`pr` 下另加受限的 `gh pr create`(只允许 title / body / base / head(且必须等于候选分支)/
-draft / assignee / label)。
+这条命令上**钉死了 hooks 路径**,所以 Worker 通过任何途径(`git init --template=`、
+解压归档、`chmod`)装进去的 `pre-push` hook 都不会在授权的 push 里以 Worker 的凭据执行。
+`pr` 下另加 `gh pr create --repo <钉住的 remote URL> --head <候选分支> …`(只允许
+title / body / base / draft / assignee / label):PR 只会开在授权 remote 对应的仓库里——
+不带 `--repo` 的话,gh 会从 remotes 里自己挑一个 base 仓库(fork 上是 `upstream`),
+那不是授权点名的仓库,核实也不会去查它。
+
+授权只会发给"就是已验证工作树"的那个 commit:工作树必须干净(含未跟踪文件——新文件也可能
+是被验证行为的一部分),且 HEAD 自 Reviewer 评审的证据被读取以来没有移动过。任一不满足,
+任务以本地候选结束并在通知里写明 `not published:` 原因,而不是发授权。
 
 有没有授权都拒绝:任何 push 选项(`-u`、`--force`、`--force-with-lease`、`--delete`、
 `--mirror`、`--all`、`--tags`、`--no-verify`、`--push-option`、`--receive-pack` 等)、
-以分支或 `HEAD` 作为 refspec 来源、裸 `git push`、别的 remote、分支或 commit、保护分支、
-被 shell 包装(含 heredoc 管进 shell)、带动态参数、第二条语句、不带 `-C` 的 `git push`、
-`-C` 指向任务目录以外或写成相对路径、不带 `--head <候选分支>` 的 `gh pr create`(否则 gh
-会用当前 checkout 的分支——被别的选项当作值吞掉的 `--head` 不算)、
-`gh pr create --body-file/-F/--template`(会把任意本地文件内容发到 PR 上)、`--web`、
-`--repo`、`gh pr merge`、`gh api`、`gh release`、`npm publish`。改动仓库 remote
-(`git remote set-url|add|rename|…`)一律拒绝;改动 push 去向或 push 期间会执行什么也一律
-拒绝——`git config` 写 `remote.*`、`url.*.insteadOf`、`push.*`、`credential.*`、`http.*`、
+除钉死的 hooks 路径以外的任何 `-c`、以分支或 `HEAD` 作为 refspec 来源、裸 `git push`、
+别的 remote、分支或 commit、保护分支、被 shell 包装(含 heredoc 管进 shell)、带动态参数、
+第二条语句、不带 `-C` 的 `git push`、`-C` 指向任务目录以外或写成相对路径、不带
+`--repo <钉住的 URL>` 或不带 `--head <候选分支>` 的 `gh pr create`(被别的选项当作值吞掉的
+`--head` 不算)、`gh pr create --body-file/-F/--template`(会把任意本地文件内容发到 PR 上)、
+`--web`、别的 `--repo`、`gh pr merge`、`gh api`、`gh release`、`npm publish`。改动仓库
+remote(`git remote set-url|add|rename|…`,藏在 git 自己的 `--git-dir`/`--work-tree`
+选项后面也一样)一律拒绝;改动 push 去向或 push 期间会执行什么也一律拒绝——`git config` 写
+`remote.*`、`url.*.insteadOf`、`push.*`、`credential.*`、`http.*`、`include.path`/`includeIf.*`、
 `core.sshCommand`、`core.hooksPath`,以及任何对 `.git/config`、`.git/hooks/` 的写入——
 否则授权认的 remote 会被偷换,连 Supervisor 的核实也会被骗过;核实同时钉住 fetch 和 push
 两个 URL。

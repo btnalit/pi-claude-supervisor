@@ -240,7 +240,11 @@ function readTrimmedString(value: string | undefined): string | undefined {
 /** Remote authority never defaults on: an unset or unrecognised value keeps the Worker local. */
 function readRemoteAuthority(value: string | undefined): RemoteAuthority {
   const normalized = value?.trim().toLowerCase();
-  return normalized === "push" || normalized === "pr" ? normalized : "none";
+  if (normalized === undefined || normalized === "" || normalized === "none") return "none";
+  if (normalized === "push" || normalized === "pr") return normalized;
+  // A typo must not silently switch the publish phase off: a task would then
+  // end at a bare "candidate is ready" with no shortfall to explain it.
+  throw new Error(`PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY must be none, push or pr: ${value?.trim()}`);
 }
 
 function readRemoteName(value: string | undefined): string {

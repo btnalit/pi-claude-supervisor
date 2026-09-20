@@ -57,6 +57,8 @@ export interface RepositoryEvidence {
   baseRef?: string;
   /** Current branch used for the local candidate, when available. */
   branch?: string;
+  /** The commit HEAD pointed at when this evidence was read; a publish grant must name the same one. */
+  head?: string;
   /** True when any evidence field was bounded or omitted. */
   truncated?: boolean;
   collectedAt: string;
@@ -90,8 +92,18 @@ export async function repositoryHead(cwd: string, signal?: AbortSignal): Promise
  * hanging.
  */
 function remoteReadEnvironment(): NodeJS.ProcessEnv {
-  return { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "" };
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "" };
+  // Inheriting the network and credential variables must not also inherit the
+  // ones that point git at another repository or inject configuration: with
+  // GIT_DIR or GIT_CONFIG_COUNT/KEY_n/VALUE_n set in the host's shell, the
+  // confirmation would pin and read a repository that is not the candidate's.
+  for (const name of Object.keys(env)) {
+    if (REPOSITORY_RELOCATING_GIT_VARIABLE.test(name)) delete env[name];
+  }
+  return env;
 }
+
+const REPOSITORY_RELOCATING_GIT_VARIABLE = /^(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_NAMESPACE|GIT_INDEX_FILE|GIT_OBJECT_DIRECTORY|GIT_ALTERNATE_OBJECT_DIRECTORIES|GIT_CONFIG_GLOBAL|GIT_CONFIG_SYSTEM|GIT_CONFIG_NOSYSTEM|GIT_CONFIG_COUNT|GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+|GIT_CONFIG_PARAMETERS|GIT_CEILING_DIRECTORIES|GIT_DISCOVERY_ACROSS_FILESYSTEM)$/u;
 
 /**
  * Run a read-only inspection command without a shell, for confirming what the
@@ -124,8 +136,10 @@ export interface RemoteDestination {
  */
 export async function remoteUrl(cwd: string, remote: string, signal?: AbortSignal): Promise<RemoteDestination | undefined> {
   try {
-    const fetch = (await runReadOnly("git", ["remote", "get-url", "--", remote], cwd, signal)).stdout.trim();
-    const push = (await runReadOnly("git", ["remote", "get-url", "--push", "--", remote], cwd, signal)).stdout.trim();
+    const [fetch, push] = (await Promise.all([
+      runReadOnly("git", ["remote", "get-url", "--", remote], cwd, signal),
+      runReadOnly("git", ["remote", "get-url", "--push", "--", remote], cwd, signal),
+    ])).map((result) => result.stdout.trim()) as [string, string];
     return fetch === "" || push === "" ? undefined : { fetch, push };
   } catch {
     return undefined;
@@ -267,13 +281,14 @@ export async function collectRepositoryEvidence(cwd: string, options: Pick<Verif
   const baseRef = options.baseRef;
   const diffRef = baseRef ?? "HEAD";
   const commitArgs = baseRef ? ["log", "--format=%h %s", "--no-decorate", `${baseRef}..HEAD`, "--"] : ["log", "--format=%h %s", "--no-decorate", "-20", "--"];
-  const [statusResult, diffResult, commitsResult, branchResult, untrackedResult] = await Promise.all([
+  const [statusResult, diffResult, commitsResult, branchResult, untrackedResult, head] = await Promise.all([
     readGitEvidence(cwd, ["status", "--short", "--untracked-files=all"], options.signal),
     // A baseline-relative diff includes committed, staged, and unstaged changes.
     readGitEvidence(cwd, ["diff", "--no-ext-diff", "--unified=3", diffRef, "--"], options.signal),
     readGitEvidence(cwd, commitArgs, options.signal),
     readGitEvidence(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"], options.signal),
     collectUntrackedEvidence(cwd, options.signal),
+    repositoryHead(cwd, options.signal),
   ]);
   throwIfAborted(options.signal);
   return {
@@ -283,6 +298,7 @@ export async function collectRepositoryEvidence(cwd: string, options: Pick<Verif
     untracked: untrackedResult.text,
     ...(baseRef ? { baseRef } : {}),
     ...(branchResult.text.trim() !== "(none)" ? { branch: branchResult.text.trim() } : {}),
+    ...(head ? { head } : {}),
     complete: statusResult.complete && diffResult.complete && commitsResult.complete && branchResult.complete && untrackedResult.complete,
     truncated: statusResult.truncated || diffResult.truncated || commitsResult.truncated || branchResult.truncated || untrackedResult.truncated,
     collectedAt: new Date().toISOString(),

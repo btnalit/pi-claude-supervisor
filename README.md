@@ -270,34 +270,48 @@ which stays deliverable locally.
 
 The grant is deliberately unforgiving, and both commands are matched literally —
 an option nobody reviewed is refused rather than assumed harmless. It admits
-exactly `git -C '<task directory>' push <remote> <verified commit>:refs/heads/<branch>`,
-with no option at all. The refspec names the **verified commit**, not the branch:
+exactly `git -C '<task directory>' -c core.hooksPath=/dev/null push <remote> <verified commit>:refs/heads/<branch>`,
+with no other option. The refspec names the **verified commit**, not the branch:
 git pushes exactly that object, so a commit the Worker makes during the publish
 turn stays local ("Everything up-to-date") instead of riding the grant. `-C` is
 **required and absolute**, and both sides are resolved through the kernel,
 because Claude's Bash tool keeps its working directory between calls and `cd` is
 ordinary local work — without it the grant could be spent in any other clone,
 and a relative `-C .` would resolve against the Supervisor's process rather than
-the Worker's shell. For `pr` a `gh pr create` limited to title, body, base,
-head (pinned to the candidate branch), draft, assignee and label.
+the Worker's shell. The hooks path is **pinned** on that one command so no
+`pre-push` hook a Worker could have installed (by any door: `git init
+--template=`, an archive, a `chmod`) runs inside the granted push with the
+Worker's credentials. For `pr` a `gh pr create --repo <pinned remote URL>
+--head <candidate branch> …` limited to title, body, base, draft, assignee and
+label: the pull request opens in the granted remote's repository, full stop —
+without `--repo`, gh picks a base repository from the remotes (`upstream` on a
+fork) that the grant never named and the confirmation never reads.
+
+The grant is only issued for a commit that *is* the verified tree: the working
+tree must be clean (untracked files included — a new file may be part of the
+verified behavior), and HEAD must not have moved since the evidence the Reviewer
+judged was read. Either failure ends the task at the local candidate with a
+`not published:` reason instead of a grant.
 
 Refused with or without a grant: every push option (`-u`, `--force`,
 `--force-with-lease`, `--delete`, `--mirror`, `--all`, `--tags`, `--no-verify`,
-`--push-option`, `--receive-pack`, …), a branch or `HEAD` as the refspec source,
-a bare `git push`, another remote, branch or commit, a protected branch, a
-shell wrapper (`sh -c`, and a heredoc piped into a shell), a dynamic word, a
-second statement, `git push` without `-C`, a `-C` naming anything but the task
-directory or spelled relatively, `gh pr create` without `--head <candidate
-branch>` (gh would otherwise use whatever branch is checked out — and a
-`--head` swallowed as another option's value does not count), `gh pr create
---body-file/-F/--template` (which would post the contents of an arbitrary local
-file), `--web`, `--repo`, `gh pr merge`, `gh api`, `gh release` and `npm
-publish`. Changing the repository's remotes (`git remote set-url|add|rename|…`)
-is denied outright, and so is reconfiguring where a push goes or what runs
-during it — `git config` writes to `remote.*`, `url.*.insteadOf`, `push.*`,
-`credential.*`, `http.*`, `core.sshCommand` or `core.hooksPath`, and any write
-to `.git/config` or `.git/hooks/` — so the granted remote cannot be repointed
-underneath the confirmation, which pins both the fetch and the push URL.
+`--push-option`, `--receive-pack`, …), any `-c` but the pinned hooks path, a
+branch or `HEAD` as the refspec source, a bare `git push`, another remote,
+branch or commit, a protected branch, a shell wrapper (`sh -c`, and a heredoc
+piped into a shell), a dynamic word, a second statement, `git push` without
+`-C`, a `-C` naming anything but the task directory or spelled relatively,
+`gh pr create` without `--repo <pinned URL>` or without `--head <candidate
+branch>` (a `--head` swallowed as another option's value does not count),
+`gh pr create --body-file/-F/--template` (which would post the contents of an
+arbitrary local file), `--web`, another `--repo`, `gh pr merge`, `gh api`,
+`gh release` and `npm publish`. Changing the repository's remotes (`git remote
+set-url|add|rename|…`, behind any of git's own `--git-dir`/`--work-tree`
+options too) is denied outright, and so is reconfiguring where a push goes or
+what runs during it — `git config` writes to `remote.*`, `url.*.insteadOf`,
+`push.*`, `credential.*`, `http.*`, `include.path`/`includeIf.*`,
+`core.sshCommand` or `core.hooksPath`, and any write to `.git/config` or
+`.git/hooks/` — so the granted remote cannot be repointed underneath the
+confirmation, which pins both the fetch and the push URL.
 
 The grant is **one-shot**: it is revoked the moment the publish turn completes,
 not when the next decision arrives, and it is pinned to the remote's URL as well

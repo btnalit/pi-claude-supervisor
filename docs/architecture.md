@@ -441,10 +441,14 @@ naming another project. A root is honored before it exists (Claude creates the
 memory directory on first write) and through a symlinked ancestor.
 
 When a task is granted remote authority (`autonomy.remoteAuthority`, default
-`none`), verification does not end it. `#requestPublish` records the verified
-HEAD, issues a `RemoteGrant` naming that commit, the candidate's own branch, the
-remote and the task directory, and asks the Worker to publish: the Worker runs
-the push and any `gh pr create`, the Supervisor never does. Under hybrid
+`none`), verification does not end it. `#requestPublish` first checks that
+HEAD *is* the verified tree — the evidence the Reviewer judged shows a clean
+working tree and carries the same `head` — then issues a `RemoteGrant` naming
+that commit, the candidate's own branch, the remote, the task directory and the
+remote's pinned fetch URL, and asks the Worker to publish: the Worker runs the
+push and any `gh pr create`, the Supervisor never does. The instruction is built
+by `publishCommand`/`pullRequestCommand` in `policy.ts`, beside the parser that
+admits it, and a test round-trips one through the other. Under every permission
 authority the granted command is answered by the policy (`PolicyResult.granted`)
 rather than escalated to the Decision Worker. The returning turn skips
 acceptance and the Reviewer when HEAD is unchanged — they already passed on that
@@ -457,11 +461,15 @@ is re-verified in full, with the same confirmation deciding whether the notice
 says the verified commit landed first. The grant is cleared on every terminal
 path, so it never outlives the turn it was issued for, and
 `permittedRemoteCommand` admits a single literal shape —
-`git -C '<task dir>' push <remote> <commit>:refs/heads/<branch>` with no option
-— so no force, delete, mirror, tags, push-options, branch or `HEAD` source,
-other remote or branch, relative `-C`, shell wrapper, dynamic word or second
-statement. `git config` writes to transport-affecting keys and direct writes to
-`.git/config` or `.git/hooks/` are refused alongside `git remote` mutations.
+`git -C '<task dir>' -c core.hooksPath=/dev/null push <remote> <commit>:refs/heads/<branch>`
+with no other option, and `gh pr create --repo <pinned URL> --head <branch> …`
+— so no force, delete, mirror, tags, push-options, other `-c`, branch or `HEAD`
+source, other remote, branch or repository, relative `-C`, shell wrapper,
+dynamic word or second statement; the pinned hooks path keeps any installed
+`pre-push` out of the granted command. `git config` writes to
+transport-affecting keys (including `include.*`) and direct writes to
+`.git/config` or `.git/hooks/` are refused alongside `git remote` mutations,
+and git's own `--git-dir`/`--work-tree` options cannot hide either.
 
 A record left behind by the outright
 stop (`recoverable_failure`, so `active/interrupted`) is not a dead end either:

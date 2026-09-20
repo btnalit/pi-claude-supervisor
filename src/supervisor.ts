@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { EventLog, type SupervisorEvent } from "./events.ts";
 import { SupervisorStateMachine } from "./state.ts";
-import { evaluatePermission, isProtectedBranch, isRoutinePermission, type RemoteGrant } from "./policy.ts";
+import { evaluatePermission, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, type PermissionPolicyOptions, type RemoteGrant } from "./policy.ts";
 import { PiDecisionWorker, type DecisionAction, type DecisionContext, type DecisionDeadlineContext, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
 import { DEFAULT_DEADLINE_GRACE_MS, DEFAULT_DEADLINE_MS, DEFAULT_DEADLINE_WARNING_MS, DEFAULT_NO_OUTPUT_TIMEOUT_MS, formatDurationMs } from "./config.ts";
 import { collectRepositoryEvidence, remoteBranchHead, remoteUrl, runReadOnly, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryIsAncestor, repositoryWorkTree, verifyAll, type RemoteDestination, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
@@ -760,7 +760,10 @@ export class Supervisor {
         } else if (this.#automation && !this.#humanRequired) {
           const authority = task.spec.autonomy.permissionAuthority;
           const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd, this.#permissionOptions(event.request.writeRoots));
-          const answerLocally = authority === "policy"
+          // A granted publish is the Supervisor's own decision under every
+          // authority, `decision-worker` included: the Decision Worker's
+          // standing rule is to refuse a push and it is never told a grant is live.
+          const answerLocally = authority === "policy" || policy.granted === true
             || (authority === "hybrid" && (policy.decision === "deny" || isRoutinePermission(event.request.toolName, event.request.input, task.cwd, this.#permissionOptions(event.request.writeRoots))));
           if (answerLocally && this.#adapter.respondPermission) {
             const behavior: "allow" | "deny" = policy.decision === "deny" ? "deny" : "allow";
@@ -883,7 +886,7 @@ export class Supervisor {
   }
 
   /** Permission options for one request; the single place the live grant is attached. */
-  #permissionOptions(writeRoots?: readonly string[]): { writeRoots?: readonly string[]; remote?: RemoteGrant } {
+  #permissionOptions(writeRoots?: readonly string[]): PermissionPolicyOptions {
     return { ...(writeRoots ? { writeRoots } : {}), ...(this.#remoteGrant ? { remote: this.#remoteGrant } : {}) };
   }
 
@@ -894,14 +897,18 @@ export class Supervisor {
   #publishHint(policyReason: string): string {
     if ((this.#task?.spec.autonomy.remoteAuthority ?? "none") === "none") return "";
     // Only where it answers the refusal: this explains a remote denial, not an
-    // outside-cwd write that happens to be refused in the same session.
-    if (!/remote repository or main\/integration merge authority/u.test(policyReason)) return "";
+    // outside-cwd write that happens to be refused in the same session. While
+    // the grant is live a dynamic word (`-C "$PWD"`, `$(pwd)`) is the other way
+    // the one publish turn misses its shape, so that refusal is explained too.
     const grant = this.#remoteGrant;
+    const remoteDenial = /remote repository or main\/integration merge authority/u.test(policyReason);
+    const dynamicDenial = /dynamic argument cannot be capability-checked/u.test(policyReason);
+    if (!remoteDenial && !(grant && dynamicDenial)) return "";
     if (grant) {
       // The grant is live and this command missed its shape: say which shape,
       // or the Worker reads the refusal as "I have no authority" and gives up.
-      const create = grant.authority === "pr" ? ` and \`gh pr create --head ${grant.branch} …\`` : "";
-      return `; the publish grant is live but only admits \`${publishCommand(grant)}\`${create} — no option, redirection or extra statement`;
+      const create = grant.authority === "pr" ? ` and \`${pullRequestCommand(grant)} …\`` : "";
+      return `; the publish grant is live but only admits \`${publishCommand(grant)}\`${create}, spelled literally — no other option, no shell variable, no redirection, no extra statement`;
     }
     if (this.#publishState !== "none") return "";
     return "; remote authority unlocks after this candidate's acceptance and review pass — finish and commit locally, and the Supervisor will ask you to publish";
@@ -1673,6 +1680,8 @@ export class Supervisor {
       }
     }
 
+    // The evidence the verdict was reached on; the publish grant is tied to it.
+    let judgedEvidence = repositoryEvidence;
     if (this.#reviewer) {
       await this.#appendEvent({ type: "review_started", taskId: this.#task.taskId, workerId: this.#handle?.id, data: { round: this.#repairRound } });
       this.#reportProgress("review", "collecting repository evidence and running independent Reviewer", true);
@@ -1680,6 +1689,7 @@ export class Supervisor {
       let reviewUsageReceived = false;
       try {
         const evidence = repositoryEvidence ?? redactRepositoryEvidence(await collectRepositoryEvidence(this.#task.cwd, { signal: verificationAbortController.signal, baseRef: this.#task.baseCommit }));
+        judgedEvidence = evidence;
         const rawReview = await withTimeout(this.#reviewer.review({
           taskId: this.#task.taskId,
           cwd: this.#task.cwd,
@@ -1736,7 +1746,7 @@ export class Supervisor {
     }
 
     this.#lastVerification = result;
-    if (result.ok && await this.#requestPublish(result, this.#verificationAbortController?.signal)) {
+    if (result.ok && await this.#requestPublish(result, judgedEvidence, this.#verificationAbortController?.signal)) {
       this.#verificationAbortController = undefined;
       return result;
     }
@@ -1749,7 +1759,7 @@ export class Supervisor {
    * the push and the pull request (the Supervisor never runs them), while the
    * Supervisor decides when it may happen and confirms afterwards that it did.
    */
-  async #requestPublish(result: AcceptanceReport, signal?: AbortSignal): Promise<boolean> {
+  async #requestPublish(result: AcceptanceReport, evidence: RepositoryEvidence | undefined, signal?: AbortSignal): Promise<boolean> {
     const task = this.#task;
     const handle = this.#handle;
     const authority = task?.spec.autonomy.remoteAuthority ?? "none";
@@ -1757,7 +1767,10 @@ export class Supervisor {
     if (this.#publishState !== "none") return false;
     // Everything below is a task that *was* given remote authority and is not
     // going to use it; saying so keeps "candidate is ready" honest.
-    if (!this.#automation) return false;
+    if (!this.#automation) {
+      await this.#notePublishShortfall(handle.id, { reason: "manual mode does not run a publish turn; push the verified candidate yourself" });
+      return false;
+    }
     if (this.#humanRequired || this.#stopRequested !== undefined) {
       await this.#notePublishShortfall(handle.id, { reason: this.#humanRequired ? "a human took over, so the publish turn was not started" : "the task was stopped before the publish turn" });
       return false;
@@ -1783,6 +1796,24 @@ export class Supervisor {
       await this.#notePublishShortfall(handle.id, { reason: "the candidate HEAD could not be read" });
       return false;
     }
+    // Acceptance and the Reviewer judged the working tree, so the commit the
+    // grant names has to *be* that tree: nothing uncommitted (untracked files
+    // included — fail closed, a new file may be part of the verified
+    // behavior), and HEAD unchanged since the evidence was read, in case a
+    // background turn committed while the Reviewer was still deliberating.
+    if (!evidence) {
+      await this.#notePublishShortfall(handle.id, { reason: "no repository evidence was collected for this candidate, so its verified tree cannot be tied to a commit" });
+      return false;
+    }
+    const uncommitted = evidence.status.trim();
+    if (uncommitted !== "" && uncommitted !== "(none)") {
+      await this.#notePublishShortfall(handle.id, { reason: "the verified working tree has uncommitted or untracked changes, so HEAD is not the tree that passed; commit everything that belongs to the candidate and remove the rest" });
+      return false;
+    }
+    if (evidence.head !== undefined && evidence.head !== head) {
+      await this.#notePublishShortfall(handle.id, { reason: `HEAD moved from ${evidence.head.slice(0, 12)} to ${head.slice(0, 12)} after the evidence was reviewed, so the current commit was never verified` });
+      return false;
+    }
     const status = await this.#adapter.getStatus(handle).catch(() => undefined);
     if (!status?.running || status.activeRequests) {
       await this.#notePublishShortfall(handle.id, { reason: "the Worker is no longer idle and available to publish" });
@@ -1803,12 +1834,13 @@ export class Supervisor {
     await this.#appendEvent({ type: "publish_requested", taskId: task.taskId, workerId: handle.id, data: { authority, remoteName, branch, head } }).catch(() => {});
     this.#reportProgress("candidate", `verified; asking the Worker to publish ${branch} to ${remoteName}`, true);
     // The commands are spelled out because the grant admits exactly these
-    // shapes: an absolute `-C`, the verified commit as the refspec source, and
-    // `--head` for a pull request.
-    const grant: RemoteGrant = { authority, remoteName, branch, head, cwd: task.cwd };
+    // shapes, and they come from the same module that parses them: an
+    // absolute `-C`, the hooks path pinned, the verified commit as the refspec
+    // source, and `--repo`/`--head` for a pull request.
+    const grant: RemoteGrant = { authority, remoteName, branch, head, cwd: task.cwd, repository: url.fetch };
     const pushCommand = publishCommand(grant);
     const instruction = authority === "pr"
-      ? `Independent acceptance and review passed for this candidate. Publish it with exactly these two commands, one per Bash call: \`${pushCommand}\` then \`gh pr create --head ${branch} --title <title> --body <body>\`. Any other form is refused: no push option, force-push, delete, tags, merge, release, --web, --repo or --body-file, and do not commit anything more — the grant names commit ${head} and nothing else will be pushed. Report the pull request URL when done.`
+      ? `Independent acceptance and review passed for this candidate. Publish it with exactly these two commands, one per Bash call: \`${pushCommand}\` then \`${pullRequestCommand(grant)} --title <title> --body <body>\`. Any other form is refused: no push option, force-push, delete, tags, merge, release, --web, --body-file or another repository, and do not commit anything more — the grant names commit ${head} and nothing else will be pushed. Report the pull request URL when done.`
       : `Independent acceptance and review passed for this candidate. Publish it with exactly this command: \`${pushCommand}\`. Any other form is refused: no push option, force-push, delete, tags, pull request, merge or release, and do not commit anything more — the grant names commit ${head} and nothing else will be pushed. Report when the push succeeded.`;
     this.#machine.transition("running");
     this.#repairSendInProgress = true;
@@ -2630,15 +2662,6 @@ function removeFlagWithValue(args: readonly string[], flag: string): string[] {
  */
 export function extendedDeadlineMs(currentDeadlineMs: number, elapsedMs: number, extendMs: number): number {
   return Math.max(currentDeadlineMs, elapsedMs) + Math.max(0, extendMs);
-}
-
-/**
- * The one command a grant admits, spelled the way the policy will read it: the
- * task directory single-quoted so a space in the path survives the Worker's
- * shell as one word, and the verified commit as the refspec source.
- */
-function publishCommand(grant: RemoteGrant): string {
-  return `git -C '${grant.cwd.replaceAll("'", "'\\''")}' push ${grant.remoteName} ${grant.head}:refs/heads/${grant.branch}`;
 }
 
 function canRepairInPlace(adapter: WorkerAdapter): boolean {
