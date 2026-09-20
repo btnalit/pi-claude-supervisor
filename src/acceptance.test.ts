@@ -15,7 +15,7 @@ test("legacy tasks receive a default acceptance check", () => {
   assert.equal(spec.goal, "inspect the repository");
   assert.deepEqual(spec.acceptance.map((check) => check.id), ["diff-check"]);
   assert.equal(spec.maxRepairRounds, 3);
-  assert.deepEqual(spec.autonomy, { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid" });
+  assert.deepEqual(spec.autonomy, { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
 });
 
 test("task specs validate checks and reject duplicate ids", () => {
@@ -194,4 +194,12 @@ test("verifyAll records timeout evidence and bounds check output", async () => {
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+});
+
+test("remote authority is validated and defaults to none", () => {
+  assert.equal(normalizeTaskSpec({ goal: "g" }, "g").autonomy.remoteAuthority, "none");
+  assert.equal(normalizeTaskSpec({ goal: "g", autonomy: { remoteAuthority: "pr" } }, "g").autonomy.remoteAuthority, "pr");
+  assert.equal(normalizeTaskSpec({ goal: "g", autonomy: { remoteName: "upstream" } }, "g").autonomy.remoteName, "upstream");
+  assert.throws(() => normalizeTaskSpec({ goal: "g", autonomy: { remoteAuthority: "merge" } }, "g"), /remoteAuthority must be none, push or pr/u);
+  assert.throws(() => normalizeTaskSpec({ goal: "g", autonomy: { remoteName: "a b" } }, "g"), /remoteName must be a plain remote name/u);
 });

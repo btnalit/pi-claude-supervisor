@@ -500,3 +500,66 @@ test("a write root is honored before it exists and through a symlinked ancestor"
     await rm(base, { recursive: true, force: true });
   }
 });
+
+test("a publish grant admits exactly one shape and nothing else", () => {
+  const branch = "s6/console-completion";
+  const push = { authority: "push" as const, remoteName: "origin", branch };
+  const pr = { authority: "pr" as const, remoteName: "origin", branch };
+
+  for (const command of [
+    "git push -u origin s6/console-completion",
+    "git push origin s6/console-completion",
+    "git push origin s6/console-completion:s6/console-completion",
+    "git -C /repo push origin s6/console-completion",
+  ]) assert.equal(evaluateCommand(command, [], push).decision, "allow", command);
+  assert.equal(evaluateCommand("gh pr create --title x --body y", [], pr).decision, "allow");
+  assert.equal(evaluateCommand("gh pr create --head s6/console-completion --base main", [], pr).decision, "allow");
+
+  for (const command of [
+    // History-destroying or server-side-action flags.
+    "git push --force origin s6/console-completion",
+    "git push --force-with-lease origin s6/console-completion",
+    "git push --delete origin s6/console-completion",
+    "git push --mirror origin s6/console-completion",
+    "git push --tags origin s6/console-completion",
+    "git push -o merge_request.merge=1 origin s6/console-completion",
+    "git push --no-verify origin s6/console-completion",
+    "git push --receive-pack=evil origin s6/console-completion",
+    // Another target than the verified candidate.
+    "git push origin main",
+    "git push upstream s6/console-completion",
+    "git push origin other-branch",
+    // The policy is static: it cannot resolve these, so it refuses them.
+    "git push origin HEAD",
+    "git push",
+    "git push origin $BRANCH",
+    // A grant covers one statement, never a second command.
+    "git push origin s6/console-completion && rm -rf /tmp/x",
+    "git push origin s6/console-completion; gh pr merge 1",
+  ]) assert.equal(evaluateCommand(command, [], push).decision, "deny", command);
+
+  // `push` authority never reaches the pull-request surface, and `pr` never
+  // reaches merges, releases or the raw API.
+  assert.equal(evaluateCommand("gh pr create --title x", [], push).decision, "deny");
+  for (const command of ["gh pr merge 1", "gh pr create --repo other/x", "gh pr create --web", "gh api -X POST /repos/x/y/merges", "gh release create v1", "npm publish"]) {
+    assert.equal(evaluateCommand(command, [], pr).decision, "deny", command);
+  }
+
+  // A grant is never implied: without one the boundary is exactly as before.
+  assert.equal(evaluateCommand("git push -u origin s6/console-completion").decision, "deny");
+  assert.equal(evaluateCommand("gh pr create").decision, "deny");
+  assert.equal(evaluateCommand("git commit -m x").decision, "allow");
+
+  // A protected candidate branch is never publishable, grant or not.
+  assert.equal(evaluateCommand("git push origin main", [], { authority: "push", remoteName: "origin", branch: "main" }).decision, "deny");
+
+  // The grant covers the direct invocation only. A shell wrapper is still
+  // denied: the outer command is not the permitted shape, and admitting it
+  // would mean trusting a nested parse to have seen everything.
+  assert.equal(evaluateCommand("sh -c 'git push origin s6/console-completion'", [], push).decision, "deny");
+  assert.equal(evaluateCommand("bash -lc 'git push origin s6/console-completion'", [], push).decision, "deny");
+
+  // evaluatePermission threads the grant from the permission options.
+  assert.equal(evaluatePermission("Bash", { command: "git push origin s6/console-completion" }, "/repo", { remote: push }).decision, "allow");
+  assert.equal(evaluatePermission("Bash", { command: "git push origin s6/console-completion" }, "/repo").decision, "deny");
+});

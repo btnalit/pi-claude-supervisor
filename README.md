@@ -255,6 +255,30 @@ Supervisor being able to see it, or when you don't need to attach.
 - Only one cwd lease is held per task; concurrent tasks need separate
   worktrees.
 
+## Publishing a verified candidate
+
+By default a task ends at a **verified local candidate**: acceptance and the
+independent Reviewer pass, and the Worker never had remote authority at any
+point. `REMOTE_AUTHORITY=push` (or `--remote push`) adds a **publish phase**
+after that verdict: the Supervisor records the verified commit, grants a narrow
+one-shot authority, and asks the Worker to push its own branch. `pr` also lets
+it open a pull request. The Worker performs the push — the Supervisor never
+does — and the Supervisor then confirms it read-only (`git ls-remote`, and
+`gh pr list` for `pr`) before completing the task; the candidate notice carries
+the pull request URL. A publish that cannot be confirmed blocks the candidate,
+which stays deliverable locally.
+
+The grant is deliberately unforgiving. It admits exactly `git [-C <dir>] push
+[-u] <remote> <branch>` with the branch named literally, and `gh pr create` for
+`pr`. Everything else is refused, grant or not: `--force`, `--force-with-lease`,
+`--delete`, `--mirror`, `--all`, `--tags`, `--no-verify`, `--push-option`, a
+`HEAD` refspec, another remote or branch, a protected branch, a shell-wrapped or
+dynamic command, a second statement, `gh pr merge`, `gh api`, `gh release` and
+`npm publish`. It exists only between the passing verdict and the publish turn
+settling, and a Worker that changes the tree during that turn voids it and is
+re-verified in full. Before verification a refused push says so, rather than
+leaving the Worker to guess.
+
 ## Task specs
 
 `--spec file.json` accepts:
@@ -311,6 +335,8 @@ Environment variables (or `~/.config/pi-claude-supervisor/env`), all prefixed
 | `REQUIRE_LOCAL_COMMIT` | `true` | Require a local commit on the candidate's branch before completion |
 | `MAX_DECISION_RETRIES` | `2` (0–10) | Retries of a Decision Worker call that times out or fails (429/529, network, auth) |
 | `PERMISSION_AUTHORITY` | `hybrid` | `policy` \| `hybrid` \| `decision-worker` |
+| `REMOTE_AUTHORITY` | `none` | `none` \| `push` \| `pr`; grants the publish phase after verification passes. `--remote` overrides it per task |
+| `REMOTE_NAME` | `origin` | The single remote a publish grant may name |
 | `WORKER_MAX_BUDGET_USD` | unset | Hard cap passed as `--max-budget-usd`; unavailable to interactive tmux |
 | `WORKER_MODEL` | unset (Claude's own default) | `--model` for the Claude Worker |
 | `WORKER_AUTOCOMPACT_TOKENS` | `200000` in automatic mode | Per-turn context bound; `0` keeps Claude's own default |

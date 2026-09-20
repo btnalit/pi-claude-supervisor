@@ -85,7 +85,7 @@ function normalizeRepairRounds(value: unknown): number {
 }
 
 function normalizeAutonomy(value: unknown): TaskSpec["autonomy"] {
-  if (value === undefined) return { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid" };
+  if (value === undefined) return { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" };
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("task spec autonomy must be an object");
   const source = value as Record<string, unknown>;
   if (source.unattended !== undefined && typeof source.unattended !== "boolean") throw new Error("task spec autonomy.unattended must be boolean");
@@ -94,6 +94,10 @@ function normalizeAutonomy(value: unknown): TaskSpec["autonomy"] {
   if (typeof retries !== "number" || !Number.isSafeInteger(retries) || retries < 0 || retries > 10) throw new Error("task spec autonomy.maxDecisionRetries must be between 0 and 10");
   const authority = source.permissionAuthority ?? "hybrid";
   if (authority !== "policy" && authority !== "hybrid" && authority !== "decision-worker") throw new Error("task spec autonomy.permissionAuthority must be policy, hybrid or decision-worker");
+  const remoteAuthority = source.remoteAuthority ?? "none";
+  if (remoteAuthority !== "none" && remoteAuthority !== "push" && remoteAuthority !== "pr") throw new Error("task spec autonomy.remoteAuthority must be none, push or pr");
+  const remoteName = source.remoteName ?? "origin";
+  if (typeof remoteName !== "string" || !/^[A-Za-z0-9._-]+$/u.test(remoteName)) throw new Error("task spec autonomy.remoteName must be a plain remote name");
   const maxWorkerCostUsd = source.maxWorkerCostUsd;
   if (maxWorkerCostUsd !== undefined && (typeof maxWorkerCostUsd !== "number" || !Number.isFinite(maxWorkerCostUsd) || maxWorkerCostUsd <= 0)) throw new Error("task spec autonomy.maxWorkerCostUsd must be a positive number");
   return {
@@ -101,6 +105,8 @@ function normalizeAutonomy(value: unknown): TaskSpec["autonomy"] {
     requireLocalCommit: source.requireLocalCommit !== false,
     maxDecisionRetries: retries,
     permissionAuthority: authority,
+    remoteAuthority,
+    remoteName,
     ...(maxWorkerCostUsd !== undefined ? { maxWorkerCostUsd } : {}),
   };
 }

@@ -371,11 +371,15 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         if (operation === "start" || operation === "adopt-tmux") {
           const specPath = takeOption(rest, "--spec");
           const deadlineOption = takeOption(rest, "--deadline");
+          const remoteOption = takeOption(rest, "--remote");
+          if (remoteOption !== undefined && !["none", "push", "pr"].includes(remoteOption)) throw new Error(`--remote expects none, push or pr: ${remoteOption}`);
           const taskDeadlineMs = deadlineOption === undefined ? deadlineMs() : parseTaskDeadline(deadlineOption);
           const tmuxSession = operation === "adopt-tmux" ? rest.shift() : undefined;
           const task = rest.join(" ").trim();
           const fileSpec = specPath ? await readTaskSpecFile(specPath, ctx.cwd) : undefined;
           const spec = fileSpec ?? { autonomy: autonomyDefaults() };
+          // An explicit --remote overrides both the spec file and the env default.
+          if (remoteOption) spec.autonomy = { ...autonomyDefaults(), ...spec.autonomy, remoteAuthority: remoteOption as "none" | "push" | "pr" };
           const goal = fileSpec?.goal ?? task;
           // Adopted sessions are explicit manual compatibility controls; they
           // never enter the automatic Reviewer/decision loop, even when the
@@ -384,7 +388,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           // own events through hooks exactly like an owned one.
           const taskAutomation = (operation !== "adopt-tmux" || tmuxMode() === "interactive") && automation && spec.autonomy.unattended;
           const interactive = taskAutomation && adapter.capabilities().transport === "tmux" && tmuxMode() === "interactive";
-          if (!goal) throw new Error(operation === "adopt-tmux" ? "Usage: /supervise adopt-tmux [--spec <file>] [--deadline <duration>] <tmux-session> <task>" : "Usage: /supervise start [--spec <file>] [--deadline <duration>] <task>");
+          if (!goal) throw new Error(operation === "adopt-tmux" ? "Usage: /supervise adopt-tmux [--spec <file>] [--deadline <duration>] [--remote none|push|pr] <tmux-session> <task>" : "Usage: /supervise start [--spec <file>] [--deadline <duration>] [--remote none|push|pr] <task>");
           if (operation === "adopt-tmux" && adapter.capabilities().transport !== "tmux") throw new Error("/supervise adopt-tmux requires PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux");
           if (operation === "adopt-tmux" && interactive && !await userHooksInstalled(claudeUserSettingsPath())) {
             await hookServerReady?.catch(() => {});
@@ -1010,7 +1014,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           } else if (operation === "resume-auto") {
             await session.resumeAutomation(); message = `Automatic decisions resumed: ${sessionId}.`;
           } else {
-            throw new Error("Usage: /supervise start [--spec <file>] [--deadline <duration>]|adopt-tmux [--spec <file>] [--deadline <duration>]|recover [--takeover] [--extend <duration>]|discard <task-id>|sessions|status|poll [all|taskId]|send [taskId]|pause [taskId]|resume [taskId]|stop [taskId]|verify [taskId]|approve [taskId] <allow|deny>|takeover [taskId]|resume-auto [taskId]|capabilities|install-hooks|uninstall-hooks");
+            throw new Error("Usage: /supervise start [--spec <file>] [--deadline <duration>] [--remote none|push|pr]|adopt-tmux [--spec <file>] [--deadline <duration>] [--remote none|push|pr]|recover [--takeover] [--extend <duration>]|discard <task-id>|sessions|status|poll [all|taskId]|send [taskId]|pause [taskId]|resume [taskId]|stop [taskId]|verify [taskId]|approve [taskId] <allow|deny>|takeover [taskId]|resume-auto [taskId]|capabilities|install-hooks|uninstall-hooks");
           }
         }
         if (hookInstallNotice) { notify(ctx, hookInstallNotice); hookInstallNotice = undefined; }

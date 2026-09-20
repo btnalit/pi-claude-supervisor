@@ -192,7 +192,7 @@ test("a provider error retries within maxDecisionRetries and succeeds", async ()
       state: "starting",
       turn: 0,
       maxTurns: 1,
-      spec: { goal: "x", scope: [], constraints: [], forbidden: [], acceptance: [], maxRepairRounds: 0, autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, permissionAuthority: "hybrid" } },
+      spec: { goal: "x", scope: [], constraints: [], forbidden: [], acceptance: [], maxRepairRounds: 0, autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" } },
     },
   }));
   await worker.start();
@@ -225,7 +225,7 @@ test("exhausting maxDecisionRetries on repeated provider errors calls onFailure,
       state: "starting",
       turn: 0,
       maxTurns: 1,
-      spec: { goal: "x", scope: [], constraints: [], forbidden: [], acceptance: [], maxRepairRounds: 0, autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, permissionAuthority: "hybrid" } },
+      spec: { goal: "x", scope: [], constraints: [], forbidden: [], acceptance: [], maxRepairRounds: 0, autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" } },
     },
   }));
   await worker.start();
@@ -375,7 +375,7 @@ test("the current-context payload omits the task spec", async () => {
         forbidden: [],
         acceptance: [],
         maxRepairRounds: 0,
-        autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, permissionAuthority: "hybrid" },
+        autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" },
       },
     },
   }));
@@ -530,4 +530,29 @@ test("with no close-out window the instructions say the Worker is stopped at the
   assert.match(prompts[0]!, /There is no close-out window/u);
   assert.doesNotMatch(prompts[0]!, /Once closeOut is true/u);
   await worker.close();
+});
+
+test("the publish phase is explained only when the task has remote authority", async () => {
+  const spec = (remoteAuthority: "none" | "push" | "pr") => ({
+    goal: "g", scope: [], constraints: [], forbidden: [], acceptance: [], maxRepairRounds: 0,
+    autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, permissionAuthority: "hybrid" as const, remoteAuthority, remoteName: "origin" },
+  });
+  const startupPrompt = async (remoteAuthority: "none" | "push" | "pr") => {
+    const { session, prompts } = createFakeSession([{ stopReason: "stop", text: "ack" }]);
+    const worker = new PiDecisionWorker(baseOptions({
+      onAction: () => {},
+      sessionFactory: async () => ({ session }),
+      context: { ...baseOptions().context, spec: spec(remoteAuthority) },
+    }));
+    await worker.start();
+    await worker.close();
+    return prompts[0]!;
+  };
+
+  assert.doesNotMatch(await startupPrompt("none"), /Publish phase/u);
+  const push = await startupPrompt("push");
+  assert.match(push, /Publish phase: this task may push the candidate branch once/u);
+  assert.doesNotMatch(push, /open a pull request once/u);
+  assert.match(await startupPrompt("pr"), /push the candidate branch and open a pull request/u);
+  assert.match(push, /never extends to a merge, a force-push, a tag or a release/u);
 });

@@ -536,7 +536,7 @@ test("index recover does not leak a cwd reservation when the Decision Worker mod
   await decisionStore.save({
     taskId,
     task: "recover with a bad decision model spec",
-    spec: { goal: "recover with a bad decision model spec", scope: [], constraints: [], forbidden: [], acceptance: [], maxRepairRounds: 0, autonomy: { unattended: false, requireLocalCommit: false, maxDecisionRetries: 0, permissionAuthority: "hybrid" } },
+    spec: { goal: "recover with a bad decision model spec", scope: [], constraints: [], forbidden: [], acceptance: [], maxRepairRounds: 0, autonomy: { unattended: false, requireLocalCommit: false, maxDecisionRetries: 0, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" } },
     cwd,
     command: process.execPath,
     args: ["-e", "setInterval(() => {}, 10000)"],

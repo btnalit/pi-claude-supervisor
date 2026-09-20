@@ -294,12 +294,13 @@ Maximum automatic turns: ${context.maxTurns}
 Current repair round: ${context.repairRound ?? 0}
 ${deadlineInstructions(context.deadline)}Task specification: ${boundedJson(context.spec ?? { goal: context.task })}
 
-Return exactly one JSON object and no markdown:
+${remoteAuthorityInstructions(context.spec)}Return exactly one JSON object and no markdown:
 {"action":"continue|redirect|answer|allow_permission|deny_permission|verify|retry|stop|park|wait|noop",...}
 For continue/redirect/answer include message and reason. For permission actions include
 requestId and toolUseId. Retry may include a corrective message. Never choose allow_permission
-for a command that crosses the remote push or main/integration merge boundary; the deterministic
-policy will deny it.
+for a command that crosses the remote push or main/integration merge boundary unless the task's
+publish phase has granted it; the deterministic policy is the authority either way and will deny
+anything outside the grant.
 For AskUserQuestion, choose deny_permission when the question can be converted into ordinary
 Claude text, then use answer on the resulting turn. For product ambiguity or an architecture
 choice, inspect the repository and task evidence, select the best task-compatible option, state
@@ -319,6 +320,18 @@ verify. Choose wait when the Worker's result says it is waiting for its own back
 tasks or monitors: their completion re-invokes the Worker automatically, a message would only
 interrupt it, and the Supervisor asks you again if the Worker has not resumed within the wait
 timeout. A completed turn or a permission request always requires a concrete action.${deadlinePolicy(context.deadline)}`;
+}
+
+/**
+ * The publish phase exists only when the task was given remote authority. The
+ * Decision Worker has to know it is coming, or it reads the Supervisor's own
+ * publish instruction as an unexplained extra turn.
+ */
+function remoteAuthorityInstructions(spec: TaskSpec | undefined): string {
+  const authority = spec?.autonomy.remoteAuthority ?? "none";
+  if (authority === "none") return "";
+  const what = authority === "pr" ? "push the candidate branch and open a pull request" : "push the candidate branch";
+  return `Publish phase: this task may ${what} once its acceptance checks and the independent Reviewer have passed. The Supervisor issues that grant itself and asks the Worker to publish; you do not need to request it. When the Worker reports back from that turn, choose verify — the Supervisor confirms the remote rather than re-running the checks. Remote authority never extends to a merge, a force-push, a tag or a release.\n\n`;
 }
 
 function deadlineInstructions(deadline: DecisionDeadlineContext | undefined): string {

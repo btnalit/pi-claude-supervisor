@@ -208,6 +208,24 @@ stream-json` 的方式运行 Claude,完全没有终端界面;一旦设置
   不必等待完整的命令或模型超时。
 - 每个任务只持有一个 cwd 租约;并发任务需要各自独立的 worktree。
 
+## 发布已验证的候选
+
+默认情况下任务止于**已验证的本地候选**:验收与独立 Reviewer 通过,而 Worker 全程
+没有任何远程权限。设 `REMOTE_AUTHORITY=push`(或 `--remote push`)会在该判定之后
+加一个**发布阶段**:Supervisor 记下已验证的 commit,发放一次性的窄授权,并让
+Worker 推自己的分支;`pr` 还允许它开 PR。**push 由 Worker 自己执行**——Supervisor
+从不代劳——之后 Supervisor 以只读方式核实(`git ls-remote`,`pr` 还查 `gh pr list`)
+才把任务标记完成,候选通知里带上 PR 链接。核实不到则把候选标为 blocked,本地候选
+依然可交付。
+
+这个授权刻意严苛:只认 `git [-C <dir>] push [-u] <remote> <branch>`(分支必须字面
+写出)和 `pr` 下的 `gh pr create`。其余一律拒绝,有没有授权都一样:`--force`、
+`--force-with-lease`、`--delete`、`--mirror`、`--all`、`--tags`、`--no-verify`、
+`--push-option`、`HEAD` refspec、别的 remote 或分支、保护分支、被 shell 包装或带
+动态参数的命令、第二条语句、`gh pr merge`、`gh api`、`gh release`、`npm publish`。
+它只存在于"通过判定"到"发布轮结束"之间;Worker 若在该轮里改动了工作树,授权立即
+作废并重新完整验收。验证之前被拒的 push 会明确告知原因,而不是让 Worker 去猜。
+
 ## 任务 spec
 
 `--spec file.json` 接受如下格式:
@@ -263,6 +281,8 @@ stream-json` 的方式运行 Claude,完全没有终端界面;一旦设置
 | `REQUIRE_LOCAL_COMMIT` | `true` | 完成前要求在候选所在分支上有本地 commit |
 | `MAX_DECISION_RETRIES` | `2`(0–10) | Decision Worker 调用超时或失败(429/529、网络、鉴权)时的重试次数 |
 | `PERMISSION_AUTHORITY` | `hybrid` | `policy` \| `hybrid` \| `decision-worker` |
+| `REMOTE_AUTHORITY` | `none` | `none` \| `push` \| `pr`;验收通过后开启发布阶段。`--remote` 可按任务覆盖 |
+| `REMOTE_NAME` | `origin` | 发布授权唯一允许的 remote 名 |
 | `WORKER_MAX_BUDGET_USD` | 未设置 | 作为 `--max-budget-usd` 传入的硬上限;交互式 tmux 下不可用 |
 | `WORKER_MODEL` | 未设置(Claude 自身默认值) | Claude Worker 的 `--model` |
 | `WORKER_AUTOCOMPACT_TOKENS` | 自动模式默认 `200000` | 每轮上下文上限;`0` 保留 Claude 自身默认值 |

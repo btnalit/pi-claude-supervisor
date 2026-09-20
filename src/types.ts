@@ -235,7 +235,19 @@ export interface TaskAutonomy {
   permissionAuthority: PermissionAuthority;
   /** Park the candidate once the Worker's cumulative API cost exceeds this amount; undefined disables the cap. */
   maxWorkerCostUsd?: number;
+  /**
+   * Remote authority for the publish phase. `none` (the default) keeps the
+   * Worker entirely local: the task ends at a verified candidate. `push` lets
+   * the Supervisor grant one push of that candidate's own branch once its
+   * acceptance and Reviewer have passed; `pr` additionally allows opening a
+   * pull request. Never a merge, a force-push, a tag or a release.
+   */
+  remoteAuthority: RemoteAuthority;
+  /** The single remote a publish grant may name; defaults to `origin`. */
+  remoteName: string;
 }
+
+export type RemoteAuthority = "none" | "push" | "pr";
 
 export type PermissionAuthority = "policy" | "hybrid" | "decision-worker";
 

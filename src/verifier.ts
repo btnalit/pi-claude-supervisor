@@ -79,6 +79,43 @@ export async function repositoryHead(cwd: string, signal?: AbortSignal): Promise
   }
 }
 
+/**
+ * The commit a remote branch points at, or undefined when the ref is absent or
+ * unreachable. Read-only: `ls-remote` never mutates, and the prompt is disabled
+ * so a credential-less remote fails fast instead of hanging.
+ */
+export async function remoteBranchHead(cwd: string, remote: string, branch: string, signal?: AbortSignal): Promise<string | undefined> {
+  try {
+    const result = await execFileAsync("git", ["ls-remote", "--heads", "--", remote, branch], {
+      cwd,
+      timeout: 60_000,
+      maxBuffer: 64 * 1024,
+      signal,
+      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
+    });
+    const line = String(result.stdout).split("\n").map((entry) => entry.trim()).find((entry) => entry.endsWith(`refs/heads/${branch}`));
+    const sha = line?.split(/\s+/u)[0] ?? "";
+    return /^[0-9a-f]{40,64}$/u.test(sha) ? sha : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Run a read-only inspection command without a shell, for confirming what the
+ * Worker published. Never used for anything that mutates.
+ */
+export async function runReadOnly(command: string, args: readonly string[], cwd: string, signal?: AbortSignal): Promise<{ stdout: string }> {
+  const result = await execFileAsync(command, [...args], {
+    cwd,
+    timeout: 60_000,
+    maxBuffer: 256 * 1024,
+    signal,
+    env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
+  });
+  return { stdout: String(result.stdout) };
+}
+
 /** Verify that a full commit object is still present without invoking a shell. */
 export async function repositoryCommitExists(cwd: string, commit: string, signal?: AbortSignal): Promise<boolean> {
   if (!/^[0-9a-f]{40,64}$/iu.test(commit)) return false;

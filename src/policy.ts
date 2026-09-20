@@ -18,7 +18,31 @@ export interface PolicyResult {
 export interface PermissionPolicyOptions {
   /** Extra directories the Worker may write to (Claude's per-session scratchpad); each must be an absolute path. */
   writeRoots?: readonly string[];
+  /** A publish-phase grant; absent (the default) keeps the Worker with no remote authority at all. */
+  remote?: RemoteGrant;
 }
+
+/**
+ * Narrow, time-boxed remote authority for the publish phase. The Supervisor
+ * issues it only after its own acceptance and Reviewer passed, and only for the
+ * verified candidate's own branch, so an unverified Worker can never reach a
+ * remote. `pr` implies `push`.
+ */
+export interface RemoteGrant {
+  authority: "push" | "pr";
+  /** The single remote the grant covers, e.g. `origin`. */
+  remoteName: string;
+  /** The candidate branch; a push must name it literally. */
+  branch: string;
+}
+
+/** Push flags that change or destroy remote history, or smuggle server-side actions. */
+const FORBIDDEN_PUSH_FLAGS = new Set([
+  "-f", "--force", "--force-with-lease", "--force-if-includes",
+  "-d", "--delete", "--mirror", "--all", "--tags", "--follow-tags",
+  "--prune", "-o", "--push-option", "--no-verify", "--recurse-submodules",
+  "--receive-pack", "--exec", "-c", "--config",
+]);
 
 export function evaluatePermission(toolName: string, input: unknown, cwd = process.cwd(), options: PermissionPolicyOptions = {}): PolicyResult {
   if (toolName === "AskUserQuestion") return { decision: "deny", reason: "interactive questions are converted to ordinary Worker text" };
@@ -42,7 +66,7 @@ export function evaluatePermission(toolName: string, input: unknown, cwd = proce
   if (!command) return { decision: "deny", reason: "Bash request has no recognizable command" };
   // Lex the command itself: wrapping it as a literal `bash -lc` argument would
   // hide its structure (heredoc bodies, dynamic words) from the token checks.
-  return evaluateCommand(command);
+  return evaluateCommand(command, [], options.remote);
 }
 
 function fileToolPaths(input: unknown): string[] {
@@ -164,6 +188,52 @@ interface ShellToken {
 }
 
 const protectedBranches = new Set(["main", "master", "trunk", "integration", "develop"]);
+
+/**
+ * The one shape a granted publish may take. Everything is matched literally:
+ * the policy is static, so it cannot resolve `HEAD`, a variable or a second
+ * statement, and refuses rather than guess. Returns undefined when the command
+ * is not a permitted publish, leaving the ordinary denials to answer.
+ */
+function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGrant): PolicyResult | undefined {
+  // A single statement only: `git push origin x && rm -rf /` must never pass.
+  if (tokens.some((token) => token.operator)) return undefined;
+  if (tokens.some((token) => token.dynamic)) return undefined;
+  const words = tokens.map((token) => token.value);
+  if (words.length === 0) return undefined;
+  const name = (words[0] ?? "").split(/[\\/]/u).at(-1)?.toLowerCase();
+  if (protectedBranches.has(grant.branch.toLowerCase())) return undefined;
+
+  if (name === "git") {
+    let index = 1;
+    // `git -C <dir>` is the only pre-subcommand option a publish may carry.
+    while (words[index] === "-C" && words[index + 1] !== undefined) index += 2;
+    if (words[index] !== "push") return undefined;
+    index += 1;
+    const rest = words.slice(index);
+    if (rest.some((word) => word.startsWith("-") && !["-u", "--set-upstream"].includes(word))) return undefined;
+    if (rest.some((word) => FORBIDDEN_PUSH_FLAGS.has(word.split("=")[0] ?? word))) return undefined;
+    const positional = rest.filter((word) => !word.startsWith("-"));
+    if (positional.length !== 2) return undefined;
+    const [remote, refspec] = positional as [string, string];
+    if (remote !== grant.remoteName) return undefined;
+    if (refspec !== grant.branch && refspec !== `${grant.branch}:${grant.branch}`) return undefined;
+    return { decision: "allow", reason: `publish grant: push ${grant.branch} to ${grant.remoteName}` };
+  }
+
+  if (name === "gh" && grant.authority === "pr") {
+    if (words[1] !== "pr" || words[2] !== "create") return undefined;
+    const rest = words.slice(3);
+    if (rest.some((word) => ["-R", "--repo", "--web"].includes(word.split("=")[0] ?? word))) return undefined;
+    const headIndex = rest.findIndex((word) => word === "--head" || word.startsWith("--head="));
+    if (headIndex >= 0) {
+      const head = rest[headIndex] === "--head" ? rest[headIndex + 1] : rest[headIndex]!.slice("--head=".length);
+      if (head !== grant.branch) return undefined;
+    }
+    return { decision: "allow", reason: `publish grant: open a pull request for ${grant.branch}` };
+  }
+  return undefined;
+}
 /**
  * Commands whose dynamic arguments could carry a boundary-crossing action or
  * execute arbitrary expanded text: the repository, package, network and
@@ -205,16 +275,22 @@ function containsRemoteHttpMutation(command: string): boolean {
   return hasHttpClient && hasMutationFlag && hasProtectedEndpoint;
 }
 
-export function evaluateCommand(command: string, args: readonly string[] = []): PolicyResult {
+export function evaluateCommand(command: string, args: readonly string[] = [], grant?: RemoteGrant): PolicyResult {
   const normalized = command.trim();
   if (!normalized) return { decision: "deny", reason: "empty command" };
   const lexical = lexShell(normalized);
   if (lexical.error) return { decision: "deny", reason: `command could not be safely parsed: ${lexical.error}` };
   const literalArgs = args.map((value) => ({ value, operator: false, dynamic: false }));
-  return evaluateTokens([...lexical.tokens, ...literalArgs], 0);
+  return evaluateTokens([...lexical.tokens, ...literalArgs], 0, grant);
 }
 
-function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: string, depth: number): PolicyResult | undefined {
+function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: string, depth: number, grant?: RemoteGrant): PolicyResult | undefined {
+  // A publish grant admits exactly one shape; everything else still falls
+  // through to the ordinary boundary denials below.
+  if (grant) {
+    const permitted = permittedRemoteCommand(tokens, grant);
+    if (permitted) return permitted;
+  }
   const values = tokens.filter((token) => !token.operator).map((token) => token.value);
   const lower = values.map((value) => value.toLowerCase());
   const hasGit = values.some((value) => /(?:^|[\\/])git$/iu.test(value) || /^(?:git-(?:send|receive|upload)-pack)$/iu.test(value));
@@ -225,7 +301,7 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   const hasGitAliasConfiguration = hasGit && lower.some((value) => /^alias\.[^=]*(?:=|$)/u.test(value));
   if (depth < 4) {
     for (const nested of nestedShellCommands(lower, values)) {
-      const nestedResult = evaluateCommandInternal(nested, depth + 1);
+      const nestedResult = evaluateCommandInternal(nested, depth + 1, grant);
       if (nestedResult.decision === "deny") return nestedResult;
     }
   }
@@ -357,26 +433,26 @@ function nestedShellCommands(lower: readonly string[], values: readonly string[]
   return nested;
 }
 
-function evaluateCommandInternal(command: string, depth: number): PolicyResult {
+function evaluateCommandInternal(command: string, depth: number, grant?: RemoteGrant): PolicyResult {
   const normalized = command.trim();
   if (!normalized) return { decision: "deny", reason: "empty command" };
   const lexical = lexShell(normalized);
   if (lexical.error) return { decision: "deny", reason: `command could not be safely parsed: ${lexical.error}` };
-  return evaluateTokens(lexical.tokens, depth);
+  return evaluateTokens(lexical.tokens, depth, grant);
 }
 
-function evaluateTokens(rawTokens: readonly ShellToken[], depth: number): PolicyResult {
+function evaluateTokens(rawTokens: readonly ShellToken[], depth: number, grant?: RemoteGrant): PolicyResult {
   const { tokens: dataResolved, embedded } = resolveDataTokens(rawTokens);
   const tokens = resolveLiteralBindings(dataResolved);
   if (depth < 4) {
     for (const body of embedded) {
-      const nestedResult = evaluateCommandInternal(body, depth + 1);
+      const nestedResult = evaluateCommandInternal(body, depth + 1, grant);
       if (nestedResult.decision === "deny") return nestedResult;
     }
   }
   const canonical = tokens.map((token) => token.value).join(" ").trim();
   if (!canonical) return { decision: "deny", reason: "empty command" };
-  const boundary = evaluateRepositoryBoundary(tokens, canonical, depth);
+  const boundary = evaluateRepositoryBoundary(tokens, canonical, depth, grant);
   if (boundary) return boundary;
   if (containsRemoteHttpMutation(canonical)) {
     return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };

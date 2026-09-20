@@ -23,16 +23,16 @@ import {
 } from "./config.ts";
 
 test("autonomy environment defaults are unattended and bounded", () => {
-  assert.deepEqual(autonomyDefaults({}), { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid" });
+  assert.deepEqual(autonomyDefaults({}), { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
   assert.deepEqual(autonomyDefaults({
     PI_CLAUDE_SUPERVISOR_UNATTENDED: "0",
     PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT: "false",
     PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES: "4",
-  }), { unattended: false, requireLocalCommit: false, maxDecisionRetries: 4, permissionAuthority: "hybrid" });
+  }), { unattended: false, requireLocalCommit: false, maxDecisionRetries: 4, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
   assert.deepEqual(autonomyDefaults({
     PI_CLAUDE_SUPERVISOR_UNATTENDED: "not-a-boolean",
     PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES: "99",
-  }), { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid" });
+  }), { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
 });
 
 test("reviewTimeoutMs defaults and rejects out-of-range overrides", () => {
@@ -156,4 +156,16 @@ test("deadline budgets default, accept durations and honor the zero opt-out", ()
   assert.equal(noOutputTimeoutMs({ PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS: "45m" }), 45 * 60_000);
   assert.equal(noOutputTimeoutMs({ PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS: "0" }), 0);
   assert.equal(noOutputTimeoutMs({ PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS: "10s" }), 20 * 60_000, "below the 1-minute floor keeps the default");
+});
+
+test("remote authority never defaults on and only accepts the two grants", () => {
+  assert.equal(autonomyDefaults({}).remoteAuthority, "none");
+  assert.equal(autonomyDefaults({}).remoteName, "origin");
+  assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY: "push" }).remoteAuthority, "push");
+  assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY: "PR" }).remoteAuthority, "pr");
+  // Anything unrecognised keeps the Worker local rather than guessing.
+  assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY: "merge" }).remoteAuthority, "none");
+  assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY: "1" }).remoteAuthority, "none");
+  assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_NAME: "upstream" }).remoteName, "upstream");
+  assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_NAME: "bad name;rm" }).remoteName, "origin");
 });

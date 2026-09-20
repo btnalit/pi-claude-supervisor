@@ -440,6 +440,20 @@ derives from this task's cwd, which rejects a subagent transcript and any path
 naming another project. A root is honored before it exists (Claude creates the
 memory directory on first write) and through a symlinked ancestor.
 
+When a task is granted remote authority (`autonomy.remoteAuthority`, default
+`none`), verification does not end it. `#requestPublish` records the verified
+HEAD, issues a `RemoteGrant` for that candidate's own branch and asks the Worker
+to publish: the Worker runs the push and any `gh pr create`, the Supervisor never
+does. The returning turn skips acceptance and the Reviewer when HEAD is unchanged
+— they already passed on that tree — and `#settlePublish` confirms the result
+read-only (`git ls-remote`, plus `gh pr list` for `pr`) before completing, or
+blocks the still-deliverable local candidate when it cannot. A tree that changed
+during the publish turn voids the grant and is re-verified in full. The grant is
+cleared on every terminal path, so it never outlives the turn it was issued for,
+and `permittedRemoteCommand` admits a single literal shape — no force, delete,
+mirror, tags, push-options, `HEAD` refspec, other remote or branch, shell
+wrapper, dynamic word or second statement.
+
 A record left behind by the outright
 stop (`recoverable_failure`, so `active/interrupted`) is not a dead end either:
 `recover --extend <duration>` re-persists a deadline measured from now
