@@ -476,6 +476,54 @@ test("denials that a Worker can act on name the tool or place to use instead", (
   assert.match(dynamic.reason, /substitute the literal value/u);
 });
 
+test("a write root keeps the per-segment symlink guard, a missing cwd fails closed, and a redirect into a root is routine", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-write-root-guard-"));
+  const cwd = join(base, "repo");
+  const memory = join(base, "memory");
+  const elsewhere = join(base, "elsewhere");
+  await mkdir(cwd);
+  await mkdir(memory);
+  await mkdir(elsewhere);
+  await symlink(elsewhere, join(memory, "link"));
+  try {
+    const write = (file_path: string, roots?: string[]) => evaluatePermission("Write", { file_path, content: "" }, cwd, roots ? { writeRoots: roots } : {});
+    // `link/../x.md` stays inside the root as a pathname, but the kernel
+    // follows the symlink first and writes elsewhere/../x.md — outside. The
+    // remainder below the root is walked segment by segment, so the symlink is
+    // seen; `path.relative` would have normalized it away before the walk.
+    assert.equal(write(`${memory}/link/../x.md`, [memory]).decision, "deny");
+    assert.equal(write(join(memory, "link", "x.md"), [memory]).decision, "deny");
+    assert.equal(write(join(memory, "x.md"), [memory]).decision, "allow");
+    assert.equal(write(join(memory, "notes", "x.md"), [memory]).decision, "allow", "a subdirectory that does not exist yet");
+    // The same shape inside the task cwd was always denied; both branches agree.
+    await symlink(elsewhere, join(cwd, "link"));
+    assert.equal(write(`${cwd}/link/../x.md`).decision, "deny");
+
+    // A cwd that no longer exists is not a cwd to write under: the Write
+    // tool's mkdir -p would recreate it on whatever filesystem is there now.
+    const gone = join(base, "gone");
+    const missing = evaluatePermission("Write", { file_path: join(gone, "a.txt"), content: "" }, gone);
+    assert.equal(missing.decision, "deny");
+    assert.match(missing.reason, /working directory no longer exists/u);
+    // …but a write root that does not exist yet is still honored (Claude
+    // creates its memory directory on the first write).
+    assert.equal(write(join(base, "future-memory", "MEMORY.md"), [join(base, "future-memory")]).decision, "allow");
+
+    // The denial names the roots as places writes are allowed, not as scratch
+    // space: for an adopted session the only root is Claude's memory directory.
+    assert.match(write("/etc/notes.txt", [memory]).reason, /writes are also allowed under /u);
+
+    // A shell redirect into a granted root is as routine as writing there
+    // with the Write tool; one root set governs both.
+    assert.equal(isRoutinePermission("Bash", { command: `echo hi > ${memory}/out.txt` }, cwd, { writeRoots: [memory] }), true);
+    assert.equal(isRoutinePermission("Bash", { command: `echo hi > ${memory}/out.txt` }, cwd), false);
+    assert.equal(isRoutinePermission("Bash", { command: `echo hi > ${memory}/link/out.txt` }, cwd, { writeRoots: [memory] }), false, "through the symlink is not");
+    assert.equal(isRoutinePermission("Bash", { command: `cat ${memory}/MEMORY.md` }, cwd, { writeRoots: [memory] }), true);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
 test("a write root is honored before it exists and through a symlinked ancestor", async () => {
   const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-writeroot-"));
   try {

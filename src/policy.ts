@@ -68,9 +68,10 @@ export function evaluatePermission(toolName: string, input: unknown, cwd = proce
     if (violation?.classification === "outside-cwd") {
       // Only name an alternative the Worker actually has: writeRoots is empty
       // for a bridge Worker and before an adopted session's first hook event.
-      const alternatives = (options.writeRoots ?? []).length > 0 ? `; scratch work may go under ${(options.writeRoots ?? []).join(", ")}` : "";
+      const alternatives = (options.writeRoots ?? []).length > 0 ? `; writes are also allowed under ${(options.writeRoots ?? []).join(", ")}` : "";
       return { decision: "deny", reason: `Worker cannot write outside the task working directory: ${violation.path}${alternatives}` };
     }
+    if (violation?.classification === "cwd-missing") return { decision: "deny", reason: `the task working directory no longer exists, so nothing can be written under it: ${violation.path}` };
     if (violation?.classification === "git-metadata") return { decision: "deny", reason: "Worker cannot write Git metadata or protected branch refs" };
     return { decision: "allow", reason: `local Claude file tool is allowed by the task policy: ${toolName}` };
   }
@@ -92,12 +93,14 @@ function fileToolPaths(input: unknown): string[] {
     .filter((path): path is string => typeof path === "string" && path.trim().length > 0);
 }
 
-type WritePathViolation = "outside-cwd" | "git-metadata";
+type WritePathViolation = "outside-cwd" | "git-metadata" | "cwd-missing";
 
 /**
  * `realpath` of the deepest ancestor that exists, with the not-yet-created tail
  * re-appended. Plain `realpathSync` throws for a directory the Worker is about
- * to create, and the caller cannot tell that apart from a hostile path.
+ * to create, and the caller cannot tell that apart from a hostile path. Used
+ * for the write roots only: a task cwd that does not exist is refused, not
+ * tolerated (see `classifyWritePath`).
  */
 function resolveExistingPath(path: string): string {
   let current = resolve(path);
@@ -115,38 +118,65 @@ function resolveExistingPath(path: string): string {
   }
 }
 
+/**
+ * The part of `value` below `root`, taken by raw string prefix rather than
+ * `path.relative`, which normalizes `link/../x` to `x` before the per-segment
+ * walk could see the symlink. Tried against both spellings of the root — the
+ * one the caller gave and its real path — so a root reached through a
+ * symlinked ancestor (a dotfile-managed ~/.claude, /var on macOS) matches
+ * however the Worker spelled it. Undefined when the value is not under the root.
+ */
+function pathBelow(value: string, roots: readonly string[]): string | undefined {
+  const raw = value.replaceAll("\\", "/");
+  for (const root of roots) {
+    const canonical = root.replaceAll("\\", "/").replace(/\/+$/u, "") || "/";
+    const prefix = canonical === "/" ? "/" : `${canonical}/`;
+    if (raw === canonical) return "";
+    if (raw.startsWith(prefix)) return raw.slice(prefix.length);
+  }
+  return undefined;
+}
+
 function classifyWritePath(value: string, cwd: string, writeRoots: readonly string[] = []): WritePathViolation | undefined {
   if (value.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return "git-metadata";
-  // A path inside an extra write root (Claude's own scratchpad) is judged
-  // against that root instead of the cwd, with the same symlink/metadata rules.
-  for (const root of writeRoots) {
-    if (!isAbsolute(root) || !isAbsolute(value)) continue;
-    // Resolve both sides before comparing: a write root reached through a
-    // symlinked ancestor (a dotfile-managed ~/.claude, /var on macOS) would
-    // otherwise be judged outside itself. The final component stays unresolved
-    // so the per-segment symlink and `.git` checks below still see it.
-    const resolvedRoot = resolveExistingPath(root);
-    const resolvedValue = join(resolveExistingPath(dirname(value)), basename(value));
-    const rel = relative(resolvedRoot, resolvedValue);
-    if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) continue;
-    return classifyWritePath(resolvedValue, resolvedRoot);
-  }
-  // A write root need not exist yet: Claude creates its memory directory on
-  // the first write, and failing closed there denied the very write the
-  // outside-cwd message points at.
-  const root = resolveExistingPath(cwd);
-  const raw = value.replaceAll("\\", "/");
-  const canonicalRoot = root.replaceAll("\\", "/").replace(/\/+$/u, "") || "/";
-  let components: string[];
+  // A path inside an extra write root (Claude's own scratchpad or memory
+  // directory) is judged against that root instead of the cwd, with the same
+  // per-segment symlink and metadata rules. A root need not exist yet: Claude
+  // creates its memory directory on the first write, and failing closed there
+  // denied the very write the outside-cwd message points at. Each root is
+  // resolved once; the walk below never re-resolves it.
   if (isAbsolute(value)) {
-    const prefix = canonicalRoot === "/" ? "/" : `${canonicalRoot}/`;
-    if (raw !== canonicalRoot && !raw.startsWith(prefix)) return "outside-cwd";
-    components = raw === canonicalRoot ? [] : raw.slice(prefix.length).split("/");
-  } else {
-    components = raw.split("/");
+    for (const root of writeRoots) {
+      if (!isAbsolute(root)) continue;
+      const resolvedRoot = resolveExistingPath(root);
+      const below = pathBelow(value, [root, resolvedRoot]);
+      if (below === undefined) continue;
+      return walkWritePath(below, resolvedRoot);
+    }
   }
+  // The task cwd itself is resolved fail-closed: a cwd that no longer exists
+  // (deleted, or its mount gone) must not have its writes allowed on whatever
+  // filesystem now sits there, which the Write tool's `mkdir -p` would create.
+  let root: string;
+  try { root = realpathSync(cwd); }
+  catch { return "cwd-missing"; }
+  if (isAbsolute(value)) {
+    const below = pathBelow(value, [cwd, root]);
+    if (below === undefined) return "outside-cwd";
+    return walkWritePath(below, root);
+  }
+  return walkWritePath(value, root);
+}
+
+/**
+ * Walk a path relative to an already-resolved root one segment at a time,
+ * refusing `..` that would climb out, any `.git` segment, and any segment that
+ * is (or fails to be inspected as) a symlink — the kernel would follow it out
+ * of the root even though the pathname stays inside.
+ */
+function walkWritePath(relativePath: string, root: string): WritePathViolation | undefined {
   const normalized: string[] = [];
-  for (const segment of components) {
+  for (const segment of relativePath.replaceAll("\\", "/").split("/")) {
     if (!segment || segment === ".") continue;
     if (segment === "..") {
       if (normalized.length === 0) return "outside-cwd";
@@ -921,13 +951,13 @@ export function isRoutinePermission(toolName: string, input: unknown, cwd: strin
     const command = input && typeof input === "object" && typeof (input as { command?: unknown }).command === "string"
       ? (input as { command: string }).command
       : "";
-    return command ? isRoutineShellCommand(command, cwd) : false;
+    return command ? isRoutineShellCommand(command, cwd, options.writeRoots ?? []) : false;
   }
   // WebFetch, WebSearch, Task, mcp__* tools and any unrecognized tool name.
   return false;
 }
 
-function isRoutineShellCommand(command: string, cwd: string): boolean {
+function isRoutineShellCommand(command: string, cwd: string, writeRoots: readonly string[] = []): boolean {
   // A newline can carry a heredoc body, a second statement, or other content
   // this single-line lexer never sees; treat any multi-line command as
   // unrecognized rather than reasoning about what follows the first line.
@@ -949,7 +979,7 @@ function isRoutineShellCommand(command: string, cwd: string): boolean {
     segments.at(-1)!.push(token);
   }
   if (segments.some((segment) => segment.length === 0)) return false;
-  return segments.every((segment) => isRoutineSegment(segment, cwd, 0));
+  return segments.every((segment) => isRoutineSegment(segment, cwd, 0, writeRoots));
 }
 
 /** True when `(` or `)` appears outside single/double quotes and not backslash-escaped. */
@@ -996,15 +1026,15 @@ function withoutFdDuplication(tokens: readonly ShellToken[]): ShellToken[] | und
   return result;
 }
 
-function isRoutineSegment(segment: readonly ShellToken[], cwd: string, depth: number): boolean {
+function isRoutineSegment(segment: readonly ShellToken[], cwd: string, depth: number, writeRoots: readonly string[] = []): boolean {
   if (depth > 5) return false;
-  if (hasUnsafeRedirection(segment, cwd)) return false;
+  if (hasUnsafeRedirection(segment, cwd, writeRoots)) return false;
   const words = segment.filter((token) => !token.operator).map((token) => token.value);
   if (words.length === 0) return false;
-  return isRoutineWords(words, cwd, depth);
+  return isRoutineWords(words, cwd, depth, writeRoots);
 }
 
-function isRoutineWords(words: readonly string[], cwd: string, depth: number): boolean {
+function isRoutineWords(words: readonly string[], cwd: string, depth: number, writeRoots: readonly string[] = []): boolean {
   if (depth > 5) return false;
   const first = words[0]!;
   // A program named by path (./ls, /tmp/x/ls) is an arbitrary executable, not
@@ -1014,7 +1044,7 @@ function isRoutineWords(words: readonly string[], cwd: string, depth: number): b
   if (WRAPPER_COMMANDS.has(head)) {
     const wrapped = unwrapWrapper(head, words.slice(1));
     if (!wrapped || wrapped.length === 0) return false;
-    return isRoutineWords(wrapped, cwd, depth + 1);
+    return isRoutineWords(wrapped, cwd, depth + 1, writeRoots);
   }
   if (!ROUTINE_SHELL_COMMANDS.has(head)) return false;
   const rest = words.slice(1);
@@ -1023,7 +1053,7 @@ function isRoutineWords(words: readonly string[], cwd: string, depth: number): b
   // /etc, ~/.ssh or ~/.aws and every option that names an outside file out of
   // the routine set, at the cost of an occasional model call for a sed script
   // that happens to start with `/`.
-  if (rest.some((word) => namesPathOutsideCwd(word, cwd))) return false;
+  if (rest.some((word) => namesPathOutsideCwd(word, cwd, writeRoots))) return false;
   switch (head) {
     case "git": return isRoutineGit(rest, cwd);
     case "npm": return isRoutineNpm(rest);
@@ -1164,33 +1194,37 @@ function sedScriptWritesFiles(script: string): boolean {
   return /(?:^|[;{}\s])[wWrRe]\s*[^\s]|\/[gIp\d]*[we]/u.test(script);
 }
 
-function hasUnsafeRedirection(segment: readonly ShellToken[], cwd: string): boolean {
+function hasUnsafeRedirection(segment: readonly ShellToken[], cwd: string, writeRoots: readonly string[] = []): boolean {
   for (let index = 0; index < segment.length; index += 1) {
     const token = segment[index]!;
     if (token.operator && (token.value === ">" || token.value === ">>")) {
       const target = segment[index + 1];
       if (!target || target.operator) return true;
-      if (isUnsafeRedirectTarget(target.value, cwd)) return true;
+      if (isUnsafeRedirectTarget(target.value, cwd, writeRoots)) return true;
     }
   }
   return false;
 }
 
-function isUnsafeRedirectTarget(target: string, cwd: string): boolean {
+function isUnsafeRedirectTarget(target: string, cwd: string, writeRoots: readonly string[] = []): boolean {
   if (target === "/dev/null") return false; // the one device sink that discards rather than writes
   if (target.startsWith("/dev/") || target.startsWith("~") || target.startsWith("&")) return true;
-  // The same check the Write/Edit tools get: inside the cwd after resolving
-  // `..`, not Git metadata, and not through a symlink or hard link out of it.
-  return classifyWritePath(target, cwd) !== undefined;
+  // The same check the Write/Edit tools get, against the same roots: inside
+  // the cwd or a granted write root after resolving `..`, not Git metadata,
+  // and not through a symlink or hard link out of it. One root set governs
+  // both tools, so `cmd > <scratchpad>/out` is as routine as writing it.
+  return classifyWritePath(target, cwd, writeRoots) !== undefined;
 }
 
 /** True for an argument that names a filesystem location outside the task cwd (or ~), including `--flag=path` values. */
-function namesPathOutsideCwd(word: string, cwd: string): boolean {
+function namesPathOutsideCwd(word: string, cwd: string, writeRoots: readonly string[] = []): boolean {
   const value = word.startsWith("--") && word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
   if (value === "/dev/null") return false;
   if (value.startsWith("~")) return true;
   const pathLike = value.startsWith("/") || /(?:^|[\\/])\.\.(?:[\\/]|$)/u.test(value);
-  if (pathLike && !isInsideCwd(value, cwd)) return true;
+  // A path inside a granted write root is inside for this purpose too, judged
+  // by the same walk the Write tool gets (symlinks and metadata included).
+  if (pathLike && !isInsideCwd(value, cwd)) return writeRoots.length === 0 || classifyWritePath(value, cwd, writeRoots) !== undefined;
   // An argument that exists on disk may be (or pass through) a symlink that
   // leaves the cwd; compare real paths. A non-existent argument is a pattern or
   // a literal and needs no check.
