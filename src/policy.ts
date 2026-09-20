@@ -26,7 +26,7 @@ export function evaluatePermission(toolName: string, input: unknown, cwd = proce
     const paths = fileToolPaths(input);
     if (paths.length === 0) return { decision: "deny", reason: `${toolName} request has no recognizable file path` };
     const violation = paths.map((path) => ({ path, classification: classifyWritePath(path, cwd, options.writeRoots) })).find((entry) => entry.classification !== undefined);
-    if (violation?.classification === "outside-cwd") return { decision: "deny", reason: `Worker cannot write outside the task working directory: ${violation.path}` };
+    if (violation?.classification === "outside-cwd") return { decision: "deny", reason: `Worker cannot write outside the task working directory: ${violation.path}; keep deliverables in the task directory, and scratch work in this session's own scratchpad or memory directory` };
     if (violation?.classification === "git-metadata") return { decision: "deny", reason: "Worker cannot write Git metadata or protected branch refs" };
     return { decision: "allow", reason: `local Claude file tool is allowed by the task policy: ${toolName}` };
   }
@@ -212,7 +212,7 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   // Dynamic text in an ordinary local command (`for f in …; echo "$f"`) or in
   // another statement (`npm test; echo "exit $?"`) is Claude's own business.
   if ((hasDynamicArgument && hasDynamicCommandName(tokens)) || segmentsOf(tokens).some((segment) => hasDynamicSensitiveArgument(segment))) {
-    return { decision: "deny", reason: "a repository, package, network or shell command with a dynamic argument cannot be capability-checked" };
+    return { decision: "deny", reason: "a repository, package, network or shell command with a dynamic argument cannot be capability-checked; to change files under the task working directory use the Write/Edit tools, whose paths are checked, instead of an inline interpreter script (heredoc or stdin)" };
   }
   if (/\bgit\b[\s\S]*\b(?:push|merge(?!-)|send-pack|receive-pack|update-ref)\b/iu.test(canonical)
     || /\bgit-(?:send|receive|upload)-pack\b/iu.test(canonical)

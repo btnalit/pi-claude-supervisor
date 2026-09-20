@@ -1995,12 +1995,16 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     }
     record.lastOutputAt = new Date().toISOString();
     const event = request.event;
+    // Every hook event carries `transcript_path`, and an adopted session never
+    // replays SessionStart, so capture it here rather than only at startup:
+    // it is what locates Claude's own per-project memory directory below.
+    if (!record.transcriptPath && isSafeAbsolutePath(event.transcript_path)) record.transcriptPath = event.transcript_path;
     switch (event.hook_event_name) {
       case "SessionStart": {
         record.claudeSessionId ??= event.session_id;
         record.handle.sessionId = event.session_id;
-        if (event.transcript_path) record.transcriptPath = event.transcript_path;
-        if (typeof event.scratchpad_dir === "string" && isAbsolute(event.scratchpad_dir) && !event.scratchpad_dir.includes("\0")) record.scratchpadDir = event.scratchpad_dir;
+        if (isSafeAbsolutePath(event.transcript_path)) record.transcriptPath = event.transcript_path;
+        if (isSafeAbsolutePath(event.scratchpad_dir)) record.scratchpadDir = event.scratchpad_dir;
         record.sessionStartReceived = true;
         return {};
       }
@@ -2084,7 +2088,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         input: event.tool_input,
         raw: event as unknown as Record<string, unknown>,
         phase,
-        ...(record.scratchpadDir ? { writeRoots: [record.scratchpadDir] } : {}),
+        ...(writeRootsOf(record).length > 0 ? { writeRoots: writeRootsOf(record) } : {}),
       },
     });
     return new Promise<HookRelayReply>((resolve) => {
@@ -2155,6 +2159,25 @@ function bridgeEnvironment(env: NodeJS.ProcessEnv, cwd: string, command: string,
   };
   if (hookSettingsPath !== undefined) result[INTERACTIVE_KEYS.settings] = encode(hookSettingsPath);
   return result;
+}
+
+function isSafeAbsolutePath(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && isAbsolute(value) && !value.includes("\0");
+}
+
+/**
+ * The directories outside the task cwd that the Worker may still write: its own
+ * per-session scratchpad, and Claude's per-project memory directory. The memory
+ * directory is derived from the session's own `transcript_path`
+ * (`<projects>/<slug>/<session>.jsonl` -> `<projects>/<slug>/memory`), so it is
+ * reported by Claude for this session rather than guessed, and cannot name
+ * another project's memory.
+ */
+export function writeRootsOf(record: { scratchpadDir?: string; transcriptPath?: string }): string[] {
+  const roots: string[] = [];
+  if (record.scratchpadDir) roots.push(record.scratchpadDir);
+  if (record.transcriptPath) roots.push(join(dirname(record.transcriptPath), "memory"));
+  return roots;
 }
 
 /** True when both paths name the same directory (device and inode), however they are spelled. */
