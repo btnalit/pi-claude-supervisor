@@ -3297,6 +3297,56 @@ test("a commit made during the publish turn cannot ride the grant: the verified 
   }
 });
 
+test("an edit left uncommitted during the publish turn is a changed candidate, not an unchanged one", async () => {
+  const branch = "worker/publish-then-edit";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-edit-", branch);
+  try {
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: Array<{ status: string; reason: string }> = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push({ status: notice.status, reason: notice.reason }); },
+    });
+    const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repo.cwd })).stdout.trim();
+    fixture.adapter.send = async (_handle, message) => {
+      fixture.state.sent.push(message);
+      if (!message.includes("Publish it")) return;
+      await execFileAsync("git", ["-C", repo.cwd, "-c", "core.hooksPath=/dev/null", "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
+      // HEAD stays put, but the tree no longer matches the pushed commit.
+      await writeFile(join(repo.cwd, "after-publish.txt"), "uncommitted\n");
+    };
+    await supervisor.start({
+      task: "publish, then edit without committing",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const first = fixture.turn(1);
+    fixture.state.listener?.(first);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done" }, first);
+    const acceptanceRuns = events.events.filter((event) => event.type === "acceptance_started").length;
+    const second = fixture.turn(2);
+    fixture.state.listener?.(second);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "pushed" }, second);
+
+    assert.equal(events.events.filter((event) => event.type === "acceptance_started").length, acceptanceRuns + 1, "the changed tree is re-verified, HEAD unchanged or not");
+    const abandoned = events.events.find((event) => event.type === "publish_abandoned");
+    assert.equal(abandoned?.data?.published, true);
+    assert.match(String(abandoned?.data?.reason), /left with uncommitted changes/u);
+    assert.equal(supervisor.state, "completed");
+    assert.match(String(candidates.at(-1)?.reason), /not published: .*left with uncommitted changes.*new tree is not published/u);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
 test("a publish the Worker never performed blocks the candidate instead of completing it", async () => {
   const branch = "worker/publish-missing";
   const repo = await repositoryWithRemote("pi-claude-supervisor-publish-miss-", branch);

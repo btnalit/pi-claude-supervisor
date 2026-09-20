@@ -448,7 +448,8 @@ that commit, the candidate's own branch, the remote, the task directory and the
 remote's repository (`host/owner/repo` from its fetch URL, an SSH alias
 translated through `ssh -G`), and asks the Worker to publish: the Worker runs
 the push and any `gh pr create`, the Supervisor never does. A dirty tree costs a
-repair round first; the grant is armed before the instruction is sent and
+repair round first, `.git` must be a real directory, and the reviewed evidence must carry a
+HEAD (fail-closed); the grant is armed before the instruction is sent and
 revoked only if the send failed before delivery (the turn counter tells). The instruction is built
 by `publishCommand`/`pullRequestCommand` in `policy.ts`, beside the parser that
 admits it, and a test round-trips one through the other. Under every permission
@@ -461,8 +462,8 @@ plus `gh pr list` for `pr`) before completing, or blocks the candidate when it
 cannot; that candidate keeps `deliverable: true`, since it passed and is intact
 on its branch, and an unreachable remote is reported as *unconfirmed*
 (`RemoteBranchLookup` tells `absent` from `unreachable`), never as a missing
-commit or a repointed remote. A tree that changed during the publish turn voids the grant and
-is re-verified in full, with the same confirmation deciding whether the notice
+commit or a repointed remote. A tree that changed during the publish turn — an uncommitted edit included — voids
+the grant and is re-verified in full, with the same confirmation deciding whether the notice
 says the verified commit landed first. The grant is cleared on every terminal
 path, so it never outlives the turn it was issued for, and
 `permittedRemoteCommand` admits a single literal shape —
@@ -476,7 +477,9 @@ transport-affecting keys (including `include.*` and `init.*`), `git config
 --edit`, `git init --template`, and any statement naming `.git/config` or
 `.git/hooks` that does not plainly only read are refused alongside `git remote`
 mutations; git's own `--git-dir`/`--work-tree` options and `remote`'s own `-v`
-cannot hide either. For an adopted tmux session the memory write root is
+cannot hide either, nor can `-C /proc/self/cwd` or `--separate-git-dir`. The publish
+hint keys on `PolicyResult.boundary`, not on the reason text, and promises a publish turn
+only where `#requestPublish` will start one. For an adopted tmux session the memory write root is
 located under the *adopted process's* configuration directory, read from
 `/proc/<pid>/environ` at adoption, so a Claude started with another
 `CLAUDE_CONFIG_DIR` keeps its memory.

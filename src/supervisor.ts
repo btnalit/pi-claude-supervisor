@@ -2,10 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { EventLog, type SupervisorEvent } from "./events.ts";
 import { SupervisorStateMachine } from "./state.ts";
-import { evaluatePermission, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, type PermissionPolicyOptions, type RemoteGrant } from "./policy.ts";
+import { evaluatePermission, isCommitId, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, type PermissionPolicyOptions, type PolicyResult, type RemoteGrant } from "./policy.ts";
 import { PiDecisionWorker, type DecisionAction, type DecisionContext, type DecisionDeadlineContext, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
 import { DEFAULT_DEADLINE_GRACE_MS, DEFAULT_DEADLINE_MS, DEFAULT_DEADLINE_WARNING_MS, DEFAULT_NO_OUTPUT_TIMEOUT_MS, formatDurationMs } from "./config.ts";
-import { collectRepositoryEvidence, remoteBranchHead, remoteUrl, runReadOnly, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryIsAncestor, repositoryWorkTree, verifyAll, repositorySlug, type RemoteBranchLookup, type RemoteDestination, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
+import { collectRepositoryEvidence, remoteBranchHead, remoteUrl, runReadOnly, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryIsAncestor, repositoryWorkTree, verifyAll, repositoryClean, repositoryGitDirectoryIsLocal, repositorySlug, type RemoteBranchLookup, type RemoteDestination, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { redactSensitive } from "./redaction.ts";
 import { assertAutomaticClaudePermissionConfiguration, assertTrustedAutomaticClaudeExecutable, automaticClaudeArgs, automaticWorkerEnvironment, type AutomaticClaudeArgOptions } from "./worker/environment.ts";
@@ -405,7 +405,7 @@ export class Supervisor {
     try {
       if (this.#automation && !this.#reviewer) throw new Error("automatic supervision requires an independent Reviewer");
       const recovering = Boolean(options.taskId && options.startedAt);
-      if (options.baseCommit && !/^[0-9a-f]{40,64}$/iu.test(options.baseCommit)) {
+      if (options.baseCommit && !isCommitId(options.baseCommit)) {
         throw new Error("automatic supervision requires a full hexadecimal git baseline");
       }
       let startupHead: string | undefined;
@@ -733,7 +733,7 @@ export class Supervisor {
               if (this.#adapter.respondPermission) {
                 await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, {
                   behavior: "deny",
-                  message: `${policy.reason}${this.#publishHint(policy.reason)}; denied by supervisor policy`,
+                  message: `${policy.reason}${this.#publishHint(policy)}; denied by supervisor policy`,
                 });
                 this.#pendingPermissions.delete(event.request.requestId);
                 await this.#appendEvent({
@@ -769,7 +769,7 @@ export class Supervisor {
             const behavior: "allow" | "deny" = policy.decision === "deny" ? "deny" : "allow";
             await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, {
               behavior,
-              message: behavior === "deny" ? `${policy.reason}${this.#publishHint(policy.reason)}; denied by supervisor policy` : undefined,
+              message: behavior === "deny" ? `${policy.reason}${this.#publishHint(policy)}; denied by supervisor policy` : undefined,
             }, behavior === "allow" ? event.request.input : undefined);
             this.#pendingPermissions.delete(event.request.requestId);
             await this.#appendEvent({
@@ -894,15 +894,16 @@ export class Supervisor {
    * Appended to a refused remote action: before the grant, that it is coming;
    * during it, the one shape that is accepted. Silent for every other denial.
    */
-  #publishHint(policyReason: string): string {
+  #publishHint(policy: PolicyResult): string {
     if ((this.#task?.spec.autonomy.remoteAuthority ?? "none") === "none") return "";
-    // Only where it answers the refusal: this explains a remote denial, not an
-    // outside-cwd write that happens to be refused in the same session. While
-    // the grant is live a dynamic word (`-C "$PWD"`, `$(pwd)`) is the other way
-    // the one publish turn misses its shape, so that refusal is explained too.
+    // Only where it answers the refusal: the policy marks a denial of the
+    // remote boundary itself, so an HTTP mutation or an outside-cwd write that
+    // shares words with it gets no hint. While the grant is live a dynamic word
+    // (`-C "$PWD"`, `$(pwd)`) is the other way the one publish turn misses its
+    // shape, so that refusal is explained too.
     const grant = this.#remoteGrant;
-    const remoteDenial = /remote repository or main\/integration merge authority/u.test(policyReason);
-    const dynamicDenial = /dynamic argument cannot be capability-checked/u.test(policyReason);
+    const remoteDenial = policy.boundary === "remote";
+    const dynamicDenial = /dynamic argument cannot be capability-checked/u.test(policy.reason);
     if (!remoteDenial && !(grant && dynamicDenial)) return "";
     if (grant) {
       // The grant is live and this command missed its shape: say which shape,
@@ -916,10 +917,15 @@ export class Supervisor {
       return "; the one-shot publish grant expired when the publish turn ended — report what happened so the Supervisor can confirm the remote or re-verify, rather than retrying the push";
     }
     if (this.#publishState !== "none") return "";
-    // The publish turn exists only for an automatic task on a transport that
-    // can take one; promising it elsewhere leaves the Worker waiting for a
-    // turn that never comes.
-    if (!this.#automation || !canRepairInPlace(this.#adapter)) return "; remote authority is exercised after verification, not by the Worker: finish and commit locally, and the verified candidate is published from there";
+    // Promise the publish turn only where `#requestPublish` will actually
+    // start one — automatic task, a transport that can take a turn, a branch
+    // that is not protected — and otherwise say plainly that the task ends
+    // unpublished, so the Worker is never left waiting for a turn that never
+    // comes or told something gets published when nothing does.
+    const branch = this.#lastObservedBranch;
+    if (!this.#automation) return "; this task is supervised manually, so no publish turn will run: finish and commit locally, and the verified candidate is published by the operator";
+    if (!canRepairInPlace(this.#adapter)) return `; the ${this.#adapter.capabilities().transport} transport cannot take a publish turn, so the task ends at a verified local candidate: finish and commit locally`;
+    if (branch && isProtectedBranch(branch)) return `; ${branch} is a protected branch that is never published, so the task ends at a verified local candidate: finish and commit locally`;
     return "; remote authority unlocks after this candidate's acceptance and review pass — finish and commit locally, and the Supervisor will ask you to publish";
   }
 
@@ -998,7 +1004,7 @@ export class Supervisor {
             // Decision Worker's chosen option and rationale there.
             ? `Supervisor answer: ${action.reason}`
             : policy.decision === "deny"
-              ? `${policy.reason}${this.#publishHint(policy.reason)}; denied by supervisor policy`
+              ? `${policy.reason}${this.#publishHint(policy)}; denied by supervisor policy`
               : `denied by supervisor: ${action.reason}`;
         await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, { behavior, message }, behavior === "allow" ? event.request.input : undefined);
         this.#pendingPermissions.delete(event.request.requestId);
@@ -1569,7 +1575,17 @@ export class Supervisor {
         this.#publishShortfall = "the candidate HEAD could not be read when the publish turn returned, so the publish was not confirmed";
         return this.#finalizeVerification(this.#lastVerification, "blocked", this.#publishShortfall, { publishOnly: true });
       }
-      if (head === this.#verifiedHead) return this.#settlePublish(this.#lastVerification, verificationAbortController.signal);
+      // "Unchanged" means the commit *and* the tree: an edit left uncommitted
+      // during the publish turn is a candidate that no longer matches what was
+      // pushed, exactly like a new commit.
+      const clean = head === this.#verifiedHead ? await repositoryClean(this.#task.cwd, verificationAbortController.signal) : false;
+      if (clean === undefined) {
+        this.#publishState = "settled";
+        this.#remoteGrant = undefined;
+        this.#publishShortfall = "the working tree could not be read when the publish turn returned, so the publish was not confirmed";
+        return this.#finalizeVerification(this.#lastVerification, "blocked", this.#publishShortfall, { publishOnly: true });
+      }
+      if (clean) return this.#settlePublish(this.#lastVerification, verificationAbortController.signal);
       // The Worker changed the candidate during the publish turn; the grant is
       // void and the new tree has to earn its own verification. The grant named
       // the verified commit, so nothing newer can have been pushed under it —
@@ -1579,9 +1595,10 @@ export class Supervisor {
       this.#remoteGrant = undefined;
       const grant = this.#publishTarget;
       const landed = grant ? await this.#confirmPublish(grant, verificationAbortController.signal) : undefined;
+      const how = head === this.#verifiedHead ? "was left with uncommitted changes" : "changed";
       this.#publishShortfall = landed?.pushed
-        ? `the verified commit ${String(this.#verifiedHead).slice(0, 12)} was published to ${grant!.remoteName}/${grant!.branch}${landed.prUrl ? ` (pull request ${landed.prUrl})` : ""}, but the candidate then changed locally, so the grant was voided and the new tree re-verified; the new tree is not published`
-        : "the candidate changed during the publish turn, so the publish grant was voided and the new tree re-verified; nothing was published";
+        ? `the verified commit ${String(this.#verifiedHead).slice(0, 12)} was published to ${grant!.remoteName}/${grant!.branch}${landed.prUrl ? ` (pull request ${landed.prUrl})` : ""}, but the candidate then ${how} locally, so the grant was voided and the new tree re-verified; the new tree is not published`
+        : `the candidate ${how} during the publish turn, so the publish grant was voided and the new tree re-verified; nothing was published`;
       await this.#appendEvent({ type: "publish_abandoned", taskId: this.#task.taskId, workerId: this.#handle?.id, data: { reason: this.#publishShortfall, verifiedHead: this.#verifiedHead, head, ...(landed?.pushed ? { published: true } : {}) } }).catch(() => {});
     }
     this.#reportProgress("acceptance", "running acceptance checks", true);
@@ -1824,8 +1841,20 @@ export class Supervisor {
       await this.#notePublishShortfall(handle.id, { reason: `${reason} (no repair round was available)` });
       return false;
     }
-    if (evidence.head !== undefined && evidence.head !== head) {
+    if (evidence.head === undefined) {
+      await this.#notePublishShortfall(handle.id, { reason: "the reviewed evidence carries no HEAD, so the current commit cannot be shown to be the one that was verified" });
+      return false;
+    }
+    if (evidence.head !== head) {
       await this.#notePublishShortfall(handle.id, { reason: `HEAD moved from ${evidence.head.slice(0, 12)} to ${head.slice(0, 12)} after the evidence was reviewed, so the current commit was never verified` });
+      return false;
+    }
+    // Every `.git/config` and `.git/hooks` guard names the directory inside
+    // the task cwd; a repository whose Git directory was moved elsewhere
+    // (`--separate-git-dir`, refused for the Worker but not for whoever made
+    // the clone) keeps its transport configuration where no guard looks.
+    if (!(await repositoryGitDirectoryIsLocal(task.cwd))) {
+      await this.#notePublishShortfall(handle.id, { reason: "the repository's Git directory is not the task directory's own .git, so its configuration and hooks are outside the publish boundary" });
       return false;
     }
     const status = await this.#adapter.getStatus(handle).catch(() => undefined);
@@ -2605,14 +2634,14 @@ async function automaticRepositoryBoundary(
   if (signal?.aborted) throw new Error("automatic repository boundary check aborted");
   const head = await repositoryHead(cwd, signal);
   if (signal?.aborted) throw new Error("automatic repository boundary check aborted");
-  if (!head || !/^[0-9a-f]{40,64}$/iu.test(head)) {
+  if (!head || !isCommitId(head)) {
     throw new Error("automatic supervision requires a verified git baseline before Worker startup");
   }
   if (expectedHead && head !== expectedHead) {
     throw new Error(`automatic supervision repository HEAD changed from ${expectedHead} to ${head}`);
   }
   const baseCommit = expectedBaseCommit ?? head;
-  if (!/^[0-9a-f]{40,64}$/iu.test(baseCommit)) {
+  if (!isCommitId(baseCommit)) {
     throw new Error("automatic supervision requires a full hexadecimal git baseline");
   }
   if (!await repositoryCommitExists(cwd, baseCommit, signal)) {
@@ -2635,7 +2664,7 @@ async function automaticRepositoryBoundary(
   }
   const finalHead = await repositoryHead(cwd, signal);
   if (signal?.aborted) throw new Error("automatic repository boundary check aborted");
-  if (!finalHead || !/^[0-9a-f]{40,64}$/iu.test(finalHead)) {
+  if (!finalHead || !isCommitId(finalHead)) {
     throw new Error("automatic supervision requires a verified git baseline before Worker startup");
   }
   if (finalHead !== head) {

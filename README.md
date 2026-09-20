@@ -277,8 +277,8 @@ turn stays local ("Everything up-to-date") instead of riding the grant. `-C` is
 **required and absolute**, and both sides are resolved through the kernel,
 because Claude's Bash tool keeps its working directory between calls and `cd` is
 ordinary local work — without it the grant could be spent in any other clone,
-and a relative `-C .` would resolve against the Supervisor's process rather than
-the Worker's shell. The hooks path is **pinned** on that one command so no
+and a relative `-C .` — or `/proc/self/cwd` — would resolve against the Supervisor's
+process rather than the Worker's shell. The hooks path is **pinned** on that one command so no
 `pre-push` hook a Worker could have installed (by any door: `git init
 --template=`, an archive, a `chmod`) runs inside the granted push with the
 Worker's credentials. For `pr` a `gh pr create --repo <pinned remote URL>
@@ -295,7 +295,8 @@ round-trips through the policy.
 The grant is only issued for a commit that *is* the verified tree: the working
 tree must be clean (untracked files included — a new file may be part of the
 verified behavior), and HEAD must not have moved since the evidence the Reviewer
-judged was read. A dirty tree first costs a repair round asking the Worker to
+judged was read. The repository's `.git` must be its own directory (not a `gitdir:` pointer
+left by `--separate-git-dir`). A dirty tree first costs a repair round asking the Worker to
 commit what belongs to the candidate; only when none is left, or when HEAD
 moved, does the task end at the local candidate with a `not published:` reason
 instead of a grant. A remote that cannot be reached at confirmation time leaves
@@ -318,7 +319,7 @@ set-url|add|rename|…`, behind git's own `--git-dir`/`--work-tree` options or
 push goes or what runs during it — `git config` writes to `remote.*`,
 `url.*.insteadOf`, `push.*`, `credential.*`, `http.*`, `include.path`/
 `includeIf.*`, `init.*`, `core.sshCommand` or `core.hooksPath`, `git config
---edit`, `git init --template=…`, and any statement that names `.git/config` or
+--edit`, `git init --template=…`, `git init|clone --separate-git-dir=…`, and any statement that names `.git/config` or
 `.git/hooks` unless it plainly only reads (`cat`, `grep`, `ls`, …) — so the
 granted remote cannot be repointed underneath the confirmation, which pins both
 the fetch and the push URL and scrubs `GIT_DIR`/`GIT_CONFIG_*` from its own
@@ -329,8 +330,9 @@ says of every text-level rule; absolute isolation is the host boundary's job.
 The grant is **one-shot**: it is revoked the moment the publish turn completes,
 not when the next decision arrives, and it is pinned to the remote's URL as well
 as its name. A Worker that changes the tree during that turn voids it and is
-re-verified in full; because the grant named the commit, the notice can say
-whether the verified commit landed before the tree moved on. Before verification a refused push says the grant is coming
+re-verified in full — an edit left uncommitted counts as a change, exactly like a new
+commit; because the grant named the commit, the notice can say whether the
+verified commit landed before the tree moved on. Before verification a refused push says the grant is coming
 rather than leaving the Worker to guess, and a task that ends without a
 confirmed publish says so in its candidate notice instead of reporting a bare
 "ready".

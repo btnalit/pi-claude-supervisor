@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isPlainRemoteName } from "./policy.ts";
 import { redactSensitive } from "./redaction.ts";
 import type { PermissionAuthority, RemoteAuthority } from "./types.ts";
 
@@ -252,7 +253,7 @@ function readRemoteName(value: string | undefined): string {
   if (trimmed === undefined || trimmed === "") return "origin";
   // A typo must not silently redirect where a publish goes; the spec validator
   // throws for the same input, so this fails the same way instead of guessing.
-  if (!/^[A-Za-z0-9._-]+$/u.test(trimmed)) throw new Error(`PI_CLAUDE_SUPERVISOR_REMOTE_NAME must be a plain remote name: ${trimmed}`);
+  if (!isPlainRemoteName(trimmed)) throw new Error(`PI_CLAUDE_SUPERVISOR_REMOTE_NAME must be a plain remote name: ${trimmed}`);
   return trimmed;
 }
 

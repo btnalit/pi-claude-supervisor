@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { remoteBranchHead, repositorySlug } from "./verifier.ts";
+import { remoteBranchHead, repositoryClean, repositoryGitDirectoryIsLocal, repositorySlug } from "./verifier.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -54,6 +54,26 @@ test("a remote branch lookup tells an absent branch from a remote that cannot be
     assert.equal(lookup.outcome, "unreachable");
     assert.ok(lookup.outcome === "unreachable" && lookup.error.length > 0);
     assert.deepEqual(await remoteBranchHead(cwd, "no-such-remote", "feat/x").then((result) => result.outcome), "unreachable");
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("a clean tree and a local .git directory are what the grant requires", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-clean-"));
+  try {
+    const cwd = join(base, "work");
+    await execFileAsync("git", ["init", "-q", "-b", "main", cwd]);
+    await execFileAsync("git", ["-C", cwd, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "one"]);
+    assert.equal(await repositoryClean(cwd), true);
+    await writeFile(join(cwd, "untracked.txt"), "x\n");
+    assert.equal(await repositoryClean(cwd), false, "an untracked file is not clean");
+    assert.equal(await repositoryClean(join(base, "not-a-repo")), undefined, "git could not say");
+    assert.equal(await repositoryGitDirectoryIsLocal(cwd), true);
+    const moved = join(base, "moved");
+    await execFileAsync("git", ["init", "-q", "-b", "main", "--separate-git-dir", join(base, "gitdir"), moved]);
+    assert.equal(await repositoryGitDirectoryIsLocal(moved), false, "a gitdir: pointer is not a local .git directory");
+    assert.equal(await repositoryGitDirectoryIsLocal(join(base, "not-a-repo")), false);
   } finally {
     await rm(base, { recursive: true, force: true });
   }

@@ -224,7 +224,7 @@ Worker 推自己的分支;`pr` 还允许它开 PR。**push 由 Worker 自己执�
 Worker 在发布轮里再提交的内容会留在本地("Everything up-to-date"),搭不上这次授权。
 **`-C` 是必需的且必须是绝对路径**,两侧都按内核解析后比较——因为 Claude 的 Bash 工具
 会在多次调用之间保留工作目录,而 `cd` 属于普通本地操作,没有 `-C` 的话授权可能被花在
-任何别的克隆上;相对写法 `-C .` 则会按 Supervisor 进程而不是 Worker 的 shell 解析。
+任何别的克隆上;相对写法 `-C .`(或 `/proc/self/cwd`)则会按 Supervisor 进程而不是 Worker 的 shell 解析。
 这条命令上**钉死了 hooks 路径**,所以 Worker 通过任何途径(`git init --template=`、
 解压归档、`chmod`)装进去的 `pre-push` hook 都不会在授权的 push 里以 Worker 的凭据执行。
 `pr` 下另加 `gh pr create --repo <钉住的 remote URL> --head <候选分支> …`(只允许
@@ -236,7 +236,7 @@ title / body / base / draft / assignee / label):PR 只会开在授权 remote 对
 也能原样通过策略。
 
 授权只会发给"就是已验证工作树"的那个 commit:工作树必须干净(含未跟踪文件——新文件也可能
-是被验证行为的一部分),且 HEAD 自 Reviewer 评审的证据被读取以来没有移动过。工作树不干净
+是被验证行为的一部分),且 HEAD 自 Reviewer 评审的证据被读取以来没有移动过。仓库的 `.git` 必须是自己的目录(不能是 `--separate-git-dir` 留下的 `gitdir:` 指针)。工作树不干净
 会先花一轮修复让 Worker 把属于候选的内容提交掉;只有修复轮用尽或 HEAD 移动过,任务才以本地
 候选结束并在通知里写明 `not published:` 原因,而不是发授权。核实时 remote 连不上,发布只是
 "未确认"(候选仍可交付),绝不会被说成"没推上去"。
@@ -253,14 +253,14 @@ remote(`git remote set-url|add|rename|…`,藏在 git 自己的 `--git-dir`/`--w
 或 `remote` 自己的 `-v` 后面也一样)一律拒绝;改动 push 去向或 push 期间会执行什么也一律
 拒绝——`git config` 写 `remote.*`、`url.*.insteadOf`、`push.*`、`credential.*`、`http.*`、
 `include.path`/`includeIf.*`、`init.*`、`core.sshCommand`、`core.hooksPath`,`git config --edit`、
-`git init --template=…`,以及任何提到 `.git/config` 或 `.git/hooks` 的语句(除非它显然只读:
+`git init --template=…`、`git init|clone --separate-git-dir=…`,以及任何提到 `.git/config` 或 `.git/hooks` 的语句(除非它显然只读:
 `cat`、`grep`、`ls` 等)——否则授权认的 remote 会被偷换,连 Supervisor 的核实也会被骗过;
 核实同时钉住 fetch 和 push 两个 URL,并从自己的环境里剔除 `GIT_DIR`/`GIT_CONFIG_*`。这是一层
 作用于命令文本的策略:Worker 自己写一个脚本再运行,策略看不见——如
 [autonomy-target.md](docs/autonomy-target.md) 对所有文本级规则所说,绝对隔离是 host 边界的事。
 
 授权是**一次性**的:发布轮一结束就收回(不等下一个决策),并且同时绑定 remote 的 URL
-而不只是名字。Worker 若在该轮里改动了工作树,授权立即作废并重新完整验收;因为授权写的是
+而不只是名字。Worker 若在该轮里改动了工作树(未提交的修改同样算改动),授权立即作废并重新完整验收;因为授权写的是
 commit,通知能说清已验证的 commit 是否在工作树变动之前就已经推上去了。验证之前
 被拒的 push 会说明授权稍后会来,而不是让 Worker 去猜;没能确认发布的任务会在候选
 通知里写明原因,而不是只报一句 "ready"。

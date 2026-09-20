@@ -1,11 +1,11 @@
 import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { lstat, open, readlink, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { AcceptanceCheck, AcceptanceCheckResult, AcceptanceReport, VerificationResult } from "./types.ts";
 import { evidenceMaxBytes, evidenceMaxUntrackedFiles } from "./config.ts";
-import { assertSafeWorkerCommand } from "./policy.ts";
+import { assertSafeWorkerCommand, isCommitId } from "./policy.ts";
 import { workerEnvironment } from "./worker/environment.ts";
 
 const execFileAsync = promisify(execFile);
@@ -75,7 +75,7 @@ export async function repositoryHead(cwd: string, signal?: AbortSignal): Promise
       env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
     });
     const head = String(result.stdout).trim();
-    return /^[0-9a-f]{40,64}$/u.test(head) ? head : undefined;
+    return isCommitId(head) ? head : undefined;
   } catch {
     return undefined;
   }
@@ -159,7 +159,7 @@ export async function remoteBranchHead(cwd: string, remote: string, branch: stri
     const { stdout } = await runReadOnly("git", ["ls-remote", "--heads", "--", remote, branch], cwd, signal);
     const line = stdout.split("\n").map((entry) => entry.trim()).find((entry) => entry.endsWith(`refs/heads/${branch}`));
     const sha = line?.split(/\s+/u)[0] ?? "";
-    return /^[0-9a-f]{40,64}$/u.test(sha) ? { outcome: "found", head: sha } : { outcome: "absent" };
+    return isCommitId(sha) ? { outcome: "found", head: sha } : { outcome: "absent" };
   } catch (error) {
     return { outcome: "unreachable", error: error instanceof Error ? error.message : String(error) };
   }
@@ -177,7 +177,9 @@ export async function repositorySlug(url: string, signal?: AbortSignal): Promise
   const parsed = parseRemoteUrl(url.trim());
   if (!parsed) return undefined;
   let host = parsed.host;
-  if (parsed.sshAlias) host = (await resolveSshHostname(parsed.host, signal)) ?? parsed.host;
+  // `git@github.com:` is the common scp form and needs no translation; only a
+  // bare word (`gh-work`) can be an SSH-config alias worth asking `ssh -G` about.
+  if (parsed.sshAlias && !parsed.host.includes(".")) host = (await resolveSshHostname(parsed.host, signal)) ?? parsed.host;
   return `${host.toLowerCase()}/${parsed.owner}/${parsed.repo}`;
 }
 
@@ -215,7 +217,7 @@ async function resolveSshHostname(alias: string, signal?: AbortSignal): Promise<
 
 /** Verify that a full commit object is still present without invoking a shell. */
 export async function repositoryCommitExists(cwd: string, commit: string, signal?: AbortSignal): Promise<boolean> {
-  if (!/^[0-9a-f]{40,64}$/iu.test(commit)) return false;
+  if (!isCommitId(commit)) return false;
   try {
     const result = await execFileAsync("git", ["cat-file", "-e", `${commit}^{commit}`], {
       cwd,
@@ -241,6 +243,35 @@ export async function repositoryIsAncestor(cwd: string, ancestor: string, descen
       env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
     });
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether the working tree has nothing uncommitted or untracked, or undefined
+ * when git could not say. The same reading the evidence uses, so the publish
+ * turn's "unchanged" means what the grant's "clean" meant.
+ */
+export async function repositoryClean(cwd: string, signal?: AbortSignal): Promise<boolean | undefined> {
+  try {
+    const result = await execFileAsync("git", ["status", "--porcelain", "--untracked-files=all"], {
+      cwd,
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+      signal,
+      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
+    });
+    return String(result.stdout).trim() === "";
+  } catch {
+    return undefined;
+  }
+}
+
+/** True when `<cwd>/.git` is a directory of its own rather than a `gitdir:` pointer somewhere else. */
+export async function repositoryGitDirectoryIsLocal(cwd: string): Promise<boolean> {
+  try {
+    return (await lstat(join(cwd, ".git"))).isDirectory();
   } catch {
     return false;
   }

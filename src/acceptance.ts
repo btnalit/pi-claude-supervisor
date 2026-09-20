@@ -1,3 +1,4 @@
+import { isPlainRemoteName } from "./policy.ts";
 import type { AcceptanceCheck, TaskSpec } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -100,7 +101,7 @@ function normalizeAutonomy(value: unknown, defaults?: Partial<TaskSpec["autonomy
   const remoteAuthority = source.remoteAuthority ?? defaults?.remoteAuthority ?? "none";
   if (remoteAuthority !== "none" && remoteAuthority !== "push" && remoteAuthority !== "pr") throw new Error("task spec autonomy.remoteAuthority must be none, push or pr");
   const remoteName = source.remoteName ?? defaults?.remoteName ?? "origin";
-  if (typeof remoteName !== "string" || !/^[A-Za-z0-9._-]+$/u.test(remoteName)) throw new Error("task spec autonomy.remoteName must be a plain remote name");
+  if (!isPlainRemoteName(remoteName)) throw new Error("task spec autonomy.remoteName must be a plain remote name");
   const maxWorkerCostUsd = source.maxWorkerCostUsd ?? defaults?.maxWorkerCostUsd;
   if (maxWorkerCostUsd !== undefined && (typeof maxWorkerCostUsd !== "number" || !Number.isFinite(maxWorkerCostUsd) || maxWorkerCostUsd <= 0)) throw new Error("task spec autonomy.maxWorkerCostUsd must be a positive number");
   return {

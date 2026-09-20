@@ -7,6 +7,13 @@ export interface PolicyResult {
   decision: PolicyDecision;
   reason: string;
   /**
+   * Set on a denial of the remote-repository boundary itself — a push, merge,
+   * pull request or remote mutation — so the Supervisor's publish hint answers
+   * that refusal and not an unrelated denial (an HTTP mutation, an outside-cwd
+   * write) that happens to share words with it.
+   */
+  boundary?: "remote";
+  /**
    * Set only when a live publish grant admitted the command. The Supervisor
    * issued that grant itself, so the request is answered locally rather than
    * routed to a Decision Worker whose standing rule is to refuse a push.
@@ -58,6 +65,16 @@ export interface RemoteGrant {
    * granted remote's repository, full stop.
    */
   repository?: string;
+}
+
+/** A full git object id (SHA-1 or SHA-256), lowercase or not. One test for the grant, the evidence and the baseline. */
+export function isCommitId(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{40,64}$/iu.test(value);
+}
+
+/** A remote name git accepts verbatim; anything else could be an option or a path. One test for the env default and the spec. */
+export function isPlainRemoteName(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9._-]+$/u.test(value);
 }
 
 /** The hooks path the granted push must carry, so no hook a Worker could have installed runs inside the one granted command. */
@@ -311,7 +328,7 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
   if (words.length === 0) return undefined;
   const name = (words[0] ?? "").split(/[\\/]/u).at(-1)?.toLowerCase();
   if (isProtectedBranch(grant.branch)) return undefined;
-  if (!/^[0-9a-f]{40,64}$/u.test(grant.head)) return undefined;
+  if (!isCommitId(grant.head)) return undefined;
   const optionName = (word: string): string => word.split("=")[0] ?? word;
 
   if (name === "git") {
@@ -326,6 +343,11 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
     if (words[1] !== "-C") return undefined;
     const directory = words[2];
     if (directory === undefined || !isAbsolute(directory) || !sameDirectory(directory, grant.cwd)) return undefined;
+    // `/proc/self/cwd` (and `/proc/thread-self/cwd`, `/dev/fd/…`) resolve to
+    // *this* process's directory here and to the Worker's shell's under git,
+    // so they compare equal while git runs somewhere else; only a plain path
+    // names one directory for both.
+    if (/^\/(?:proc|dev)(?:\/|$)/iu.test(resolve(directory))) return undefined;
     // `-c core.hooksPath=/dev/null` is required too: a `pre-push` hook runs
     // inside the granted push with the Worker's credentials where no policy
     // sees it, and hooks can arrive by more doors than a write denial can
@@ -479,10 +501,10 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   if (/\bgit\b[\s\S]*\b(?:push|merge(?!-)|send-pack|receive-pack|update-ref)\b/iu.test(canonical)
     || /\bgit-(?:send|receive|upload)-pack\b/iu.test(canonical)
     || containsRemoteCliMutation(canonical)) {
-    return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
+    return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority", boundary: "remote" };
   }
   if (hasGit && (hasRemoteOperation || hasGitTransport) || hasGhRemote) {
-    return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
+    return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority", boundary: "remote" };
   }
   // Repointing a remote would make the grant's remote *name* meaningless and
   // would fool the Supervisor's own confirmation, which resolves the same name.
@@ -524,7 +546,7 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
     return { decision: "deny", reason: "Worker cannot write the repository's Git configuration or hooks directly" };
   }
   if (segments.some((segment) => initializesWithTemplate(segment))) {
-    return { decision: "deny", reason: "Worker cannot install repository hooks from a template" };
+    return { decision: "deny", reason: "Worker cannot install repository hooks from a template or relocate the repository's Git directory" };
   }
   if (hasPackagePublication) {
     return { decision: "deny", reason: "package publication belongs to the protected release workflow" };
@@ -592,12 +614,20 @@ function onlyReads(segment: readonly ShellToken[]): boolean {
   return READ_ONLY_COMMANDS.has(first);
 }
 
-/** True when this one statement is `git init --template…`, which copies hooks into `.git/hooks/` of an existing repository too. */
+/**
+ * True when this one statement is `git init --template…`, which copies hooks
+ * into `.git/hooks/` of an existing repository too, or `git init|clone
+ * --separate-git-dir…`, which moves the repository's config and hooks to a
+ * path none of the `.git/` guards name.
+ */
 function initializesWithTemplate(segment: readonly ShellToken[]): boolean {
   const words = segment.filter((token) => !token.operator).map((token) => token.value);
   const index = gitSubcommandIndex(words);
-  if (index < 0 || words[index]?.toLowerCase() !== "init") return false;
-  return words.slice(index + 1).some((word) => word.toLowerCase().startsWith("--template"));
+  if (index < 0) return false;
+  const subcommand = words[index]?.toLowerCase();
+  const options = words.slice(index + 1).map((word) => word.toLowerCase());
+  if (subcommand === "init" && options.some((word) => word.startsWith("--template"))) return true;
+  return (subcommand === "init" || subcommand === "clone") && options.some((word) => word.startsWith("--separate-git-dir"));
 }
 
 /** True when this one statement is `git [options] config` writing a transport-affecting key. */

@@ -2090,7 +2090,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     // itself away in respondPermission and hang the relay.
     record.permissionResponses.delete(requestId);
     const toolUseId = event.tool_use_id ?? requestId;
-    const writeRoots = writeRootsOf(record, record.claudeConfigDir ?? claudeConfigDir());
+    const writeRoots = writeRootsOf(record);
     this.#emit(record, {
       type: "permission_request",
       handle: record.handle,

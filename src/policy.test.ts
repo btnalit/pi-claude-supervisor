@@ -707,6 +707,11 @@ test("a publish grant admits exactly one shape and nothing else", () => {
     const expected = directory.startsWith("'/") ? "allow" : "deny";
     assert.equal(evaluateCommand(`git -C ${directory} ${hooks} push origin ${refspec}`, [], push).decision, expected, directory);
   }
+  // `/proc/self/cwd` resolves to *this* process's directory here and to the
+  // Worker's shell's under git: equal to the grant, running somewhere else.
+  for (const directory of ["/proc/self/cwd", "/proc/thread-self/cwd", `/proc/${process.pid}/cwd`, "/dev/fd/3"]) {
+    assert.equal(evaluateCommand(`git -C ${directory} ${hooks} push origin ${refspec}`, [], push).decision, "deny", directory);
+  }
 
   // One realpath-equality helper with an explicit policy for a missing path.
   assert.equal(sameDirectory(process.cwd(), `${process.cwd()}/src/..`), true);
@@ -743,13 +748,24 @@ test("a publish grant admits exactly one shape and nothing else", () => {
     "git -c core.editor='cp /tmp/evil' config --local -e",
     "git config --edit",
     "git config edit --local",
-    // A template installs hooks without naming .git/hooks.
+    // A template installs hooks without naming .git/hooks, and a separate git
+    // directory moves config and hooks to a path none of the guards name.
     "git init --template=/tmp/t",
     "git init --template /tmp/t .",
     "git config init.templateDir /tmp/t",
+    "git init --separate-git-dir=/tmp/gd",
+    "git init --separate-git-dir /tmp/gd",
+    "git clone --separate-git-dir=/tmp/gd https://example.com/x.git",
   ]) assert.equal(evaluateCommand(command).decision, "deny", command);
   assert.equal(evaluateCommand("git config --get include.path").decision, "allow");
   assert.equal(evaluateCommand("git init").decision, "allow");
+  assert.equal(evaluateCommand("git clone https://example.com/x.git").decision, "allow");
+  // The remote-boundary denial is marked structurally, so the Supervisor's
+  // publish hint answers it and not an HTTP mutation that shares its words.
+  assert.equal(evaluateCommand("git push origin main").boundary, "remote");
+  assert.equal(evaluateCommand("gh pr merge 1").boundary, "remote");
+  assert.equal(evaluateCommand("curl -X POST https://api.github.com/repos/x/y/issues -d x").boundary, undefined);
+  assert.equal(evaluateCommand("git commit -m x").boundary, undefined);
   assert.equal(evaluateCommand("git remote -v").decision, "allow");
 
   // The same boundary through `git config`: a `pushurl`, an `insteadOf`
