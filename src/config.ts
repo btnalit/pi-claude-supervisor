@@ -1,8 +1,9 @@
 import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isPlainRemoteName } from "./policy.ts";
 import { redactSensitive } from "./redaction.ts";
-import type { PermissionAuthority } from "./types.ts";
+import type { PermissionAuthority, RemoteAuthority } from "./types.ts";
 
 const allowed = new Set([
   "PI_CLAUDE_SUPERVISOR_MODE",
@@ -43,6 +44,8 @@ const allowed = new Set([
   "PI_CLAUDE_SUPERVISOR_DEADLINE_GRACE_MS",
   "PI_CLAUDE_SUPERVISOR_DEADLINE_WARNING_MS",
   "PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS",
+  "PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY",
+  "PI_CLAUDE_SUPERVISOR_REMOTE_NAME",
 ]);
 
 export interface AutonomyDefaults {
@@ -50,6 +53,8 @@ export interface AutonomyDefaults {
   requireLocalCommit: boolean;
   maxDecisionRetries: number;
   permissionAuthority: PermissionAuthority;
+  remoteAuthority: RemoteAuthority;
+  remoteName: string;
   maxWorkerCostUsd?: number;
 }
 
@@ -59,6 +64,8 @@ export function autonomyDefaults(env: NodeJS.ProcessEnv = process.env): Autonomy
     requireLocalCommit: readBoolean(env.PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT, true),
     maxDecisionRetries: readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES, 2, 0, 10),
     permissionAuthority: readPermissionAuthority(env.PI_CLAUDE_SUPERVISOR_PERMISSION_AUTHORITY),
+    remoteAuthority: readRemoteAuthority(env.PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY),
+    remoteName: readRemoteName(env.PI_CLAUDE_SUPERVISOR_REMOTE_NAME),
     ...(readPositiveNumber(env.PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD) !== undefined ? { maxWorkerCostUsd: readPositiveNumber(env.PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD) } : {}),
   };
 }
@@ -229,6 +236,25 @@ function readBoundedDurationWithZeroOptOut(value: string | undefined, fallback: 
 function readTrimmedString(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+/** Remote authority never defaults on: an unset or unrecognised value keeps the Worker local. */
+function readRemoteAuthority(value: string | undefined): RemoteAuthority {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === undefined || normalized === "" || normalized === "none") return "none";
+  if (normalized === "push" || normalized === "pr") return normalized;
+  // A typo must not silently switch the publish phase off: a task would then
+  // end at a bare "candidate is ready" with no shortfall to explain it.
+  throw new Error(`PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY must be none, push or pr: ${value?.trim()}`);
+}
+
+function readRemoteName(value: string | undefined): string {
+  const trimmed = value?.trim();
+  if (trimmed === undefined || trimmed === "") return "origin";
+  // A typo must not silently redirect where a publish goes; the spec validator
+  // throws for the same input, so this fails the same way instead of guessing.
+  if (!isPlainRemoteName(trimmed)) throw new Error(`PI_CLAUDE_SUPERVISOR_REMOTE_NAME must be a plain remote name: ${trimmed}`);
+  return trimmed;
 }
 
 function readPermissionAuthority(value: string | undefined): PermissionAuthority {

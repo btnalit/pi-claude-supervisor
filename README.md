@@ -255,6 +255,108 @@ Supervisor being able to see it, or when you don't need to attach.
 - Only one cwd lease is held per task; concurrent tasks need separate
   worktrees.
 
+## Publishing a verified candidate
+
+By default a task ends at a **verified local candidate**: acceptance and the
+independent Reviewer pass, and the Worker never had remote authority at any
+point. `REMOTE_AUTHORITY=push` (or `--remote push`) adds a **publish phase**
+after that verdict: the Supervisor records the verified commit, grants a narrow
+one-shot authority, and asks the Worker to push its own branch. `pr` also lets
+it open a pull request. The Worker performs the push — the Supervisor never
+does — and the Supervisor then confirms it read-only (`git ls-remote`, and
+`gh pr list` for `pr`) before completing the task; the candidate notice carries
+the pull request URL. A publish that cannot be confirmed blocks the candidate,
+which stays deliverable locally.
+
+The grant is deliberately unforgiving, and both commands are matched literally —
+an option nobody reviewed is refused rather than assumed harmless. It admits
+exactly `git -C '<task directory>' -c core.hooksPath=/dev/null -c push.followTags=false push <remote> <verified commit>:refs/heads/<branch>`,
+with no other option. The refspec names the **verified commit**, not the branch:
+git pushes exactly that object, so a commit the Worker makes during the publish
+turn stays local ("Everything up-to-date") instead of riding the grant. `-C` is
+**required, absolute and byte for byte the task directory** — no normalization,
+no realpath — because Claude's Bash tool keeps its working directory between
+calls and `cd` is ordinary local work, so without it the grant could be spent
+in any other clone, and every looser comparison had a spelling the Supervisor
+resolved one way and git another (`.` against the Supervisor's cwd,
+`/proc/self/cwd`, and `<cwd>/link/..`, which Node's own realpath collapses
+lexically while the kernel follows the link). The instruction spells the exact
+directory, so no other spelling is needed. The hooks path is **pinned** on that one command so no
+`pre-push` hook a Worker could have installed (by any door: `git init
+--template=`, an archive, a `chmod`) runs inside the granted push with the
+Worker's credentials, and `push.followTags=false` is pinned so a
+`followTags=true` set through any file the policy never sees cannot make the
+one push also plant a tag the grant never named (a tag is what release
+automation keys on). Both are ref and hook selection, not transport, so they
+override no legitimate per-repository setting. For `pr` a `gh pr create --repo <pinned remote URL>
+--head <candidate branch> …` limited to title, body, base, draft, assignee and
+label: the pull request opens in the granted remote's repository, full stop —
+without `--repo`, gh picks a base repository from the remotes (`upstream` on a
+fork) that the grant never named and the confirmation never reads. The
+repository is the `host/owner/repo` behind the remote's URL (an SSH-config host
+alias is translated through `ssh -G`, as gh does); a remote whose URL is not
+one — a local path, an alias with no translation — gets no `pr` grant. Every
+word the grant supplies is shell-quoted, so a branch named `feat/$ticket` still
+round-trips through the policy.
+
+The grant is only issued for a commit that *is* the verified tree: the working
+tree must be clean (untracked files included — a new file may be part of the
+verified behavior), and HEAD must not have moved since the evidence the Reviewer
+judged was read. The repository's Git directory must be its own `.git` or a linked worktree's
+`.git/worktrees/<name>` (not a `--separate-git-dir` pointer). A dirty tree first costs a repair round asking the Worker to
+commit what belongs to the candidate; only when none is left, or when HEAD
+moved, does the task end at the local candidate with a `not published:` reason
+instead of a grant. A remote that cannot be reached at confirmation time leaves
+the publish *unconfirmed* (the candidate stays deliverable), never "refuted".
+
+Refused with or without a grant: every push option (`-u`, `--force`,
+`--force-with-lease`, `--delete`, `--mirror`, `--all`, `--tags`, `--no-verify`,
+`--push-option`, `--receive-pack`, …), any `-c` but the two pins (in that order), a
+branch or `HEAD` as the refspec source, a bare `git push`, another remote,
+branch or commit, a protected branch, a shell wrapper (`sh -c`, and a heredoc
+piped into a shell), a dynamic word, a second statement, `git push` without
+`-C`, a `-C` that is not the task directory byte for byte (another directory, a
+relative path, `/proc/self/cwd`, a symlink or `..` inside it),
+`gh pr create` without `--repo <pinned URL>` or without `--head <candidate
+branch>` (a `--head` swallowed as another option's value does not count),
+`gh pr create --body-file/-F/--template` (which would post the contents of an
+arbitrary local file), `--web`, another `--repo`, `gh pr merge`, `gh api`,
+`gh release` and `npm publish`. Changing the repository's remotes (`git remote
+set-url|add|rename|…`, behind git's own `--git-dir`/`--work-tree` options or
+`remote`'s own `-v` too) is denied outright, and so is reconfiguring where a
+push goes or what runs during it — `git config` writes to `remote.*`,
+`url.*.insteadOf`, `push.*`, `credential.*`, `http.*`, `include.path`/
+`includeIf.*`, `init.*`, `core.sshCommand` or `core.hooksPath`, `git config
+--edit`, `git init --template=…`, `git init|clone --separate-git-dir=…`, and any statement that names `.git/config` or
+`.git/hooks` unless it plainly only reads (`cat`, `grep`, `ls`, …) — so the
+granted remote cannot be repointed underneath the confirmation, which pins both
+the fetch and the push URL and scrubs `GIT_DIR`/`GIT_CONFIG_*` from its own
+environment. Behind all of that sits one rule the text guards do not need:
+the remote's resolved fetch and push URLs — **every** one of them
+(`git remote get-url --all` / `--push --all`; git pushes to each `pushurl`,
+not only the first it prints), rewrites applied — are recorded when the task
+**starts**, before the Worker runs a command, and required unchanged both
+when the grant is issued *and* at the moment the granted push is authorized.
+So a `pushInsteadOf`, `pushurl` or extra destination added during the task by
+*any* means (`~/.gitconfig`, a script, an include the policy never saw), even
+as the first command of the publish turn, refuses the push and revokes the
+grant, while an operator's pre-existing rewrite, already in the baseline, is
+not. A recovered task keeps its recorded baseline and never takes a new one;
+a remote that could not be resolved at the first start is recorded as such and
+never granted. This is a policy over the command text: a script the Worker writes
+and runs is outside what it can see, as [autonomy-target.md](docs/autonomy-target.md)
+says of every text-level rule; absolute isolation is the host boundary's job.
+
+The grant is **one-shot**: it is revoked the moment the publish turn completes,
+not when the next decision arrives, and it is pinned to the remote's URL as well
+as its name. A Worker that changes the tree during that turn voids it and is
+re-verified in full — an edit left uncommitted counts as a change, exactly like a new
+commit; because the grant named the commit, the notice can say whether the
+verified commit landed before the tree moved on. Before verification a refused push says the grant is coming
+rather than leaving the Worker to guess, and a task that ends without a
+confirmed publish says so in its candidate notice instead of reporting a bare
+"ready".
+
 ## Task specs
 
 `--spec file.json` accepts:
@@ -311,6 +413,8 @@ Environment variables (or `~/.config/pi-claude-supervisor/env`), all prefixed
 | `REQUIRE_LOCAL_COMMIT` | `true` | Require a local commit on the candidate's branch before completion |
 | `MAX_DECISION_RETRIES` | `2` (0–10) | Retries of a Decision Worker call that times out or fails (429/529, network, auth) |
 | `PERMISSION_AUTHORITY` | `hybrid` | `policy` \| `hybrid` \| `decision-worker` |
+| `REMOTE_AUTHORITY` | `none` | `none` \| `push` \| `pr`; grants the publish phase after verification passes. `--remote` overrides it per task |
+| `REMOTE_NAME` | `origin` | The single remote a publish grant may name |
 | `WORKER_MAX_BUDGET_USD` | unset | Hard cap passed as `--max-budget-usd`; unavailable to interactive tmux |
 | `WORKER_MODEL` | unset (Claude's own default) | `--model` for the Claude Worker |
 | `WORKER_AUTOCOMPACT_TOKENS` | `200000` in automatic mode | Per-turn context bound; `0` keeps Claude's own default |

@@ -1,10 +1,11 @@
+import { isPlainRemoteName } from "./policy.ts";
 import type { AcceptanceCheck, TaskSpec } from "./types.ts";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_REPAIR_ROUNDS = 3;
 
 /** Normalize legacy plain-text tasks into the structured acceptance model. */
-export function normalizeTaskSpec(value: unknown, fallbackGoal: string): TaskSpec {
+export function normalizeTaskSpec(value: unknown, fallbackGoal: string, autonomyDefaults?: Partial<TaskSpec["autonomy"]>): TaskSpec {
   if (value !== undefined && (!value || typeof value !== "object" || Array.isArray(value))) {
     throw new Error("task spec must be a JSON object");
   }
@@ -18,7 +19,7 @@ export function normalizeTaskSpec(value: unknown, fallbackGoal: string): TaskSpe
     forbidden: stringList(source.forbidden, "forbidden"),
     acceptance: normalizeChecks(source.acceptance),
     maxRepairRounds: normalizeRepairRounds(source.maxRepairRounds),
-    autonomy: normalizeAutonomy(source.autonomy),
+    autonomy: normalizeAutonomy(source.autonomy, autonomyDefaults),
   };
 }
 
@@ -84,23 +85,32 @@ function normalizeRepairRounds(value: unknown): number {
   return value;
 }
 
-function normalizeAutonomy(value: unknown): TaskSpec["autonomy"] {
-  if (value === undefined) return { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid" };
+function normalizeAutonomy(value: unknown, defaults?: Partial<TaskSpec["autonomy"]>): TaskSpec["autonomy"] {
+  // A spec file that omits a key — or the whole block — must not silently
+  // override the operator's environment defaults with hardcoded ones;
+  // `defaults` carries them in and every key falls back to it.
+  if (value === undefined) return normalizeAutonomy({}, defaults);
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("task spec autonomy must be an object");
   const source = value as Record<string, unknown>;
   if (source.unattended !== undefined && typeof source.unattended !== "boolean") throw new Error("task spec autonomy.unattended must be boolean");
   if (source.requireLocalCommit !== undefined && typeof source.requireLocalCommit !== "boolean") throw new Error("task spec autonomy.requireLocalCommit must be boolean");
-  const retries = source.maxDecisionRetries ?? 2;
+  const retries = source.maxDecisionRetries ?? defaults?.maxDecisionRetries ?? 2;
   if (typeof retries !== "number" || !Number.isSafeInteger(retries) || retries < 0 || retries > 10) throw new Error("task spec autonomy.maxDecisionRetries must be between 0 and 10");
-  const authority = source.permissionAuthority ?? "hybrid";
+  const authority = source.permissionAuthority ?? defaults?.permissionAuthority ?? "hybrid";
   if (authority !== "policy" && authority !== "hybrid" && authority !== "decision-worker") throw new Error("task spec autonomy.permissionAuthority must be policy, hybrid or decision-worker");
-  const maxWorkerCostUsd = source.maxWorkerCostUsd;
+  const remoteAuthority = source.remoteAuthority ?? defaults?.remoteAuthority ?? "none";
+  if (remoteAuthority !== "none" && remoteAuthority !== "push" && remoteAuthority !== "pr") throw new Error("task spec autonomy.remoteAuthority must be none, push or pr");
+  const remoteName = source.remoteName ?? defaults?.remoteName ?? "origin";
+  if (!isPlainRemoteName(remoteName)) throw new Error("task spec autonomy.remoteName must be a plain remote name");
+  const maxWorkerCostUsd = source.maxWorkerCostUsd ?? defaults?.maxWorkerCostUsd;
   if (maxWorkerCostUsd !== undefined && (typeof maxWorkerCostUsd !== "number" || !Number.isFinite(maxWorkerCostUsd) || maxWorkerCostUsd <= 0)) throw new Error("task spec autonomy.maxWorkerCostUsd must be a positive number");
   return {
-    unattended: source.unattended !== false,
-    requireLocalCommit: source.requireLocalCommit !== false,
+    unattended: (source.unattended ?? defaults?.unattended) !== false,
+    requireLocalCommit: (source.requireLocalCommit ?? defaults?.requireLocalCommit) !== false,
     maxDecisionRetries: retries,
     permissionAuthority: authority,
+    remoteAuthority,
+    remoteName,
     ...(maxWorkerCostUsd !== undefined ? { maxWorkerCostUsd } : {}),
   };
 }

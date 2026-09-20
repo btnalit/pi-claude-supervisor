@@ -21,6 +21,17 @@ const inheritedNames = [
  * Build the baseline Worker environment. The small inherited set keeps manual
  * embedding behavior stable; callers may add any explicit variables they need.
  */
+/**
+ * Claude's configuration directory: `CLAUDE_CONFIG_DIR` when set, else
+ * `~/.claude` under the effective home. One derivation for every place that
+ * reasons about Claude's files, so a relocated config directory is honored
+ * everywhere or nowhere.
+ */
+export function claudeConfigDir(env: NodeJS.ProcessEnv = process.env): string {
+  const effectiveHome = env.HOME?.trim() ? resolve(env.HOME) : homedir();
+  return env.CLAUDE_CONFIG_DIR ? resolve(env.CLAUDE_CONFIG_DIR) : join(effectiveHome, ".claude");
+}
+
 export function workerEnvironment(
   inherited: NodeJS.ProcessEnv = process.env,
   explicit: NodeJS.ProcessEnv = {},
@@ -204,8 +215,7 @@ async function automaticClaudeSettings(cwd: string, args: readonly string[], env
     }
   }
 
-  const effectiveHome = env.HOME?.trim() ? resolve(env.HOME) : homedir();
-  const configDir = env.CLAUDE_CONFIG_DIR ? resolve(env.CLAUDE_CONFIG_DIR) : join(effectiveHome, ".claude");
+  const configDir = claudeConfigDir(env);
   const paths = new Set<string>([
     join(configDir, "settings.json"),
     "/etc/claude-code/managed-settings.json",

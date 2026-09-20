@@ -3,7 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { constants as fsConstants, lstatSync, readdirSync, unlinkSync } from "node:fs";
 import { access, chmod, lstat, mkdir, open, readdir, readFile, realpath, rm, rmdir, stat, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import type {
   PermissionDecision,
   WorkerAdapter,
@@ -16,9 +16,9 @@ import type {
 } from "../types.ts";
 import type { ClaudeHookEvent, HookEventSource, HookRelayReply, HookRelayRequest } from "../hooks/types.ts";
 import { HOOK_TIMEOUT_SECONDS } from "../hooks/types.ts";
-import { assertSafeWorkerCommand } from "../policy.ts";
+import { assertSafeWorkerCommand, sameDirectory, shellQuote } from "../policy.ts";
 import { redactSensitive } from "../redaction.ts";
-import { automaticWorkerEnvironment, workerEnvironment } from "./environment.ts";
+import { automaticWorkerEnvironment, claudeConfigDir, workerEnvironment } from "./environment.ts";
 import { claudeJsonlArgs, cleanupCgroup, currentCgroupPath, preflightCgroupContainment } from "./process-adapter.ts";
 import { isClaudeLauncherProcess, readProcess, type ProcessTreeEntry } from "./process-tree.ts";
 import { nodeScriptCommand } from "./runtime.ts";
@@ -120,6 +120,14 @@ interface TmuxRecord {
   hookUnsubscribe?: () => Promise<void>;
   claudeSessionId?: string;
   transcriptPath?: string;
+  /**
+   * The configuration directory of the adopted Claude process itself, read from
+   * its environment at adoption: a session started with another
+   * `CLAUDE_CONFIG_DIR` or `HOME` keeps its memory there, not where this
+   * Supervisor's environment says. Absent for an owned session, whose
+   * environment is this process's.
+   */
+  claudeConfigDir?: string;
   /** Claude Code's per-session scratchpad directory (from SessionStart); an extra write root for the policy. */
   scratchpadDir?: string;
   /** Primary readiness signal for interactive startup: SessionStart observed. */
@@ -1385,6 +1393,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     // Claude pid rather than the launcher.
     record.claudePid = claudePid;
     record.claudeStartTime = claudeStartTime;
+    record.claudeConfigDir = await processConfigDir(claudePid);
     if (expected?.startTime && record.paneStartTime !== expected.startTime) throw new Error("tmux pane process start time changed; refusing identity-unverified handoff");
     if (expected?.paneStartTime && record.paneStartTime !== expected.paneStartTime) throw new Error("tmux pane identity changed; refusing identity-unverified handoff");
     if (expected?.paneCommand && record.paneCommand !== expected.paneCommand) throw new Error("tmux pane command changed; refusing identity-unverified handoff");
@@ -1997,7 +2006,11 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     // Every hook event carries `transcript_path`, and an adopted session never
     // replays SessionStart, so capture it here rather than only at startup:
     // it is what locates Claude's own per-project memory directory below.
-    if (!record.transcriptPath && isSafeAbsolutePath(event.transcript_path)) record.transcriptPath = event.transcript_path;
+    // Only a path that locates *this* task's memory root is kept: the first
+    // event after adoption may come from a subagent, whose transcript sits
+    // under `<slug>/<session>/subagents/` and would otherwise freeze a path
+    // `memoryRootFor` rejects for the task's whole lifetime.
+    if (!record.transcriptPath && isSafeAbsolutePath(event.transcript_path) && memoryRootFor(event.transcript_path, record.handle.cwd, record.claudeConfigDir ?? claudeConfigDir())) record.transcriptPath = event.transcript_path;
     switch (event.hook_event_name) {
       case "SessionStart": {
         record.claudeSessionId ??= event.session_id;
@@ -2163,8 +2176,18 @@ function bridgeEnvironment(env: NodeJS.ProcessEnv, cwd: string, command: string,
 
 /** Same shape the decision-session registry requires of an untrusted absolute path. */
 function isSafeAbsolutePath(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= 4_096
+  return typeof value === "string" && value.length > 0 && value.length <= 4_096 && !value.includes("\0")
     && isAbsolute(value) && String(redactSensitiveText(value)) === value;
+}
+
+/**
+ * The directory name Claude gives a project under `<config>/projects/`: every
+ * character outside `[A-Za-z0-9]` becomes `-` (`cwd.replace(/[^a-zA-Z0-9]/g, "-")`
+ * in the Claude Code bundle), so `/srv/foo.bar` and `/home/u/my_app` are
+ * `-srv-foo-bar` and `-home-u-my-app`, not merely the slashes swapped.
+ */
+export function claudeProjectSlug(cwd: string): string {
+  return cwd.replace(/[^A-Za-z0-9]/gu, "-");
 }
 
 /**
@@ -2172,29 +2195,54 @@ function isSafeAbsolutePath(value: unknown): value is string {
  * reported transcript path is not this project's session transcript.
  *
  * `transcript_path` is untrusted hook input, so the shape is checked rather
- * than trusted: it must be `<…>/.claude/projects/<slug>/<session>.jsonl` whose
- * `<slug>` is the one Claude derives from this task's cwd. That rejects a
- * subagent transcript (`<slug>/<session>/subagents/agent-*.jsonl`, which would
- * otherwise freeze a bogus root) and any path naming another project, a home
- * directory, or somewhere inside the repository.
+ * than trusted: it must be `<config>/projects/<slug>/<session>.jsonl` where
+ * `<config>` is Claude's real configuration directory (`CLAUDE_CONFIG_DIR` or
+ * `~/.claude`, compared by real path) and `<slug>` is the one Claude derives
+ * from this task's cwd. That rejects a subagent transcript
+ * (`<slug>/<session>/subagents/agent-*.jsonl`, which would otherwise freeze a
+ * bogus root), any path naming another project, and a forged
+ * `<anywhere>/.claude/projects/<slug>/x.jsonl` that only imitates the shape.
  */
-export function memoryRootFor(transcriptPath: string | undefined, cwd: string): string | undefined {
+export function memoryRootFor(transcriptPath: string | undefined, cwd: string, configDir: string = claudeConfigDir()): string | undefined {
   if (!transcriptPath || !cwd) return undefined;
   const sessionDir = dirname(transcriptPath);
   const projectsDir = dirname(sessionDir);
-  if (basename(projectsDir) !== "projects" || basename(dirname(projectsDir)) !== ".claude") return undefined;
-  if (basename(sessionDir) !== cwd.replaceAll("/", "-")) return undefined;
+  if (!sameDirectory(projectsDir, join(configDir, "projects"), "lexical")) return undefined;
+  if (basename(sessionDir) !== claudeProjectSlug(cwd)) return undefined;
   return join(sessionDir, "memory");
+}
+
+/**
+ * The configuration directory a running Claude process uses, from its own
+ * environment (`/proc/<pid>/environ`, readable for a same-user process), or
+ * undefined when it cannot be read — then this process's own derivation
+ * applies, which is right for every session this Supervisor started.
+ */
+async function processConfigDir(pid: number): Promise<string | undefined> {
+  try {
+    const raw = await readFile(`/proc/${pid}/environ`);
+    const env: NodeJS.ProcessEnv = {};
+    for (const entry of raw.toString("utf8").split("\0")) {
+      const separator = entry.indexOf("=");
+      if (separator <= 0) continue;
+      const name = entry.slice(0, separator);
+      if (name === "CLAUDE_CONFIG_DIR" || name === "HOME") env[name] = entry.slice(separator + 1);
+    }
+    const dir = claudeConfigDir(env);
+    return isAbsolute(dir) && !dir.includes("\0") ? dir : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
  * The directories outside the task cwd that the Worker may still write: its own
  * per-session scratchpad, and Claude's per-project memory directory.
  */
-export function writeRootsOf(record: { scratchpadDir?: string; transcriptPath?: string; handle?: { cwd: string } }): string[] {
+export function writeRootsOf(record: { scratchpadDir?: string; transcriptPath?: string; claudeConfigDir?: string; handle?: { cwd: string } }, configDir: string = record.claudeConfigDir ?? claudeConfigDir()): string[] {
   const roots: string[] = [];
   if (record.scratchpadDir) roots.push(record.scratchpadDir);
-  const memory = memoryRootFor(record.transcriptPath, record.handle?.cwd ?? "");
+  const memory = memoryRootFor(record.transcriptPath, record.handle?.cwd ?? "", configDir);
   if (memory) roots.push(memory);
   return roots;
 }
@@ -2400,10 +2448,6 @@ function matchesPendingMessage(pending: string, prompt: string): boolean {
   if (normalizedPending === normalizedPrompt) return true;
   const prefixLength = 200;
   return normalizedPending.slice(0, prefixLength) === normalizedPrompt.slice(0, prefixLength);
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {

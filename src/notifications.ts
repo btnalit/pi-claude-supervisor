@@ -99,7 +99,7 @@ function toGeneric(notice: HumanInterventionNotice | CandidateNotice): Record<st
     question: sanitize(notice.question),
     permission: notice.permission ? sanitize(notice.permission) : undefined,
     ...(notice.attach ? { attach: sanitize(notice.attach) } : {}),
-    ...(candidate ? { status: notice.status, deliverable: notice.deliverable, ...(notice.usage ? { usage: usageSummary(notice.usage) } : {}) } : { actions: ["approve_or_deny_permission", "send_instruction", "stop_worker", "takeover"] }),
+    ...(candidate ? { status: notice.status, deliverable: notice.deliverable, ...(notice.prUrl ? { prUrl: sanitize(notice.prUrl) } : {}), ...(notice.usage ? { usage: usageSummary(notice.usage) } : {}) } : { actions: ["approve_or_deny_permission", "send_instruction", "stop_worker", "takeover"] }),
     note: candidate
       ? "This is an optional candidate notification. It does not grant remote push or main/integration merge permission."
       : "This is an outbound notification. Use the Pi session or a separately authenticated callback service to approve actions.",
@@ -111,6 +111,9 @@ function toWeCom(notice: HumanInterventionNotice | CandidateNotice): Record<stri
   const permission = notice.permission ? `\n工具: ${safeText(notice.permission.toolName)}\n请求 ID: ${safeText(notice.permission.requestId)}` : "";
   const question = notice.question ? `\n问题: ${safeText(notice.question)}` : "";
   const attach = notice.attach ? `\n接入: ${safeText(notice.attach)}` : "";
+  // Not Markdown-escaped: `escapeMarkdown` would turn an `_` in the org or
+  // repository name into `\_` and break the link. The URL is already sanitized.
+  const pullRequest = "status" in notice && notice.prUrl ? `\nPR: ${safeText(notice.prUrl)}` : "";
   const title = candidate ? "Claude Supervisor 候选状态" : "Claude Supervisor 需要人工介入";
   const usage = candidate && notice.usage ? `\n> Worker 费用: $${notice.usage.workerCostUsd.toFixed(2)} (${notice.usage.workerTurns} turns)\n> Pi tokens: ${usageSummary(notice.usage).piTokens}` : "";
   const suffix = candidate
@@ -119,7 +122,7 @@ function toWeCom(notice: HumanInterventionNotice | CandidateNotice): Record<stri
   return {
     msgtype: "markdown",
     markdown: {
-      content: `### ${title}\n> 任务: ${safeText(notice.task)}\n> Task ID: ${safeText(notice.taskId)}\n> 原因: ${safeText(notice.reason)}${escapeMarkdown(question)}${escapeMarkdown(permission)}${escapeMarkdown(attach)}${suffix}`,
+      content: `### ${title}\n> 任务: ${safeText(notice.task)}\n> Task ID: ${safeText(notice.taskId)}\n> 原因: ${safeText(notice.reason)}${escapeMarkdown(question)}${escapeMarkdown(permission)}${escapeMarkdown(attach)}${pullRequest}${suffix}`,
     },
   };
 }

@@ -1,5 +1,6 @@
 import { BLOCKING_HOOK_EVENTS, HOOK_TIMEOUT_SECONDS } from "./types.ts";
 import { nodeScriptCommand } from "../worker/runtime.ts";
+import { shellQuote } from "../policy.ts";
 
 /**
  * Plain JavaScript (no TypeScript syntax), executed by Claude Code as a hook
@@ -185,7 +186,3 @@ export function hookRelayCommand(relayPath: string): string {
   return `${shellQuote(nodeScriptCommand())} ${shellQuote(relayPath)}`;
 }
 
-function shellQuote(value: string): string {
-  if (/^[A-Za-z0-9_.\/-]+$/u.test(value)) return value;
-  return `'${value.replace(/'/gu, "'\\''")}'`;
-}

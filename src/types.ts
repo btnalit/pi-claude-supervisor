@@ -235,7 +235,19 @@ export interface TaskAutonomy {
   permissionAuthority: PermissionAuthority;
   /** Park the candidate once the Worker's cumulative API cost exceeds this amount; undefined disables the cap. */
   maxWorkerCostUsd?: number;
+  /**
+   * Remote authority for the publish phase. `none` (the default) keeps the
+   * Worker entirely local: the task ends at a verified candidate. `push` lets
+   * the Supervisor grant one push of that candidate's own branch once its
+   * acceptance and Reviewer have passed; `pr` additionally allows opening a
+   * pull request. Never a merge, a force-push, a tag or a release.
+   */
+  remoteAuthority: RemoteAuthority;
+  /** The single remote a publish grant may name; defaults to `origin`. */
+  remoteName: string;
 }
+
+export type RemoteAuthority = "none" | "push" | "pr";
 
 export type PermissionAuthority = "policy" | "hybrid" | "decision-worker";
 
@@ -299,6 +311,14 @@ export interface TaskContext {
   baseCommit?: string;
   /** The branch the task started on; the Worker may move to another branch, the baseline commit stays the anchor. */
   baseBranch?: string;
+  /**
+   * Where the granted remote fetched from and pushed to when the task started,
+   * URL rewrites applied. A publish grant requires the same two URLs at grant
+   * time: a `url.*.insteadOf`/`pushInsteadOf` or `pushurl` added during the
+   * task by any means — a config file the policy never sees included — changes
+   * one of them and is refused, while an operator's pre-existing rewrite is not.
+   */
+  remoteBaseline?: { fetch: string[]; push: string[] };
   spec: TaskSpec;
   repairRound: number;
   lastFindingSignature?: string;

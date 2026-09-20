@@ -15,7 +15,7 @@ test("legacy tasks receive a default acceptance check", () => {
   assert.equal(spec.goal, "inspect the repository");
   assert.deepEqual(spec.acceptance.map((check) => check.id), ["diff-check"]);
   assert.equal(spec.maxRepairRounds, 3);
-  assert.deepEqual(spec.autonomy, { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid" });
+  assert.deepEqual(spec.autonomy, { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
 });
 
 test("task specs validate checks and reject duplicate ids", () => {
@@ -194,4 +194,24 @@ test("verifyAll records timeout evidence and bounds check output", async () => {
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+});
+
+test("remote authority is validated and defaults to none", () => {
+  assert.equal(normalizeTaskSpec({ goal: "g" }, "g").autonomy.remoteAuthority, "none");
+  assert.equal(normalizeTaskSpec({ goal: "g", autonomy: { remoteAuthority: "pr" } }, "g").autonomy.remoteAuthority, "pr");
+  assert.equal(normalizeTaskSpec({ goal: "g", autonomy: { remoteName: "upstream" } }, "g").autonomy.remoteName, "upstream");
+  assert.throws(() => normalizeTaskSpec({ goal: "g", autonomy: { remoteAuthority: "merge" } }, "g"), /remoteAuthority must be none, push or pr/u);
+  assert.throws(() => normalizeTaskSpec({ goal: "g", autonomy: { remoteName: "a b" } }, "g"), /remoteName must be a plain remote name/u);
+});
+
+test("a spec file that omits a key, or the whole autonomy block, keeps the operator's environment defaults", () => {
+  const defaults = { unattended: false, requireLocalCommit: false, maxDecisionRetries: 5, permissionAuthority: "policy" as const, remoteAuthority: "push" as const, remoteName: "upstream", maxWorkerCostUsd: 3 };
+  // No block at all is the common spec file; it must not fall back to hardcoded values.
+  assert.deepEqual(normalizeTaskSpec({ goal: "g" }, "g", defaults).autonomy, defaults);
+  assert.deepEqual(normalizeTaskSpec({ goal: "g", autonomy: {} }, "g", defaults).autonomy, defaults);
+  // A key the spec does name wins over the default, key by key.
+  const partial = normalizeTaskSpec({ goal: "g", autonomy: { remoteAuthority: "none", unattended: true } }, "g", defaults).autonomy;
+  assert.deepEqual(partial, { ...defaults, remoteAuthority: "none", unattended: true });
+  // Without defaults the hardcoded values still apply.
+  assert.deepEqual(normalizeTaskSpec({ goal: "g" }, "g").autonomy, { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
 });

@@ -1,11 +1,24 @@
 import { lstatSync, realpathSync, statSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 
 export type PolicyDecision = "allow" | "review" | "deny";
 
 export interface PolicyResult {
   decision: PolicyDecision;
   reason: string;
+  /**
+   * Set on a denial of the remote-repository boundary itself — a push, merge,
+   * pull request or remote mutation — so the Supervisor's publish hint answers
+   * that refusal and not an unrelated denial (an HTTP mutation, an outside-cwd
+   * write) that happens to share words with it.
+   */
+  boundary?: "remote";
+  /**
+   * Set only when a live publish grant admitted the command. The Supervisor
+   * issued that grant itself, so the request is answered locally rather than
+   * routed to a Decision Worker whose standing rule is to refuse a push.
+   */
+  granted?: true;
 }
 
 /**
@@ -18,7 +31,102 @@ export interface PolicyResult {
 export interface PermissionPolicyOptions {
   /** Extra directories the Worker may write to (Claude's per-session scratchpad); each must be an absolute path. */
   writeRoots?: readonly string[];
+  /** A publish-phase grant; absent (the default) keeps the Worker with no remote authority at all. */
+  remote?: RemoteGrant;
 }
+
+/**
+ * Narrow, time-boxed remote authority for the publish phase. The Supervisor
+ * issues it only after its own acceptance and Reviewer passed, and only for the
+ * verified candidate's own branch, so an unverified Worker can never reach a
+ * remote. `pr` implies `push`.
+ */
+export interface RemoteGrant {
+  authority: "push" | "pr";
+  /** The single remote the grant covers, e.g. `origin`. */
+  remoteName: string;
+  /** The candidate branch the verified commit is published to; a pull request must name it with `--head`. */
+  branch: string;
+  /**
+   * The verified commit. A granted push must name it as the refspec source
+   * (`<head>:refs/heads/<branch>`), so a commit made after verification can
+   * never ride the grant: git pushes exactly that object or nothing.
+   */
+  head: string;
+  /** The task working directory; a granted push must name it with an absolute `-C`, so the grant cannot be spent in another clone. */
+  cwd: string;
+  /**
+   * The granted remote's repository as `host/owner/repo`, resolved from its
+   * fetch URL when the grant was issued (an SSH-config host alias translated
+   * the way gh translates it). Under `pr` a pull request must name it with
+   * `--repo`: gh otherwise resolves a base repository from the remotes and
+   * prefers `upstream` on a fork, which is not the repository the grant named
+   * and not the one the confirmation reads. A pull request opens in the
+   * granted remote's repository, full stop.
+   */
+  repository?: string;
+}
+
+/** A full git object id (SHA-1 or SHA-256), lowercase or not. One test for the grant, the evidence and the baseline. */
+export function isCommitId(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{40,64}$/iu.test(value);
+}
+
+/** A remote name git accepts verbatim; anything else could be an option or a path. One test for the env default and the spec. */
+export function isPlainRemoteName(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9._-]+$/u.test(value);
+}
+
+/** The hooks path the granted push must carry, so no hook a Worker could have installed runs inside the one granted command. */
+export const GRANTED_HOOKS_PATH = "/dev/null";
+/**
+ * The `-c` settings the granted push must carry, in this order: the hooks path
+ * (no installed hook runs inside the command) and `push.followTags=false` (no
+ * annotated tag rides along — `push.followTags=true` set through a file the
+ * policy never sees would otherwise make the one granted push also plant a
+ * tag the grant never named, and a tag is what release automation keys on).
+ * Both are ref/hook selection, not transport, so pinning them overrides no
+ * legitimate per-repository setting.
+ */
+export const GRANTED_PUSH_SETTINGS = [`core.hooksPath=${GRANTED_HOOKS_PATH}`, "push.followTags=false"] as const;
+
+/**
+ * A word quoted for a POSIX shell: plain words pass through, anything else is
+ * single-quoted with embedded quotes escaped. The one quoter for the hook
+ * relay, the tmux attach hint and the publish instruction, which must all
+ * produce what the policy's lexer reads back as a single literal token.
+ */
+export function shellQuote(value: string): string {
+  if (/^[A-Za-z0-9_.\/-]+$/u.test(value)) return value;
+  return `'${value.replace(/'/gu, "'\\''")}'`;
+}
+
+/**
+ * The one push a grant admits, spelled the way `permittedRemoteCommand` reads
+ * it. Kept beside the parser so the instruction the Supervisor sends and the
+ * shape the policy accepts cannot drift apart. Every word the grant supplies
+ * is shell-quoted — the directory for a space, the refspec and branch because
+ * a legal branch name may carry `$`, `{}` or a quote that the lexer would
+ * otherwise read as dynamic — the hooks path is pinned so no `pre-push` runs,
+ * and the verified commit is the refspec source.
+ */
+export function publishCommand(grant: RemoteGrant): string {
+  return `git -C ${shellQuote(grant.cwd)} ${GRANTED_PUSH_SETTINGS.map((setting) => `-c ${setting}`).join(" ")} push ${shellQuote(grant.remoteName)} ${shellQuote(`${grant.head}:refs/heads/${grant.branch}`)}`;
+}
+
+/** The one `gh pr create` prefix a `pr` grant admits; the Worker appends its title and body. */
+export function pullRequestCommand(grant: RemoteGrant): string {
+  return `gh pr create --repo ${shellQuote(grant.repository ?? "")} --head ${shellQuote(grant.branch)}`;
+}
+/**
+ * The only options a granted `gh pr create` may carry. An allowlist, because an
+ * unlisted option is how a grant leaks: `--body-file`/`-F`/`--template` post the
+ * contents of an arbitrary local file, `-H` retargets the head branch, and `-w`
+ * is `--web`.
+ */
+const ALLOWED_PR_CREATE_OPTIONS = new Set(["-t", "--title", "-b", "--body", "-B", "--base", "--draft", "-d", "--fill", "--fill-first", "-a", "--assignee", "-l", "--label", "-H", "--head", "-R", "--repo"]);
+/** `gh pr create` options that take a value; the value is the next word. */
+const PR_CREATE_VALUE_OPTIONS = new Set(["-t", "--title", "-b", "--body", "-B", "--base", "-a", "--assignee", "-l", "--label", "-H", "--head", "-R", "--repo"]);
 
 export function evaluatePermission(toolName: string, input: unknown, cwd = process.cwd(), options: PermissionPolicyOptions = {}): PolicyResult {
   if (toolName === "AskUserQuestion") return { decision: "deny", reason: "interactive questions are converted to ordinary Worker text" };
@@ -29,9 +137,10 @@ export function evaluatePermission(toolName: string, input: unknown, cwd = proce
     if (violation?.classification === "outside-cwd") {
       // Only name an alternative the Worker actually has: writeRoots is empty
       // for a bridge Worker and before an adopted session's first hook event.
-      const alternatives = (options.writeRoots ?? []).length > 0 ? `; scratch work may go under ${(options.writeRoots ?? []).join(", ")}` : "";
+      const alternatives = (options.writeRoots ?? []).length > 0 ? `; writes are also allowed under ${(options.writeRoots ?? []).join(", ")}` : "";
       return { decision: "deny", reason: `Worker cannot write outside the task working directory: ${violation.path}${alternatives}` };
     }
+    if (violation?.classification === "cwd-missing") return { decision: "deny", reason: `the task working directory no longer exists, so nothing can be written under it: ${violation.path}` };
     if (violation?.classification === "git-metadata") return { decision: "deny", reason: "Worker cannot write Git metadata or protected branch refs" };
     return { decision: "allow", reason: `local Claude file tool is allowed by the task policy: ${toolName}` };
   }
@@ -42,7 +151,7 @@ export function evaluatePermission(toolName: string, input: unknown, cwd = proce
   if (!command) return { decision: "deny", reason: "Bash request has no recognizable command" };
   // Lex the command itself: wrapping it as a literal `bash -lc` argument would
   // hide its structure (heredoc bodies, dynamic words) from the token checks.
-  return evaluateCommand(command);
+  return evaluateCommand(command, [], options.remote);
 }
 
 function fileToolPaths(input: unknown): string[] {
@@ -53,18 +162,20 @@ function fileToolPaths(input: unknown): string[] {
     .filter((path): path is string => typeof path === "string" && path.trim().length > 0);
 }
 
-type WritePathViolation = "outside-cwd" | "git-metadata";
+type WritePathViolation = "outside-cwd" | "git-metadata" | "cwd-missing";
 
 /**
  * `realpath` of the deepest ancestor that exists, with the not-yet-created tail
  * re-appended. Plain `realpathSync` throws for a directory the Worker is about
- * to create, and the caller cannot tell that apart from a hostile path.
+ * to create, and the caller cannot tell that apart from a hostile path. Used
+ * for the write roots only: a task cwd that does not exist is refused, not
+ * tolerated (see `classifyWritePath`).
  */
 function resolveExistingPath(path: string): string {
   let current = resolve(path);
   const missing: string[] = [];
   for (;;) {
-    try { return join(realpathSync(current), ...[...missing].reverse()); }
+    try { return join(realpathSync.native(current), ...[...missing].reverse()); }
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "ENOENT" && code !== "ENOTDIR") return resolve(path);
@@ -76,38 +187,65 @@ function resolveExistingPath(path: string): string {
   }
 }
 
+/**
+ * The part of `value` below `root`, taken by raw string prefix rather than
+ * `path.relative`, which normalizes `link/../x` to `x` before the per-segment
+ * walk could see the symlink. Tried against both spellings of the root — the
+ * one the caller gave and its real path — so a root reached through a
+ * symlinked ancestor (a dotfile-managed ~/.claude, /var on macOS) matches
+ * however the Worker spelled it. Undefined when the value is not under the root.
+ */
+function pathBelow(value: string, roots: readonly string[]): string | undefined {
+  const raw = value.replaceAll("\\", "/");
+  for (const root of roots) {
+    const canonical = root.replaceAll("\\", "/").replace(/\/+$/u, "") || "/";
+    const prefix = canonical === "/" ? "/" : `${canonical}/`;
+    if (raw === canonical) return "";
+    if (raw.startsWith(prefix)) return raw.slice(prefix.length);
+  }
+  return undefined;
+}
+
 function classifyWritePath(value: string, cwd: string, writeRoots: readonly string[] = []): WritePathViolation | undefined {
   if (value.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return "git-metadata";
-  // A path inside an extra write root (Claude's own scratchpad) is judged
-  // against that root instead of the cwd, with the same symlink/metadata rules.
-  for (const root of writeRoots) {
-    if (!isAbsolute(root) || !isAbsolute(value)) continue;
-    // Resolve both sides before comparing: a write root reached through a
-    // symlinked ancestor (a dotfile-managed ~/.claude, /var on macOS) would
-    // otherwise be judged outside itself. The final component stays unresolved
-    // so the per-segment symlink and `.git` checks below still see it.
-    const resolvedRoot = resolveExistingPath(root);
-    const resolvedValue = join(resolveExistingPath(dirname(value)), basename(value));
-    const rel = relative(resolvedRoot, resolvedValue);
-    if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) continue;
-    return classifyWritePath(resolvedValue, resolvedRoot);
-  }
-  // A write root need not exist yet: Claude creates its memory directory on
-  // the first write, and failing closed there denied the very write the
-  // outside-cwd message points at.
-  const root = resolveExistingPath(cwd);
-  const raw = value.replaceAll("\\", "/");
-  const canonicalRoot = root.replaceAll("\\", "/").replace(/\/+$/u, "") || "/";
-  let components: string[];
+  // A path inside an extra write root (Claude's own scratchpad or memory
+  // directory) is judged against that root instead of the cwd, with the same
+  // per-segment symlink and metadata rules. A root need not exist yet: Claude
+  // creates its memory directory on the first write, and failing closed there
+  // denied the very write the outside-cwd message points at. Each root is
+  // resolved once; the walk below never re-resolves it.
   if (isAbsolute(value)) {
-    const prefix = canonicalRoot === "/" ? "/" : `${canonicalRoot}/`;
-    if (raw !== canonicalRoot && !raw.startsWith(prefix)) return "outside-cwd";
-    components = raw === canonicalRoot ? [] : raw.slice(prefix.length).split("/");
-  } else {
-    components = raw.split("/");
+    for (const root of writeRoots) {
+      if (!isAbsolute(root)) continue;
+      const resolvedRoot = resolveExistingPath(root);
+      const below = pathBelow(value, [root, resolvedRoot]);
+      if (below === undefined) continue;
+      return walkWritePath(below, resolvedRoot);
+    }
   }
+  // The task cwd itself is resolved fail-closed: a cwd that no longer exists
+  // (deleted, or its mount gone) must not have its writes allowed on whatever
+  // filesystem now sits there, which the Write tool's `mkdir -p` would create.
+  let root: string;
+  try { root = realpathSync.native(cwd); }
+  catch { return "cwd-missing"; }
+  if (isAbsolute(value)) {
+    const below = pathBelow(value, [cwd, root]);
+    if (below === undefined) return "outside-cwd";
+    return walkWritePath(below, root);
+  }
+  return walkWritePath(value, root);
+}
+
+/**
+ * Walk a path relative to an already-resolved root one segment at a time,
+ * refusing `..` that would climb out, any `.git` segment, and any segment that
+ * is (or fails to be inspected as) a symlink — the kernel would follow it out
+ * of the root even though the pathname stays inside.
+ */
+function walkWritePath(relativePath: string, root: string): WritePathViolation | undefined {
   const normalized: string[] = [];
-  for (const segment of components) {
+  for (const segment of relativePath.replaceAll("\\", "/").split("/")) {
     if (!segment || segment === ".") continue;
     if (segment === "..") {
       if (normalized.length === 0) return "outside-cwd";
@@ -131,7 +269,7 @@ function classifyWritePath(value: string, cwd: string, writeRoots: readonly stri
     // A regular file with multiple links may be an alias for a Git ref or
     // other metadata file even when its pathname contains no `.git` segment.
     if (info.isFile() && info.nlink > 1) return "git-metadata";
-    const resolved = realpathSync(absolute);
+    const resolved = realpathSync.native(absolute);
     if (resolved.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return "git-metadata";
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -164,6 +302,127 @@ interface ShellToken {
 }
 
 const protectedBranches = new Set(["main", "master", "trunk", "integration", "develop"]);
+
+/**
+ * Branch names that are never published: the integration names themselves and
+ * any `<prefix>/main|master|integration`. One predicate for both layers — the
+ * Supervisor consults it before issuing a grant, and the policy consults it
+ * again before honoring one — so neither can admit what the other refuses.
+ */
+export function isProtectedBranch(branch: string): boolean {
+  return /^(?:main|master|trunk|integration|develop)$/iu.test(branch) || /(?:^|\/)(?:main|master|integration)$/iu.test(branch);
+}
+
+/**
+ * True when both paths name the same directory once the kernel has resolved
+ * them. `whenMissing` says what a path that does not exist means: `false` for a
+ * boundary check (a grant must never compare equal to nothing), `lexical` for
+ * a shape check on paths that may not exist yet.
+ */
+export function sameDirectory(first: string, second: string, whenMissing: "false" | "lexical" = "false"): boolean {
+  // The native realpath, not Node's JavaScript one: the latter collapses a
+  // trailing `..` lexically even after a symlink, and disagrees with the
+  // kernel for exactly the paths a boundary check exists to catch.
+  try { return realpathSync.native(first) === realpathSync.native(second); }
+  catch { return whenMissing === "lexical" ? resolve(first) === resolve(second) : false; }
+}
+
+/**
+ * The one shape a granted publish may take. Everything is matched literally:
+ * the policy is static, so it cannot resolve `HEAD`, a variable or a second
+ * statement, and refuses rather than guess. Returns undefined when the command
+ * is not a permitted publish, leaving the ordinary denials to answer.
+ */
+function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGrant): PolicyResult | undefined {
+  // A single statement only: `git push origin x && rm -rf /` must never pass.
+  if (tokens.some((token) => token.operator)) return undefined;
+  if (tokens.some((token) => token.dynamic)) return undefined;
+  const words = tokens.map((token) => token.value);
+  if (words.length === 0) return undefined;
+  const name = (words[0] ?? "").split(/[\\/]/u).at(-1)?.toLowerCase();
+  if (isProtectedBranch(grant.branch)) return undefined;
+  if (!isCommitId(grant.head)) return undefined;
+  const optionName = (word: string): string => word.split("=")[0] ?? word;
+
+  if (name === "git") {
+    // `-C <task directory>` is *required*, not merely tolerated. Claude's Bash
+    // tool keeps its working directory between calls and `cd` is ordinary local
+    // work, so without an explicit directory the grant could be spent in any
+    // clone the Worker had wandered into. The directory must be the granted one
+    // *byte for byte* — no normalization, no realpath. Every looser comparison
+    // has had a spelling that this process resolves one way and git another:
+    // a relative `.` against this process's cwd, `/proc/self/cwd` against this
+    // process's, and `<cwd>/link/..`, which Node's own `realpathSync` collapses
+    // lexically to the task directory while the kernel — and git — follow the
+    // link and end up elsewhere. The instruction spells the exact directory,
+    // so no alternate spelling needs to be accepted at all.
+    if (words[1] !== "-C") return undefined;
+    const directory = words[2];
+    if (directory === undefined || !isAbsolute(directory) || directory !== grant.cwd) return undefined;
+    // The pinned `-c` settings are required too, in order: a `pre-push` hook
+    // runs inside the granted push with the Worker's credentials where no
+    // policy sees it, and `push.followTags=true` would push a tag along with
+    // the commit; both can arrive by more doors than a write denial can
+    // enumerate, so the one granted command is made immune instead.
+    let cursor = 3;
+    for (const setting of GRANTED_PUSH_SETTINGS) {
+      if (words[cursor] !== "-c" || words[cursor + 1] !== setting) return undefined;
+      cursor += 2;
+    }
+    if (words[cursor] !== "push") return undefined;
+    // No push option at all: `-u` did nothing with a commit as the source, and
+    // an allowlist of one no-op is only surface. The refspec names the
+    // verified commit, so git pushes exactly that object; a commit made during
+    // the publish turn stays local ("Everything up-to-date") instead of riding
+    // the grant. `refs/heads/` is spelled out because a bare destination is
+    // refused by git when the remote branch does not exist yet.
+    const rest = words.slice(cursor + 1);
+    if (rest.length !== 2 || rest.some((word) => word.startsWith("-"))) return undefined;
+    const [remote, refspec] = rest as [string, string];
+    if (remote !== grant.remoteName) return undefined;
+    if (refspec !== `${grant.head}:refs/heads/${grant.branch}`) return undefined;
+    return { decision: "allow", reason: `publish grant: push ${grant.head.slice(0, 12)} to ${grant.remoteName}/${grant.branch}`, granted: true };
+  }
+
+  if (name === "gh" && grant.authority === "pr") {
+    if (!grant.repository) return undefined;
+    if (words[1] !== "pr" || words[2] !== "create") return undefined;
+    const rest = words.slice(3);
+    // `--head <candidate branch>` is mandatory: without it gh uses whatever
+    // branch is checked out, and `git checkout` is ordinary local work, so a
+    // bare `gh pr create` could open a pull request for a branch nothing
+    // verified. `--repo <pinned URL>` is mandatory for the same reason one
+    // level up: without it gh picks a base repository from the remotes
+    // (`upstream` on a fork, or whatever clone the Worker's shell sits in).
+    // Each counts only as the option the loop itself parses, never as a word
+    // another option swallowed: `--title --head` sets the title.
+    let sawHead = false;
+    let sawRepo = false;
+    for (let cursor = 0; cursor < rest.length; cursor += 1) {
+      const word = rest[cursor]!;
+      if (!word.startsWith("-")) return undefined;
+      const option = optionName(word);
+      if (!ALLOWED_PR_CREATE_OPTIONS.has(option)) return undefined;
+      const inlineValue = word.includes("=");
+      const value = inlineValue ? word.slice(option.length + 1) : rest[cursor + 1];
+      if (PR_CREATE_VALUE_OPTIONS.has(option)) {
+        if (value === undefined) return undefined;
+        if (option === "-H" || option === "--head") {
+          if (value !== grant.branch) return undefined;
+          sawHead = true;
+        }
+        if (option === "-R" || option === "--repo") {
+          if (value !== grant.repository) return undefined;
+          sawRepo = true;
+        }
+        if (!inlineValue) cursor += 1;
+      }
+    }
+    if (!sawHead || !sawRepo) return undefined;
+    return { decision: "allow", reason: `publish grant: open a pull request for ${grant.branch}`, granted: true };
+  }
+  return undefined;
+}
 /**
  * Commands whose dynamic arguments could carry a boundary-crossing action or
  * execute arbitrary expanded text: the repository, package, network and
@@ -205,16 +464,22 @@ function containsRemoteHttpMutation(command: string): boolean {
   return hasHttpClient && hasMutationFlag && hasProtectedEndpoint;
 }
 
-export function evaluateCommand(command: string, args: readonly string[] = []): PolicyResult {
+export function evaluateCommand(command: string, args: readonly string[] = [], grant?: RemoteGrant): PolicyResult {
   const normalized = command.trim();
   if (!normalized) return { decision: "deny", reason: "empty command" };
   const lexical = lexShell(normalized);
   if (lexical.error) return { decision: "deny", reason: `command could not be safely parsed: ${lexical.error}` };
   const literalArgs = args.map((value) => ({ value, operator: false, dynamic: false }));
-  return evaluateTokens([...lexical.tokens, ...literalArgs], 0);
+  return evaluateTokens([...lexical.tokens, ...literalArgs], 0, grant);
 }
 
-function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: string, depth: number): PolicyResult | undefined {
+function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: string, depth: number, grant?: RemoteGrant): PolicyResult | undefined {
+  // A publish grant admits exactly one shape; everything else still falls
+  // through to the ordinary boundary denials below.
+  if (grant) {
+    const permitted = permittedRemoteCommand(tokens, grant);
+    if (permitted) return permitted;
+  }
   const values = tokens.filter((token) => !token.operator).map((token) => token.value);
   const lower = values.map((value) => value.toLowerCase());
   const hasGit = values.some((value) => /(?:^|[\\/])git$/iu.test(value) || /^(?:git-(?:send|receive|upload)-pack)$/iu.test(value));
@@ -244,16 +509,33 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   // interpreter that would execute the expanded text, in the same statement.
   // Dynamic text in an ordinary local command (`for f in …; echo "$f"`) or in
   // another statement (`npm test; echo "exit $?"`) is Claude's own business.
-  if ((hasDynamicArgument && hasDynamicCommandName(tokens)) || segmentsOf(tokens).some((segment) => hasDynamicSensitiveArgument(segment))) {
+  const segments = segmentsOf(tokens);
+  if ((hasDynamicArgument && hasDynamicCommandName(tokens)) || segments.some((segment) => hasDynamicSensitiveArgument(segment))) {
     return { decision: "deny", reason: "a repository, package, network or shell command with a dynamic argument cannot be capability-checked; substitute the literal value for the shell variable so the command can be read, or use the Write/Edit tools when the intent is to change a file" };
   }
   if (/\bgit\b[\s\S]*\b(?:push|merge(?!-)|send-pack|receive-pack|update-ref)\b/iu.test(canonical)
     || /\bgit-(?:send|receive|upload)-pack\b/iu.test(canonical)
     || containsRemoteCliMutation(canonical)) {
-    return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
+    return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority", boundary: "remote" };
   }
   if (hasGit && (hasRemoteOperation || hasGitTransport) || hasGhRemote) {
-    return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
+    return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority", boundary: "remote" };
+  }
+  // Repointing a remote would make the grant's remote *name* meaningless and
+  // would fool the Supervisor's own confirmation, which resolves the same name.
+  // Scoped to one statement with `remote` in git's subcommand position and the
+  // action right after it: matching the words anywhere denied `git remote -v &&
+  // git add -A` and even `git add remote`, which are ordinary local work.
+  if (segments.some((segment) => mutatesRemotes(segment))) {
+    return { decision: "deny", reason: "Worker cannot change the repository's remotes" };
+  }
+  // The same boundary through `git config`: `remote.<name>.pushurl`,
+  // `url.<x>.insteadOf`, `push.*`, `core.sshCommand`, `core.hooksPath` and the
+  // credential/http keys change where a push goes, what travels with it or
+  // what runs during it, without touching the remote's name. Reads stay
+  // ordinary local work; only a write of one of these keys is refused.
+  if (segments.some((segment) => configuresRemoteTransport(segment))) {
+    return { decision: "deny", reason: "Worker cannot reconfigure the repository's remotes, URL rewrites, push behavior, credentials or hooks" };
   }
   if (hasGitAliasConfiguration) {
     return { decision: "deny", reason: "Worker cannot redefine Git command aliases" };
@@ -267,6 +549,22 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
     || (directRefWrite && hasProtectedBranch && /refs[\\/]heads[\\/]/iu.test(canonical))) {
     return { decision: "deny", reason: "Worker cannot write protected Git branch refs directly" };
   }
+  // `.git/config` (and `.git/config.worktree`) is the `git config` boundary
+  // above by another door, and a hook in `.git/hooks/` runs during the granted
+  // push where no policy sees it. A list of writing commands cannot be
+  // complete (`python3 -c`, `tar -C`, an archive), so any statement naming
+  // either path is refused unless it plainly only reads — the same stance the
+  // branch-ref rule above takes. The Write and Edit tools already refuse every
+  // `.git` path, and `git init --template=` would install hooks without naming
+  // the directory at all. What this cannot see (`~/.gitconfig`, a script) the
+  // Supervisor's remote-URL baseline catches at grant time instead.
+  const namesMetadataFile = (segment: readonly ShellToken[]): boolean => segment.some((token) => !token.operator && namesGitMetadata(token.value));
+  if (segments.some((segment) => namesMetadataFile(segment) && !onlyReads(segment))) {
+    return { decision: "deny", reason: "Worker cannot write the repository's Git configuration or hooks directly" };
+  }
+  if (segments.some((segment) => initializesWithTemplate(segment))) {
+    return { decision: "deny", reason: "Worker cannot install repository hooks from a template or relocate the repository's Git directory" };
+  }
   if (hasPackagePublication) {
     return { decision: "deny", reason: "package publication belongs to the protected release workflow" };
   }
@@ -276,6 +574,144 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
     return { decision: "deny", reason: "Worker cannot bypass Claude permission prompts" };
   }
   return undefined;
+}
+
+const REMOTE_MUTATIONS = new Set(["set-url", "add", "rename", "remove", "rm", "prune", "set-branches", "set-head"]);
+
+/** git's own pre-subcommand options that take the next word as their value when not written `--opt=value`. */
+const GIT_GLOBAL_VALUE_OPTIONS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source"]);
+
+/**
+ * The index of git's subcommand in one statement's words, or -1 when the
+ * statement is not a git invocation. Skips the pre-subcommand options,
+ * including the space-separated value forms: `git --git-dir .git remote …`
+ * has its subcommand at index 3, not 2, and a locator that only knew `-C`
+ * and `-c` let `remote set-url` and `config remote.*` hide behind `--git-dir`.
+ */
+function gitSubcommandIndex(words: readonly string[]): number {
+  const first = words[0]?.split(/[\\/]/u).at(-1)?.toLowerCase();
+  if (first !== "git") return -1;
+  let index = 1;
+  while (index < words.length && words[index]!.startsWith("-")) {
+    index += GIT_GLOBAL_VALUE_OPTIONS.has(words[index]!) ? 2 : 1;
+  }
+  return index < words.length ? index : -1;
+}
+
+/** True when this one statement is `git [options] remote <mutating action>`. */
+function mutatesRemotes(segment: readonly ShellToken[]): boolean {
+  const words = segment.filter((token) => !token.operator).map((token) => token.value);
+  const index = gitSubcommandIndex(words);
+  if (index < 0 || words[index]?.toLowerCase() !== "remote") return false;
+  // `remote`'s own options (`-v`, `--verbose`) sit before the action: git
+  // parses `git remote -v add evil …` as an `add`.
+  const action = words.slice(index + 1).find((word) => !word.startsWith("-"))?.toLowerCase();
+  return action !== undefined && REMOTE_MUTATIONS.has(action);
+}
+
+/**
+ * Configuration keys that decide where a push goes, what travels with it or
+ * what runs during it. `remote.*` covers `pushurl`; `url.*` the `insteadOf`
+ * rewrites; `push.*` follow-tags and push options; `include.*`/`includeIf.*`
+ * would pull any of the others in from a file the Worker wrote; the rest are
+ * credentials, transport and hook locations.
+ */
+const REMOTE_TRANSPORT_CONFIG_KEY = /^(?:remote\.|url\.|push\.|credential\.|http\.|https\.|include\.|includeif\.|init\.|core\.(?:sshcommand|hookspath|gitproxy|askpass|alternaterefscommand)$)/iu;
+/** `git config` flags and verbs that only read; a key next to one of them is a query, not a change. */
+const GIT_CONFIG_READ_FLAGS = new Set(["--get", "--get-all", "--get-regexp", "--get-urlmatch", "-l", "--list", "--show-origin", "--show-scope", "--name-only"]);
+const GIT_CONFIG_WRITE_FLAGS = new Set(["--add", "--replace-all", "--unset", "--unset-all", "--remove-section", "--rename-section", "--edit", "-e"]);
+
+/**
+ * True when a word names `.git/config`, `.git/config.worktree` or something
+ * under `.git/hooks/` in any spelling the shell would resolve to it: the raw
+ * text, its normalized path (`.git/./config`, `.git//config`, `src/../.git/config`),
+ * and — for a word carrying glob characters — the shape the glob could expand
+ * to (`.gi[t]/config`; anything wildcarded whose path has a `config` or
+ * `hooks` segment). The Write and Edit tools normalize their paths; Bash
+ * does not, so this does.
+ */
+function namesGitMetadata(word: string): boolean {
+  const metadata = /\.git[\\/](?:config|hooks)(?![A-Za-z0-9_-])/iu;
+  const value = word.replaceAll("\\", "/");
+  if (metadata.test(value) || metadata.test(posix.normalize(value))) return true;
+  if (!/[*?[]/u.test(value)) return false;
+  // A glob is judged segment by segment: it names the metadata only where
+  // some segment could expand to `.git` and the next to `config`,
+  // `config.worktree` or `hooks`. `src/hooks/*.ts` and `config/*.json` have no
+  // such segment and stay ordinary work; `.gi[t]/config`, `.git/conf?g`,
+  // `.g*/hooks/x` and `*/config` do not.
+  const segments = posix.normalize(value).split("/");
+  for (let index = 0; index + 1 < segments.length; index += 1) {
+    if (!globMatches(segments[index]!, ".git")) continue;
+    const next = segments[index + 1]!;
+    if (globMatches(next, "config") || globMatches(next, "config.worktree") || globMatches(next, "hooks")) return true;
+  }
+  return false;
+}
+
+/** True when one shell-glob path segment could expand to `literal` (`*` any run, `?` one character, `[…]` a class). */
+function globMatches(segment: string, literal: string): boolean {
+  let pattern = "";
+  for (let index = 0; index < segment.length; index += 1) {
+    const char = segment[index]!;
+    if (char === "*") pattern += "[^/]*";
+    else if (char === "?") pattern += "[^/]";
+    else if (char === "[") {
+      const close = segment.indexOf("]", index + 1);
+      if (close > index) { pattern += `[${segment.slice(index + 1, close).replace(/\\/gu, "\\\\")}]`; index = close; }
+      else pattern += "\\[";
+    } else pattern += char.replace(/[.+^${}()|\\]/gu, "\\$&");
+  }
+  try { return new RegExp(`^${pattern}$`, "iu").test(literal); }
+  catch { return true; }
+}
+
+/** Commands that only read what they are given; a statement led by one of these may name `.git/config` or a hook to look at it. */
+const READ_ONLY_COMMANDS = new Set(["cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ls", "stat", "file", "wc", "diff", "md5sum", "sha256sum", "bat", "view"]);
+
+/** True when this one statement is led by a read-only command and carries no redirection. */
+function onlyReads(segment: readonly ShellToken[]): boolean {
+  if (segment.some((token) => token.operator)) return false;
+  const first = segment[0]?.value.split(/[\\/]/u).at(-1)?.toLowerCase() ?? "";
+  return READ_ONLY_COMMANDS.has(first);
+}
+
+/**
+ * True when this one statement is `git init --template…`, which copies hooks
+ * into `.git/hooks/` of an existing repository too, or `git init|clone
+ * --separate-git-dir…`, which moves the repository's config and hooks to a
+ * path none of the `.git/` guards name.
+ */
+function initializesWithTemplate(segment: readonly ShellToken[]): boolean {
+  const words = segment.filter((token) => !token.operator).map((token) => token.value);
+  const index = gitSubcommandIndex(words);
+  if (index < 0) return false;
+  const subcommand = words[index]?.toLowerCase();
+  const options = words.slice(index + 1).map((word) => word.toLowerCase());
+  if (subcommand === "init" && options.some((word) => word.startsWith("--template"))) return true;
+  return (subcommand === "init" || subcommand === "clone") && options.some((word) => word.startsWith("--separate-git-dir"));
+}
+
+/** True when this one statement is `git [options] config` writing a transport-affecting key. */
+function configuresRemoteTransport(segment: readonly ShellToken[]): boolean {
+  const words = segment.filter((token) => !token.operator).map((token) => token.value);
+  const index = gitSubcommandIndex(words);
+  if (index < 0 || words[index]?.toLowerCase() !== "config") return false;
+  const rest = words.slice(index + 1);
+  const lower = rest.map((word) => word.toLowerCase());
+  const positional = rest.filter((word) => !word.startsWith("-"));
+  const verb = positional[0]?.toLowerCase();
+  // An editor session rewrites the whole file, every guarded key included,
+  // and names none of them on the command line.
+  if (lower.includes("-e") || lower.includes("--edit") || verb === "edit") return true;
+  if (!rest.some((word) => REMOTE_TRANSPORT_CONFIG_KEY.test(word))) return false;
+  // `git config <key>` alone reads it, as do the query flags and the newer
+  // `git config get <key>` form; anything that names a value or a write verb
+  // is a change.
+  if (lower.some((word) => GIT_CONFIG_READ_FLAGS.has(word)) || verb === "get" || verb === "list") return false;
+  const writes = lower.some((word) => GIT_CONFIG_WRITE_FLAGS.has(word))
+    || verb === "set" || verb === "unset" || verb === "remove-section" || verb === "rename-section" || verb === "edit";
+  return writes || positional.length >= 2;
 }
 
 /** The statements of a command, split on `;`, `&&`, `||`, `|` and `&`. */
@@ -357,26 +793,29 @@ function nestedShellCommands(lower: readonly string[], values: readonly string[]
   return nested;
 }
 
-function evaluateCommandInternal(command: string, depth: number): PolicyResult {
+function evaluateCommandInternal(command: string, depth: number, grant?: RemoteGrant): PolicyResult {
   const normalized = command.trim();
   if (!normalized) return { decision: "deny", reason: "empty command" };
   const lexical = lexShell(normalized);
   if (lexical.error) return { decision: "deny", reason: `command could not be safely parsed: ${lexical.error}` };
-  return evaluateTokens(lexical.tokens, depth);
+  return evaluateTokens(lexical.tokens, depth, grant);
 }
 
-function evaluateTokens(rawTokens: readonly ShellToken[], depth: number): PolicyResult {
+function evaluateTokens(rawTokens: readonly ShellToken[], depth: number, grant?: RemoteGrant): PolicyResult {
   const { tokens: dataResolved, embedded } = resolveDataTokens(rawTokens);
   const tokens = resolveLiteralBindings(dataResolved);
   if (depth < 4) {
     for (const body of embedded) {
+      // Never with the grant: a nested result is consulted only when it denies,
+      // so a grant here could only suppress a denial -- a heredoc-wrapped push
+      // would pass while the direct form is the only shape that was reviewed.
       const nestedResult = evaluateCommandInternal(body, depth + 1);
       if (nestedResult.decision === "deny") return nestedResult;
     }
   }
   const canonical = tokens.map((token) => token.value).join(" ").trim();
   if (!canonical) return { decision: "deny", reason: "empty command" };
-  const boundary = evaluateRepositoryBoundary(tokens, canonical, depth);
+  const boundary = evaluateRepositoryBoundary(tokens, canonical, depth, grant);
   if (boundary) return boundary;
   if (containsRemoteHttpMutation(canonical)) {
     return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
@@ -699,19 +1138,23 @@ const FIND_WRITE_ACTIONS = new Set(["-delete", "-exec", "-execdir", "-ok", "-okd
 export function isRoutinePermission(toolName: string, input: unknown, cwd: string, options: PermissionPolicyOptions = {}): boolean {
   const policyResult = evaluatePermission(toolName, input, cwd, options);
   if (policyResult.decision === "deny") return false;
+  // A granted publish is the Supervisor's own decision, already made: under
+  // hybrid authority it is answered here, not escalated to a Decision Worker
+  // that was never told the grant exists and whose standing rule is to refuse.
+  if (policyResult.granted) return true;
   if (toolName === "Edit" || toolName === "Write" || toolName === "NotebookEdit") return true;
   if (toolName === "Read" || toolName === "Glob" || toolName === "Grep" || toolName === "LS" || toolName === "TodoWrite") return true;
   if (toolName === "Bash") {
     const command = input && typeof input === "object" && typeof (input as { command?: unknown }).command === "string"
       ? (input as { command: string }).command
       : "";
-    return command ? isRoutineShellCommand(command, cwd) : false;
+    return command ? isRoutineShellCommand(command, cwd, options.writeRoots ?? []) : false;
   }
   // WebFetch, WebSearch, Task, mcp__* tools and any unrecognized tool name.
   return false;
 }
 
-function isRoutineShellCommand(command: string, cwd: string): boolean {
+function isRoutineShellCommand(command: string, cwd: string, writeRoots: readonly string[] = []): boolean {
   // A newline can carry a heredoc body, a second statement, or other content
   // this single-line lexer never sees; treat any multi-line command as
   // unrecognized rather than reasoning about what follows the first line.
@@ -733,7 +1176,7 @@ function isRoutineShellCommand(command: string, cwd: string): boolean {
     segments.at(-1)!.push(token);
   }
   if (segments.some((segment) => segment.length === 0)) return false;
-  return segments.every((segment) => isRoutineSegment(segment, cwd, 0));
+  return segments.every((segment) => isRoutineSegment(segment, cwd, 0, writeRoots));
 }
 
 /** True when `(` or `)` appears outside single/double quotes and not backslash-escaped. */
@@ -780,15 +1223,15 @@ function withoutFdDuplication(tokens: readonly ShellToken[]): ShellToken[] | und
   return result;
 }
 
-function isRoutineSegment(segment: readonly ShellToken[], cwd: string, depth: number): boolean {
+function isRoutineSegment(segment: readonly ShellToken[], cwd: string, depth: number, writeRoots: readonly string[] = []): boolean {
   if (depth > 5) return false;
-  if (hasUnsafeRedirection(segment, cwd)) return false;
+  if (hasUnsafeRedirection(segment, cwd, writeRoots)) return false;
   const words = segment.filter((token) => !token.operator).map((token) => token.value);
   if (words.length === 0) return false;
-  return isRoutineWords(words, cwd, depth);
+  return isRoutineWords(words, cwd, depth, writeRoots);
 }
 
-function isRoutineWords(words: readonly string[], cwd: string, depth: number): boolean {
+function isRoutineWords(words: readonly string[], cwd: string, depth: number, writeRoots: readonly string[] = []): boolean {
   if (depth > 5) return false;
   const first = words[0]!;
   // A program named by path (./ls, /tmp/x/ls) is an arbitrary executable, not
@@ -798,7 +1241,7 @@ function isRoutineWords(words: readonly string[], cwd: string, depth: number): b
   if (WRAPPER_COMMANDS.has(head)) {
     const wrapped = unwrapWrapper(head, words.slice(1));
     if (!wrapped || wrapped.length === 0) return false;
-    return isRoutineWords(wrapped, cwd, depth + 1);
+    return isRoutineWords(wrapped, cwd, depth + 1, writeRoots);
   }
   if (!ROUTINE_SHELL_COMMANDS.has(head)) return false;
   const rest = words.slice(1);
@@ -807,7 +1250,7 @@ function isRoutineWords(words: readonly string[], cwd: string, depth: number): b
   // /etc, ~/.ssh or ~/.aws and every option that names an outside file out of
   // the routine set, at the cost of an occasional model call for a sed script
   // that happens to start with `/`.
-  if (rest.some((word) => namesPathOutsideCwd(word, cwd))) return false;
+  if (rest.some((word) => namesPathOutsideCwd(word, cwd, writeRoots))) return false;
   switch (head) {
     case "git": return isRoutineGit(rest, cwd);
     case "npm": return isRoutineNpm(rest);
@@ -948,46 +1391,50 @@ function sedScriptWritesFiles(script: string): boolean {
   return /(?:^|[;{}\s])[wWrRe]\s*[^\s]|\/[gIp\d]*[we]/u.test(script);
 }
 
-function hasUnsafeRedirection(segment: readonly ShellToken[], cwd: string): boolean {
+function hasUnsafeRedirection(segment: readonly ShellToken[], cwd: string, writeRoots: readonly string[] = []): boolean {
   for (let index = 0; index < segment.length; index += 1) {
     const token = segment[index]!;
     if (token.operator && (token.value === ">" || token.value === ">>")) {
       const target = segment[index + 1];
       if (!target || target.operator) return true;
-      if (isUnsafeRedirectTarget(target.value, cwd)) return true;
+      if (isUnsafeRedirectTarget(target.value, cwd, writeRoots)) return true;
     }
   }
   return false;
 }
 
-function isUnsafeRedirectTarget(target: string, cwd: string): boolean {
+function isUnsafeRedirectTarget(target: string, cwd: string, writeRoots: readonly string[] = []): boolean {
   if (target === "/dev/null") return false; // the one device sink that discards rather than writes
   if (target.startsWith("/dev/") || target.startsWith("~") || target.startsWith("&")) return true;
-  // The same check the Write/Edit tools get: inside the cwd after resolving
-  // `..`, not Git metadata, and not through a symlink or hard link out of it.
-  return classifyWritePath(target, cwd) !== undefined;
+  // The same check the Write/Edit tools get, against the same roots: inside
+  // the cwd or a granted write root after resolving `..`, not Git metadata,
+  // and not through a symlink or hard link out of it. One root set governs
+  // both tools, so `cmd > <scratchpad>/out` is as routine as writing it.
+  return classifyWritePath(target, cwd, writeRoots) !== undefined;
 }
 
 /** True for an argument that names a filesystem location outside the task cwd (or ~), including `--flag=path` values. */
-function namesPathOutsideCwd(word: string, cwd: string): boolean {
+function namesPathOutsideCwd(word: string, cwd: string, writeRoots: readonly string[] = []): boolean {
   const value = word.startsWith("--") && word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
   if (value === "/dev/null") return false;
   if (value.startsWith("~")) return true;
   const pathLike = value.startsWith("/") || /(?:^|[\\/])\.\.(?:[\\/]|$)/u.test(value);
-  if (pathLike && !isInsideCwd(value, cwd)) return true;
+  // A path inside a granted write root is inside for this purpose too, judged
+  // by the same walk the Write tool gets (symlinks and metadata included).
+  if (pathLike && !isInsideCwd(value, cwd)) return writeRoots.length === 0 || classifyWritePath(value, cwd, writeRoots) !== undefined;
   // An argument that exists on disk may be (or pass through) a symlink that
   // leaves the cwd; compare real paths. A non-existent argument is a pattern or
   // a literal and needs no check.
   if (value.startsWith("-") || value === "") return false;
   let root: string;
-  try { root = realpathSync(cwd); }
+  try { root = realpathSync.native(cwd); }
   catch { return true; }
   // Resolve the nearest existing ancestor so a symlinked directory component
   // (`link/new-file`) is caught even when the leaf does not exist yet.
   let candidate = resolve(cwd, value);
   while (true) {
     try {
-      const real = realpathSync(candidate);
+      const real = realpathSync.native(candidate);
       const rel = relative(root, real);
       return rel !== "" && (rel.startsWith("..") || isAbsolute(rel));
     } catch {

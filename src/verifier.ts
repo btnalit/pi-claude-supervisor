@@ -1,11 +1,11 @@
 import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { lstat, open, readlink, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { AcceptanceCheck, AcceptanceCheckResult, AcceptanceReport, VerificationResult } from "./types.ts";
 import { evidenceMaxBytes, evidenceMaxUntrackedFiles } from "./config.ts";
-import { assertSafeWorkerCommand } from "./policy.ts";
+import { assertSafeWorkerCommand, isCommitId } from "./policy.ts";
 import { workerEnvironment } from "./worker/environment.ts";
 
 const execFileAsync = promisify(execFile);
@@ -57,6 +57,8 @@ export interface RepositoryEvidence {
   baseRef?: string;
   /** Current branch used for the local candidate, when available. */
   branch?: string;
+  /** The commit HEAD pointed at when this evidence was read; a publish grant must name the same one. */
+  head?: string;
   /** True when any evidence field was bounded or omitted. */
   truncated?: boolean;
   collectedAt: string;
@@ -73,7 +75,151 @@ export async function repositoryHead(cwd: string, signal?: AbortSignal): Promise
       env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
     });
     const head = String(result.stdout).trim();
-    return /^[0-9a-f]{40,64}$/u.test(head) ? head : undefined;
+    return isCommitId(head) ? head : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Environment for confirming a publish: the Supervisor's own read-only
+ * inspection, not a Worker command, so it inherits the process environment
+ * rather than the restricted one `repositoryHead` uses for local reads. It has
+ * to reach whatever remote the Worker just pushed to, and an allowlist cannot
+ * keep up with that — proxies, CA bundles, enterprise tokens, credential
+ * helpers — where every omission reports a real publish as unconfirmed. Only
+ * the prompts are forced off, so an unreadable remote fails fast instead of
+ * hanging.
+ */
+function remoteReadEnvironment(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "" };
+  // Inheriting the network and credential variables must not also inherit the
+  // ones that point git at another repository or inject configuration: with
+  // GIT_DIR or GIT_CONFIG_COUNT/KEY_n/VALUE_n set in the host's shell, the
+  // confirmation would pin and read a repository that is not the candidate's.
+  for (const name of Object.keys(env)) {
+    if (REPOSITORY_RELOCATING_GIT_VARIABLE.test(name)) delete env[name];
+  }
+  return env;
+}
+
+const REPOSITORY_RELOCATING_GIT_VARIABLE = /^(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_NAMESPACE|GIT_INDEX_FILE|GIT_OBJECT_DIRECTORY|GIT_ALTERNATE_OBJECT_DIRECTORIES|GIT_CONFIG_GLOBAL|GIT_CONFIG_SYSTEM|GIT_CONFIG_NOSYSTEM|GIT_CONFIG_COUNT|GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+|GIT_CONFIG_PARAMETERS|GIT_CEILING_DIRECTORIES|GIT_DISCOVERY_ACROSS_FILESYSTEM)$/u;
+
+/**
+ * Run a read-only inspection command without a shell, for confirming what the
+ * Worker published. Never used for anything that mutates.
+ */
+export async function runReadOnly(command: string, args: readonly string[], cwd: string, signal?: AbortSignal): Promise<{ stdout: string }> {
+  const result = await execFileAsync(command, [...args], {
+    cwd,
+    timeout: 60_000,
+    maxBuffer: 256 * 1024,
+    signal,
+    env: remoteReadEnvironment(),
+  });
+  return { stdout: String(result.stdout) };
+}
+
+/** Where a remote name currently fetches from and pushes to, so a grant can be pinned to destinations rather than a name. */
+export interface RemoteDestination {
+  /** Every fetch URL, in order; the first is what `ls-remote` reads through. */
+  fetch: string[];
+  /** Every push URL, in order — git pushes to *all* of them, so a second `pushurl` is a second destination. */
+  push: string[];
+}
+
+/**
+ * The URLs a remote name resolves to, every one of them: `git remote get-url`
+ * prints only the first, but git pushes to every configured `pushurl`, so a
+ * destination added second would be invisible to a single-URL comparison.
+ * Both sides are pinned because they diverge independently — `pushurl` and
+ * `url.*.pushInsteadOf` redirect the push while the fetch URL the confirmation
+ * reads through stays put — and each is reported after any rewrite.
+ */
+export async function remoteUrl(cwd: string, remote: string, signal?: AbortSignal): Promise<RemoteDestination | undefined> {
+  try {
+    const lines = (text: string): string[] => text.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+    const [fetch, push] = (await Promise.all([
+      runReadOnly("git", ["remote", "get-url", "--all", "--", remote], cwd, signal),
+      runReadOnly("git", ["remote", "get-url", "--push", "--all", "--", remote], cwd, signal),
+    ])).map((result) => lines(result.stdout)) as [string[], string[]];
+    return fetch.length === 0 || push.length === 0 ? undefined : { fetch, push };
+  } catch {
+    return undefined;
+  }
+}
+
+/** True when two destinations list exactly the same URLs in the same order, on both sides. */
+export function sameDestination(first: RemoteDestination | undefined, second: RemoteDestination | undefined): boolean {
+  if (!first || !second) return false;
+  const same = (a: readonly string[], b: readonly string[]): boolean => a.length === b.length && a.every((value, index) => value === b[index]);
+  return same(first.fetch, second.fetch) && same(first.push, second.push);
+}
+
+/**
+ * What a remote branch points at. `absent` is a fact the remote reported;
+ * `unreachable` means the remote could not be asked (network, timeout, a
+ * refused credential), which the caller must not report as a fact about the
+ * branch. Read-only: `ls-remote` never mutates.
+ */
+export type RemoteBranchLookup = { outcome: "found"; head: string } | { outcome: "absent" } | { outcome: "unreachable"; error: string };
+
+export async function remoteBranchHead(cwd: string, remote: string, branch: string, signal?: AbortSignal): Promise<RemoteBranchLookup> {
+  try {
+    const { stdout } = await runReadOnly("git", ["ls-remote", "--heads", "--", remote, branch], cwd, signal);
+    const line = stdout.split("\n").map((entry) => entry.trim()).find((entry) => entry.endsWith(`refs/heads/${branch}`));
+    const sha = line?.split(/\s+/u)[0] ?? "";
+    return isCommitId(sha) ? { outcome: "found", head: sha } : { outcome: "absent" };
+  } catch (error) {
+    return { outcome: "unreachable", error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * A remote URL as the `host/owner/repo` gh accepts for `--repo`, or undefined
+ * when the URL does not name one. gh parses `https://`, `ssh://` and
+ * `git@host:owner/repo` forms itself but not an SSH-config host alias
+ * (`gh-work:owner/repo.git`, the usual multi-account setup); the alias is
+ * translated here the way gh translates a remote, through `ssh -G`, so a `pr`
+ * grant can be pinned to a repository gh can actually open.
+ */
+export async function repositorySlug(url: string, signal?: AbortSignal): Promise<string | undefined> {
+  const parsed = parseRemoteUrl(url.trim());
+  if (!parsed) return undefined;
+  let host = parsed.host;
+  // `git@github.com:` is the common scp form and needs no translation; only a
+  // bare word (`gh-work`) can be an SSH-config alias worth asking `ssh -G` about.
+  if (parsed.sshAlias && !parsed.host.includes(".")) host = (await resolveSshHostname(parsed.host, signal)) ?? parsed.host;
+  return `${host.toLowerCase()}/${parsed.owner}/${parsed.repo}`;
+}
+
+function parseRemoteUrl(url: string): { host: string; owner: string; repo: string; sshAlias: boolean } | undefined {
+  const path = (value: string): [string, string] | undefined => {
+    const parts = value.replace(/^\/+/u, "").replace(/\/+$/u, "").replace(/\.git$/u, "").split("/");
+    return parts.length === 2 && parts.every((part) => /^[A-Za-z0-9._-]+$/u.test(part)) ? [parts[0]!, parts[1]!] : undefined;
+  };
+  const scheme = url.match(/^(?:https?|ssh|git):\/\/(?:[^@\/]+@)?([^\/:]+)(?::\d+)?\/(.+)$/u);
+  if (scheme) {
+    const parts = path(scheme[2]!);
+    return parts ? { host: scheme[1]!, owner: parts[0], repo: parts[1], sshAlias: false } : undefined;
+  }
+  // scp-like: `user@host:owner/repo` or `alias:owner/repo`. Without a user the
+  // host is most likely an SSH-config alias; with one it may still be.
+  const scp = url.match(/^(?:([^@\/:]+)@)?([A-Za-z0-9._-]+):(.+)$/u);
+  if (scp && !scp[3]!.startsWith("/")) {
+    const parts = path(scp[3]!);
+    return parts ? { host: scp[2]!, owner: parts[0], repo: parts[1], sshAlias: true } : undefined;
+  }
+  return undefined;
+}
+
+/** The real hostname behind an SSH-config alias (`ssh -G` prints `hostname <real>`), or undefined. */
+async function resolveSshHostname(alias: string, signal?: AbortSignal): Promise<string | undefined> {
+  try {
+    const result = await execFileAsync("ssh", ["-G", "--", alias], { timeout: 10_000, maxBuffer: 64 * 1024, signal, env: { ...process.env, SSH_ASKPASS: "" } });
+    const line = String(result.stdout).split("\n").find((entry) => entry.startsWith("hostname "));
+    const host = line?.slice("hostname ".length).trim();
+    return host && /^[A-Za-z0-9.-]+$/u.test(host) ? host : undefined;
   } catch {
     return undefined;
   }
@@ -81,7 +227,7 @@ export async function repositoryHead(cwd: string, signal?: AbortSignal): Promise
 
 /** Verify that a full commit object is still present without invoking a shell. */
 export async function repositoryCommitExists(cwd: string, commit: string, signal?: AbortSignal): Promise<boolean> {
-  if (!/^[0-9a-f]{40,64}$/iu.test(commit)) return false;
+  if (!isCommitId(commit)) return false;
   try {
     const result = await execFileAsync("git", ["cat-file", "-e", `${commit}^{commit}`], {
       cwd,
@@ -107,6 +253,56 @@ export async function repositoryIsAncestor(cwd: string, ancestor: string, descen
       env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
     });
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether the working tree has nothing uncommitted or untracked, or undefined
+ * when git could not say. The same reading the evidence uses, so the publish
+ * turn's "unchanged" means what the grant's "clean" meant.
+ */
+export async function repositoryClean(cwd: string, signal?: AbortSignal): Promise<boolean | undefined> {
+  try {
+    const result = await execFileAsync("git", ["status", "--porcelain", "--untracked-files=all"], {
+      cwd,
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+      signal,
+      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
+    });
+    return String(result.stdout).trim() === "";
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * True when the repository's Git directory is where the `.git/` guards look:
+ * `<cwd>/.git` itself, or a linked worktree's `<common>/.git/worktrees/<name>`
+ * (a worktree's `.git` is a `gitdir:` file by design, and its config and hooks
+ * live in the common directory — the pinned `core.hooksPath` is what protects
+ * the granted push there). A Git directory anywhere else is the
+ * `--separate-git-dir` case, refused for the Worker but not for whoever made
+ * the clone.
+ */
+export async function repositoryGitDirectoryIsLocal(cwd: string, signal?: AbortSignal): Promise<boolean> {
+  try {
+    const read = async (args: string[]): Promise<string> => {
+      const result = await execFileAsync("git", args, { cwd, timeout: 30_000, maxBuffer: 4096, signal, env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }) });
+      return String(result.stdout).trim();
+    };
+    const [gitDir, commonDir] = await Promise.all([read(["rev-parse", "--git-dir"]), read(["rev-parse", "--git-common-dir"])]);
+    if (!gitDir || !commonDir) return false;
+    const resolvedGitDir = await realpath(resolve(cwd, gitDir));
+    const resolvedCommon = await realpath(resolve(cwd, commonDir));
+    const own = await realpath(cwd).then((real) => join(real, ".git")).catch(() => undefined);
+    if (own !== undefined && resolvedGitDir === own) return true;
+    // A linked worktree: its git dir sits under the common dir's worktrees/,
+    // and the common dir is itself a repository's own .git.
+    const worktrees = join(resolvedCommon, "worktrees");
+    return resolvedCommon.endsWith(`${sep}.git`) && resolvedGitDir.startsWith(`${worktrees}${sep}`);
   } catch {
     return false;
   }
@@ -199,13 +395,14 @@ export async function collectRepositoryEvidence(cwd: string, options: Pick<Verif
   const baseRef = options.baseRef;
   const diffRef = baseRef ?? "HEAD";
   const commitArgs = baseRef ? ["log", "--format=%h %s", "--no-decorate", `${baseRef}..HEAD`, "--"] : ["log", "--format=%h %s", "--no-decorate", "-20", "--"];
-  const [statusResult, diffResult, commitsResult, branchResult, untrackedResult] = await Promise.all([
+  const [statusResult, diffResult, commitsResult, branchResult, untrackedResult, head] = await Promise.all([
     readGitEvidence(cwd, ["status", "--short", "--untracked-files=all"], options.signal),
     // A baseline-relative diff includes committed, staged, and unstaged changes.
     readGitEvidence(cwd, ["diff", "--no-ext-diff", "--unified=3", diffRef, "--"], options.signal),
     readGitEvidence(cwd, commitArgs, options.signal),
     readGitEvidence(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"], options.signal),
     collectUntrackedEvidence(cwd, options.signal),
+    repositoryHead(cwd, options.signal),
   ]);
   throwIfAborted(options.signal);
   return {
@@ -215,6 +412,7 @@ export async function collectRepositoryEvidence(cwd: string, options: Pick<Verif
     untracked: untrackedResult.text,
     ...(baseRef ? { baseRef } : {}),
     ...(branchResult.text.trim() !== "(none)" ? { branch: branchResult.text.trim() } : {}),
+    ...(head ? { head } : {}),
     complete: statusResult.complete && diffResult.complete && commitsResult.complete && branchResult.complete && untrackedResult.complete,
     truncated: statusResult.truncated || diffResult.truncated || commitsResult.truncated || branchResult.truncated || untrackedResult.truncated,
     collectedAt: new Date().toISOString(),

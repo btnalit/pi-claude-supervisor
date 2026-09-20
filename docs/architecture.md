@@ -440,6 +440,51 @@ derives from this task's cwd, which rejects a subagent transcript and any path
 naming another project. A root is honored before it exists (Claude creates the
 memory directory on first write) and through a symlinked ancestor.
 
+When a task is granted remote authority (`autonomy.remoteAuthority`, default
+`none`), verification does not end it. `#requestPublish` first checks that
+HEAD *is* the verified tree — the evidence the Reviewer judged shows a clean
+working tree and carries the same `head` — then issues a `RemoteGrant` naming
+that commit, the candidate's own branch, the remote, the task directory and the
+remote's repository (`host/owner/repo` from its fetch URL, an SSH alias
+translated through `ssh -G`), and asks the Worker to publish: the Worker runs
+the push and any `gh pr create`, the Supervisor never does. A dirty tree costs a
+repair round first, the remote's resolved URL lists (`get-url --all`, both sides) must equal the baseline recorded at task start (`TaskContext.remoteBaseline`, persisted with the decision session, restored on recovery, never re-taken) — checked again by `#grantedRemoteChanged` at the moment a granted command is authorized, in both the PreToolUse and prompt-phase paths — the Git directory must be the task's own `.git` or a linked worktree's, and the reviewed evidence must carry a
+HEAD (fail-closed); the grant is armed before the instruction is sent and
+revoked only if the send failed before delivery (the turn counter tells). The instruction is built
+by `publishCommand`/`pullRequestCommand` in `policy.ts`, beside the parser that
+admits it, and a test round-trips one through the other. Under every permission
+authority the granted command is answered by the policy (`PolicyResult.granted`)
+rather than escalated to the Decision Worker. The returning turn skips
+acceptance and the Reviewer when HEAD is unchanged — they already passed on that
+tree — and `#settlePublish` confirms the result read-only (`#confirmPublish`:
+both pinned remote URLs unchanged, `git ls-remote` carrying the verified commit,
+plus `gh pr list` for `pr`) before completing, or blocks the candidate when it
+cannot; that candidate keeps `deliverable: true`, since it passed and is intact
+on its branch, and an unreachable remote is reported as *unconfirmed*
+(`RemoteBranchLookup` tells `absent` from `unreachable`), never as a missing
+commit or a repointed remote. A tree that changed during the publish turn — an uncommitted edit included — voids
+the grant and is re-verified in full, with the same confirmation deciding whether the notice
+says the verified commit landed first. The grant is cleared on every terminal
+path, so it never outlives the turn it was issued for, and
+`permittedRemoteCommand` admits a single literal shape —
+`git -C '<task dir>' -c core.hooksPath=/dev/null -c push.followTags=false push <remote> <commit>:refs/heads/<branch>`
+with no other option, and `gh pr create --repo <pinned URL> --head <branch> …`
+— so no force, delete, mirror, tags, push-options, other `-c`, branch or `HEAD`
+source, other remote, branch or repository, relative `-C`, shell wrapper,
+dynamic word or second statement; the pinned hooks path keeps any installed
+`pre-push` out of the granted command and the pinned `push.followTags=false` keeps any tag out of it. `git config` writes to
+transport-affecting keys (including `include.*` and `init.*`), `git config
+--edit`, `git init --template`, and any statement naming `.git/config` or
+`.git/hooks` in any spelling (`namesGitMetadata` normalizes the path and matches a glob segment by segment, so only a
+segment that could expand to `.git` counts — a project's own `src/hooks/` is ordinary work) that does not plainly only read are refused alongside `git remote`
+mutations; git's own `--git-dir`/`--work-tree` options and `remote`'s own `-v`
+cannot hide either, nor can `-C /proc/self/cwd` or `-C <cwd>/link/..` (the directory must be the granted one byte for byte; every realpath comparison elsewhere uses the native implementation, since Node's JavaScript `realpathSync` collapses `link/..` lexically) or `--separate-git-dir`. The publish
+hint keys on `PolicyResult.boundary`, not on the reason text, and promises a publish turn
+only where `#requestPublish` will start one. For an adopted tmux session the memory write root is
+located under the *adopted process's* configuration directory, read from
+`/proc/<pid>/environ` at adoption, so a Claude started with another
+`CLAUDE_CONFIG_DIR` keeps its memory.
+
 A record left behind by the outright
 stop (`recoverable_failure`, so `active/interrupted`) is not a dead end either:
 `recover --extend <duration>` re-persists a deadline measured from now

@@ -208,6 +208,66 @@ stream-json` 的方式运行 Claude,完全没有终端界面;一旦设置
   不必等待完整的命令或模型超时。
 - 每个任务只持有一个 cwd 租约;并发任务需要各自独立的 worktree。
 
+## 发布已验证的候选
+
+默认情况下任务止于**已验证的本地候选**:验收与独立 Reviewer 通过,而 Worker 全程
+没有任何远程权限。设 `REMOTE_AUTHORITY=push`(或 `--remote push`)会在该判定之后
+加一个**发布阶段**:Supervisor 记下已验证的 commit,发放一次性的窄授权,并让
+Worker 推自己的分支;`pr` 还允许它开 PR。**push 由 Worker 自己执行**——Supervisor
+从不代劳——之后 Supervisor 以只读方式核实(`git ls-remote`,`pr` 还查 `gh pr list`)
+才把任务标记完成,候选通知里带上 PR 链接。核实不到则把候选标为 blocked,本地候选
+依然可交付。
+
+这个授权刻意严苛,而且两条命令都按字面匹配——没被审过的选项一律拒绝,而不是默认
+无害。它只认 `git -C '<任务目录>' -c core.hooksPath=/dev/null -c push.followTags=false push <remote> <已验证 commit>:refs/heads/<branch>`,
+不带其他任何选项。refspec 写的是**已验证的 commit** 而不是分支:git 只会推送这一个对象,
+Worker 在发布轮里再提交的内容会留在本地("Everything up-to-date"),搭不上这次授权。
+**`-C` 是必需的、必须是绝对路径、且必须与任务目录逐字节相同**——不做规范化、不做 realpath——因为 Claude 的 Bash 工具
+会在多次调用之间保留工作目录,而 `cd` 属于普通本地操作,没有 `-C` 的话授权可能被花在
+任何别的克隆上;任何更宽松的比较都出现过 Supervisor 与 git 解析不一致的写法(相对路径 `.` 按 Supervisor 的目录解析、`/proc/self/cwd`,以及 `<cwd>/link/..`——Node 自己的 realpath 会按字面折叠而内核会跟随 symlink)。指令写的就是精确目录,不需要接受任何别的写法。
+这条命令上**钉死了 hooks 路径**,所以 Worker 通过任何途径(`git init --template=`、
+解压归档、`chmod`)装进去的 `pre-push` hook 都不会在授权的 push 里以 Worker 的凭据执行;也钉死了
+`push.followTags=false`,所以通过策略看不见的任何文件设的 `followTags=true` 都不能让这一次 push
+顺带推上授权没点名的 tag(tag 正是发布自动化的触发点)。两者都是 ref/hook 选择而非传输层,不会
+覆盖任何合理的仓库级设置。
+`pr` 下另加 `gh pr create --repo <钉住的 remote URL> --head <候选分支> …`(只允许
+title / body / base / draft / assignee / label):PR 只会开在授权 remote 对应的仓库里——
+不带 `--repo` 的话,gh 会从 remotes 里自己挑一个 base 仓库(fork 上是 `upstream`),
+那不是授权点名的仓库,核实也不会去查它。仓库取 remote URL 背后的 `host/owner/repo`
+(SSH config 里的 host 别名会像 gh 那样经 `ssh -G` 翻译);URL 不是仓库的 remote(本地路径、
+翻译不了的别名)不会拿到 `pr` 授权。授权提供的每个词都做了 shell 引用,分支叫 `feat/$ticket`
+也能原样通过策略。
+
+授权只会发给"就是已验证工作树"的那个 commit:工作树必须干净(含未跟踪文件——新文件也可能
+是被验证行为的一部分),且 HEAD 自 Reviewer 评审的证据被读取以来没有移动过。仓库的 Git 目录必须是自己的 `.git` 或 linked worktree 的 `.git/worktrees/<name>`(不能是 `--separate-git-dir` 指针)。工作树不干净
+会先花一轮修复让 Worker 把属于候选的内容提交掉;只有修复轮用尽或 HEAD 移动过,任务才以本地
+候选结束并在通知里写明 `not published:` 原因,而不是发授权。核实时 remote 连不上,发布只是
+"未确认"(候选仍可交付),绝不会被说成"没推上去"。
+
+有没有授权都拒绝:任何 push 选项(`-u`、`--force`、`--force-with-lease`、`--delete`、
+`--mirror`、`--all`、`--tags`、`--no-verify`、`--push-option`、`--receive-pack` 等)、
+除这两个钉死项(且顺序固定)以外的任何 `-c`、以分支或 `HEAD` 作为 refspec 来源、裸 `git push`、
+别的 remote、分支或 commit、保护分支、被 shell 包装(含 heredoc 管进 shell)、带动态参数、
+第二条语句、不带 `-C` 的 `git push`、`-C` 与任务目录不逐字节相同(别的目录、相对路径、`/proc/self/cwd`、其中的 symlink 或 `..`)、不带
+`--repo <钉住的 URL>` 或不带 `--head <候选分支>` 的 `gh pr create`(被别的选项当作值吞掉的
+`--head` 不算)、`gh pr create --body-file/-F/--template`(会把任意本地文件内容发到 PR 上)、
+`--web`、别的 `--repo`、`gh pr merge`、`gh api`、`gh release`、`npm publish`。改动仓库
+remote(`git remote set-url|add|rename|…`,藏在 git 自己的 `--git-dir`/`--work-tree` 选项
+或 `remote` 自己的 `-v` 后面也一样)一律拒绝;改动 push 去向或 push 期间会执行什么也一律
+拒绝——`git config` 写 `remote.*`、`url.*.insteadOf`、`push.*`、`credential.*`、`http.*`、
+`include.path`/`includeIf.*`、`init.*`、`core.sshCommand`、`core.hooksPath`,`git config --edit`、
+`git init --template=…`、`git init|clone --separate-git-dir=…`,以及任何提到 `.git/config` 或 `.git/hooks` 的语句(除非它显然只读:
+`cat`、`grep`、`ls` 等)——否则授权认的 remote 会被偷换,连 Supervisor 的核实也会被骗过;
+核实同时钉住 fetch 和 push 两个 URL,并从自己的环境里剔除 `GIT_DIR`/`GIT_CONFIG_*`。这些文本规则之下还有一条不依赖它们的规则:remote 解析后的**全部** fetch/push URL(`git remote get-url --all` / `--push --all`;git 会推到每一个 `pushurl`,而不只是它打印的第一个;已应用改写)在任务**开始**、Worker 还没跑任何命令时记录,并在发放授权时和授权的 push 被批准的那一刻都要求原样不变。任务期间用任何手段(`~/.gitconfig`、脚本、策略看不见的 include)、哪怕在发布轮的第一条命令里加进来的 `pushInsteadOf`、`pushurl` 或额外目的地,都会让 push 被拒、授权作废;操作者原本就有的改写已在基线里,不受影响。恢复的任务沿用记录的基线、绝不重新采集;首次启动时解析不到的 remote 会被记录下来,永不授权。这是一层
+作用于命令文本的策略:Worker 自己写一个脚本再运行,策略看不见——如
+[autonomy-target.md](docs/autonomy-target.md) 对所有文本级规则所说,绝对隔离是 host 边界的事。
+
+授权是**一次性**的:发布轮一结束就收回(不等下一个决策),并且同时绑定 remote 的 URL
+而不只是名字。Worker 若在该轮里改动了工作树(未提交的修改同样算改动),授权立即作废并重新完整验收;因为授权写的是
+commit,通知能说清已验证的 commit 是否在工作树变动之前就已经推上去了。验证之前
+被拒的 push 会说明授权稍后会来,而不是让 Worker 去猜;没能确认发布的任务会在候选
+通知里写明原因,而不是只报一句 "ready"。
+
 ## 任务 spec
 
 `--spec file.json` 接受如下格式:
@@ -263,6 +323,8 @@ stream-json` 的方式运行 Claude,完全没有终端界面;一旦设置
 | `REQUIRE_LOCAL_COMMIT` | `true` | 完成前要求在候选所在分支上有本地 commit |
 | `MAX_DECISION_RETRIES` | `2`(0–10) | Decision Worker 调用超时或失败(429/529、网络、鉴权)时的重试次数 |
 | `PERMISSION_AUTHORITY` | `hybrid` | `policy` \| `hybrid` \| `decision-worker` |
+| `REMOTE_AUTHORITY` | `none` | `none` \| `push` \| `pr`;验收通过后开启发布阶段。`--remote` 可按任务覆盖 |
+| `REMOTE_NAME` | `origin` | 发布授权唯一允许的 remote 名 |
 | `WORKER_MAX_BUDGET_USD` | 未设置 | 作为 `--max-budget-usd` 传入的硬上限;交互式 tmux 下不可用 |
 | `WORKER_MODEL` | 未设置(Claude 自身默认值) | Claude Worker 的 `--model` |
 | `WORKER_AUTOCOMPACT_TOKENS` | 自动模式默认 `200000` | 每轮上下文上限;`0` 保留 Claude 自身默认值 |

@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { publishCommand } from "./policy.ts";
 import { promisify } from "node:util";
 import type { SupervisorEvent } from "./events.ts";
 import type { PiUsageSample, WorkerAdapter, WorkerEvent, WorkerHandle, WorkerOutputChunk, WorkerStartInput, WorkerStatus } from "./types.ts";
@@ -3154,4 +3155,657 @@ test("extendedDeadlineMs grants the extension from now for an expired task and f
   // Not yet expired: the extension is added to the remaining budget.
   assert.equal(extendedDeadlineMs(4 * hour, 1 * hour, 30 * 60_000), 4 * hour + 30 * 60_000);
   assert.equal(extendedDeadlineMs(4 * hour, 1 * hour, -5), 4 * hour);
+});
+
+/**
+ * A repository with a real `origin` the test controls, so the publish phase can
+ * be confirmed the way the Supervisor confirms it: by reading the remote.
+ */
+async function repositoryWithRemote(prefix: string, branch: string): Promise<{ cwd: string; remote: string; cleanup: () => Promise<void> }> {
+  const cwd = await mkdtemp(join(tmpdir(), prefix));
+  const remote = await mkdtemp(join(tmpdir(), `${prefix}remote-`));
+  await execFileAsync("git", ["init", "--bare", "-q"], { cwd: remote });
+  await initializeGitRepository(cwd, branch);
+  await execFileAsync("git", ["remote", "add", "origin", remote], { cwd });
+  return { cwd, remote, cleanup: async () => { await rm(cwd, { recursive: true, force: true }); await rm(remote, { recursive: true, force: true }); } };
+}
+
+test("with push authority the verified candidate is handed back to publish, and completion confirms the remote", async () => {
+  const branch = "worker/publish-ok";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-", branch);
+  try {
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: Array<{ status: string; reason: string }> = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push({ status: notice.status, reason: notice.reason }); },
+    });
+    // The Worker "publishes" when the Supervisor asks: the instruction arriving
+    // is what triggers the real push here, in the one shape the grant admits.
+    const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repo.cwd })).stdout.trim();
+    fixture.adapter.send = async (_handle, message) => {
+      fixture.state.sent.push(message);
+      if (message.includes("Publish it")) await execFileAsync("git", ["-C", repo.cwd, "-c", "core.hooksPath=/dev/null", "-c", "push.followTags=false", "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
+    };
+    await supervisor.start({
+      task: "publish the verified candidate",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+
+    const first = fixture.turn(1);
+    fixture.state.listener?.(first);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "work is done" }, first);
+
+    // Verification passed, so the task is not finished: the Worker was asked to publish.
+    const requested = events.events.find((event) => event.type === "publish_requested");
+    assert.ok(requested, "the verified candidate is handed back to publish");
+    assert.equal(requested?.data?.branch, branch);
+    assert.equal(supervisor.state, "running");
+    const expected = publishCommand({ authority: "push", remoteName: "origin", branch, head, cwd: repo.cwd });
+    assert.ok(fixture.state.sent.some((message) => message.includes(`\`${expected}\``)),
+      "the instruction spells out the one shape the grant admits: an absolute -C, the hooks path pinned, and the verified commit as the refspec source");
+    assert.match(expected, /^git -C \S+ -c core\.hooksPath=\/dev\/null -c push\.followTags=false push origin '[0-9a-f]{40}:refs\/heads\/worker\/publish-ok'$/u);
+    assert.equal(candidates.length, 0, "no candidate is announced until the publish settles");
+
+    // The publish turn comes back; acceptance is not re-run on the unchanged tree.
+    const acceptanceRuns = events.events.filter((event) => event.type === "acceptance_started").length;
+    const second = fixture.turn(2);
+    fixture.state.listener?.(second);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "pushed" }, second);
+    assert.equal(events.events.filter((event) => event.type === "acceptance_started").length, acceptanceRuns, "the unchanged tree is not re-verified");
+
+    assert.equal(supervisor.state, "completed");
+    assert.ok(events.events.some((event) => event.type === "publish_confirmed"));
+    assert.deepEqual(candidates.map((candidate) => candidate.status), ["ready"]);
+    // The remote really carries the verified commit.
+    const { stdout } = await execFileAsync("git", ["ls-remote", "--heads", "origin", branch], { cwd: repo.cwd });
+    assert.match(stdout, new RegExp(`^${head}\\s+refs/heads/${branch}`, "u"));
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test("a commit made during the publish turn cannot ride the grant: the verified commit is published and the notice says which tree is where", async () => {
+  const branch = "worker/publish-then-commit";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-drift-", branch);
+  try {
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: Array<{ status: string; reason: string; prUrl?: string }> = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push({ status: notice.status, reason: notice.reason, ...(notice.prUrl ? { prUrl: notice.prUrl } : {}) }); },
+    });
+    const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repo.cwd })).stdout.trim();
+    // The Worker pushes the granted commit, then — against the instruction —
+    // commits again. The refspec names the commit, so the second one stays local.
+    fixture.adapter.send = async (_handle, message) => {
+      fixture.state.sent.push(message);
+      if (!message.includes("Publish it")) return;
+      await execFileAsync("git", ["-C", repo.cwd, "-c", "core.hooksPath=/dev/null", "-c", "push.followTags=false", "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
+      await writeFile(join(repo.cwd, "after-publish.txt"), "unverified\n");
+      await execFileAsync("git", ["add", "after-publish.txt"], { cwd: repo.cwd });
+      await execFileAsync("git", ["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "after publish"], { cwd: repo.cwd });
+    };
+    await supervisor.start({
+      task: "publish, then keep committing",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const first = fixture.turn(1);
+    fixture.state.listener?.(first);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done" }, first);
+    assert.ok(events.events.some((event) => event.type === "publish_requested"));
+    const acceptanceRuns = events.events.filter((event) => event.type === "acceptance_started").length;
+
+    const second = fixture.turn(2);
+    fixture.state.listener?.(second);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "pushed and tidied up" }, second);
+
+    // The changed tree earned its own verification and the grant was not reissued.
+    assert.equal(events.events.filter((event) => event.type === "acceptance_started").length, acceptanceRuns + 1, "the changed tree is re-verified");
+    assert.equal(events.events.filter((event) => event.type === "publish_requested").length, 1, "the grant is one-shot");
+    const abandoned = events.events.find((event) => event.type === "publish_abandoned");
+    assert.equal(abandoned?.data?.published, true, "the confirmation found the verified commit on the remote");
+    assert.equal(supervisor.state, "completed");
+    assert.match(String(candidates.at(-1)?.reason), /was published to origin\/worker\/publish-then-commit/u);
+    assert.match(String(candidates.at(-1)?.reason), /new tree is not published/u);
+    assert.equal(candidates.at(-1)?.prUrl, undefined, "the notice's pull request field means this candidate, not the one that left");
+    // The remote holds exactly the verified commit, not the later one.
+    const { stdout } = await execFileAsync("git", ["ls-remote", "--heads", "origin", branch], { cwd: repo.cwd });
+    assert.match(stdout, new RegExp(`^${head}\\s+refs/heads/${branch}`, "u"));
+    const local = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repo.cwd })).stdout.trim();
+    assert.notEqual(local, head);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test("an edit left uncommitted during the publish turn is a changed candidate, not an unchanged one", async () => {
+  const branch = "worker/publish-then-edit";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-edit-", branch);
+  try {
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: Array<{ status: string; reason: string }> = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push({ status: notice.status, reason: notice.reason }); },
+    });
+    const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repo.cwd })).stdout.trim();
+    fixture.adapter.send = async (_handle, message) => {
+      fixture.state.sent.push(message);
+      if (!message.includes("Publish it")) return;
+      await execFileAsync("git", ["-C", repo.cwd, "-c", "core.hooksPath=/dev/null", "-c", "push.followTags=false", "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
+      // HEAD stays put, but the tree no longer matches the pushed commit.
+      await writeFile(join(repo.cwd, "after-publish.txt"), "uncommitted\n");
+    };
+    await supervisor.start({
+      task: "publish, then edit without committing",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const first = fixture.turn(1);
+    fixture.state.listener?.(first);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done" }, first);
+    const acceptanceRuns = events.events.filter((event) => event.type === "acceptance_started").length;
+    const second = fixture.turn(2);
+    fixture.state.listener?.(second);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "pushed" }, second);
+
+    assert.equal(events.events.filter((event) => event.type === "acceptance_started").length, acceptanceRuns + 1, "the changed tree is re-verified, HEAD unchanged or not");
+    const abandoned = events.events.find((event) => event.type === "publish_abandoned");
+    assert.equal(abandoned?.data?.published, true);
+    assert.match(String(abandoned?.data?.reason), /left with uncommitted changes/u);
+    assert.equal(supervisor.state, "completed");
+    assert.match(String(candidates.at(-1)?.reason), /not published: .*left with uncommitted changes.*new tree is not published/u);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test("a URL rewrite added during the task, by any means, is refused at grant time: the remote must resolve as it did at start", async () => {
+  const branch = "worker/publish-rewritten";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-rewrite-", branch);
+  const evil = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-publish-evil-"));
+  try {
+    await execFileAsync("git", ["init", "--bare", "-q"], { cwd: evil });
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: Array<{ status: string; reason: string }> = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push({ status: notice.status, reason: notice.reason }); },
+    });
+    await supervisor.start({
+      task: "publish after someone rewrote the push URL",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    // Written straight into the repository config, standing in for every door
+    // the command policy cannot see (~/.gitconfig, a script, an include): the
+    // push now goes to `evil` while the fetch URL — and `ls-remote` — still
+    // name the real remote. Before the baseline this pinned the diverted URL
+    // as the destination and confirmed against it.
+    // A second `pushurl` rather than a rewrite: `git remote get-url --push`
+    // still prints the real one, and git pushes to both.
+    await execFileAsync("git", ["config", "--add", "remote.origin.pushurl", repo.remote], { cwd: repo.cwd });
+    await execFileAsync("git", ["config", "--add", "remote.origin.pushurl", evil], { cwd: repo.cwd });
+    const pushUrl = (await execFileAsync("git", ["remote", "get-url", "--push", "origin"], { cwd: repo.cwd })).stdout.trim();
+    assert.equal(pushUrl, repo.remote, "the first push URL is unchanged; the second is the diversion");
+
+    const turn = fixture.turn(1);
+    fixture.state.listener?.(turn);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done" }, turn);
+
+    assert.ok(!events.events.some((event) => event.type === "publish_requested"), "no grant against a rewritten remote");
+    const skipped = events.events.find((event) => event.type === "publish_skipped");
+    assert.match(String(skipped?.data?.reason), /no longer resolves to the URLs it had when the task started/u);
+    assert.equal(supervisor.state, "completed");
+    assert.match(String(candidates.at(-1)?.reason), /not published: .*extra destination or a repoint/u);
+    assert.deepEqual(fixture.state.sent, []);
+    const { stdout } = await execFileAsync("git", ["ls-remote", "--heads", evil], { cwd: repo.cwd });
+    assert.equal(stdout.trim(), "", "nothing reached the diverted destination");
+  } finally {
+    await repo.cleanup();
+    await rm(evil, { recursive: true, force: true });
+  }
+});
+
+test("a destination changed after the grant refuses the granted push at the moment it is authorized", async () => {
+  const branch = "worker/publish-late-rewrite";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-late-", branch);
+  const evil = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-publish-late-evil-"));
+  try {
+    await execFileAsync("git", ["init", "--bare", "-q"], { cwd: evil });
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: Array<{ status: string; reason: string }> = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push({ status: notice.status, reason: notice.reason }); },
+    });
+    const responded: Array<{ requestId: string; behavior: string; message?: string }> = [];
+    fixture.adapter.respondPermission = async (_handle, requestId, _toolUseId, response) => { responded.push({ requestId, behavior: response.behavior, ...(response.message ? { message: response.message } : {}) }); };
+    await supervisor.start({
+      task: "rewrite the destination inside the publish turn",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const first = fixture.turn(1);
+    fixture.state.listener?.(first);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done" }, first);
+    const requested = events.events.find((event) => event.type === "publish_requested");
+    assert.ok(requested, "the grant was issued against the untouched remote");
+
+    // The Worker's first command of the publish turn rewrites the push URL
+    // through a door the policy never sees (written straight into the repo
+    // config here); its second is the exact granted push.
+    await execFileAsync("git", ["config", `url.${evil}.pushInsteadOf`, repo.remote], { cwd: repo.cwd });
+    const head = String(requested?.data?.head);
+    const granted = publishCommand({ authority: "push", remoteName: "origin", branch, head, cwd: repo.cwd });
+    fixture.state.listener?.({ type: "permission_request", handle: fixture.handle, request: { requestId: "req-diverted-push", toolUseId: "tool-diverted-push", toolName: "Bash", input: { command: granted }, raw: {} } });
+    await supervisor.poll();
+    assert.equal(responded.at(-1)?.requestId, "req-diverted-push");
+    assert.equal(responded.at(-1)?.behavior, "deny");
+    assert.match(String(responded.at(-1)?.message), /no longer resolves as it did when the publish was granted/u);
+    assert.ok(events.events.some((event) => event.type === "publish_grant_revoked" && /no longer resolves/u.test(String(event.data?.reason))));
+    // The same request through the PreToolUse veto point is refused as well.
+    fixture.state.listener?.({ type: "permission_request", handle: fixture.handle, request: { requestId: "req-diverted-pre", toolUseId: "tool-diverted-pre", toolName: "Bash", input: { command: granted }, raw: {}, phase: "pre" } });
+    await supervisor.poll();
+    assert.equal(responded.at(-1)?.behavior, "deny");
+
+    const second = fixture.turn(2);
+    fixture.state.listener?.(second);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "tried to push" }, second);
+    assert.equal(supervisor.state, "blocked");
+    assert.match(String(candidates.at(-1)?.reason), /may have gone to the rewritten destination/u);
+    for (const remote of [repo.remote, evil]) {
+      const { stdout } = await execFileAsync("git", ["ls-remote", "--heads", remote], { cwd: repo.cwd });
+      assert.equal(stdout.trim(), "", `nothing reached ${remote}`);
+    }
+  } finally {
+    await repo.cleanup();
+    await rm(evil, { recursive: true, force: true });
+  }
+});
+
+test("a task recovered without a recorded baseline, or started without a remote, is never granted", async () => {
+  const branch = "worker/publish-no-baseline";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-nobase-", branch);
+  try {
+    const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repo.cwd })).stdout.trim();
+    // Recovery: taskId + startedAt mark it, and the record carries no baseline
+    // (its first start could not resolve the remote). Nothing is recorded now,
+    // after the Worker ran, so the grant is refused.
+    {
+      const fixture = closeOutFixture(repo.cwd);
+      const events = new FlakyEventLog("never-fail");
+      const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+      await supervisor.start({
+        taskId: "recovered-no-baseline",
+        startedAt: new Date(Date.now() - 60_000).toISOString(),
+        baseCommit: head,
+        baseBranch: branch,
+        task: "recovered without a baseline",
+        cwd: repo.cwd,
+        command: "claude",
+        automation: true,
+        spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+        deadlineMs: 0,
+        noOutputTimeoutMs: 0,
+        decisionWorkerFactory: fixture.decisionWorkerFactory,
+      });
+      assert.ok(!events.events.some((event) => event.type === "publish_baseline"), "recovery records no baseline");
+      const turn = fixture.turn(1);
+      fixture.state.listener?.(turn);
+      await supervisor.poll();
+      await fixture.state.onAction?.({ action: "verify", reason: "done" }, turn);
+      assert.ok(!events.events.some((event) => event.type === "publish_requested"));
+      assert.match(String(events.events.find((event) => event.type === "publish_skipped")?.data?.reason), /were not recorded when the task started/u);
+      assert.equal(supervisor.state, "completed");
+    }
+    // A fresh start whose remote does not exist records that fact; a remote
+    // the Worker defines later is not one the operator configured.
+    {
+      await execFileAsync("git", ["remote", "remove", "origin"], { cwd: repo.cwd });
+      const fixture = closeOutFixture(repo.cwd);
+      const events = new FlakyEventLog("never-fail");
+      const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+      await supervisor.start({
+        task: "no remote at start",
+        cwd: repo.cwd,
+        command: "claude",
+        automation: true,
+        spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+        deadlineMs: 0,
+        noOutputTimeoutMs: 0,
+        decisionWorkerFactory: fixture.decisionWorkerFactory,
+      });
+      const baseline = events.events.find((event) => event.type === "publish_baseline");
+      assert.equal(baseline?.data?.unresolved, true);
+      await execFileAsync("git", ["remote", "add", "origin", repo.remote], { cwd: repo.cwd });
+      const turn = fixture.turn(1);
+      fixture.state.listener?.(turn);
+      await supervisor.poll();
+      await fixture.state.onAction?.({ action: "verify", reason: "done" }, turn);
+      assert.ok(!events.events.some((event) => event.type === "publish_requested"));
+      assert.match(String(events.events.find((event) => event.type === "publish_skipped")?.data?.reason), /had no URL when the task started/u);
+    }
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test("a publish the Worker never performed blocks the candidate instead of completing it", async () => {
+  const branch = "worker/publish-missing";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-miss-", branch);
+  try {
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: Array<{ status: string; reason: string; deliverable: boolean }> = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push({ status: notice.status, reason: notice.reason, deliverable: notice.deliverable }); },
+    });
+    await supervisor.start({
+      task: "publish is requested but not done",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const first = fixture.turn(1);
+    fixture.state.listener?.(first);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done" }, first);
+    assert.ok(events.events.some((event) => event.type === "publish_requested"));
+
+    // The Worker reports back without having pushed anything.
+    const second = fixture.turn(2);
+    fixture.state.listener?.(second);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "claims to have pushed" }, second);
+
+    assert.equal(supervisor.state, "blocked");
+    assert.ok(events.events.some((event) => event.type === "publish_unconfirmed"));
+    assert.equal(candidates.at(-1)?.status, "blocked");
+    assert.match(String(candidates.at(-1)?.reason), /does not point at/u);
+    // `status` is the task outcome; `deliverable` is the candidate: it passed
+    // acceptance and review and is intact on its branch, so the operator can
+    // publish it by hand — which is exactly what the notice is for.
+    assert.equal(candidates.at(-1)?.deliverable, true);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test("a verified tree with uncommitted changes is never granted: the Worker is asked to commit, and the task ends unpublished only when no repair round is left", async () => {
+  const branch = "worker/publish-dirty";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-dirty-", branch);
+  try {
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: Array<{ status: string; reason: string; deliverable: boolean }> = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push({ status: notice.status, reason: notice.reason, deliverable: notice.deliverable }); },
+    });
+    await supervisor.start({
+      task: "leave an uncommitted fix behind",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      // requireLocalCommit off is the one way a dirty tree reaches the publish
+      // step at all; the grant must still refuse it.
+      spec: { maxRepairRounds: 1, autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    await writeFile(join(repo.cwd, "uncommitted-fix.txt"), "the Reviewer saw this in the diff; HEAD does not have it\n");
+    const first = fixture.turn(1);
+    fixture.state.listener?.(first);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done" }, first);
+
+    // Not a dead end: the Worker is asked to commit what belongs to the candidate.
+    assert.ok(!events.events.some((event) => event.type === "publish_requested"), "no grant for a tree HEAD does not represent");
+    assert.equal(fixture.state.sent.length, 1);
+    assert.match(fixture.state.sent[0]!, /uncommitted or untracked changes.*commit everything that belongs to the candidate/u);
+    assert.equal(supervisor.state, "running");
+
+    // The Worker comes back without committing; the one repair round is spent.
+    const second = fixture.turn(2);
+    fixture.state.listener?.(second);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done again" }, second);
+    assert.ok(!events.events.some((event) => event.type === "publish_requested"));
+    const skipped = events.events.find((event) => event.type === "publish_skipped");
+    assert.match(String(skipped?.data?.reason), /uncommitted or untracked changes.*no repair round was available/u);
+    assert.equal(supervisor.state, "completed");
+    assert.match(String(candidates.at(-1)?.reason), /not published: .*uncommitted or untracked/u);
+    assert.equal(fixture.state.sent.length, 1, "no publish instruction was ever sent");
+    const { stdout } = await execFileAsync("git", ["ls-remote", "--heads", "origin", branch], { cwd: repo.cwd });
+    assert.equal(stdout.trim(), "", "nothing reached the remote");
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test("a remote that cannot be reached leaves the publish unconfirmed, not falsely refuted", async () => {
+  const branch = "worker/publish-unreachable";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-unreachable-", branch);
+  try {
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: Array<{ status: string; reason: string; deliverable: boolean }> = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push({ status: notice.status, reason: notice.reason, deliverable: notice.deliverable }); },
+    });
+    const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repo.cwd })).stdout.trim();
+    fixture.adapter.send = async (_handle, message) => {
+      fixture.state.sent.push(message);
+      if (!message.includes("Publish it")) return;
+      await execFileAsync("git", ["-C", repo.cwd, "-c", "core.hooksPath=/dev/null", "-c", "push.followTags=false", "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
+      // The push landed; then the remote drops off the network (here: is deleted).
+      await rm(repo.remote, { recursive: true, force: true });
+    };
+    await supervisor.start({
+      task: "publish, then lose the remote",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const first = fixture.turn(1);
+    fixture.state.listener?.(first);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done" }, first);
+    assert.ok(events.events.some((event) => event.type === "publish_requested"));
+    const second = fixture.turn(2);
+    fixture.state.listener?.(second);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "pushed" }, second);
+
+    assert.equal(supervisor.state, "blocked");
+    const unconfirmed = events.events.find((event) => event.type === "publish_unconfirmed");
+    assert.ok(unconfirmed, "the publish is unconfirmed, not refuted");
+    assert.ok(typeof unconfirmed?.data?.unreachable === "string", "the event records that the remote could not be asked");
+    assert.notEqual(unconfirmed?.data?.remoteChanged, true, "a remote that cannot be read was not 'repointed'");
+    assert.match(String(candidates.at(-1)?.reason), /could not be reached to confirm the publish/u);
+    assert.doesNotMatch(String(candidates.at(-1)?.reason), /does not point at|no longer points/u);
+    assert.equal(candidates.at(-1)?.deliverable, true);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test("without remote authority the task still completes at the verified candidate", async () => {
+  const branch = "worker/no-authority";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-none-", branch);
+  try {
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "no remote authority",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const turn = fixture.turn(1);
+    fixture.state.listener?.(turn);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done" }, turn);
+    assert.equal(supervisor.state, "completed");
+    assert.ok(!events.events.some((event) => event.type === "publish_requested"));
+    assert.deepEqual(fixture.state.sent, []);
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test("the publish grant dies with its turn, so a later unverified push is refused", async () => {
+  const branch = "worker/publish-oneshot";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-oneshot-", branch);
+  try {
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "the grant is one-shot",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const responded: Array<{ requestId: string; behavior: string; message?: string }> = [];
+    fixture.adapter.respondPermission = async (_handle, requestId, _toolUseId, response) => { responded.push({ requestId, behavior: response.behavior, ...(response.message ? { message: response.message } : {}) }); };
+    const first = fixture.turn(1);
+    fixture.state.listener?.(first);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done" }, first);
+    assert.ok(events.events.some((event) => event.type === "publish_requested"));
+
+    // The granted push, requested under the default hybrid authority, is the
+    // Supervisor's own decision: answered by the policy, never escalated to a
+    // Decision Worker whose standing rule is to refuse a push.
+    const head = String(events.events.find((event) => event.type === "publish_requested")?.data?.head);
+    const granted = { requestId: "req-granted-push", toolUseId: "tool-granted-push", toolName: "Bash", input: { command: publishCommand({ authority: "push", remoteName: "origin", branch, head, cwd: repo.cwd }) }, raw: {} };
+    fixture.state.listener?.({ type: "permission_request", handle: fixture.handle, request: granted });
+    await supervisor.poll();
+    assert.deepEqual(responded.map((entry) => [entry.requestId, entry.behavior]), [["req-granted-push", "allow"]]);
+    const decision = events.events.find((event) => event.type === "permission_decision" && event.data?.requestId === "req-granted-push");
+    assert.equal(decision?.data?.actor, "policy");
+    assert.equal(decision?.data?.behavior, "allow");
+    // The same grant does not stretch to a differently shaped push.
+    fixture.state.listener?.({ type: "permission_request", handle: fixture.handle, request: { ...granted, requestId: "req-branch-push", input: { command: `git -C ${repo.cwd} -c core.hooksPath=/dev/null push origin ${branch}` } } });
+    await supervisor.poll();
+    assert.equal(responded.at(-1)?.behavior, "deny");
+    assert.match(String(responded.at(-1)?.message), /publish grant is live but only admits/u);
+
+    // The publish turn ends. Whatever the Decision Worker decides next, the
+    // authority is already gone — it does not wait for a `verify`.
+    fixture.state.listener?.(fixture.turn(2));
+    await supervisor.poll();
+    assert.ok(events.events.some((event) => event.type === "publish_grant_revoked"));
+    assert.equal(supervisor.deadline, undefined);
+    // The very command the grant admitted a moment ago is refused now, through
+    // the same permission path, not by asking the policy without a grant.
+    fixture.state.listener?.({ type: "permission_request", handle: fixture.handle, request: { ...granted, requestId: "req-late-push" } });
+    await supervisor.poll();
+    assert.equal(responded.at(-1)?.requestId, "req-late-push");
+    assert.equal(responded.at(-1)?.behavior, "deny");
+    assert.match(String(responded.at(-1)?.message), /no remote repository/u);
+    assert.match(String(responded.at(-1)?.message), /one-shot publish grant expired/u, "the denial says the grant is gone rather than that no authority ever existed");
+  } finally {
+    await repo.cleanup();
+  }
+});
+
+test("a task granted remote authority never reports ready without saying the publish did not happen", async () => {
+  const branch = "main";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-skip-", branch);
+  try {
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: Array<{ status: string; reason: string }> = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push({ status: notice.status, reason: notice.reason }); },
+    });
+    await supervisor.start({
+      task: "the candidate sits on a protected branch",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      // The candidate is on `main`, which is never publishable.
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const turn = fixture.turn(1);
+    fixture.state.listener?.(turn);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done" }, turn);
+
+    assert.equal(supervisor.state, "completed");
+    assert.ok(events.events.some((event) => event.type === "publish_skipped"));
+    // Completing silently would tell the operator a PR exists when none does.
+    assert.match(String(candidates.at(-1)?.reason), /not published: .*protected branch/u);
+  } finally {
+    await repo.cleanup();
+  }
 });
