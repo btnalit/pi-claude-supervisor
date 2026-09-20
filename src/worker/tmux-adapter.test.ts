@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
-import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS, sweepDeadTmuxSockets } from "./tmux-adapter.ts";
+import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS, sameDirectory, sweepDeadTmuxSockets } from "./tmux-adapter.ts";
 import { preflightCgroupContainment } from "./process-adapter.ts";
 import type { HookEventSource, HookRelayReply, HookRelayRequest } from "../hooks/types.ts";
 import type { WorkerEvent } from "../types.ts";
@@ -1534,5 +1534,23 @@ test("sweepDeadTmuxSockets removes pi-cs sockets no server answers on and keeps 
   } finally {
     spawnSync("tmux", ["-S", live, "kill-server"], { stdio: "ignore" });
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("sameDirectory compares directory identity, not the spelling of the path", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-same-dir-"));
+  try {
+    const target = join(root, "target");
+    await mkdir(target);
+    await symlink(target, join(root, "alias"));
+    await writeFile(join(root, "file"), "x");
+    assert.equal(await sameDirectory(target, join(root, "alias")), true);
+    // The process's own cwd through /proc, the way an adopted pane is checked.
+    assert.equal(await sameDirectory(process.cwd(), `/proc/${process.pid}/cwd`), process.platform === "linux");
+    assert.equal(await sameDirectory(target, root), false);
+    assert.equal(await sameDirectory(target, join(root, "file")), false, "a file is never the same directory");
+    assert.equal(await sameDirectory(target, join(root, "missing")), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
