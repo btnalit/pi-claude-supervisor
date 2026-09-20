@@ -585,7 +585,7 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
   assert.equal(evaluatePermission("Bash", { command: `${pullRequestCommand(pr)} --title t --body b` }, process.cwd(), { remote: pr }).granted, true);
   const spaced = { ...push, cwd: "/tmp/it's a dir" };
   assert.match(publishCommand(spaced), /^git -C '\/tmp\/it'\\''s a dir' -c core\.hooksPath=\/dev\/null -c push\.followTags=false push origin /u);
-  assert.equal(evaluatePermission("Bash", { command: publishCommand(spaced) }, process.cwd(), { remote: spaced }).decision, "deny", "a directory that is not the task's");
+  assert.equal(evaluatePermission("Bash", { command: publishCommand(spaced) }, process.cwd(), { remote: push }).decision, "deny", "another grant's directory is not this grant's");
   // Every word the grant supplies is quoted: a legal branch name may carry
   // `$`, `{}` or a quote, which unquoted the lexer reads as dynamic and the
   // matcher refuses — the Supervisor's own instruction would be unfulfillable.
@@ -703,30 +703,42 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
     `cat <<'EOF' | bash\ngit -C ${process.cwd()} ${hooks} push origin ${refspec}\nEOF`,
   ]) assert.equal(evaluateCommand(wrapper, [], push).decision, "deny", wrapper);
 
-  // `-C <task directory>` is required, absolute, and resolved through the
-  // kernel, so the grant cannot be spent in another clone the Worker has
-  // wandered into. A relative directory would resolve against *this* process,
-  // not the Worker's shell: `.` passed while git ran somewhere else.
+  // `-C <task directory>` is required, absolute, and byte for byte the
+  // granted directory — no normalization, no realpath — so the grant cannot be
+  // spent in another clone the Worker has wandered into. Every looser
+  // comparison had a spelling this process resolved one way and git another:
+  // a relative `.` against this process's cwd, `/proc/self/cwd` against this
+  // process's, and `<cwd>/link/..`, which Node's own `realpathSync` collapses
+  // lexically while the kernel follows the link. The instruction spells the
+  // exact directory; a quoted spelling of it is the same word to the lexer.
   assert.equal(evaluateCommand(`git ${hooks} push origin ${refspec}`, [], push).decision, "deny", "no -C");
-  assert.equal(evaluateCommand(`git -C ${process.cwd()}/src/.. ${hooks} push origin ${refspec}`, [], push).decision, "allow", "the same directory, spelled differently");
-  for (const directory of ["/tmp", "/", `${process.cwd()}/src`, ".", "''", "src/..", "./", `'${process.cwd()}/../${process.cwd().split("/").at(-1)}/src/..'`]) {
-    const expected = directory.startsWith("'/") ? "allow" : "deny";
-    assert.equal(evaluateCommand(`git -C ${directory} ${hooks} push origin ${refspec}`, [], push).decision, expected, directory);
-  }
-  // `/proc/self/cwd` resolves to *this* process's directory here and to the
-  // Worker's shell's under git: equal through the kernel, running somewhere
-  // else. So does a symlink to it inside the task directory, which is why the
-  // directory must also equal the task directory *lexically*.
-  for (const directory of ["/proc/self/cwd", "/proc/thread-self/cwd", `/proc/${process.pid}/cwd`, "/dev/fd/3"]) {
+  assert.equal(evaluateCommand(`git -C '${process.cwd()}' ${hooks} push origin ${refspec}`, [], push).decision, "allow", "quoted, the same word");
+  for (const directory of ["/tmp", "/", `${process.cwd()}/src`, `${process.cwd()}/src/..`, `${process.cwd()}/`, ".", "''", "src/..", "./", `'${process.cwd()}/../${process.cwd().split("/").at(-1)}/src/..'`, "/proc/self/cwd", "/proc/thread-self/cwd", `/proc/${process.pid}/cwd`, "/dev/fd/3"]) {
     assert.equal(evaluateCommand(`git -C ${directory} ${hooks} push origin ${refspec}`, [], push).decision, "deny", directory);
   }
-  const procLinkBase = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-proclink-"));
+  // A symlink *inside* the granted directory: `<task>/link/..` is where the
+  // review that found it placed one, pointing at another clone with another
+  // origin. Node's realpathSync said "the task directory"; git went elsewhere.
+  const symlinkBase = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-grant-symlink-"));
   try {
-    await symlink("/proc/self/cwd", join(procLinkBase, "link"));
-    assert.equal(evaluateCommand(`git -C ${procLinkBase}/link ${hooks} push origin ${refspec}`, [], push).decision, "deny", "a symlink to /proc/self/cwd");
-    assert.equal(evaluateCommand(`git -C ${procLinkBase}/link/.. ${hooks} push origin ${refspec}`, [], push).decision, "deny", "and through it");
+    const task = join(symlinkBase, "task");
+    const elsewhere = join(symlinkBase, "elsewhere");
+    await mkdir(task);
+    await mkdir(elsewhere);
+    await symlink(elsewhere, join(task, "link"));
+    await symlink("/proc/self/cwd", join(task, "proc"));
+    const inside = { ...push, cwd: task };
+    assert.equal(evaluateCommand(`git -C ${task} ${hooks} push origin ${refspec}`, [], inside).decision, "allow");
+    assert.equal(evaluatePermission("Bash", { command: publishCommand(inside) }, task, { remote: inside }).granted, true);
+    for (const directory of [`${task}/link/..`, `${task}/link`, `${task}/proc`, `${task}/proc/..`, `${task}/./`, `${task}/.`]) {
+      assert.equal(evaluateCommand(`git -C ${directory} ${hooks} push origin ${refspec}`, [], inside).decision, "deny", directory);
+    }
+    // The realpath helper the other layers use agrees with the kernel, not
+    // with Node's JavaScript realpath.
+    assert.equal(sameDirectory(`${task}/link/..`, task), false, "a link followed by .. is not the task directory");
+    assert.equal(sameDirectory(`${task}/link/..`, symlinkBase), true, "it is the link's parent");
   } finally {
-    await rm(procLinkBase, { recursive: true, force: true });
+    await rm(symlinkBase, { recursive: true, force: true });
   }
 
   // One realpath-equality helper with an explicit policy for a missing path.

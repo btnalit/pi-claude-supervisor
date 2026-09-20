@@ -175,7 +175,7 @@ function resolveExistingPath(path: string): string {
   let current = resolve(path);
   const missing: string[] = [];
   for (;;) {
-    try { return join(realpathSync(current), ...[...missing].reverse()); }
+    try { return join(realpathSync.native(current), ...[...missing].reverse()); }
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "ENOENT" && code !== "ENOTDIR") return resolve(path);
@@ -227,7 +227,7 @@ function classifyWritePath(value: string, cwd: string, writeRoots: readonly stri
   // (deleted, or its mount gone) must not have its writes allowed on whatever
   // filesystem now sits there, which the Write tool's `mkdir -p` would create.
   let root: string;
-  try { root = realpathSync(cwd); }
+  try { root = realpathSync.native(cwd); }
   catch { return "cwd-missing"; }
   if (isAbsolute(value)) {
     const below = pathBelow(value, [cwd, root]);
@@ -269,7 +269,7 @@ function walkWritePath(relativePath: string, root: string): WritePathViolation |
     // A regular file with multiple links may be an alias for a Git ref or
     // other metadata file even when its pathname contains no `.git` segment.
     if (info.isFile() && info.nlink > 1) return "git-metadata";
-    const resolved = realpathSync(absolute);
+    const resolved = realpathSync.native(absolute);
     if (resolved.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return "git-metadata";
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -320,7 +320,10 @@ export function isProtectedBranch(branch: string): boolean {
  * a shape check on paths that may not exist yet.
  */
 export function sameDirectory(first: string, second: string, whenMissing: "false" | "lexical" = "false"): boolean {
-  try { return realpathSync(first) === realpathSync(second); }
+  // The native realpath, not Node's JavaScript one: the latter collapses a
+  // trailing `..` lexically even after a symlink, and disagrees with the
+  // kernel for exactly the paths a boundary check exists to catch.
+  try { return realpathSync.native(first) === realpathSync.native(second); }
   catch { return whenMissing === "lexical" ? resolve(first) === resolve(second) : false; }
 }
 
@@ -345,20 +348,17 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
     // `-C <task directory>` is *required*, not merely tolerated. Claude's Bash
     // tool keeps its working directory between calls and `cd` is ordinary local
     // work, so without an explicit directory the grant could be spent in any
-    // clone the Worker had wandered into. The directory must be absolute: a
-    // relative one (`.`, `''`, `src/..`) would resolve against *this* process,
-    // not the Worker's shell, and pass while git ran somewhere else. It must
-    // then equal the task directory *both* lexically and through the kernel:
-    // lexically, because `/proc/self/cwd` — or a symlink to it inside the task
-    // directory — resolves to *this* process's cwd here and to the Worker's
-    // shell's under git; through the kernel, because `<cwd>/link/..` spells
-    // the task directory while git follows the link and ends up elsewhere.
-    // The instruction spells the exact directory, so `<cwd>/src/..` is the
-    // only latitude a Worker needs.
+    // clone the Worker had wandered into. The directory must be the granted one
+    // *byte for byte* — no normalization, no realpath. Every looser comparison
+    // has had a spelling that this process resolves one way and git another:
+    // a relative `.` against this process's cwd, `/proc/self/cwd` against this
+    // process's, and `<cwd>/link/..`, which Node's own `realpathSync` collapses
+    // lexically to the task directory while the kernel — and git — follow the
+    // link and end up elsewhere. The instruction spells the exact directory,
+    // so no alternate spelling needs to be accepted at all.
     if (words[1] !== "-C") return undefined;
     const directory = words[2];
-    if (directory === undefined || !isAbsolute(directory)) return undefined;
-    if (resolve(directory) !== resolve(grant.cwd) || !sameDirectory(directory, grant.cwd)) return undefined;
+    if (directory === undefined || !isAbsolute(directory) || directory !== grant.cwd) return undefined;
     // The pinned `-c` settings are required too, in order: a `pre-push` hook
     // runs inside the granted push with the Worker's credentials where no
     // policy sees it, and `push.followTags=true` would push a tag along with
@@ -1427,14 +1427,14 @@ function namesPathOutsideCwd(word: string, cwd: string, writeRoots: readonly str
   // a literal and needs no check.
   if (value.startsWith("-") || value === "") return false;
   let root: string;
-  try { root = realpathSync(cwd); }
+  try { root = realpathSync.native(cwd); }
   catch { return true; }
   // Resolve the nearest existing ancestor so a symlinked directory component
   // (`link/new-file`) is caught even when the leaf does not exist yet.
   let candidate = resolve(cwd, value);
   while (true) {
     try {
-      const real = realpathSync(candidate);
+      const real = realpathSync.native(candidate);
       const rel = relative(root, real);
       return rel !== "" && (rel.startsWith("..") || isAbsolute(rel));
     } catch {

@@ -478,7 +478,7 @@ transport-affecting keys (including `include.*` and `init.*`), `git config
 `.git/hooks` in any spelling (`namesGitMetadata` normalizes the path and matches a glob segment by segment, so only a
 segment that could expand to `.git` counts — a project's own `src/hooks/` is ordinary work) that does not plainly only read are refused alongside `git remote`
 mutations; git's own `--git-dir`/`--work-tree` options and `remote`'s own `-v`
-cannot hide either, nor can `-C /proc/self/cwd` (the directory must match lexically *and* through the kernel) or `--separate-git-dir`. The publish
+cannot hide either, nor can `-C /proc/self/cwd` or `-C <cwd>/link/..` (the directory must be the granted one byte for byte; every realpath comparison elsewhere uses the native implementation, since Node's JavaScript `realpathSync` collapses `link/..` lexically) or `--separate-git-dir`. The publish
 hint keys on `PolicyResult.boundary`, not on the reason text, and promises a publish turn
 only where `#requestPublish` will start one. For an adopted tmux session the memory write root is
 located under the *adopted process's* configuration directory, read from

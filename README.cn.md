@@ -222,9 +222,9 @@ Worker 推自己的分支;`pr` 还允许它开 PR。**push 由 Worker 自己执�
 无害。它只认 `git -C '<任务目录>' -c core.hooksPath=/dev/null -c push.followTags=false push <remote> <已验证 commit>:refs/heads/<branch>`,
 不带其他任何选项。refspec 写的是**已验证的 commit** 而不是分支:git 只会推送这一个对象,
 Worker 在发布轮里再提交的内容会留在本地("Everything up-to-date"),搭不上这次授权。
-**`-C` 是必需的且必须是绝对路径**,两侧都按内核解析后比较——因为 Claude 的 Bash 工具
+**`-C` 是必需的、必须是绝对路径、且必须与任务目录逐字节相同**——不做规范化、不做 realpath——因为 Claude 的 Bash 工具
 会在多次调用之间保留工作目录,而 `cd` 属于普通本地操作,没有 `-C` 的话授权可能被花在
-任何别的克隆上;目录必须在字面上和经内核解析后都等于任务目录:`/proc/self/cwd`(或指向它的 symlink)会解析成 Supervisor 自己的进程目录,而 `<cwd>/link/..` 字面上是任务目录、git 却会走到别处。
+任何别的克隆上;任何更宽松的比较都出现过 Supervisor 与 git 解析不一致的写法(相对路径 `.` 按 Supervisor 的目录解析、`/proc/self/cwd`,以及 `<cwd>/link/..`——Node 自己的 realpath 会按字面折叠而内核会跟随 symlink)。指令写的就是精确目录,不需要接受任何别的写法。
 这条命令上**钉死了 hooks 路径**,所以 Worker 通过任何途径(`git init --template=`、
 解压归档、`chmod`)装进去的 `pre-push` hook 都不会在授权的 push 里以 Worker 的凭据执行;也钉死了
 `push.followTags=false`,所以通过策略看不见的任何文件设的 `followTags=true` 都不能让这一次 push
@@ -248,7 +248,7 @@ title / body / base / draft / assignee / label):PR 只会开在授权 remote 对
 `--mirror`、`--all`、`--tags`、`--no-verify`、`--push-option`、`--receive-pack` 等)、
 除这两个钉死项(且顺序固定)以外的任何 `-c`、以分支或 `HEAD` 作为 refspec 来源、裸 `git push`、
 别的 remote、分支或 commit、保护分支、被 shell 包装(含 heredoc 管进 shell)、带动态参数、
-第二条语句、不带 `-C` 的 `git push`、`-C` 指向任务目录以外或写成相对路径、不带
+第二条语句、不带 `-C` 的 `git push`、`-C` 与任务目录不逐字节相同(别的目录、相对路径、`/proc/self/cwd`、其中的 symlink 或 `..`)、不带
 `--repo <钉住的 URL>` 或不带 `--head <候选分支>` 的 `gh pr create`(被别的选项当作值吞掉的
 `--head` 不算)、`gh pr create --body-file/-F/--template`(会把任意本地文件内容发到 PR 上)、
 `--web`、别的 `--repo`、`gh pr merge`、`gh api`、`gh release`、`npm publish`。改动仓库

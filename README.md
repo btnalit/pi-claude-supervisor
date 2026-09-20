@@ -274,12 +274,14 @@ exactly `git -C '<task directory>' -c core.hooksPath=/dev/null -c push.followTag
 with no other option. The refspec names the **verified commit**, not the branch:
 git pushes exactly that object, so a commit the Worker makes during the publish
 turn stays local ("Everything up-to-date") instead of riding the grant. `-C` is
-**required and absolute**, and both sides are resolved through the kernel,
-because Claude's Bash tool keeps its working directory between calls and `cd` is
-ordinary local work — without it the grant could be spent in any other clone,
-and the directory must equal the task's both lexically and through the kernel:
-`/proc/self/cwd` (or a symlink to it) resolves to the Supervisor's own process,
-and `<cwd>/link/..` spells the task directory while git ends up elsewhere. The hooks path is **pinned** on that one command so no
+**required, absolute and byte for byte the task directory** — no normalization,
+no realpath — because Claude's Bash tool keeps its working directory between
+calls and `cd` is ordinary local work, so without it the grant could be spent
+in any other clone, and every looser comparison had a spelling the Supervisor
+resolved one way and git another (`.` against the Supervisor's cwd,
+`/proc/self/cwd`, and `<cwd>/link/..`, which Node's own realpath collapses
+lexically while the kernel follows the link). The instruction spells the exact
+directory, so no other spelling is needed. The hooks path is **pinned** on that one command so no
 `pre-push` hook a Worker could have installed (by any door: `git init
 --template=`, an archive, a `chmod`) runs inside the granted push with the
 Worker's credentials, and `push.followTags=false` is pinned so a
@@ -313,7 +315,8 @@ Refused with or without a grant: every push option (`-u`, `--force`,
 branch or `HEAD` as the refspec source, a bare `git push`, another remote,
 branch or commit, a protected branch, a shell wrapper (`sh -c`, and a heredoc
 piped into a shell), a dynamic word, a second statement, `git push` without
-`-C`, a `-C` naming anything but the task directory or spelled relatively,
+`-C`, a `-C` that is not the task directory byte for byte (another directory, a
+relative path, `/proc/self/cwd`, a symlink or `..` inside it),
 `gh pr create` without `--repo <pinned URL>` or without `--head <candidate
 branch>` (a `--head` swallowed as another option's value does not count),
 `gh pr create --body-file/-F/--template` (which would post the contents of an
