@@ -48,6 +48,7 @@ export interface DecisionSessionReadyInfo {
   repairRound: number;
   baseCommit?: string;
   baseBranch?: string;
+  remoteBaseline?: RemoteDestination;
   resolvedExecutable: string;
   lastFindingSignature?: string;
 }
@@ -157,6 +158,8 @@ export interface SupervisorStartOptions {
   workerArgOptions?: AutomaticClaudeArgOptions;
   /** Non-protected local branch before automatic work begins. */
   baseBranch?: string;
+  /** The granted remote's URLs when the task first started; recovery reuses the recorded baseline. */
+  remoteBaseline?: RemoteDestination;
   /** Internal recovery values; elapsed wall time remains cumulative. */
   startedAt?: string;
   initialTurn?: number;
@@ -376,7 +379,7 @@ export class Supervisor {
     this.#workerCostBaseline = this.#usage.workerCostUsd;
     this.#lastWorkerResultCost = 0;
     this.#repairSendInProgress = false;
-    this.#task = { taskId, task: spec.goal, cwd: options.cwd, maxTurns: options.maxTurns ?? 100, startedAt: options.startedAt ?? new Date().toISOString(), ...(options.baseCommit ? { baseCommit: options.baseCommit } : {}), ...(options.baseBranch ? { baseBranch: options.baseBranch } : {}), spec, repairRound: options.initialRepairRound ?? 0, ...(options.initialFindingSignature ? { lastFindingSignature: options.initialFindingSignature } : {}) };
+    this.#task = { taskId, task: spec.goal, cwd: options.cwd, maxTurns: options.maxTurns ?? 100, startedAt: options.startedAt ?? new Date().toISOString(), ...(options.baseCommit ? { baseCommit: options.baseCommit } : {}), ...(options.baseBranch ? { baseBranch: options.baseBranch } : {}), ...(options.remoteBaseline ? { remoteBaseline: options.remoteBaseline } : {}), spec, repairRound: options.initialRepairRound ?? 0, ...(options.initialFindingSignature ? { lastFindingSignature: options.initialFindingSignature } : {}) };
     this.#repairRound = options.initialRepairRound ?? 0;
     this.#lastFindingSignature = options.initialFindingSignature;
     this.#turn = options.initialTurn ?? 0;
@@ -423,6 +426,14 @@ export class Supervisor {
         this.#task.baseBranch = options.baseBranch ?? boundary.branch;
         this.#lastObservedBranch = this.#task.baseBranch;
         startupHead = boundary.head;
+        // The remote's resolved URLs are pinned now, before the Worker runs a
+        // single command: the publish grant later requires the same two, so a
+        // rewrite added during the task is caught wherever it was written. A
+        // recovered task keeps the baseline its first start recorded.
+        if (spec.autonomy.remoteAuthority !== "none" && !this.#task.remoteBaseline) {
+          this.#task.remoteBaseline = await remoteUrl(options.cwd, spec.autonomy.remoteName, startAbortController.signal);
+          this.#assertStartNotAborted(startAbortController.signal);
+        }
       }
       await this.#appendEvent({
         type: "task_started",
@@ -503,6 +514,7 @@ export class Supervisor {
                 repairRound: this.#repairRound,
                 ...(this.#task?.baseCommit ? { baseCommit: this.#task.baseCommit } : {}),
                 ...(this.#task?.baseBranch ? { baseBranch: this.#task.baseBranch } : {}),
+                ...(this.#task?.remoteBaseline ? { remoteBaseline: this.#task.remoteBaseline } : {}),
                 ...(this.#lastFindingSignature ? { lastFindingSignature: this.#lastFindingSignature } : {}),
               });
             },
@@ -924,8 +936,11 @@ export class Supervisor {
     // comes or told something gets published when nothing does.
     const branch = this.#lastObservedBranch;
     if (!this.#automation) return "; this task is supervised manually, so no publish turn will run: finish and commit locally, and the verified candidate is published by the operator";
+    if (this.#humanRequired) return "; a human has taken over this session, so no publish turn will run while that lasts: finish and commit locally";
     if (!canRepairInPlace(this.#adapter)) return `; the ${this.#adapter.capabilities().transport} transport cannot take a publish turn, so the task ends at a verified local candidate: finish and commit locally`;
     if (branch && isProtectedBranch(branch)) return `; ${branch} is a protected branch that is never published, so the task ends at a verified local candidate: finish and commit locally`;
+    const closeOut = this.#deadlineContext();
+    if (closeOut?.closeOut && (closeOut.closeOutRemainingMs ?? 0) < MIN_CLOSE_OUT_REPAIR_MS) return "; the task's close-out window is nearly spent, so no publish turn can start: commit what is complete now";
     return "; remote authority unlocks after this candidate's acceptance and review pass — finish and commit locally, and the Supervisor will ask you to publish";
   }
 
@@ -1868,6 +1883,21 @@ export class Supervisor {
     const url = await remoteUrl(task.cwd, remoteName, signal);
     if (!url) {
       await this.#notePublishShortfall(handle.id, { reason: `the remote ${remoteName} has no URL to publish to` });
+      return false;
+    }
+    // The URLs must be the ones the task started with. `git remote get-url`
+    // reports them with every `insteadOf`/`pushInsteadOf` applied, so a
+    // rewrite added since — through `git config`, a file the policy never
+    // sees, `~/.gitconfig`, anything — moves one of them and is refused here,
+    // before a grant could pin the diverted destination as if it were the
+    // real one. An operator's pre-existing rewrite was already in the baseline.
+    const baseline = task.remoteBaseline;
+    if (!baseline) {
+      await this.#notePublishShortfall(handle.id, { reason: `the URLs of ${remoteName} were not recorded when the task started, so a rewrite since then cannot be ruled out` });
+      return false;
+    }
+    if (url.fetch !== baseline.fetch || url.push !== baseline.push) {
+      await this.#notePublishShortfall(handle.id, { reason: `${remoteName} no longer resolves to the URLs it had when the task started (fetch ${baseline.fetch} → ${url.fetch}, push ${baseline.push} → ${url.push}); a URL rewrite or repoint happened during the task, so nothing is granted` });
       return false;
     }
     // A pull request needs a repository gh can name with `--repo`; a remote

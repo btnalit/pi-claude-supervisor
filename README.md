@@ -324,7 +324,12 @@ push goes or what runs during it — `git config` writes to `remote.*`,
 `.git/hooks` unless it plainly only reads (`cat`, `grep`, `ls`, …) — so the
 granted remote cannot be repointed underneath the confirmation, which pins both
 the fetch and the push URL and scrubs `GIT_DIR`/`GIT_CONFIG_*` from its own
-environment. This is a policy over the command text: a script the Worker writes
+environment. Behind all of that sits one rule the text guards do not need:
+the remote's resolved fetch and push URLs (`git remote get-url`, rewrites
+applied) are recorded when the task **starts**, and a grant requires the same
+two — so a `pushInsteadOf` or `pushurl` added during the task by *any* means
+(`~/.gitconfig`, a script, an include the policy never saw) is refused at grant
+time, while an operator's pre-existing rewrite, already in the baseline, is not. This is a policy over the command text: a script the Worker writes
 and runs is outside what it can see, as [autonomy-target.md](docs/autonomy-target.md)
 says of every text-level rule; absolute isolation is the host boundary's job.
 

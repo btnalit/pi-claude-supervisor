@@ -311,6 +311,14 @@ export interface TaskContext {
   baseCommit?: string;
   /** The branch the task started on; the Worker may move to another branch, the baseline commit stays the anchor. */
   baseBranch?: string;
+  /**
+   * Where the granted remote fetched from and pushed to when the task started,
+   * URL rewrites applied. A publish grant requires the same two URLs at grant
+   * time: a `url.*.insteadOf`/`pushInsteadOf` or `pushurl` added during the
+   * task by any means — a config file the policy never sees included — changes
+   * one of them and is refused, while an operator's pre-existing rewrite is not.
+   */
+  remoteBaseline?: { fetch: string; push: string };
   spec: TaskSpec;
   repairRound: number;
   lastFindingSignature?: string;

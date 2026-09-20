@@ -5,6 +5,13 @@ import { redactSensitive } from "./redaction.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import type { TaskSpec } from "./types.ts";
 
+/** Two non-empty URL strings and nothing else; a persisted baseline is data the grant trusts, so its shape is checked. */
+function isRemoteBaseline(value: unknown): value is { fetch: string; push: string } {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    && typeof (value as { fetch?: unknown }).fetch === "string" && (value as { fetch: string }).fetch.length > 0 && (value as { fetch: string }).fetch.length <= 4_096
+    && typeof (value as { push?: unknown }).push === "string" && (value as { push: string }).push.length > 0 && (value as { push: string }).push.length <= 4_096;
+}
+
 export type DecisionRecoveryState = "ready" | "starting" | "registered" | "recovered_idle" | "interrupted";
 
 export interface DecisionRecoveryWorker {
@@ -29,6 +36,8 @@ export interface DecisionSessionRecord {
   startedAt: string;
   baseCommit?: string;
   baseBranch?: string;
+  /** The granted remote's resolved URLs when the task first started; the publish grant requires the same two. */
+  remoteBaseline?: { fetch: string; push: string };
   /** Real executable identity pinned by automatic startup and recovery. */
   resolvedExecutable?: string;
   turn: number;
@@ -408,6 +417,7 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     || (value.workerCostUsd !== undefined && (typeof value.workerCostUsd !== "number" || !Number.isFinite(value.workerCostUsd) || value.workerCostUsd < 0))
     || (value.baseCommit !== undefined && (typeof value.baseCommit !== "string" || !/^[0-9a-f]{40,64}$/iu.test(value.baseCommit)))
     || (value.baseBranch !== undefined && (typeof value.baseBranch !== "string" || !/^[A-Za-z0-9._/-]+$/u.test(value.baseBranch)))
+    || (value.remoteBaseline !== undefined && !isRemoteBaseline(value.remoteBaseline))
     || (value.resolvedExecutable !== undefined && (typeof value.resolvedExecutable !== "string" || !isAbsolute(value.resolvedExecutable) || value.resolvedExecutable.length > 4_096))
     || (value.startedAt !== undefined && (typeof value.startedAt !== "string" || !Number.isFinite(Date.parse(value.startedAt))))
     || (value.recoveryWorker !== undefined && !isRecoveryWorker(value.recoveryWorker))) {
@@ -439,6 +449,7 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     startedAt: value.startedAt ?? value.updatedAt,
     ...(typeof value.baseCommit === "string" ? { baseCommit: value.baseCommit } : {}),
     ...(typeof value.baseBranch === "string" ? { baseBranch: value.baseBranch } : {}),
+    ...(isRemoteBaseline(value.remoteBaseline) ? { remoteBaseline: { fetch: value.remoteBaseline.fetch, push: value.remoteBaseline.push } } : {}),
     ...(typeof value.resolvedExecutable === "string" ? { resolvedExecutable: value.resolvedExecutable } : {}),
     turn: value.turn ?? 0,
     repairRound: value.repairRound ?? 0,

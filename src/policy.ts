@@ -535,14 +535,16 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
     || (directRefWrite && hasProtectedBranch && /refs[\\/]heads[\\/]/iu.test(canonical))) {
     return { decision: "deny", reason: "Worker cannot write protected Git branch refs directly" };
   }
-  // `.git/config` is the `git config` boundary above by another door, and a
-  // hook in `.git/hooks/` runs during the granted push where no policy sees
-  // it. A list of writing commands cannot be complete (`python3 -c`, `tar -C`,
-  // an archive), so any statement naming either path is refused unless it
-  // plainly only reads — the same stance the branch-ref rule above takes. The
-  // Write and Edit tools already refuse every `.git` path, and `git init
-  // --template=` would install hooks without naming the directory at all.
-  const namesMetadataFile = (segment: readonly ShellToken[]): boolean => segment.some((token) => !token.operator && /\.git[\\/](?:config|hooks)(?![A-Za-z0-9_.-])/iu.test(token.value));
+  // `.git/config` (and `.git/config.worktree`) is the `git config` boundary
+  // above by another door, and a hook in `.git/hooks/` runs during the granted
+  // push where no policy sees it. A list of writing commands cannot be
+  // complete (`python3 -c`, `tar -C`, an archive), so any statement naming
+  // either path is refused unless it plainly only reads — the same stance the
+  // branch-ref rule above takes. The Write and Edit tools already refuse every
+  // `.git` path, and `git init --template=` would install hooks without naming
+  // the directory at all. What this cannot see (`~/.gitconfig`, a script) the
+  // Supervisor's remote-URL baseline catches at grant time instead.
+  const namesMetadataFile = (segment: readonly ShellToken[]): boolean => segment.some((token) => !token.operator && /\.git[\\/](?:config|hooks)(?![A-Za-z0-9_-])/iu.test(token.value));
   if (segments.some((segment) => namesMetadataFile(segment) && !onlyReads(segment))) {
     return { decision: "deny", reason: "Worker cannot write the repository's Git configuration or hooks directly" };
   }

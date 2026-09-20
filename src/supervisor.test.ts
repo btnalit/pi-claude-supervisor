@@ -3347,6 +3347,57 @@ test("an edit left uncommitted during the publish turn is a changed candidate, n
   }
 });
 
+test("a URL rewrite added during the task, by any means, is refused at grant time: the remote must resolve as it did at start", async () => {
+  const branch = "worker/publish-rewritten";
+  const repo = await repositoryWithRemote("pi-claude-supervisor-publish-rewrite-", branch);
+  const evil = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-publish-evil-"));
+  try {
+    await execFileAsync("git", ["init", "--bare", "-q"], { cwd: evil });
+    const fixture = closeOutFixture(repo.cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: Array<{ status: string; reason: string }> = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push({ status: notice.status, reason: notice.reason }); },
+    });
+    await supervisor.start({
+      task: "publish after someone rewrote the push URL",
+      cwd: repo.cwd,
+      command: "claude",
+      automation: true,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, remoteAuthority: "push" } },
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    // Written straight into the repository config, standing in for every door
+    // the command policy cannot see (~/.gitconfig, a script, an include): the
+    // push now goes to `evil` while the fetch URL — and `ls-remote` — still
+    // name the real remote. Before the baseline this pinned the diverted URL
+    // as the destination and confirmed against it.
+    await execFileAsync("git", ["config", `url.${evil}.pushInsteadOf`, repo.remote], { cwd: repo.cwd });
+    const pushUrl = (await execFileAsync("git", ["remote", "get-url", "--push", "origin"], { cwd: repo.cwd })).stdout.trim();
+    assert.equal(pushUrl, evil, "the rewrite is in effect");
+
+    const turn = fixture.turn(1);
+    fixture.state.listener?.(turn);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "verify", reason: "done" }, turn);
+
+    assert.ok(!events.events.some((event) => event.type === "publish_requested"), "no grant against a rewritten remote");
+    const skipped = events.events.find((event) => event.type === "publish_skipped");
+    assert.match(String(skipped?.data?.reason), /no longer resolves to the URLs it had when the task started/u);
+    assert.equal(supervisor.state, "completed");
+    assert.match(String(candidates.at(-1)?.reason), /not published: .*rewrite or repoint/u);
+    assert.deepEqual(fixture.state.sent, []);
+    const { stdout } = await execFileAsync("git", ["ls-remote", "--heads", evil], { cwd: repo.cwd });
+    assert.equal(stdout.trim(), "", "nothing reached the diverted destination");
+  } finally {
+    await repo.cleanup();
+    await rm(evil, { recursive: true, force: true });
+  }
+});
+
 test("a publish the Worker never performed blocks the candidate instead of completing it", async () => {
   const branch = "worker/publish-missing";
   const repo = await repositoryWithRemote("pi-claude-supervisor-publish-miss-", branch);
