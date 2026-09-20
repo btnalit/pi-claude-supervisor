@@ -1,5 +1,5 @@
 import { lstatSync, realpathSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 export type PolicyDecision = "allow" | "review" | "deny";
 
@@ -26,7 +26,12 @@ export function evaluatePermission(toolName: string, input: unknown, cwd = proce
     const paths = fileToolPaths(input);
     if (paths.length === 0) return { decision: "deny", reason: `${toolName} request has no recognizable file path` };
     const violation = paths.map((path) => ({ path, classification: classifyWritePath(path, cwd, options.writeRoots) })).find((entry) => entry.classification !== undefined);
-    if (violation?.classification === "outside-cwd") return { decision: "deny", reason: `Worker cannot write outside the task working directory: ${violation.path}; keep deliverables in the task directory, and scratch work in this session's own scratchpad or memory directory` };
+    if (violation?.classification === "outside-cwd") {
+      // Only name an alternative the Worker actually has: writeRoots is empty
+      // for a bridge Worker and before an adopted session's first hook event.
+      const alternatives = (options.writeRoots ?? []).length > 0 ? `; scratch work may go under ${(options.writeRoots ?? []).join(", ")}` : "";
+      return { decision: "deny", reason: `Worker cannot write outside the task working directory: ${violation.path}${alternatives}` };
+    }
     if (violation?.classification === "git-metadata") return { decision: "deny", reason: "Worker cannot write Git metadata or protected branch refs" };
     return { decision: "allow", reason: `local Claude file tool is allowed by the task policy: ${toolName}` };
   }
@@ -50,19 +55,47 @@ function fileToolPaths(input: unknown): string[] {
 
 type WritePathViolation = "outside-cwd" | "git-metadata";
 
+/**
+ * `realpath` of the deepest ancestor that exists, with the not-yet-created tail
+ * re-appended. Plain `realpathSync` throws for a directory the Worker is about
+ * to create, and the caller cannot tell that apart from a hostile path.
+ */
+function resolveExistingPath(path: string): string {
+  let current = resolve(path);
+  const missing: string[] = [];
+  for (;;) {
+    try { return join(realpathSync(current), ...[...missing].reverse()); }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") return resolve(path);
+      const parent = dirname(current);
+      if (parent === current) return resolve(path);
+      missing.push(basename(current));
+      current = parent;
+    }
+  }
+}
+
 function classifyWritePath(value: string, cwd: string, writeRoots: readonly string[] = []): WritePathViolation | undefined {
   if (value.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return "git-metadata";
   // A path inside an extra write root (Claude's own scratchpad) is judged
   // against that root instead of the cwd, with the same symlink/metadata rules.
   for (const root of writeRoots) {
     if (!isAbsolute(root) || !isAbsolute(value)) continue;
-    const rel = relative(root, value);
+    // Resolve both sides before comparing: a write root reached through a
+    // symlinked ancestor (a dotfile-managed ~/.claude, /var on macOS) would
+    // otherwise be judged outside itself. The final component stays unresolved
+    // so the per-segment symlink and `.git` checks below still see it.
+    const resolvedRoot = resolveExistingPath(root);
+    const resolvedValue = join(resolveExistingPath(dirname(value)), basename(value));
+    const rel = relative(resolvedRoot, resolvedValue);
     if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) continue;
-    return classifyWritePath(value, root);
+    return classifyWritePath(resolvedValue, resolvedRoot);
   }
-  let root: string;
-  try { root = realpathSync(cwd); }
-  catch { return "git-metadata"; }
+  // A write root need not exist yet: Claude creates its memory directory on
+  // the first write, and failing closed there denied the very write the
+  // outside-cwd message points at.
+  const root = resolveExistingPath(cwd);
   const raw = value.replaceAll("\\", "/");
   const canonicalRoot = root.replaceAll("\\", "/").replace(/\/+$/u, "") || "/";
   let components: string[];
@@ -212,7 +245,7 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   // Dynamic text in an ordinary local command (`for f in …; echo "$f"`) or in
   // another statement (`npm test; echo "exit $?"`) is Claude's own business.
   if ((hasDynamicArgument && hasDynamicCommandName(tokens)) || segmentsOf(tokens).some((segment) => hasDynamicSensitiveArgument(segment))) {
-    return { decision: "deny", reason: "a repository, package, network or shell command with a dynamic argument cannot be capability-checked; to change files under the task working directory use the Write/Edit tools, whose paths are checked, instead of an inline interpreter script (heredoc or stdin)" };
+    return { decision: "deny", reason: "a repository, package, network or shell command with a dynamic argument cannot be capability-checked; substitute the literal value for the shell variable so the command can be read, or use the Write/Edit tools when the intent is to change a file" };
   }
   if (/\bgit\b[\s\S]*\b(?:push|merge(?!-)|send-pack|receive-pack|update-ref)\b/iu.test(canonical)
     || /\bgit-(?:send|receive|upload)-pack\b/iu.test(canonical)
