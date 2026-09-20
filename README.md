@@ -325,11 +325,18 @@ push goes or what runs during it — `git config` writes to `remote.*`,
 granted remote cannot be repointed underneath the confirmation, which pins both
 the fetch and the push URL and scrubs `GIT_DIR`/`GIT_CONFIG_*` from its own
 environment. Behind all of that sits one rule the text guards do not need:
-the remote's resolved fetch and push URLs (`git remote get-url`, rewrites
-applied) are recorded when the task **starts**, and a grant requires the same
-two — so a `pushInsteadOf` or `pushurl` added during the task by *any* means
-(`~/.gitconfig`, a script, an include the policy never saw) is refused at grant
-time, while an operator's pre-existing rewrite, already in the baseline, is not. This is a policy over the command text: a script the Worker writes
+the remote's resolved fetch and push URLs — **every** one of them
+(`git remote get-url --all` / `--push --all`; git pushes to each `pushurl`,
+not only the first it prints), rewrites applied — are recorded when the task
+**starts**, before the Worker runs a command, and required unchanged both
+when the grant is issued *and* at the moment the granted push is authorized.
+So a `pushInsteadOf`, `pushurl` or extra destination added during the task by
+*any* means (`~/.gitconfig`, a script, an include the policy never saw), even
+as the first command of the publish turn, refuses the push and revokes the
+grant, while an operator's pre-existing rewrite, already in the baseline, is
+not. A recovered task keeps its recorded baseline and never takes a new one;
+a remote that could not be resolved at the first start is recorded as such and
+never granted. This is a policy over the command text: a script the Worker writes
 and runs is outside what it can see, as [autonomy-target.md](docs/autonomy-target.md)
 says of every text-level rule; absolute isolation is the host boundary's job.
 

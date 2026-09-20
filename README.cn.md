@@ -255,7 +255,7 @@ remote(`git remote set-url|add|rename|…`,藏在 git 自己的 `--git-dir`/`--w
 `include.path`/`includeIf.*`、`init.*`、`core.sshCommand`、`core.hooksPath`,`git config --edit`、
 `git init --template=…`、`git init|clone --separate-git-dir=…`,以及任何提到 `.git/config` 或 `.git/hooks` 的语句(除非它显然只读:
 `cat`、`grep`、`ls` 等)——否则授权认的 remote 会被偷换,连 Supervisor 的核实也会被骗过;
-核实同时钉住 fetch 和 push 两个 URL,并从自己的环境里剔除 `GIT_DIR`/`GIT_CONFIG_*`。这些文本规则之下还有一条不依赖它们的规则:remote 解析后的 fetch/push URL(`git remote get-url`,已应用改写)在任务**开始**时记录,授权要求这两个 URL 原样不变——任务期间用任何手段(`~/.gitconfig`、脚本、策略看不见的 include)加进来的 `pushInsteadOf` 或 `pushurl` 都会在授权时被拒绝,而操作者原本就有的改写已在基线里,不受影响。这是一层
+核实同时钉住 fetch 和 push 两个 URL,并从自己的环境里剔除 `GIT_DIR`/`GIT_CONFIG_*`。这些文本规则之下还有一条不依赖它们的规则:remote 解析后的**全部** fetch/push URL(`git remote get-url --all` / `--push --all`;git 会推到每一个 `pushurl`,而不只是它打印的第一个;已应用改写)在任务**开始**、Worker 还没跑任何命令时记录,并在发放授权时和授权的 push 被批准的那一刻都要求原样不变。任务期间用任何手段(`~/.gitconfig`、脚本、策略看不见的 include)、哪怕在发布轮的第一条命令里加进来的 `pushInsteadOf`、`pushurl` 或额外目的地,都会让 push 被拒、授权作废;操作者原本就有的改写已在基线里,不受影响。恢复的任务沿用记录的基线、绝不重新采集;首次启动时解析不到的 remote 会被记录下来,永不授权。这是一层
 作用于命令文本的策略:Worker 自己写一个脚本再运行,策略看不见——如
 [autonomy-target.md](docs/autonomy-target.md) 对所有文本级规则所说,绝对隔离是 host 边界的事。
 

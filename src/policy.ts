@@ -1,5 +1,5 @@
 import { lstatSync, realpathSync, statSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 
 export type PolicyDecision = "allow" | "review" | "deny";
 
@@ -544,7 +544,7 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   // `.git` path, and `git init --template=` would install hooks without naming
   // the directory at all. What this cannot see (`~/.gitconfig`, a script) the
   // Supervisor's remote-URL baseline catches at grant time instead.
-  const namesMetadataFile = (segment: readonly ShellToken[]): boolean => segment.some((token) => !token.operator && /\.git[\\/](?:config|hooks)(?![A-Za-z0-9_-])/iu.test(token.value));
+  const namesMetadataFile = (segment: readonly ShellToken[]): boolean => segment.some((token) => !token.operator && namesGitMetadata(token.value));
   if (segments.some((segment) => namesMetadataFile(segment) && !onlyReads(segment))) {
     return { decision: "deny", reason: "Worker cannot write the repository's Git configuration or hooks directly" };
   }
@@ -606,6 +606,25 @@ const REMOTE_TRANSPORT_CONFIG_KEY = /^(?:remote\.|url\.|push\.|credential\.|http
 /** `git config` flags and verbs that only read; a key next to one of them is a query, not a change. */
 const GIT_CONFIG_READ_FLAGS = new Set(["--get", "--get-all", "--get-regexp", "--get-urlmatch", "-l", "--list", "--show-origin", "--show-scope", "--name-only"]);
 const GIT_CONFIG_WRITE_FLAGS = new Set(["--add", "--replace-all", "--unset", "--unset-all", "--remove-section", "--rename-section", "--edit", "-e"]);
+
+/**
+ * True when a word names `.git/config`, `.git/config.worktree` or something
+ * under `.git/hooks/` in any spelling the shell would resolve to it: the raw
+ * text, its normalized path (`.git/./config`, `.git//config`, `src/../.git/config`),
+ * and — for a word carrying glob characters — the shape the glob could expand
+ * to (`.gi[t]/config`; anything wildcarded whose path has a `config` or
+ * `hooks` segment). The Write and Edit tools normalize their paths; Bash
+ * does not, so this does.
+ */
+function namesGitMetadata(word: string): boolean {
+  const metadata = /\.git[\\/](?:config|hooks)(?![A-Za-z0-9_-])/iu;
+  const value = word.replaceAll("\\", "/");
+  if (metadata.test(value) || metadata.test(posix.normalize(value))) return true;
+  if (!/[*?[]/u.test(value)) return false;
+  const collapsed = posix.normalize(value.replace(/\[([^\]]*)\]/gu, (_, inner: string) => inner.charAt(0)).replace(/[*?]/gu, ""));
+  if (metadata.test(collapsed)) return true;
+  return /(?:^|\/)(?:config(?:\.worktree)?|hooks)(?:\/|$)/iu.test(posix.normalize(value));
+}
 
 /** Commands that only read what they are given; a statement led by one of these may name `.git/config` or a hook to look at it. */
 const READ_ONLY_COMMANDS = new Set(["cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ls", "stat", "file", "wc", "diff", "md5sum", "sha256sum", "bat", "view"]);

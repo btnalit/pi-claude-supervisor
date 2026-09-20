@@ -5,11 +5,15 @@ import { redactSensitive } from "./redaction.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import type { TaskSpec } from "./types.ts";
 
-/** Two non-empty URL strings and nothing else; a persisted baseline is data the grant trusts, so its shape is checked. */
-function isRemoteBaseline(value: unknown): value is { fetch: string; push: string } {
+/**
+ * Two lists of URL strings and nothing else; a persisted baseline is data the
+ * grant trusts, so its shape is checked. Empty lists are valid: they record
+ * that the remote had no URL when the task started, which refuses a grant.
+ */
+function isRemoteBaseline(value: unknown): value is { fetch: string[]; push: string[] } {
+  const urls = (list: unknown): list is string[] => Array.isArray(list) && list.length <= 32 && list.every((entry) => typeof entry === "string" && entry.length > 0 && entry.length <= 4_096);
   return typeof value === "object" && value !== null && !Array.isArray(value)
-    && typeof (value as { fetch?: unknown }).fetch === "string" && (value as { fetch: string }).fetch.length > 0 && (value as { fetch: string }).fetch.length <= 4_096
-    && typeof (value as { push?: unknown }).push === "string" && (value as { push: string }).push.length > 0 && (value as { push: string }).push.length <= 4_096;
+    && urls((value as { fetch?: unknown }).fetch) && urls((value as { push?: unknown }).push);
 }
 
 export type DecisionRecoveryState = "ready" | "starting" | "registered" | "recovered_idle" | "interrupted";
@@ -37,7 +41,7 @@ export interface DecisionSessionRecord {
   baseCommit?: string;
   baseBranch?: string;
   /** The granted remote's resolved URLs when the task first started; the publish grant requires the same two. */
-  remoteBaseline?: { fetch: string; push: string };
+  remoteBaseline?: { fetch: string[]; push: string[] };
   /** Real executable identity pinned by automatic startup and recovery. */
   resolvedExecutable?: string;
   turn: number;
@@ -449,7 +453,7 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     startedAt: value.startedAt ?? value.updatedAt,
     ...(typeof value.baseCommit === "string" ? { baseCommit: value.baseCommit } : {}),
     ...(typeof value.baseBranch === "string" ? { baseBranch: value.baseBranch } : {}),
-    ...(isRemoteBaseline(value.remoteBaseline) ? { remoteBaseline: { fetch: value.remoteBaseline.fetch, push: value.remoteBaseline.push } } : {}),
+    ...(isRemoteBaseline(value.remoteBaseline) ? { remoteBaseline: { fetch: [...value.remoteBaseline.fetch], push: [...value.remoteBaseline.push] } } : {}),
     ...(typeof value.resolvedExecutable === "string" ? { resolvedExecutable: value.resolvedExecutable } : {}),
     turn: value.turn ?? 0,
     repairRound: value.repairRound ?? 0,

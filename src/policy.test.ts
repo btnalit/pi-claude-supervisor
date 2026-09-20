@@ -830,8 +830,16 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
     "cat .git/config > /tmp/copy",
     "cat /tmp/evil | tee .git/config",
     "printf '[url \"https://evil.example/\"]\\n\\tpushInsteadOf = https://github.com/' >> .git/config.worktree",
+    // Every spelling the shell resolves to the same file: normalized, and
+    // what a glob could expand to. Bash does not normalize; this does.
+    "printf x >> .git/./config",
+    "printf x >> .git//config",
+    "printf x >> src/../.git/config",
+    "printf x >> .gi[t]/config",
+    "cp /tmp/h .git/./hooks/pre-commit",
+    "cp /tmp/h .g*/hooks/pre-commit",
   ]) assert.equal(evaluateCommand(command).decision, "deny", command);
-  for (const command of ["cat .git/config", "cat .git/hooks/pre-commit", "ls .git/hooks", "grep url .git/config", "head -5 .git/config && git status"]) {
+  for (const command of ["cat .git/config", "cat .git/hooks/pre-commit", "ls .git/hooks", "grep url .git/config", "head -5 .git/config && git status", "cat .git/./config", "cat src/*/config.json", "echo x > build/config", "echo x > .github/config"]) {
     assert.equal(evaluateCommand(command).decision, "allow", command);
   }
   // The file tools were already refused for every `.git` path.

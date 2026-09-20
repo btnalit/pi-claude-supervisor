@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { remoteBranchHead, repositoryClean, repositoryGitDirectoryIsLocal, repositorySlug } from "./verifier.ts";
+import { remoteBranchHead, remoteUrl, repositoryClean, repositoryGitDirectoryIsLocal, repositorySlug, sameDestination } from "./verifier.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -79,6 +79,29 @@ test("a clean tree and a local .git directory are what the grant requires", asyn
     await execFileAsync("git", ["init", "-q", "-b", "main", "--separate-git-dir", join(base, "gitdir"), moved]);
     assert.equal(await repositoryGitDirectoryIsLocal(moved), false, "a gitdir: pointer is not a local .git directory");
     assert.equal(await repositoryGitDirectoryIsLocal(join(base, "not-a-repo")), false);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("a remote destination lists every URL git would push to, and compares as a whole", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-destination-"));
+  try {
+    const cwd = join(base, "work");
+    await execFileAsync("git", ["init", "-q", "-b", "main", cwd]);
+    await execFileAsync("git", ["-C", cwd, "remote", "add", "origin", "/srv/real.git"]);
+    const before = await remoteUrl(cwd, "origin");
+    assert.deepEqual(before, { fetch: ["/srv/real.git"], push: ["/srv/real.git"] });
+    // `git remote get-url --push` would still print only the first; git
+    // pushes to both, so the second one is a second destination.
+    await execFileAsync("git", ["-C", cwd, "config", "--add", "remote.origin.pushurl", "/srv/real.git"]);
+    await execFileAsync("git", ["-C", cwd, "config", "--add", "remote.origin.pushurl", "/srv/evil.git"]);
+    const after = await remoteUrl(cwd, "origin");
+    assert.deepEqual(after, { fetch: ["/srv/real.git"], push: ["/srv/real.git", "/srv/evil.git"] });
+    assert.equal(sameDestination(before, after), false);
+    assert.equal(sameDestination(before, { fetch: ["/srv/real.git"], push: ["/srv/real.git"] }), true);
+    assert.equal(sameDestination(before, undefined), false);
+    assert.equal(await remoteUrl(cwd, "nope"), undefined);
   } finally {
     await rm(base, { recursive: true, force: true });
   }

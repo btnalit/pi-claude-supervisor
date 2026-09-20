@@ -5,7 +5,7 @@ import { SupervisorStateMachine } from "./state.ts";
 import { evaluatePermission, isCommitId, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, type PermissionPolicyOptions, type PolicyResult, type RemoteGrant } from "./policy.ts";
 import { PiDecisionWorker, type DecisionAction, type DecisionContext, type DecisionDeadlineContext, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
 import { DEFAULT_DEADLINE_GRACE_MS, DEFAULT_DEADLINE_MS, DEFAULT_DEADLINE_WARNING_MS, DEFAULT_NO_OUTPUT_TIMEOUT_MS, formatDurationMs } from "./config.ts";
-import { collectRepositoryEvidence, remoteBranchHead, remoteUrl, runReadOnly, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryIsAncestor, repositoryWorkTree, verifyAll, repositoryClean, repositoryGitDirectoryIsLocal, repositorySlug, type RemoteBranchLookup, type RemoteDestination, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
+import { collectRepositoryEvidence, remoteBranchHead, remoteUrl, runReadOnly, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryIsAncestor, repositoryWorkTree, verifyAll, repositoryClean, repositoryGitDirectoryIsLocal, repositorySlug, sameDestination, type RemoteBranchLookup, type RemoteDestination, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { redactSensitive } from "./redaction.ts";
 import { assertAutomaticClaudePermissionConfiguration, assertTrustedAutomaticClaudeExecutable, automaticClaudeArgs, automaticWorkerEnvironment, type AutomaticClaudeArgOptions } from "./worker/environment.ts";
@@ -426,14 +426,22 @@ export class Supervisor {
         this.#task.baseBranch = options.baseBranch ?? boundary.branch;
         this.#lastObservedBranch = this.#task.baseBranch;
         startupHead = boundary.head;
-        // The remote's resolved URLs are pinned now, before the Worker runs a
-        // single command: the publish grant later requires the same two, so a
-        // rewrite added during the task is caught wherever it was written. A
-        // recovered task keeps the baseline its first start recorded.
-        if (spec.autonomy.remoteAuthority !== "none" && !this.#task.remoteBaseline) {
-          this.#task.remoteBaseline = await remoteUrl(options.cwd, spec.autonomy.remoteName, startAbortController.signal);
+        // The remote's resolved URLs — every one of them — are pinned now,
+        // before the Worker runs a single command: the publish grant later
+        // requires the same lists, so a rewrite or an extra destination added
+        // during the task is caught wherever it was written. A recovered task
+        // keeps the baseline its first start recorded and never takes a new
+        // one, since by then the Worker has already run; a remote that could
+        // not be resolved at the first start is recorded as having no URL,
+        // which refuses a grant rather than letting a later definition stand.
+        if (spec.autonomy.remoteAuthority !== "none" && !recovering && !this.#task.remoteBaseline) {
+          const baseline = await remoteUrl(options.cwd, spec.autonomy.remoteName, startAbortController.signal);
           this.#assertStartNotAborted(startAbortController.signal);
+          this.#task.remoteBaseline = baseline ?? { fetch: [], push: [] };
         }
+      }
+      if (this.#task.remoteBaseline) {
+        await this.#appendEvent({ type: "publish_baseline", taskId, workerId: undefined, data: { remoteName: spec.autonomy.remoteName, ...this.#task.remoteBaseline, ...(this.#task.remoteBaseline.fetch.length === 0 ? { unresolved: true } : {}) } });
       }
       await this.#appendEvent({
         type: "task_started",
@@ -740,7 +748,17 @@ export class Supervisor {
             this.#pendingPermissions.delete(event.request.requestId);
             skipDecisionNotify = true;
           } else {
-            const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd, this.#permissionOptions(event.request.writeRoots));
+            let policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd, this.#permissionOptions(event.request.writeRoots));
+            // The veto point sees the granted push first: the remote is read
+            // again here, as in the prompt-phase path below, so a destination
+            // changed since the grant is refused before Claude's own permission
+            // mode could wave the command through.
+            const diverted = policy.granted === true ? await this.#grantedRemoteChanged(task) : undefined;
+            if (diverted) {
+              this.#remoteGrant = undefined;
+              await this.#appendEvent({ type: "publish_grant_revoked", taskId, workerId: handle.id, data: { reason: diverted } }).catch(() => {});
+              policy = { decision: "deny", reason: diverted };
+            }
             if (policy.decision === "deny") {
               if (this.#adapter.respondPermission) {
                 await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, {
@@ -778,10 +796,21 @@ export class Supervisor {
           const answerLocally = authority === "policy" || policy.granted === true
             || (authority === "hybrid" && (policy.decision === "deny" || isRoutinePermission(event.request.toolName, event.request.input, task.cwd, this.#permissionOptions(event.request.writeRoots))));
           if (answerLocally && this.#adapter.respondPermission) {
-            const behavior: "allow" | "deny" = policy.decision === "deny" ? "deny" : "allow";
+            // The grant was issued against the remote as it resolved then; the
+            // push is authorized now. Anything the Worker did in between — a
+            // rewrite in a file the policy never sees, an extra push
+            // destination — shows up in the resolved URL lists, so they are
+            // read again here and a changed remote refuses the granted command
+            // and ends the grant, rather than letting the push follow the change.
+            const diverted = policy.granted === true ? await this.#grantedRemoteChanged(task) : undefined;
+            if (diverted) {
+              this.#remoteGrant = undefined;
+              await this.#appendEvent({ type: "publish_grant_revoked", taskId, workerId: handle.id, data: { reason: diverted } }).catch(() => {});
+            }
+            const behavior: "allow" | "deny" = policy.decision === "deny" || diverted ? "deny" : "allow";
             await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, {
               behavior,
-              message: behavior === "deny" ? `${policy.reason}${this.#publishHint(policy)}; denied by supervisor policy` : undefined,
+              message: behavior === "deny" ? `${diverted ?? `${policy.reason}${this.#publishHint(policy)}`}; denied by supervisor policy` : undefined,
             }, behavior === "allow" ? event.request.input : undefined);
             this.#pendingPermissions.delete(event.request.requestId);
             await this.#appendEvent({
@@ -1896,14 +1925,18 @@ export class Supervisor {
       await this.#notePublishShortfall(handle.id, { reason: `the URLs of ${remoteName} were not recorded when the task started, so a rewrite since then cannot be ruled out` });
       return false;
     }
-    if (url.fetch !== baseline.fetch || url.push !== baseline.push) {
-      await this.#notePublishShortfall(handle.id, { reason: `${remoteName} no longer resolves to the URLs it had when the task started (fetch ${baseline.fetch} → ${url.fetch}, push ${baseline.push} → ${url.push}); a URL rewrite or repoint happened during the task, so nothing is granted` });
+    if (baseline.fetch.length === 0) {
+      await this.#notePublishShortfall(handle.id, { reason: `the remote ${remoteName} had no URL when the task started; a remote defined during the task is not one the operator configured` });
+      return false;
+    }
+    if (!sameDestination(url, baseline)) {
+      await this.#notePublishShortfall(handle.id, { reason: `${remoteName} no longer resolves to the URLs it had when the task started (fetch ${baseline.fetch.join(", ")} → ${url.fetch.join(", ")}; push ${baseline.push.join(", ")} → ${url.push.join(", ")}); a URL rewrite, an extra destination or a repoint happened during the task, so nothing is granted` });
       return false;
     }
     // A pull request needs a repository gh can name with `--repo`; a remote
     // whose URL is not one (a local path, an alias `ssh -G` cannot translate)
     // gets no `pr` grant rather than an instruction gh would refuse.
-    const repository = await repositorySlug(url.fetch, signal);
+    const repository = await repositorySlug(url.fetch[0]!, signal);
     if (authority === "pr" && !repository) {
       await this.#notePublishShortfall(handle.id, { reason: `the remote ${remoteName} (${url.fetch}) does not name a repository gh can open a pull request in; use push authority or a canonical remote URL` });
       return false;
@@ -1993,7 +2026,7 @@ export class Supervisor {
       return this.#finalizeVerification(result, "blocked", `${grant.remoteName} could not be reached to confirm the publish (${lookup.error.split("\n")[0]}); the local candidate is unchanged on its branch`, { publishOnly: true });
     }
     if (!sameRemote) {
-      return this.#finalizeVerification(result, "blocked", `the remote ${grant.remoteName} no longer points where the publish was granted; nothing was confirmed; the local candidate is unchanged on its branch`, { publishOnly: true });
+      return this.#finalizeVerification(result, "blocked", `the remote ${grant.remoteName} no longer resolves to the URLs the publish was granted against; a push made after that change may have gone to the rewritten destination, and nothing was confirmed against the granted one; the local candidate is unchanged on its branch`, { publishOnly: true });
     }
     if (!pushed) {
       return this.#finalizeVerification(result, "blocked", `the candidate was verified but ${grant.remoteName}/${grant.branch} does not point at ${String(this.#verifiedHead).slice(0, 12)}; the local candidate is unchanged on its branch`, { publishOnly: true });
@@ -2002,6 +2035,25 @@ export class Supervisor {
       return this.#finalizeVerification(result, "blocked", `the candidate was pushed to ${grant.remoteName}/${grant.branch} but no pull request was found; open one from the pushed branch`, { publishOnly: true });
     }
     return this.#finalizeVerification(result);
+  }
+
+  /**
+   * The reason a granted command must be refused now, or undefined when the
+   * remote still resolves exactly as it did at task start and at grant time.
+   * A remote that cannot be read is refused too: the push must not proceed on
+   * a destination nobody can confirm.
+   */
+  async #grantedRemoteChanged(task: TaskContext): Promise<string | undefined> {
+    const grant = this.#remoteGrant;
+    if (!grant) return undefined;
+    const current = await remoteUrl(task.cwd, grant.remoteName, this.#verificationAbortController?.signal);
+    if (!current) return `the remote ${grant.remoteName} cannot be read at the moment of the push, so the granted publish is refused`;
+    const expected = task.remoteBaseline && this.#publishRemote && sameDestination(task.remoteBaseline, this.#publishRemote) ? this.#publishRemote : undefined;
+    if (!expected || !sameDestination(current, expected)) {
+      const list = (destination: RemoteDestination | undefined): string => destination ? `fetch ${destination.fetch.join(", ")}; push ${destination.push.join(", ")}` : "unknown";
+      return `the remote ${grant.remoteName} no longer resolves as it did when the publish was granted (${list(expected)} → ${list(current)}); the granted push is refused and the grant is revoked`;
+    }
+    return undefined;
   }
 
   /**
@@ -2017,7 +2069,7 @@ export class Supervisor {
     const current = await remoteUrl(task.cwd, grant.remoteName, signal);
     const pinned = this.#publishRemote;
     const remoteReadable = current !== undefined;
-    const sameRemote = Boolean(current && pinned && current.fetch === pinned.fetch && current.push === pinned.push);
+    const sameRemote = sameDestination(current, pinned);
     const lookup = sameRemote ? await remoteBranchHead(task.cwd, grant.remoteName, grant.branch, signal) : undefined;
     const remoteHead = lookup?.outcome === "found" ? lookup.head : undefined;
     const pushed = Boolean(remoteHead && remoteHead === this.#verifiedHead);

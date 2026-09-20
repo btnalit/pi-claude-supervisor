@@ -122,28 +122,38 @@ export async function runReadOnly(command: string, args: readonly string[], cwd:
 
 /** Where a remote name currently fetches from and pushes to, so a grant can be pinned to destinations rather than a name. */
 export interface RemoteDestination {
-  /** The fetch URL, which `ls-remote` reads through. */
-  fetch: string;
-  /** The push URL, which the granted push travels through; equals `fetch` unless a `pushurl` or `pushInsteadOf` diverts it. */
-  push: string;
+  /** Every fetch URL, in order; the first is what `ls-remote` reads through. */
+  fetch: string[];
+  /** Every push URL, in order — git pushes to *all* of them, so a second `pushurl` is a second destination. */
+  push: string[];
 }
 
 /**
- * The URLs a remote name resolves to. Both sides are pinned because they can
- * diverge independently: `remote.<name>.pushurl` and `url.*.pushInsteadOf`
- * redirect the push while the fetch URL the confirmation reads through stays
- * put, and `git remote get-url` reports each after any `insteadOf` rewrite.
+ * The URLs a remote name resolves to, every one of them: `git remote get-url`
+ * prints only the first, but git pushes to every configured `pushurl`, so a
+ * destination added second would be invisible to a single-URL comparison.
+ * Both sides are pinned because they diverge independently — `pushurl` and
+ * `url.*.pushInsteadOf` redirect the push while the fetch URL the confirmation
+ * reads through stays put — and each is reported after any rewrite.
  */
 export async function remoteUrl(cwd: string, remote: string, signal?: AbortSignal): Promise<RemoteDestination | undefined> {
   try {
+    const lines = (text: string): string[] => text.split("\n").map((line) => line.trim()).filter((line) => line !== "");
     const [fetch, push] = (await Promise.all([
-      runReadOnly("git", ["remote", "get-url", "--", remote], cwd, signal),
-      runReadOnly("git", ["remote", "get-url", "--push", "--", remote], cwd, signal),
-    ])).map((result) => result.stdout.trim()) as [string, string];
-    return fetch === "" || push === "" ? undefined : { fetch, push };
+      runReadOnly("git", ["remote", "get-url", "--all", "--", remote], cwd, signal),
+      runReadOnly("git", ["remote", "get-url", "--push", "--all", "--", remote], cwd, signal),
+    ])).map((result) => lines(result.stdout)) as [string[], string[]];
+    return fetch.length === 0 || push.length === 0 ? undefined : { fetch, push };
   } catch {
     return undefined;
   }
+}
+
+/** True when two destinations list exactly the same URLs in the same order, on both sides. */
+export function sameDestination(first: RemoteDestination | undefined, second: RemoteDestination | undefined): boolean {
+  if (!first || !second) return false;
+  const same = (a: readonly string[], b: readonly string[]): boolean => a.length === b.length && a.every((value, index) => value === b[index]);
+  return same(first.fetch, second.fetch) && same(first.push, second.push);
 }
 
 /**

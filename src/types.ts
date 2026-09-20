@@ -318,7 +318,7 @@ export interface TaskContext {
    * task by any means — a config file the policy never sees included — changes
    * one of them and is refused, while an operator's pre-existing rewrite is not.
    */
-  remoteBaseline?: { fetch: string; push: string };
+  remoteBaseline?: { fetch: string[]; push: string[] };
   spec: TaskSpec;
   repairRound: number;
   lastFindingSignature?: string;
