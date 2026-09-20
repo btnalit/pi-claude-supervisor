@@ -1344,8 +1344,14 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     if (expected?.pid !== undefined && pane.pid !== expected.pid) throw new Error("tmux pane pid changed; refusing identity-unverified handoff");
     if (pane.dead) throw new Error("cannot adopt a dead tmux pane");
     record.handle.pid = pane.pid;
-    const currentPath = await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_current_path}"]);
-    if (currentPath.stdout.trim() !== cwd) throw new Error(`tmux session cwd mismatch: expected ${cwd}, got ${currentPath.stdout.trim()}`);
+    const currentPath = (await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_current_path}"])).stdout.trim();
+    // The pane may sit on an older instance of the same mount (an autofs
+    // remount, a bind mount): the kernel then renders its cwd under a path
+    // that no longer resolves, while /proc/<pid>/cwd still reaches the very
+    // same directory. Only an identity mismatch is a real mismatch.
+    if (currentPath !== cwd && !(pane.pid && await sameDirectory(cwd, `/proc/${pane.pid}/cwd`))) {
+      throw new Error(`tmux session cwd mismatch: expected ${cwd}, got ${currentPath}`);
+    }
     const command = (await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_current_command}"])).stdout.trim();
     let processArgs: { stdout: string; stderr: string };
     if (!pane.pid) throw new Error("tmux pane pid is unavailable; refusing to adopt without command inspection");
@@ -2149,6 +2155,16 @@ function bridgeEnvironment(env: NodeJS.ProcessEnv, cwd: string, command: string,
   };
   if (hookSettingsPath !== undefined) result[INTERACTIVE_KEYS.settings] = encode(hookSettingsPath);
   return result;
+}
+
+/** True when both paths name the same directory (device and inode), however they are spelled. */
+export async function sameDirectory(first: string, second: string): Promise<boolean> {
+  try {
+    const [a, b] = await Promise.all([stat(first), stat(second)]);
+    return a.isDirectory() && b.isDirectory() && a.dev === b.dev && a.ino === b.ino;
+  } catch {
+    return false;
+  }
 }
 
 export function attachCommand(handle: Pick<WorkerHandle, "tmuxSocket" | "sessionName">): string {
