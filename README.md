@@ -270,10 +270,11 @@ which stays deliverable locally.
 
 The grant is deliberately unforgiving, and both commands are matched by
 **option allowlist** — an option nobody reviewed is refused rather than assumed
-harmless. It admits `git push [-u] <remote> <branch>` with the branch named
-literally (no `-C`: the publish turn already runs in the task directory, and
-any check against it could only be lexical while git resolves the path through
-the kernel), and for `pr` a `gh pr create` limited to title, body,
+harmless. It admits `git -C <task directory> push [-u] <remote> <branch>` with the branch
+named literally — `-C` is **required** and both sides are resolved through the
+kernel, because Claude's Bash tool keeps its working directory between calls and
+`cd` is ordinary local work, so without it the grant could be spent in any other
+clone, and for `pr` a `gh pr create` limited to title, body,
 base, head (pinned to the candidate branch), draft, assignee and label.
 
 Refused with or without a grant: every other push option (`--force`,
@@ -281,7 +282,9 @@ Refused with or without a grant: every other push option (`--force`,
 `--push-option`, `--receive-pack`, …), a `HEAD` refspec, a bare `git push`,
 another remote or branch, a protected branch, `-C` naming any directory but the
 task's own, a shell wrapper (`sh -c`, and a heredoc piped into a shell), a
-dynamic word, a second statement, `git -C` in any form, `gh pr create --body-file/-F/--template`
+dynamic word, a second statement, `git push` without `-C`, a `-C` naming anything but the task directory,
+`gh pr create` without `--head <candidate branch>` (gh would otherwise use
+whatever branch is checked out), `gh pr create --body-file/-F/--template`
 (which would post the contents of an arbitrary local file), `--web`, `--repo`,
 `gh pr merge`, `gh api`, `gh release` and `npm publish`. Changing the
 repository's remotes (`git remote set-url|add|rename|…`) is denied outright, so

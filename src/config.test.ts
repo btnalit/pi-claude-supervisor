@@ -167,5 +167,5 @@ test("remote authority never defaults on and only accepts the two grants", () =>
   assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY: "merge" }).remoteAuthority, "none");
   assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY: "1" }).remoteAuthority, "none");
   assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_NAME: "upstream" }).remoteName, "upstream");
-  assert.equal(autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_NAME: "bad name;rm" }).remoteName, "origin");
+  assert.throws(() => autonomyDefaults({ PI_CLAUDE_SUPERVISOR_REMOTE_NAME: "bad name;rm" }), /must be a plain remote name/u);
 });

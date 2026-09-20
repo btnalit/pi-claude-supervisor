@@ -34,6 +34,8 @@ export interface RemoteGrant {
   remoteName: string;
   /** The candidate branch; a push must name it literally. */
   branch: string;
+  /** The task working directory; a granted push must name it with `-C`, so the grant cannot be spent in another clone. */
+  cwd: string;
 }
 
 /** The only options a granted `git push` may carry. Anything else is refused, so a new git flag is denied until it is reviewed. */
@@ -199,6 +201,12 @@ const protectedBranches = new Set(["main", "master", "trunk", "integration", "de
  * statement, and refuses rather than guess. Returns undefined when the command
  * is not a permitted publish, leaving the ordinary denials to answer.
  */
+/** True when both paths name the same directory once the kernel has resolved them. */
+function sameResolvedDirectory(first: string, second: string): boolean {
+  try { return realpathSync(first) === realpathSync(second); }
+  catch { return false; }
+}
+
 function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGrant): PolicyResult | undefined {
   // A single statement only: `git push origin x && rm -rf /` must never pass.
   if (tokens.some((token) => token.operator)) return undefined;
@@ -210,12 +218,16 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
   const optionName = (word: string): string => word.split("=")[0] ?? word;
 
   if (name === "git") {
-    // No `-C`, and no other pre-subcommand option. The publish turn already
-    // runs in the task directory, so `-C` buys nothing and costs the guarantee:
-    // comparing it to the task cwd can only be lexical, while git resolves it
-    // through the kernel, so `<cwd>/link/..` could name a different repository.
-    if (words[1] !== "push") return undefined;
-    const rest = words.slice(2);
+    // `-C <task directory>` is *required*, not merely tolerated. Claude's Bash
+    // tool keeps its working directory between calls and `cd` is ordinary local
+    // work, so without an explicit directory the grant could be spent in any
+    // clone the Worker had wandered into. The comparison resolves both sides
+    // through the kernel, the way git will, so `<cwd>/link/..` cannot pass.
+    if (words[1] !== "-C") return undefined;
+    const directory = words[2];
+    if (directory === undefined || !sameResolvedDirectory(directory, grant.cwd)) return undefined;
+    if (words[3] !== "push") return undefined;
+    const rest = words.slice(4);
     const positional: string[] = [];
     for (const word of rest) {
       if (word.startsWith("-")) {
@@ -234,6 +246,10 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
   if (name === "gh" && grant.authority === "pr") {
     if (words[1] !== "pr" || words[2] !== "create") return undefined;
     const rest = words.slice(3);
+    // `--head` is mandatory: without it gh uses whatever branch is checked out,
+    // and `git checkout` is ordinary local work, so a bare `gh pr create` could
+    // open a pull request for a branch nothing verified.
+    if (!rest.some((word) => word === "-H" || word === "--head" || word.startsWith("--head=") || word.startsWith("-H="))) return undefined;
     for (let cursor = 0; cursor < rest.length; cursor += 1) {
       const word = rest[cursor]!;
       if (!word.startsWith("-")) return undefined;
@@ -350,7 +366,10 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   }
   // Repointing a remote would make the grant's remote *name* meaningless and
   // would fool the Supervisor's own confirmation, which resolves the same name.
-  if (hasGit && lower.includes("remote") && lower.some((value) => ["set-url", "add", "rename", "remove", "rm", "prune", "set-branches", "set-head"].includes(value))) {
+  // Scoped to one statement with `remote` in git's subcommand position and the
+  // action right after it: matching the words anywhere denied `git remote -v &&
+  // git add -A` and even `git add remote`, which are ordinary local work.
+  if (segmentsOf(tokens).some((segment) => mutatesRemotes(segment))) {
     return { decision: "deny", reason: "Worker cannot change the repository's remotes" };
   }
   if (hasGitAliasConfiguration) {
@@ -374,6 +393,21 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
     return { decision: "deny", reason: "Worker cannot bypass Claude permission prompts" };
   }
   return undefined;
+}
+
+const REMOTE_MUTATIONS = new Set(["set-url", "add", "rename", "remove", "rm", "prune", "set-branches", "set-head"]);
+
+/** True when this one statement is `git [options] remote <mutating action>`. */
+function mutatesRemotes(segment: readonly ShellToken[]): boolean {
+  const words = segment.filter((token) => !token.operator).map((token) => token.value);
+  const first = words[0]?.split(/[\\/]/u).at(-1)?.toLowerCase();
+  if (first !== "git") return false;
+  // Skip git's own pre-subcommand options (`-C <dir>`, `-c k=v`, `--git-dir=…`).
+  let index = 1;
+  while (index < words.length && words[index]!.startsWith("-")) index += words[index] === "-C" || words[index] === "-c" ? 2 : 1;
+  if (words[index]?.toLowerCase() !== "remote") return false;
+  const action = words[index + 1]?.toLowerCase();
+  return action !== undefined && REMOTE_MUTATIONS.has(action);
 }
 
 /** The statements of a command, split on `;`, `&&`, `||`, `|` and `&`. */

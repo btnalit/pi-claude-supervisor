@@ -198,7 +198,7 @@ test("newlines separate statements and comments are ignored", () => {
 
 test("the Bash tool path and direct command evaluation agree", () => {
   const matrix = [
-    "git push origin main", "git pu{sh,} origin main", "$CMD --flag", "timeout 30 $CMD", "claude --permission-mode \"$MODE\"",
+    `git -C ${process.cwd()} push origin main`, "git pu{sh,} origin main", "$CMD --flag", "timeout 30 $CMD", "claude --permission-mode \"$MODE\"",
     "sh -c \"$x\"", "bash -lc 'git push origin main'", "npm publish", "gh pr create --title \"$title\"",
     "for f in a b; do echo \"$f\"; done", "rm -rf /tmp/*", "rm -rf /", "cat > notes.md <<'EOF'\ngit push origin main\nEOF",
     "bash <<'EOF'\ngit push origin main\nEOF", "git commit -m \"$(cat <<'EOF'\nfix: merge\nEOF\n)\"", "echo hi # don't",
@@ -503,38 +503,40 @@ test("a write root is honored before it exists and through a symlinked ancestor"
 
 test("a publish grant admits exactly one shape and nothing else", () => {
   const branch = "s6/console-completion";
-  const push = { authority: "push" as const, remoteName: "origin", branch };
-  const pr = { authority: "pr" as const, remoteName: "origin", branch };
+  const push = { authority: "push" as const, remoteName: "origin", branch, cwd: process.cwd() };
+  const pr = { authority: "pr" as const, remoteName: "origin", branch, cwd: process.cwd() };
 
   for (const command of [
-    "git push -u origin s6/console-completion",
-    "git push origin s6/console-completion",
-    "git push origin s6/console-completion:s6/console-completion",
+    `git -C ${process.cwd()} push -u origin s6/console-completion`,
+    `git -C ${process.cwd()} push origin s6/console-completion`,
+    `git -C ${process.cwd()} push origin s6/console-completion:s6/console-completion`,
   ]) assert.equal(evaluateCommand(command, [], push).decision, "allow", command);
-  assert.equal(evaluateCommand("gh pr create --title x --body y", [], pr).decision, "allow");
+  assert.equal(evaluateCommand("gh pr create --head s6/console-completion --title x --body y", [], pr).decision, "allow");
   assert.equal(evaluateCommand("gh pr create --head s6/console-completion --base main", [], pr).decision, "allow");
+  // Without --head gh uses whatever branch is checked out, which nothing verified.
+  assert.equal(evaluateCommand("gh pr create --title x --body y", [], pr).decision, "deny");
 
   for (const command of [
     // History-destroying or server-side-action flags.
-    "git push --force origin s6/console-completion",
-    "git push --force-with-lease origin s6/console-completion",
-    "git push --delete origin s6/console-completion",
-    "git push --mirror origin s6/console-completion",
-    "git push --tags origin s6/console-completion",
-    "git push -o merge_request.merge=1 origin s6/console-completion",
-    "git push --no-verify origin s6/console-completion",
-    "git push --receive-pack=evil origin s6/console-completion",
+    `git -C ${process.cwd()} push --force origin s6/console-completion`,
+    `git -C ${process.cwd()} push --force-with-lease origin s6/console-completion`,
+    `git -C ${process.cwd()} push --delete origin s6/console-completion`,
+    `git -C ${process.cwd()} push --mirror origin s6/console-completion`,
+    `git -C ${process.cwd()} push --tags origin s6/console-completion`,
+    `git -C ${process.cwd()} push -o merge_request.merge=1 origin s6/console-completion`,
+    `git -C ${process.cwd()} push --no-verify origin s6/console-completion`,
+    `git -C ${process.cwd()} push --receive-pack=evil origin s6/console-completion`,
     // Another target than the verified candidate.
-    "git push origin main",
-    "git push upstream s6/console-completion",
-    "git push origin other-branch",
+    `git -C ${process.cwd()} push origin main`,
+    `git -C ${process.cwd()} push upstream s6/console-completion`,
+    `git -C ${process.cwd()} push origin other-branch`,
     // The policy is static: it cannot resolve these, so it refuses them.
-    "git push origin HEAD",
-    "git push",
-    "git push origin $BRANCH",
+    `git -C ${process.cwd()} push origin HEAD`,
+    `git -C ${process.cwd()} push`,
+    `git -C ${process.cwd()} push origin $BRANCH`,
     // A grant covers one statement, never a second command.
-    "git push origin s6/console-completion && rm -rf /tmp/x",
-    "git push origin s6/console-completion; gh pr merge 1",
+    `git -C ${process.cwd()} push origin s6/console-completion && rm -rf /tmp/x`,
+    `git -C ${process.cwd()} push origin s6/console-completion; gh pr merge 1`,
   ]) assert.equal(evaluateCommand(command, [], push).decision, "deny", command);
 
   // `push` authority never reaches the pull-request surface, and `pr` never
@@ -545,29 +547,36 @@ test("a publish grant admits exactly one shape and nothing else", () => {
   }
 
   // A grant is never implied: without one the boundary is exactly as before.
-  assert.equal(evaluateCommand("git push -u origin s6/console-completion").decision, "deny");
+  assert.equal(evaluateCommand(`git -C ${process.cwd()} push -u origin s6/console-completion`).decision, "deny");
   assert.equal(evaluateCommand("gh pr create").decision, "deny");
   assert.equal(evaluateCommand("git commit -m x").decision, "allow");
 
   // A protected candidate branch is never publishable, grant or not.
-  assert.equal(evaluateCommand("git push origin main", [], { authority: "push", remoteName: "origin", branch: "main" }).decision, "deny");
+  assert.equal(evaluateCommand(`git -C ${process.cwd()} push origin main`, [], { authority: "push", remoteName: "origin", branch: "main", cwd: process.cwd() }).decision, "deny");
 
   // The grant covers the direct invocation only. A shell wrapper is still
   // denied: the outer command is not the permitted shape, and admitting it
   // would mean trusting a nested parse to have seen everything.
   for (const wrapper of [
-    "sh -c 'git push origin s6/console-completion'",
-    "bash -lc 'git push origin s6/console-completion'",
-    "bash <<'EOF'\ngit push origin s6/console-completion\nEOF",
-    "sh -s <<'EOF'\ngit push origin s6/console-completion\nEOF",
-    "cat <<'EOF' | bash\ngit push origin s6/console-completion\nEOF",
+    `sh -c 'git -C ${process.cwd()} push origin s6/console-completion'`,
+    `bash -lc 'git -C ${process.cwd()} push origin s6/console-completion'`,
+    `bash <<'EOF'\ngit -C ${process.cwd()} push origin s6/console-completion\nEOF`,
+    `sh -s <<'EOF'\ngit -C ${process.cwd()} push origin s6/console-completion\nEOF`,
+    `cat <<'EOF' | bash\ngit -C ${process.cwd()} push origin s6/console-completion\nEOF`,
   ]) assert.equal(evaluateCommand(wrapper, [], push).decision, "deny", wrapper);
 
-  // `-C` is not accepted at all: the publish turn already runs in the task
-  // directory, and any comparison against it could only be lexical while git
-  // resolves the path through the kernel (`<cwd>/link/..`).
-  for (const directory of ["/repo", "/tmp/evil", "/repo/sub", "/repo/.", "/repo//", "/repo/sub/.."]) {
+  // `-C <task directory>` is required and resolved through the kernel, so the
+  // grant cannot be spent in another clone the Worker has wandered into.
+  assert.equal(evaluateCommand("git push origin s6/console-completion", [], push).decision, "deny", "no -C");
+  assert.equal(evaluateCommand(`git -C ${process.cwd()}/src/.. push origin s6/console-completion`, [], push).decision, "allow", "the same directory, spelled differently");
+  for (const directory of ["/tmp", "/", `${process.cwd()}/src`]) {
     assert.equal(evaluateCommand(`git -C ${directory} push origin s6/console-completion`, [], push).decision, "deny", directory);
+  }
+
+  // The remote denial is scoped to git's subcommand position in one statement:
+  // matching the words anywhere denied ordinary local work.
+  for (const command of ["git remote -v && git add -A", "git remote get-url origin && git add .", "git add remote", "git remote -v"]) {
+    assert.equal(evaluateCommand(command).decision, "allow", command);
   }
 
   // Repointing a remote would make the grant's remote name meaningless.
@@ -588,13 +597,13 @@ test("a publish grant admits exactly one shape and nothing else", () => {
     "gh pr create --head=other-branch",
   ]) assert.equal(evaluateCommand(command, [], pr).decision, "deny", command);
   for (const command of [
-    "gh pr create --title x --body y",
-    "gh pr create -t x -b y --base main --draft",
+    "gh pr create -H s6/console-completion --title x --body y",
+    "gh pr create --head s6/console-completion -t x -b y --base main --draft",
     "gh pr create -H s6/console-completion",
     "gh pr create --head=s6/console-completion",
   ]) assert.equal(evaluateCommand(command, [], pr).decision, "allow", command);
 
   // evaluatePermission threads the grant from the permission options.
-  assert.equal(evaluatePermission("Bash", { command: "git push origin s6/console-completion" }, "/repo", { remote: push }).decision, "allow");
-  assert.equal(evaluatePermission("Bash", { command: "git push origin s6/console-completion" }, "/repo").decision, "deny");
+  assert.equal(evaluatePermission("Bash", { command: `git -C ${process.cwd()} push origin s6/console-completion` }, process.cwd(), { remote: push }).decision, "allow");
+  assert.equal(evaluatePermission("Bash", { command: `git -C ${process.cwd()} push origin s6/console-completion` }, process.cwd()).decision, "deny");
 });

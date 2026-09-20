@@ -88,12 +88,13 @@ export async function repositoryHead(cwd: string, signal?: AbortSignal): Promise
  * remote we cannot read fails fast instead of hanging.
  */
 function remoteReadEnvironment(): NodeJS.ProcessEnv {
-  const inherited = workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "" });
-  for (const name of ["SSH_AUTH_SOCK", "GH_TOKEN", "GITHUB_TOKEN", "GH_HOST", "GH_CONFIG_DIR", "XDG_CONFIG_HOME", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "SSH_AGENT_PID"]) {
-    const value = process.env[name];
-    if (value !== undefined) inherited[name] = value;
-  }
-  return inherited;
+  // The Supervisor's own read-only inspection, not a Worker command: it has to
+  // reach whatever remote the Worker just pushed to. An allowlist cannot keep
+  // up with that — proxies, CA bundles, enterprise tokens, credential helpers —
+  // and every omission reports a real publish as unconfirmed. Inherit the
+  // environment and only force the prompts off, so an unreadable remote fails
+  // fast instead of hanging.
+  return { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "" };
 }
 
 /**

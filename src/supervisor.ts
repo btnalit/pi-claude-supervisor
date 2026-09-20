@@ -217,11 +217,11 @@ export class Supervisor {
   /** Key of the completed turn whose decision is still in flight; the deadline must not verify underneath it. */
   #pendingDecisionKey?: string;
   /**
-   * Publish phase. A grant exists only between "acceptance and Reviewer
-   * passed" and "the publish turn settled", and only for `#verifiedHead` on
+   * Publish phase. Authority exists only between "acceptance and Reviewer
+   * passed" and "the publish turn completed", and only for `#verifiedHead` on
    * the candidate's own branch, so an unverified Worker never reaches a remote.
+   * The live grant the policy sees is revoked as soon as that turn completes.
    */
-  /** The live authority the policy sees; revoked as soon as the publish turn completes. */
   #remoteGrant?: RemoteGrant;
   /** What was granted, kept past the revocation so the publish can still be confirmed. */
   #publishTarget?: RemoteGrant;
@@ -761,7 +761,7 @@ export class Supervisor {
           const authority = task.spec.autonomy.permissionAuthority;
           const policy = evaluatePermission(event.request.toolName, event.request.input, task.cwd, this.#permissionOptions(event.request.writeRoots));
           const answerLocally = authority === "policy"
-            || (authority === "hybrid" && (policy.decision === "deny" || isRoutinePermission(event.request.toolName, event.request.input, task.cwd, { writeRoots: event.request.writeRoots })));
+            || (authority === "hybrid" && (policy.decision === "deny" || isRoutinePermission(event.request.toolName, event.request.input, task.cwd, this.#permissionOptions(event.request.writeRoots))));
           if (answerLocally && this.#adapter.respondPermission) {
             const behavior: "allow" | "deny" = policy.decision === "deny" ? "deny" : "allow";
             await this.#adapter.respondPermission(handle, event.request.requestId, event.request.toolUseId, {
@@ -882,21 +882,28 @@ export class Supervisor {
     })).catch(() => {});
   }
 
-  /**
-   * Told to a Worker refused a remote action while the task still has remote
-   * authority to give: the grant is coming, it just has to finish first.
-   */
   /** Permission options for one request; the single place the live grant is attached. */
   #permissionOptions(writeRoots?: readonly string[]): { writeRoots?: readonly string[]; remote?: RemoteGrant } {
     return { ...(writeRoots ? { writeRoots } : {}), ...(this.#remoteGrant ? { remote: this.#remoteGrant } : {}) };
   }
 
+  /**
+   * Appended to a refused remote action: before the grant, that it is coming;
+   * during it, the one shape that is accepted. Silent for every other denial.
+   */
   #publishHint(policyReason: string): string {
-    if (this.#publishState !== "none") return "";
     if ((this.#task?.spec.autonomy.remoteAuthority ?? "none") === "none") return "";
     // Only where it answers the refusal: this explains a remote denial, not an
     // outside-cwd write that happens to be refused in the same session.
     if (!/remote repository or main\/integration merge authority/u.test(policyReason)) return "";
+    const grant = this.#remoteGrant;
+    if (grant) {
+      // The grant is live and this command missed its shape: say which shape,
+      // or the Worker reads the refusal as "I have no authority" and gives up.
+      const create = grant.authority === "pr" ? ` and \`gh pr create --head ${grant.branch} …\`` : "";
+      return `; the publish grant is live but only admits \`git -C ${grant.cwd} push [-u] ${grant.remoteName} ${grant.branch}\`${create} — no other option, redirection or extra statement`;
+    }
+    if (this.#publishState !== "none") return "";
     return "; remote authority unlocks after this candidate's acceptance and review pass — finish and commit locally, and the Supervisor will ask you to publish";
   }
 
@@ -1538,7 +1545,15 @@ export class Supervisor {
     // minutes they took. Confirm the publish instead and finish.
     if (this.#publishState === "requested" && this.#lastVerification) {
       const head = await repositoryHead(this.#task.cwd, verificationAbortController.signal);
-      if (head && head === this.#verifiedHead) return this.#settlePublish(this.#lastVerification, verificationAbortController.signal);
+      if (head === undefined) {
+        // Unreadable is not "changed": discarding a landed push and re-running
+        // the whole pipeline over a transient git failure is the worse error.
+        this.#publishState = "settled";
+        this.#remoteGrant = undefined;
+        this.#publishShortfall = "the candidate HEAD could not be read when the publish turn returned, so the publish was not confirmed";
+        return this.#finalizeVerification(this.#lastVerification, "blocked", this.#publishShortfall);
+      }
+      if (head === this.#verifiedHead) return this.#settlePublish(this.#lastVerification, verificationAbortController.signal);
       // The Worker changed the candidate during the publish turn; the grant is
       // void and the new tree has to earn its own verification.
       this.#publishState = "settled";
@@ -1731,9 +1746,19 @@ export class Supervisor {
     const task = this.#task;
     const handle = this.#handle;
     const authority = task?.spec.autonomy.remoteAuthority ?? "none";
-    if (!task || !handle || !this.#automation || authority === "none") return false;
-    if (this.#publishState !== "none" || this.#humanRequired || this.#stopRequested !== undefined) return false;
-    if (!canRepairInPlace(this.#adapter)) return false;
+    if (!task || !handle || authority === "none") return false;
+    if (this.#publishState !== "none") return false;
+    // Everything below is a task that *was* given remote authority and is not
+    // going to use it; saying so keeps "candidate is ready" honest.
+    if (!this.#automation) return false;
+    if (this.#humanRequired || this.#stopRequested !== undefined) {
+      await this.#notePublishShortfall(handle.id, { reason: this.#humanRequired ? "a human took over, so the publish turn was not started" : "the task was stopped before the publish turn" });
+      return false;
+    }
+    if (!canRepairInPlace(this.#adapter)) {
+      await this.#notePublishShortfall(handle.id, { reason: `the ${this.#adapter.capabilities().transport} transport cannot take a publish turn` });
+      return false;
+    }
     // A publish turn the deadline stop would cut short leaves a half-finished
     // push and a stopped task, where a plain verified candidate would have completed.
     const closeOut = this.#deadlineContext();
@@ -1764,26 +1789,39 @@ export class Supervisor {
       await this.#notePublishShortfall(handle.id, { reason: `the remote ${remoteName} has no URL to publish to` });
       return false;
     }
-    this.#verifiedHead = head;
-    this.#publishRemoteUrl = url;
-    this.#remoteGrant = { authority, remoteName, branch };
-    this.#publishTarget = this.#remoteGrant;
-    this.#publishState = "requested";
-    await this.#appendEvent({ type: "publish_requested", taskId: task.taskId, workerId: handle.id, data: { authority, remoteName, branch, head } });
+    if (this.#machine.state !== "verifying") {
+      await this.#notePublishShortfall(handle.id, { reason: `the Supervisor was in ${this.#machine.state}, not verifying, when the publish turn was due` });
+      return false;
+    }
+    await this.#appendEvent({ type: "publish_requested", taskId: task.taskId, workerId: handle.id, data: { authority, remoteName, branch, head } }).catch(() => {});
     this.#reportProgress("candidate", `verified; asking the Worker to publish ${branch} to ${remoteName}`, true);
+    // The commands are spelled out because the grant admits exactly these
+    // shapes: `-C` is required, and `--head` is required for a pull request.
+    const pushCommand = `git -C ${task.cwd} push -u ${remoteName} ${branch}`;
     const instruction = authority === "pr"
-      ? `Independent acceptance and review passed for this candidate. Publish it: push the current branch with \`git push -u ${remoteName} ${branch}\` and open a pull request with \`gh pr create\`. Do not merge, tag, release or force-push, and do not change the tree — the pushed commit must stay ${head}. Report the pull request URL when done.`
-      : `Independent acceptance and review passed for this candidate. Publish it: push the current branch with \`git push -u ${remoteName} ${branch}\`. Do not open a pull request, merge, tag, release or force-push, and do not change the tree — the pushed commit must stay ${head}. Report when the push succeeded.`;
+      ? `Independent acceptance and review passed for this candidate. Publish it with exactly these two commands, one per Bash call: \`${pushCommand}\` then \`gh pr create --head ${branch} --title <title> --body <body>\`. Any other form is refused: no force-push, delete, tags, push options, merge, release, --web, --repo or --body-file, and do not change the tree — the pushed commit must stay ${head}. Report the pull request URL when done.`
+      : `Independent acceptance and review passed for this candidate. Publish it with exactly this command: \`${pushCommand}\`. Any other form is refused: no force-push, delete, tags, push options, pull request, merge or release, and do not change the tree — the pushed commit must stay ${head}. Report when the push succeeded.`;
     this.#machine.transition("running");
     this.#repairSendInProgress = true;
     try {
       await this.#sendInternal(instruction);
+      // Armed only once the instruction is really on its way: an exception
+      // above must never leave a live push grant with no publish turn.
+      this.#verifiedHead = head;
+      this.#publishRemoteUrl = url;
+      this.#remoteGrant = { authority, remoteName, branch, cwd: task.cwd };
+      this.#publishTarget = this.#remoteGrant;
+      this.#publishState = "requested";
       return true;
     } catch (error) {
       this.#publishState = "settled";
       this.#remoteGrant = undefined;
+      this.#publishTarget = undefined;
       await this.#notePublishShortfall(handle.id, { reason: `the publish instruction could not be sent: ${safeMessage(error)}` });
-      if (this.#machine.state === "running") this.#machine.transition("verifying");
+      // The transition above already moved the machine; read it without the
+      // narrowing the guard at the top of this method introduced.
+      const current: string = this.#machine.state;
+      if (current === "running") this.#machine.transition("verifying");
       return false;
     } finally {
       this.#repairSendInProgress = false;
@@ -1822,10 +1860,10 @@ export class Supervisor {
       data: { remoteName: grant.remoteName, branch: grant.branch, expected: this.#verifiedHead, ...(remoteHead ? { remoteHead } : {}), ...(prUrl ? { prUrl } : {}), ...(sameRemote ? {} : { remoteChanged: true }) },
     }).catch(() => {});
     if (!sameRemote) {
-      return this.#finalizeVerification(result, "blocked", `the remote ${grant.remoteName} no longer points where the publish was granted; nothing was confirmed and the local candidate is unchanged`);
+      return this.#finalizeVerification(result, "blocked", `the remote ${grant.remoteName} no longer points where the publish was granted; nothing was confirmed; the local candidate is unchanged on its branch`);
     }
     if (!pushed) {
-      return this.#finalizeVerification(result, "blocked", `the candidate was verified but ${grant.remoteName}/${grant.branch} does not point at ${String(this.#verifiedHead).slice(0, 12)}; the local candidate is unchanged and still deliverable`);
+      return this.#finalizeVerification(result, "blocked", `the candidate was verified but ${grant.remoteName}/${grant.branch} does not point at ${String(this.#verifiedHead).slice(0, 12)}; the local candidate is unchanged on its branch`);
     }
     if (grant.authority === "pr" && !prUrl) {
       return this.#finalizeVerification(result, "blocked", `the candidate was pushed to ${grant.remoteName}/${grant.branch} but no pull request was found; open one from the pushed branch`);
@@ -1841,7 +1879,10 @@ export class Supervisor {
    */
   async #findPullRequest(cwd: string, branch: string, signal?: AbortSignal): Promise<string | undefined> {
     try {
-      const { stdout } = await runReadOnly("gh", ["pr", "list", "--head", branch, "--state", "open", "--limit", "10", "--json", "url,headRefOid"], cwd, signal);
+      // Pin the repository: gh resolves a base repo from the remotes (preferring
+      // `upstream`), which on a fork is not the one the grant was issued for.
+      const repository = this.#publishRemoteUrl;
+      const { stdout } = await runReadOnly("gh", ["pr", "list", ...(repository ? ["--repo", repository] : []), "--head", branch, "--state", "open", "--limit", "10", "--json", "url,headRefOid"], cwd, signal);
       const parsed = JSON.parse(stdout) as Array<{ url?: unknown; headRefOid?: unknown }>;
       if (!Array.isArray(parsed)) return undefined;
       const match = parsed.find((entry) => typeof entry.headRefOid === "string" && entry.headRefOid === this.#verifiedHead);

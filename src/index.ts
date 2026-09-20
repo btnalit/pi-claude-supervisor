@@ -379,7 +379,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           const fileSpec = specPath ? await readTaskSpecFile(specPath, ctx.cwd) : undefined;
           const spec = fileSpec ?? { autonomy: autonomyDefaults() };
           // An explicit --remote overrides both the spec file and the env default.
-          if (remoteOption) spec.autonomy = { ...autonomyDefaults(), ...spec.autonomy, remoteAuthority: remoteOption as "none" | "push" | "pr" };
+          if (remoteOption) spec.autonomy = { ...spec.autonomy, remoteAuthority: remoteOption as "none" | "push" | "pr" };
           const goal = fileSpec?.goal ?? task;
           // Adopted sessions are explicit manual compatibility controls; they
           // never enter the automatic Reviewer/decision loop, even when the
@@ -1188,7 +1188,9 @@ function selectedWorkerEnvironment(automatic = false): NodeJS.ProcessEnv {
 async function readTaskSpecFile(path: string, cwd: string): Promise<TaskSpec> {
   const file = resolve(cwd, path.replace(/^['"]|['"]$/gu, ""));
   const value = JSON.parse(await readFile(file, "utf8")) as unknown;
-  return normalizeTaskSpec(value, "");
+  // A spec that omits an autonomy key inherits the operator's environment
+  // default for it, the way a plain-text task does.
+  return normalizeTaskSpec(value, "", autonomyDefaults());
 }
 
 function parseCommand(value: string): string[] {

@@ -3207,7 +3207,8 @@ test("with push authority the verified candidate is handed back to publish, and 
     assert.ok(requested, "the verified candidate is handed back to publish");
     assert.equal(requested?.data?.branch, branch);
     assert.equal(supervisor.state, "running");
-    assert.ok(fixture.state.sent.some((message) => message.includes(`git push -u origin ${branch}`)));
+    assert.ok(fixture.state.sent.some((message) => message.includes(`git -C ${repo.cwd} push -u origin ${branch}`)),
+      "the instruction spells out the one shape the grant admits, including -C");
     assert.equal(candidates.length, 0, "no candidate is announced until the publish settles");
 
     // The publish turn comes back; acceptance is not re-run on the unchanged tree.

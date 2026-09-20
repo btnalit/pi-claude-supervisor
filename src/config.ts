@@ -245,7 +245,11 @@ function readRemoteAuthority(value: string | undefined): RemoteAuthority {
 
 function readRemoteName(value: string | undefined): string {
   const trimmed = value?.trim();
-  return trimmed && /^[A-Za-z0-9._-]+$/u.test(trimmed) ? trimmed : "origin";
+  if (trimmed === undefined || trimmed === "") return "origin";
+  // A typo must not silently redirect where a publish goes; the spec validator
+  // throws for the same input, so this fails the same way instead of guessing.
+  if (!/^[A-Za-z0-9._-]+$/u.test(trimmed)) throw new Error(`PI_CLAUDE_SUPERVISOR_REMOTE_NAME must be a plain remote name: ${trimmed}`);
+  return trimmed;
 }
 
 function readPermissionAuthority(value: string | undefined): PermissionAuthority {
