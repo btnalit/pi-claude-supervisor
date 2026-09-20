@@ -467,16 +467,16 @@ the grant and is re-verified in full, with the same confirmation deciding whethe
 says the verified commit landed first. The grant is cleared on every terminal
 path, so it never outlives the turn it was issued for, and
 `permittedRemoteCommand` admits a single literal shape —
-`git -C '<task dir>' -c core.hooksPath=/dev/null push <remote> <commit>:refs/heads/<branch>`
+`git -C '<task dir>' -c core.hooksPath=/dev/null -c push.followTags=false push <remote> <commit>:refs/heads/<branch>`
 with no other option, and `gh pr create --repo <pinned URL> --head <branch> …`
 — so no force, delete, mirror, tags, push-options, other `-c`, branch or `HEAD`
 source, other remote, branch or repository, relative `-C`, shell wrapper,
 dynamic word or second statement; the pinned hooks path keeps any installed
-`pre-push` out of the granted command. `git config` writes to
+`pre-push` out of the granted command and the pinned `push.followTags=false` keeps any tag out of it. `git config` writes to
 transport-affecting keys (including `include.*` and `init.*`), `git config
 --edit`, `git init --template`, and any statement naming `.git/config` or
-`.git/hooks` in any spelling (`namesGitMetadata` normalizes the path and
-collapses globs) that does not plainly only read are refused alongside `git remote`
+`.git/hooks` in any spelling (`namesGitMetadata` normalizes the path and matches a glob segment by segment, so only a
+segment that could expand to `.git` counts — a project's own `src/hooks/` is ordinary work) that does not plainly only read are refused alongside `git remote`
 mutations; git's own `--git-dir`/`--work-tree` options and `remote`'s own `-v`
 cannot hide either, nor can `-C /proc/self/cwd` (the directory must match lexically *and* through the kernel) or `--separate-git-dir`. The publish
 hint keys on `PolicyResult.boundary`, not on the reason text, and promises a publish turn

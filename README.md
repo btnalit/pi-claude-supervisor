@@ -270,7 +270,7 @@ which stays deliverable locally.
 
 The grant is deliberately unforgiving, and both commands are matched literally —
 an option nobody reviewed is refused rather than assumed harmless. It admits
-exactly `git -C '<task directory>' -c core.hooksPath=/dev/null push <remote> <verified commit>:refs/heads/<branch>`,
+exactly `git -C '<task directory>' -c core.hooksPath=/dev/null -c push.followTags=false push <remote> <verified commit>:refs/heads/<branch>`,
 with no other option. The refspec names the **verified commit**, not the branch:
 git pushes exactly that object, so a commit the Worker makes during the publish
 turn stays local ("Everything up-to-date") instead of riding the grant. `-C` is
@@ -282,7 +282,11 @@ and the directory must equal the task's both lexically and through the kernel:
 and `<cwd>/link/..` spells the task directory while git ends up elsewhere. The hooks path is **pinned** on that one command so no
 `pre-push` hook a Worker could have installed (by any door: `git init
 --template=`, an archive, a `chmod`) runs inside the granted push with the
-Worker's credentials. For `pr` a `gh pr create --repo <pinned remote URL>
+Worker's credentials, and `push.followTags=false` is pinned so a
+`followTags=true` set through any file the policy never sees cannot make the
+one push also plant a tag the grant never named (a tag is what release
+automation keys on). Both are ref and hook selection, not transport, so they
+override no legitimate per-repository setting. For `pr` a `gh pr create --repo <pinned remote URL>
 --head <candidate branch> …` limited to title, body, base, draft, assignee and
 label: the pull request opens in the granted remote's repository, full stop —
 without `--repo`, gh picks a base repository from the remotes (`upstream` on a
@@ -305,7 +309,7 @@ the publish *unconfirmed* (the candidate stays deliverable), never "refuted".
 
 Refused with or without a grant: every push option (`-u`, `--force`,
 `--force-with-lease`, `--delete`, `--mirror`, `--all`, `--tags`, `--no-verify`,
-`--push-option`, `--receive-pack`, …), any `-c` but the pinned hooks path, a
+`--push-option`, `--receive-pack`, …), any `-c` but the two pins (in that order), a
 branch or `HEAD` as the refspec source, a bare `git push`, another remote,
 branch or commit, a protected branch, a shell wrapper (`sh -c`, and a heredoc
 piped into a shell), a dynamic word, a second statement, `git push` without

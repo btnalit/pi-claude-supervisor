@@ -79,6 +79,16 @@ export function isPlainRemoteName(value: unknown): value is string {
 
 /** The hooks path the granted push must carry, so no hook a Worker could have installed runs inside the one granted command. */
 export const GRANTED_HOOKS_PATH = "/dev/null";
+/**
+ * The `-c` settings the granted push must carry, in this order: the hooks path
+ * (no installed hook runs inside the command) and `push.followTags=false` (no
+ * annotated tag rides along — `push.followTags=true` set through a file the
+ * policy never sees would otherwise make the one granted push also plant a
+ * tag the grant never named, and a tag is what release automation keys on).
+ * Both are ref/hook selection, not transport, so pinning them overrides no
+ * legitimate per-repository setting.
+ */
+export const GRANTED_PUSH_SETTINGS = [`core.hooksPath=${GRANTED_HOOKS_PATH}`, "push.followTags=false"] as const;
 
 /**
  * A word quoted for a POSIX shell: plain words pass through, anything else is
@@ -101,7 +111,7 @@ export function shellQuote(value: string): string {
  * and the verified commit is the refspec source.
  */
 export function publishCommand(grant: RemoteGrant): string {
-  return `git -C ${shellQuote(grant.cwd)} -c core.hooksPath=${GRANTED_HOOKS_PATH} push ${shellQuote(grant.remoteName)} ${shellQuote(`${grant.head}:refs/heads/${grant.branch}`)}`;
+  return `git -C ${shellQuote(grant.cwd)} ${GRANTED_PUSH_SETTINGS.map((setting) => `-c ${setting}`).join(" ")} push ${shellQuote(grant.remoteName)} ${shellQuote(`${grant.head}:refs/heads/${grant.branch}`)}`;
 }
 
 /** The one `gh pr create` prefix a `pr` grant admits; the Worker appends its title and body. */
@@ -349,20 +359,24 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
     const directory = words[2];
     if (directory === undefined || !isAbsolute(directory)) return undefined;
     if (resolve(directory) !== resolve(grant.cwd) || !sameDirectory(directory, grant.cwd)) return undefined;
-    // `-c core.hooksPath=/dev/null` is required too: a `pre-push` hook runs
-    // inside the granted push with the Worker's credentials where no policy
-    // sees it, and hooks can arrive by more doors than a write denial can
-    // enumerate (`git init --template=`, an archive). Pinning the hooks path
-    // on the one granted command makes it immune instead.
-    if (words[3] !== "-c" || words[4] !== `core.hooksPath=${GRANTED_HOOKS_PATH}`) return undefined;
-    if (words[5] !== "push") return undefined;
+    // The pinned `-c` settings are required too, in order: a `pre-push` hook
+    // runs inside the granted push with the Worker's credentials where no
+    // policy sees it, and `push.followTags=true` would push a tag along with
+    // the commit; both can arrive by more doors than a write denial can
+    // enumerate, so the one granted command is made immune instead.
+    let cursor = 3;
+    for (const setting of GRANTED_PUSH_SETTINGS) {
+      if (words[cursor] !== "-c" || words[cursor + 1] !== setting) return undefined;
+      cursor += 2;
+    }
+    if (words[cursor] !== "push") return undefined;
     // No push option at all: `-u` did nothing with a commit as the source, and
     // an allowlist of one no-op is only surface. The refspec names the
     // verified commit, so git pushes exactly that object; a commit made during
     // the publish turn stays local ("Everything up-to-date") instead of riding
     // the grant. `refs/heads/` is spelled out because a bare destination is
     // refused by git when the remote branch does not exist yet.
-    const rest = words.slice(6);
+    const rest = words.slice(cursor + 1);
     if (rest.length !== 2 || rest.some((word) => word.startsWith("-"))) return undefined;
     const [remote, refspec] = rest as [string, string];
     if (remote !== grant.remoteName) return undefined;
@@ -621,9 +635,35 @@ function namesGitMetadata(word: string): boolean {
   const value = word.replaceAll("\\", "/");
   if (metadata.test(value) || metadata.test(posix.normalize(value))) return true;
   if (!/[*?[]/u.test(value)) return false;
-  const collapsed = posix.normalize(value.replace(/\[([^\]]*)\]/gu, (_, inner: string) => inner.charAt(0)).replace(/[*?]/gu, ""));
-  if (metadata.test(collapsed)) return true;
-  return /(?:^|\/)(?:config(?:\.worktree)?|hooks)(?:\/|$)/iu.test(posix.normalize(value));
+  // A glob is judged segment by segment: it names the metadata only where
+  // some segment could expand to `.git` and the next to `config`,
+  // `config.worktree` or `hooks`. `src/hooks/*.ts` and `config/*.json` have no
+  // such segment and stay ordinary work; `.gi[t]/config`, `.git/conf?g`,
+  // `.g*/hooks/x` and `*/config` do not.
+  const segments = posix.normalize(value).split("/");
+  for (let index = 0; index + 1 < segments.length; index += 1) {
+    if (!globMatches(segments[index]!, ".git")) continue;
+    const next = segments[index + 1]!;
+    if (globMatches(next, "config") || globMatches(next, "config.worktree") || globMatches(next, "hooks")) return true;
+  }
+  return false;
+}
+
+/** True when one shell-glob path segment could expand to `literal` (`*` any run, `?` one character, `[…]` a class). */
+function globMatches(segment: string, literal: string): boolean {
+  let pattern = "";
+  for (let index = 0; index < segment.length; index += 1) {
+    const char = segment[index]!;
+    if (char === "*") pattern += "[^/]*";
+    else if (char === "?") pattern += "[^/]";
+    else if (char === "[") {
+      const close = segment.indexOf("]", index + 1);
+      if (close > index) { pattern += `[${segment.slice(index + 1, close).replace(/\\/gu, "\\\\")}]`; index = close; }
+      else pattern += "\\[";
+    } else pattern += char.replace(/[.+^${}()|\\]/gu, "\\$&");
+  }
+  try { return new RegExp(`^${pattern}$`, "iu").test(literal); }
+  catch { return true; }
 }
 
 /** Commands that only read what they are given; a statement led by one of these may name `.git/config` or a hook to look at it. */

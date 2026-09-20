@@ -3186,7 +3186,7 @@ test("with push authority the verified candidate is handed back to publish, and 
     const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repo.cwd })).stdout.trim();
     fixture.adapter.send = async (_handle, message) => {
       fixture.state.sent.push(message);
-      if (message.includes("Publish it")) await execFileAsync("git", ["-C", repo.cwd, "-c", "core.hooksPath=/dev/null", "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
+      if (message.includes("Publish it")) await execFileAsync("git", ["-C", repo.cwd, "-c", "core.hooksPath=/dev/null", "-c", "push.followTags=false", "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
     };
     await supervisor.start({
       task: "publish the verified candidate",
@@ -3212,7 +3212,7 @@ test("with push authority the verified candidate is handed back to publish, and 
     const expected = publishCommand({ authority: "push", remoteName: "origin", branch, head, cwd: repo.cwd });
     assert.ok(fixture.state.sent.some((message) => message.includes(`\`${expected}\``)),
       "the instruction spells out the one shape the grant admits: an absolute -C, the hooks path pinned, and the verified commit as the refspec source");
-    assert.match(expected, /^git -C \S+ -c core\.hooksPath=\/dev\/null push origin '[0-9a-f]{40}:refs\/heads\/worker\/publish-ok'$/u);
+    assert.match(expected, /^git -C \S+ -c core\.hooksPath=\/dev\/null -c push\.followTags=false push origin '[0-9a-f]{40}:refs\/heads\/worker\/publish-ok'$/u);
     assert.equal(candidates.length, 0, "no candidate is announced until the publish settles");
 
     // The publish turn comes back; acceptance is not re-run on the unchanged tree.
@@ -3251,7 +3251,7 @@ test("a commit made during the publish turn cannot ride the grant: the verified 
     fixture.adapter.send = async (_handle, message) => {
       fixture.state.sent.push(message);
       if (!message.includes("Publish it")) return;
-      await execFileAsync("git", ["-C", repo.cwd, "-c", "core.hooksPath=/dev/null", "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
+      await execFileAsync("git", ["-C", repo.cwd, "-c", "core.hooksPath=/dev/null", "-c", "push.followTags=false", "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
       await writeFile(join(repo.cwd, "after-publish.txt"), "unverified\n");
       await execFileAsync("git", ["add", "after-publish.txt"], { cwd: repo.cwd });
       await execFileAsync("git", ["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "after publish"], { cwd: repo.cwd });
@@ -3312,7 +3312,7 @@ test("an edit left uncommitted during the publish turn is a changed candidate, n
     fixture.adapter.send = async (_handle, message) => {
       fixture.state.sent.push(message);
       if (!message.includes("Publish it")) return;
-      await execFileAsync("git", ["-C", repo.cwd, "-c", "core.hooksPath=/dev/null", "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
+      await execFileAsync("git", ["-C", repo.cwd, "-c", "core.hooksPath=/dev/null", "-c", "push.followTags=false", "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
       // HEAD stays put, but the tree no longer matches the pushed commit.
       await writeFile(join(repo.cwd, "after-publish.txt"), "uncommitted\n");
     };
@@ -3647,7 +3647,7 @@ test("a remote that cannot be reached leaves the publish unconfirmed, not falsel
     fixture.adapter.send = async (_handle, message) => {
       fixture.state.sent.push(message);
       if (!message.includes("Publish it")) return;
-      await execFileAsync("git", ["-C", repo.cwd, "-c", "core.hooksPath=/dev/null", "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
+      await execFileAsync("git", ["-C", repo.cwd, "-c", "core.hooksPath=/dev/null", "-c", "push.followTags=false", "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
       // The push landed; then the remote drops off the network (here: is deleted).
       await rm(repo.remote, { recursive: true, force: true });
     };

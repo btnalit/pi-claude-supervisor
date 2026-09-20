@@ -556,7 +556,7 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
   const repository = "github.com/acme/console";
   const push = { authority: "push" as const, remoteName: "origin", branch, head, cwd: process.cwd(), repository };
   const pr = { authority: "pr" as const, remoteName: "origin", branch, head, cwd: process.cwd(), repository };
-  const hooks = "-c core.hooksPath=/dev/null";
+  const hooks = "-c core.hooksPath=/dev/null -c push.followTags=false";
   const create = `gh pr create --repo ${repository} --head ${branch}`;
 
   // The verified commit is the refspec source: git pushes exactly that object,
@@ -584,7 +584,7 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
   assert.equal(evaluatePermission("Bash", { command: publishCommand(push) }, process.cwd(), { remote: push }).granted, true);
   assert.equal(evaluatePermission("Bash", { command: `${pullRequestCommand(pr)} --title t --body b` }, process.cwd(), { remote: pr }).granted, true);
   const spaced = { ...push, cwd: "/tmp/it's a dir" };
-  assert.match(publishCommand(spaced), /^git -C '\/tmp\/it'\\''s a dir' -c core\.hooksPath=\/dev\/null push origin /u);
+  assert.match(publishCommand(spaced), /^git -C '\/tmp\/it'\\''s a dir' -c core\.hooksPath=\/dev\/null -c push\.followTags=false push origin /u);
   assert.equal(evaluatePermission("Bash", { command: publishCommand(spaced) }, process.cwd(), { remote: spaced }).decision, "deny", "a directory that is not the task's");
   // Every word the grant supplies is quoted: a legal branch name may carry
   // `$`, `{}` or a quote, which unquoted the lexer reads as dynamic and the
@@ -597,14 +597,20 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
   assert.equal(shellQuote("plain/word-1.x"), "plain/word-1.x");
   assert.equal(shellQuote("it's"), "'it'\\''s'");
 
-  // The hooks path is pinned on the one granted command so no pre-push hook a
-  // Worker could have installed (`git init --template=`, an archive, a chmod)
-  // runs inside it with the Worker's credentials; any other `-c` is refused.
+  // The hooks path and `push.followTags=false` are pinned on the one granted
+  // command, in that order: no pre-push hook a Worker could have installed
+  // (`git init --template=`, an archive, a chmod) runs inside it, and a
+  // `push.followTags=true` set through a file the policy never sees cannot
+  // make it plant a tag the grant never named. Any other `-c`, either pin
+  // alone, or the pins in another order, is refused.
   for (const command of [
     `git -C ${process.cwd()} push origin ${refspec}`,
-    `git -C ${process.cwd()} -c core.hooksPath=/tmp/hooks push origin ${refspec}`,
-    `git -C ${process.cwd()} -c core.hooksPath= push origin ${refspec}`,
-    `git -C ${process.cwd()} -c push.followTags=true push origin ${refspec}`,
+    `git -C ${process.cwd()} -c core.hooksPath=/dev/null push origin ${refspec}`,
+    `git -C ${process.cwd()} -c push.followTags=false push origin ${refspec}`,
+    `git -C ${process.cwd()} -c push.followTags=false -c core.hooksPath=/dev/null push origin ${refspec}`,
+    `git -C ${process.cwd()} -c core.hooksPath=/dev/null -c push.followTags=true push origin ${refspec}`,
+    `git -C ${process.cwd()} -c core.hooksPath=/tmp/hooks -c push.followTags=false push origin ${refspec}`,
+    `git -C ${process.cwd()} -c core.hooksPath= -c push.followTags=false push origin ${refspec}`,
     `git -C ${process.cwd()} ${hooks} -c push.followTags=true push origin ${refspec}`,
     `git ${hooks} -C ${process.cwd()} push origin ${refspec}`,
   ]) assert.equal(evaluateCommand(command, [], push).decision, "deny", command);
@@ -838,8 +844,13 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
     "printf x >> .gi[t]/config",
     "cp /tmp/h .git/./hooks/pre-commit",
     "cp /tmp/h .g*/hooks/pre-commit",
+    "printf x >> .git/conf?g",
+    "printf x >> .git/conf*",
+    "cp x */config",
   ]) assert.equal(evaluateCommand(command).decision, "deny", command);
-  for (const command of ["cat .git/config", "cat .git/hooks/pre-commit", "ls .git/hooks", "grep url .git/config", "head -5 .git/config && git status", "cat .git/./config", "cat src/*/config.json", "echo x > build/config", "echo x > .github/config"]) {
+  // A glob names the metadata only where a segment could expand to `.git`:
+  // a project's own `src/hooks/` or `config/` directory is ordinary work.
+  for (const command of ["cat .git/config", "cat .git/hooks/pre-commit", "ls .git/hooks", "grep url .git/config", "head -5 .git/config && git status", "cat .git/./config", "cat src/*/config.json", "echo x > build/config", "echo x > .github/config", "rm -f src/hooks/*.test.ts", "cp src/config/*.json dist/", "sed -i s/a/b/ src/hooks/*.ts", "mv src/hooks/* src/lib/", "touch config/*.bak", "prettier --write src/hooks/*.tsx"]) {
     assert.equal(evaluateCommand(command).decision, "allow", command);
   }
   // The file tools were already refused for every `.git` path.

@@ -1938,7 +1938,7 @@ export class Supervisor {
     // gets no `pr` grant rather than an instruction gh would refuse.
     const repository = await repositorySlug(url.fetch[0]!, signal);
     if (authority === "pr" && !repository) {
-      await this.#notePublishShortfall(handle.id, { reason: `the remote ${remoteName} (${url.fetch}) does not name a repository gh can open a pull request in; use push authority or a canonical remote URL` });
+      await this.#notePublishShortfall(handle.id, { reason: `the remote ${remoteName} (${url.fetch.join(", ")}) does not name a repository gh can open a pull request in; use push authority or a canonical remote URL` });
       return false;
     }
     if (this.#machine.state !== "verifying") {
