@@ -3,7 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { constants as fsConstants, lstatSync, readdirSync, unlinkSync } from "node:fs";
 import { access, chmod, lstat, mkdir, open, readdir, readFile, realpath, rm, rmdir, stat, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, isAbsolute, join } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import type {
   PermissionDecision,
   WorkerAdapter,
@@ -1344,14 +1344,13 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     if (expected?.pid !== undefined && pane.pid !== expected.pid) throw new Error("tmux pane pid changed; refusing identity-unverified handoff");
     if (pane.dead) throw new Error("cannot adopt a dead tmux pane");
     record.handle.pid = pane.pid;
-    const currentPath = (await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_current_path}"])).stdout.trim();
-    // The pane may sit on an older instance of the same mount (an autofs
-    // remount, a bind mount): the kernel then renders its cwd under a path
-    // that no longer resolves, while /proc/<pid>/cwd still reaches the very
-    // same directory. Only an identity mismatch is a real mismatch.
-    if (currentPath !== cwd && !(pane.pid && await sameDirectory(cwd, `/proc/${pane.pid}/cwd`))) {
-      throw new Error(`tmux session cwd mismatch: expected ${cwd}, got ${currentPath}`);
-    }
+    // Compared as reported, not by inode identity: the hook relay routes events
+    // by the SHA-256 of realpath(cwd), so a pane whose cwd merely *resolves* to
+    // the same directory under a different spelling would be adopted and then
+    // never deliver a single hook event -- an unsupervised Worker that looks
+    // supervised. A mismatch means the pane cannot be governed, so it is refused.
+    const currentPath = await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_current_path}"]);
+    if (currentPath.stdout.trim() !== cwd) throw new Error(`tmux session cwd mismatch: expected ${cwd}, got ${currentPath.stdout.trim()}`);
     const command = (await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_current_command}"])).stdout.trim();
     let processArgs: { stdout: string; stderr: string };
     if (!pane.pid) throw new Error("tmux pane pid is unavailable; refusing to adopt without command inspection");
@@ -2078,6 +2077,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     // itself away in respondPermission and hang the relay.
     record.permissionResponses.delete(requestId);
     const toolUseId = event.tool_use_id ?? requestId;
+    const writeRoots = writeRootsOf(record);
     this.#emit(record, {
       type: "permission_request",
       handle: record.handle,
@@ -2088,7 +2088,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         input: event.tool_input,
         raw: event as unknown as Record<string, unknown>,
         phase,
-        ...(writeRootsOf(record).length > 0 ? { writeRoots: writeRootsOf(record) } : {}),
+        ...(writeRoots.length > 0 ? { writeRoots } : {}),
       },
     });
     return new Promise<HookRelayReply>((resolve) => {
@@ -2161,33 +2161,42 @@ function bridgeEnvironment(env: NodeJS.ProcessEnv, cwd: string, command: string,
   return result;
 }
 
+/** Same shape the decision-session registry requires of an untrusted absolute path. */
 function isSafeAbsolutePath(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && isAbsolute(value) && !value.includes("\0");
+  return typeof value === "string" && value.length > 0 && value.length <= 4_096
+    && isAbsolute(value) && String(redactSensitiveText(value)) === value;
+}
+
+/**
+ * Claude's per-project memory directory for this task, or undefined when the
+ * reported transcript path is not this project's session transcript.
+ *
+ * `transcript_path` is untrusted hook input, so the shape is checked rather
+ * than trusted: it must be `<…>/.claude/projects/<slug>/<session>.jsonl` whose
+ * `<slug>` is the one Claude derives from this task's cwd. That rejects a
+ * subagent transcript (`<slug>/<session>/subagents/agent-*.jsonl`, which would
+ * otherwise freeze a bogus root) and any path naming another project, a home
+ * directory, or somewhere inside the repository.
+ */
+export function memoryRootFor(transcriptPath: string | undefined, cwd: string): string | undefined {
+  if (!transcriptPath || !cwd) return undefined;
+  const sessionDir = dirname(transcriptPath);
+  const projectsDir = dirname(sessionDir);
+  if (basename(projectsDir) !== "projects" || basename(dirname(projectsDir)) !== ".claude") return undefined;
+  if (basename(sessionDir) !== cwd.replaceAll("/", "-")) return undefined;
+  return join(sessionDir, "memory");
 }
 
 /**
  * The directories outside the task cwd that the Worker may still write: its own
- * per-session scratchpad, and Claude's per-project memory directory. The memory
- * directory is derived from the session's own `transcript_path`
- * (`<projects>/<slug>/<session>.jsonl` -> `<projects>/<slug>/memory`), so it is
- * reported by Claude for this session rather than guessed, and cannot name
- * another project's memory.
+ * per-session scratchpad, and Claude's per-project memory directory.
  */
-export function writeRootsOf(record: { scratchpadDir?: string; transcriptPath?: string }): string[] {
+export function writeRootsOf(record: { scratchpadDir?: string; transcriptPath?: string; handle?: { cwd: string } }): string[] {
   const roots: string[] = [];
   if (record.scratchpadDir) roots.push(record.scratchpadDir);
-  if (record.transcriptPath) roots.push(join(dirname(record.transcriptPath), "memory"));
+  const memory = memoryRootFor(record.transcriptPath, record.handle?.cwd ?? "");
+  if (memory) roots.push(memory);
   return roots;
-}
-
-/** True when both paths name the same directory (device and inode), however they are spelled. */
-export async function sameDirectory(first: string, second: string): Promise<boolean> {
-  try {
-    const [a, b] = await Promise.all([stat(first), stat(second)]);
-    return a.isDirectory() && b.isDirectory() && a.dev === b.dev && a.ino === b.ino;
-  } catch {
-    return false;
-  }
 }
 
 export function attachCommand(handle: Pick<WorkerHandle, "tmuxSocket" | "sessionName">): string {

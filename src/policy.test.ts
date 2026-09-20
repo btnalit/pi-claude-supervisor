@@ -247,8 +247,7 @@ test("file tools reject outside-cwd and hard-link Git aliases", async () => {
     assert.equal(evaluatePermission("Write", { file_path: "main-alias", content: "moved\n" }, root).decision, "deny");
     const outside = evaluatePermission("Write", { file_path: "../outside.txt", content: "outside\n" }, root);
     assert.equal(outside.decision, "deny");
-    assert.match(outside.reason, /^Worker cannot write outside the task working directory: \.\.\/outside\.txt;/u);
-    assert.match(outside.reason, /scratchpad or memory directory/u, "the denial tells the Worker where scratch work may go");
+    assert.equal(outside.reason, "Worker cannot write outside the task working directory: ../outside.txt");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -474,6 +473,30 @@ test("denials that a Worker can act on name the tool or place to use instead", (
   const dynamic = evaluateCommand("git commit -m $MSG");
   assert.equal(dynamic.decision, "deny");
   assert.match(dynamic.reason, /cannot be capability-checked/u);
-  assert.match(dynamic.reason, /Write\/Edit tools/u);
-  assert.match(dynamic.reason, /heredoc or stdin/u);
+  assert.match(dynamic.reason, /substitute the literal value/u);
+});
+
+test("a write root is honored before it exists and through a symlinked ancestor", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-writeroot-"));
+  try {
+    const cwd = join(base, "repo");
+    await mkdir(cwd);
+    // Claude creates its memory directory on the first write; failing closed
+    // there denied the very write the outside-cwd message points at.
+    const missing = join(base, ".claude", "projects", "-slug", "memory");
+    assert.equal(evaluatePermission("Write", { file_path: join(missing, "MEMORY.md") }, cwd, { writeRoots: [missing] }).decision, "allow");
+
+    // A dotfile-managed ~/.claude reaches the same directory through a symlink.
+    const real = join(base, "dotfiles", "claude");
+    await mkdir(real, { recursive: true });
+    await symlink(real, join(base, "linked"));
+    const viaLink = join(base, "linked", "projects", "-slug", "memory");
+    assert.equal(evaluatePermission("Write", { file_path: join(viaLink, "notes.md") }, cwd, { writeRoots: [viaLink] }).decision, "allow");
+
+    // The root is not a licence to leave it.
+    assert.equal(evaluatePermission("Write", { file_path: join(base, "elsewhere.txt") }, cwd, { writeRoots: [missing] }).decision, "deny");
+    assert.equal(evaluatePermission("Write", { file_path: join(cwd, ".git", "config") }, cwd, { writeRoots: [missing] }).decision, "deny");
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
 });

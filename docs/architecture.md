@@ -427,15 +427,20 @@ close-out exists so that a task which merely ran long still ends with a verified
 candidate instead of a silent hand-back.
 
 A denial is a capability boundary the Worker has to route around by itself, so
-each one names the checked alternative: a dynamic argument on a repository or
-package command points at the Write/Edit tools (whose paths are checked) rather
-than an inline interpreter script, and an outside-cwd write points at the
-session's own scratchpad or memory directory. Those two directories are the
-`writeRoots` the permission policy accepts beside the task cwd: the scratchpad
-Claude reports at SessionStart, and the per-project memory directory derived
-from the session's own `transcript_path` (`<projects>/<slug>/<session>.jsonl` ->
-`<projects>/<slug>/memory`). The transcript path is captured from any hook
-event, not only SessionStart, because an adopted session never replays it. A record left behind by the outright
+each one names a remedy it can act on: a dynamic argument says to substitute the
+literal value so the command can be read, and an outside-cwd write names the
+write roots this Worker actually holds (and nothing when it holds none). Those
+roots are what the permission policy accepts beside the task cwd: the scratchpad
+Claude reports at SessionStart, and its per-project memory directory, derived
+from the session's own `transcript_path`. The transcript path is captured from
+any hook event, since an adopted session never replays SessionStart, and it is
+untrusted input, so the shape is verified rather than trusted — it must be
+`<…>/.claude/projects/<slug>/<session>.jsonl` whose slug is the one Claude
+derives from this task's cwd, which rejects a subagent transcript and any path
+naming another project. A root is honored before it exists (Claude creates the
+memory directory on first write) and through a symlinked ancestor.
+
+A record left behind by the outright
 stop (`recoverable_failure`, so `active/interrupted`) is not a dead end either:
 `recover --extend <duration>` re-persists a deadline measured from now
 (`extendedDeadlineMs`), `--extend 0` recovers straight into the close-out, and

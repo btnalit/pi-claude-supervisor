@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
-import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS, sameDirectory, sweepDeadTmuxSockets, writeRootsOf } from "./tmux-adapter.ts";
+import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS, memoryRootFor, sweepDeadTmuxSockets, writeRootsOf } from "./tmux-adapter.ts";
 import { preflightCgroupContainment } from "./process-adapter.ts";
 import type { HookEventSource, HookRelayReply, HookRelayRequest } from "../hooks/types.ts";
 import type { WorkerEvent } from "../types.ts";
@@ -1537,35 +1537,34 @@ test("sweepDeadTmuxSockets removes pi-cs sockets no server answers on and keeps 
   }
 });
 
-test("sameDirectory compares directory identity, not the spelling of the path", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-same-dir-"));
-  try {
-    const target = join(root, "target");
-    await mkdir(target);
-    await symlink(target, join(root, "alias"));
-    await writeFile(join(root, "file"), "x");
-    assert.equal(await sameDirectory(target, join(root, "alias")), true);
-    // The process's own cwd through /proc, the way an adopted pane is checked.
-    assert.equal(await sameDirectory(process.cwd(), `/proc/${process.pid}/cwd`), process.platform === "linux");
-    assert.equal(await sameDirectory(target, root), false);
-    assert.equal(await sameDirectory(target, join(root, "file")), false, "a file is never the same directory");
-    assert.equal(await sameDirectory(target, join(root, "missing")), false);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
+test("the memory write root is accepted only for this project's own session transcript", () => {
+  const cwd = "/mnt/work/Repo";
+  const slug = "-mnt-work-Repo";
+  const projects = `/home/u/.claude/projects/${slug}`;
+
+  assert.equal(memoryRootFor(`${projects}/1234.jsonl`, cwd), `${projects}/memory`);
+
+  // A subagent transcript sits one level deeper; deriving from it would freeze a
+  // bogus root that the first-wins capture could never correct.
+  assert.equal(memoryRootFor(`${projects}/1234/subagents/agent-a.jsonl`, cwd), undefined);
+  // Another project's memory, a bare home directory, and anything outside
+  // ~/.claude/projects are refused: transcript_path is untrusted hook input.
+  assert.equal(memoryRootFor("/home/u/.claude/projects/-other-repo/1.jsonl", cwd), undefined);
+  assert.equal(memoryRootFor("/home/u/1.jsonl", cwd), undefined);
+  assert.equal(memoryRootFor("/tmp/evil/projects/-mnt-work-Repo/1.jsonl", cwd), undefined);
+  assert.equal(memoryRootFor(undefined, cwd), undefined);
 });
 
-test("writeRoots cover the session's scratchpad and Claude's own project memory directory", () => {
-  const transcriptPath = "/home/u/.claude/projects/-repo-slug/1234.jsonl";
-  const scratchpadDir = "/tmp/claude-1000/-repo-slug/abc/scratchpad";
+test("writeRoots carry the scratchpad and the project memory directory", () => {
+  const cwd = "/mnt/work/Repo";
+  const handle = { cwd };
+  const scratchpadDir = "/tmp/claude-1000/-mnt-work-Repo/abc/scratchpad";
+  const transcriptPath = "/home/u/.claude/projects/-mnt-work-Repo/1234.jsonl";
 
-  // The memory directory is derived from the transcript Claude itself reports,
-  // so it always belongs to this session's project and is never guessed.
-  assert.deepEqual(writeRootsOf({ transcriptPath }), ["/home/u/.claude/projects/-repo-slug/memory"]);
-  assert.deepEqual(writeRootsOf({ scratchpadDir, transcriptPath }), [scratchpadDir, "/home/u/.claude/projects/-repo-slug/memory"]);
-
-  // An adopted session that never replayed SessionStart has no scratchpad yet;
-  // the memory root still applies once any hook reports a transcript path.
-  assert.deepEqual(writeRootsOf({ scratchpadDir }), [scratchpadDir]);
-  assert.deepEqual(writeRootsOf({}), []);
+  assert.deepEqual(writeRootsOf({ handle, scratchpadDir, transcriptPath }),
+    [scratchpadDir, "/home/u/.claude/projects/-mnt-work-Repo/memory"]);
+  // An adopted session has no scratchpad until SessionStart, which it never replays.
+  assert.deepEqual(writeRootsOf({ handle, transcriptPath }), ["/home/u/.claude/projects/-mnt-work-Repo/memory"]);
+  assert.deepEqual(writeRootsOf({ handle, scratchpadDir }), [scratchpadDir]);
+  assert.deepEqual(writeRootsOf({ handle }), []);
 });
