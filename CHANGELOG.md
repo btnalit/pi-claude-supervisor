@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.9.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.8.1...v0.9.0) (2026-09-20)
+
+
+### Features
+
+* **supervisor:** publish a verified candidate under a narrow, one-shot remote grant ([5e117cc](https://github.com/btnalit/pi-claude-supervisor/commit/5e117cc5695492d03684270ea25cac224f1fe41e))
+
 ## [0.8.1](https://github.com/btnalit/pi-claude-supervisor/compare/v0.8.0...v0.8.1) (2026-09-20)
 
 
