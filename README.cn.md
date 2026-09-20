@@ -219,14 +219,13 @@ Worker 推自己的分支;`pr` 还允许它开 PR。**push 由 Worker 自己执�
 依然可交付。
 
 这个授权刻意严苛,而且两条命令都按**选项白名单**匹配——没被审过的选项一律拒绝,
-而不是默认无害。它只认 `git [-C <任务目录>] push [-u] <remote> <branch>`(分支必须
-字面写出),`pr` 下另加受限的 `gh pr create`(只允许 title / body / base / head(且
+而不是默认无害。它只认 `git push [-u] <remote> <branch>`(分支必须字面写出;**不接受 `-C`**——
+发布轮本来就在任务目录里运行,而对 `-C` 的比对只能是词法的,git 却按内核解析路径),`pr` 下另加受限的 `gh pr create`(只允许 title / body / base / head(且
 必须等于候选分支)/ draft / assignee / label)。
 
 有没有授权都拒绝:其余所有 push 选项(`--force`、`--force-with-lease`、`--delete`、
 `--mirror`、`--all`、`--tags`、`--no-verify`、`--push-option`、`--receive-pack` 等)、
-`HEAD` refspec、裸 `git push`、别的 remote 或分支、保护分支、`-C` 指向任务目录以外
-的任何目录、被 shell 包装(含 heredoc 管进 shell)、带动态参数、第二条语句、
+`HEAD` refspec、裸 `git push`、别的 remote 或分支、保护分支、任何形式的 `git -C`、被 shell 包装(含 heredoc 管进 shell)、带动态参数、第二条语句、
 `gh pr create --body-file/-F/--template`(会把任意本地文件内容发到 PR 上)、
 `--web`、`--repo`、`gh pr merge`、`gh api`、`gh release`、`npm publish`。改动仓库
 remote(`git remote set-url|add|rename|…`)一律拒绝,否则授权认的 remote 名会被偷换,

@@ -1766,7 +1766,7 @@ export class Supervisor {
     }
     this.#verifiedHead = head;
     this.#publishRemoteUrl = url;
-    this.#remoteGrant = { authority, remoteName, branch, cwd: task.cwd };
+    this.#remoteGrant = { authority, remoteName, branch };
     this.#publishTarget = this.#remoteGrant;
     this.#publishState = "requested";
     await this.#appendEvent({ type: "publish_requested", taskId: task.taskId, workerId: handle.id, data: { authority, remoteName, branch, head } });

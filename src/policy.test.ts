@@ -503,14 +503,13 @@ test("a write root is honored before it exists and through a symlinked ancestor"
 
 test("a publish grant admits exactly one shape and nothing else", () => {
   const branch = "s6/console-completion";
-  const push = { authority: "push" as const, remoteName: "origin", branch, cwd: "/repo" };
-  const pr = { authority: "pr" as const, remoteName: "origin", branch, cwd: "/repo" };
+  const push = { authority: "push" as const, remoteName: "origin", branch };
+  const pr = { authority: "pr" as const, remoteName: "origin", branch };
 
   for (const command of [
     "git push -u origin s6/console-completion",
     "git push origin s6/console-completion",
     "git push origin s6/console-completion:s6/console-completion",
-    "git -C /repo push origin s6/console-completion",
   ]) assert.equal(evaluateCommand(command, [], push).decision, "allow", command);
   assert.equal(evaluateCommand("gh pr create --title x --body y", [], pr).decision, "allow");
   assert.equal(evaluateCommand("gh pr create --head s6/console-completion --base main", [], pr).decision, "allow");
@@ -551,7 +550,7 @@ test("a publish grant admits exactly one shape and nothing else", () => {
   assert.equal(evaluateCommand("git commit -m x").decision, "allow");
 
   // A protected candidate branch is never publishable, grant or not.
-  assert.equal(evaluateCommand("git push origin main", [], { authority: "push", remoteName: "origin", branch: "main", cwd: "/repo" }).decision, "deny");
+  assert.equal(evaluateCommand("git push origin main", [], { authority: "push", remoteName: "origin", branch: "main" }).decision, "deny");
 
   // The grant covers the direct invocation only. A shell wrapper is still
   // denied: the outer command is not the permitted shape, and admitting it
@@ -564,10 +563,12 @@ test("a publish grant admits exactly one shape and nothing else", () => {
     "cat <<'EOF' | bash\ngit push origin s6/console-completion\nEOF",
   ]) assert.equal(evaluateCommand(wrapper, [], push).decision, "deny", wrapper);
 
-  // `-C` may name the task directory and nothing else.
-  assert.equal(evaluateCommand("git -C /repo push origin s6/console-completion", [], push).decision, "allow");
-  assert.equal(evaluateCommand("git -C /tmp/evil push origin s6/console-completion", [], push).decision, "deny");
-  assert.equal(evaluateCommand("git -C /repo/sub push origin s6/console-completion", [], push).decision, "deny");
+  // `-C` is not accepted at all: the publish turn already runs in the task
+  // directory, and any comparison against it could only be lexical while git
+  // resolves the path through the kernel (`<cwd>/link/..`).
+  for (const directory of ["/repo", "/tmp/evil", "/repo/sub", "/repo/.", "/repo//", "/repo/sub/.."]) {
+    assert.equal(evaluateCommand(`git -C ${directory} push origin s6/console-completion`, [], push).decision, "deny", directory);
+  }
 
   // Repointing a remote would make the grant's remote name meaningless.
   for (const command of [

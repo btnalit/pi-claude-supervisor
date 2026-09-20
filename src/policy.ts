@@ -34,8 +34,6 @@ export interface RemoteGrant {
   remoteName: string;
   /** The candidate branch; a push must name it literally. */
   branch: string;
-  /** The task working directory; `git -C` may name only this, so the grant cannot be spent on another repository. */
-  cwd: string;
 }
 
 /** The only options a granted `git push` may carry. Anything else is refused, so a new git flag is denied until it is reviewed. */
@@ -212,16 +210,12 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
   const optionName = (word: string): string => word.split("=")[0] ?? word;
 
   if (name === "git") {
-    let index = 1;
-    // `-C` may name the task directory and nothing else: otherwise the grant
-    // could be spent pushing an unrelated repository the Worker just created.
-    while (words[index] === "-C") {
-      const directory = words[index + 1];
-      if (directory === undefined || resolve(directory) !== resolve(grant.cwd)) return undefined;
-      index += 2;
-    }
-    if (words[index] !== "push") return undefined;
-    const rest = words.slice(index + 1);
+    // No `-C`, and no other pre-subcommand option. The publish turn already
+    // runs in the task directory, so `-C` buys nothing and costs the guarantee:
+    // comparing it to the task cwd can only be lexical, while git resolves it
+    // through the kernel, so `<cwd>/link/..` could name a different repository.
+    if (words[1] !== "push") return undefined;
+    const rest = words.slice(2);
     const positional: string[] = [];
     for (const word of rest) {
       if (word.startsWith("-")) {
