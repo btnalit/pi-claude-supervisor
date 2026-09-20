@@ -549,7 +549,7 @@ test("a write root is honored before it exists and through a symlinked ancestor"
   }
 });
 
-test("a publish grant admits exactly one shape and nothing else", () => {
+test("a publish grant admits exactly one shape and nothing else", async () => {
   const branch = "s6/console-completion";
   const head = "02ab45aafc8afde10d156575743afc4861adfa16";
   const refspec = `${head}:refs/heads/${branch}`;
@@ -708,9 +708,19 @@ test("a publish grant admits exactly one shape and nothing else", () => {
     assert.equal(evaluateCommand(`git -C ${directory} ${hooks} push origin ${refspec}`, [], push).decision, expected, directory);
   }
   // `/proc/self/cwd` resolves to *this* process's directory here and to the
-  // Worker's shell's under git: equal to the grant, running somewhere else.
+  // Worker's shell's under git: equal through the kernel, running somewhere
+  // else. So does a symlink to it inside the task directory, which is why the
+  // directory must also equal the task directory *lexically*.
   for (const directory of ["/proc/self/cwd", "/proc/thread-self/cwd", `/proc/${process.pid}/cwd`, "/dev/fd/3"]) {
     assert.equal(evaluateCommand(`git -C ${directory} ${hooks} push origin ${refspec}`, [], push).decision, "deny", directory);
+  }
+  const procLinkBase = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-proclink-"));
+  try {
+    await symlink("/proc/self/cwd", join(procLinkBase, "link"));
+    assert.equal(evaluateCommand(`git -C ${procLinkBase}/link ${hooks} push origin ${refspec}`, [], push).decision, "deny", "a symlink to /proc/self/cwd");
+    assert.equal(evaluateCommand(`git -C ${procLinkBase}/link/.. ${hooks} push origin ${refspec}`, [], push).decision, "deny", "and through it");
+  } finally {
+    await rm(procLinkBase, { recursive: true, force: true });
   }
 
   // One realpath-equality helper with an explicit policy for a missing path.

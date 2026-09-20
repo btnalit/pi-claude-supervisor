@@ -70,6 +70,11 @@ test("a clean tree and a local .git directory are what the grant requires", asyn
     assert.equal(await repositoryClean(cwd), false, "an untracked file is not clean");
     assert.equal(await repositoryClean(join(base, "not-a-repo")), undefined, "git could not say");
     assert.equal(await repositoryGitDirectoryIsLocal(cwd), true);
+    // A linked worktree's .git is a `gitdir:` file by design; its git dir sits
+    // under the main repository's .git/worktrees/ and is accepted.
+    const linked = join(base, "linked");
+    await execFileAsync("git", ["-C", cwd, "worktree", "add", "-q", linked, "-b", "feat/linked"]);
+    assert.equal(await repositoryGitDirectoryIsLocal(linked), true, "a linked worktree");
     const moved = join(base, "moved");
     await execFileAsync("git", ["init", "-q", "-b", "main", "--separate-git-dir", join(base, "gitdir"), moved]);
     assert.equal(await repositoryGitDirectoryIsLocal(moved), false, "a gitdir: pointer is not a local .git directory");

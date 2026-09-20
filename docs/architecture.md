@@ -448,7 +448,7 @@ that commit, the candidate's own branch, the remote, the task directory and the
 remote's repository (`host/owner/repo` from its fetch URL, an SSH alias
 translated through `ssh -G`), and asks the Worker to publish: the Worker runs
 the push and any `gh pr create`, the Supervisor never does. A dirty tree costs a
-repair round first, `.git` must be a real directory, and the reviewed evidence must carry a
+repair round first, the Git directory must be the task's own `.git` or a linked worktree's, and the reviewed evidence must carry a
 HEAD (fail-closed); the grant is armed before the instruction is sent and
 revoked only if the send failed before delivery (the turn counter tells). The instruction is built
 by `publishCommand`/`pullRequestCommand` in `policy.ts`, beside the parser that
@@ -477,7 +477,7 @@ transport-affecting keys (including `include.*` and `init.*`), `git config
 --edit`, `git init --template`, and any statement naming `.git/config` or
 `.git/hooks` that does not plainly only read are refused alongside `git remote`
 mutations; git's own `--git-dir`/`--work-tree` options and `remote`'s own `-v`
-cannot hide either, nor can `-C /proc/self/cwd` or `--separate-git-dir`. The publish
+cannot hide either, nor can `-C /proc/self/cwd` (the directory must match lexically *and* through the kernel) or `--separate-git-dir`. The publish
 hint keys on `PolicyResult.boundary`, not on the reason text, and promises a publish turn
 only where `#requestPublish` will start one. For an adopted tmux session the memory write root is
 located under the *adopted process's* configuration directory, read from

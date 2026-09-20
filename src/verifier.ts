@@ -268,10 +268,31 @@ export async function repositoryClean(cwd: string, signal?: AbortSignal): Promis
   }
 }
 
-/** True when `<cwd>/.git` is a directory of its own rather than a `gitdir:` pointer somewhere else. */
-export async function repositoryGitDirectoryIsLocal(cwd: string): Promise<boolean> {
+/**
+ * True when the repository's Git directory is where the `.git/` guards look:
+ * `<cwd>/.git` itself, or a linked worktree's `<common>/.git/worktrees/<name>`
+ * (a worktree's `.git` is a `gitdir:` file by design, and its config and hooks
+ * live in the common directory — the pinned `core.hooksPath` is what protects
+ * the granted push there). A Git directory anywhere else is the
+ * `--separate-git-dir` case, refused for the Worker but not for whoever made
+ * the clone.
+ */
+export async function repositoryGitDirectoryIsLocal(cwd: string, signal?: AbortSignal): Promise<boolean> {
   try {
-    return (await lstat(join(cwd, ".git"))).isDirectory();
+    const read = async (args: string[]): Promise<string> => {
+      const result = await execFileAsync("git", args, { cwd, timeout: 30_000, maxBuffer: 4096, signal, env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }) });
+      return String(result.stdout).trim();
+    };
+    const [gitDir, commonDir] = await Promise.all([read(["rev-parse", "--git-dir"]), read(["rev-parse", "--git-common-dir"])]);
+    if (!gitDir || !commonDir) return false;
+    const resolvedGitDir = await realpath(resolve(cwd, gitDir));
+    const resolvedCommon = await realpath(resolve(cwd, commonDir));
+    const own = await realpath(cwd).then((real) => join(real, ".git")).catch(() => undefined);
+    if (own !== undefined && resolvedGitDir === own) return true;
+    // A linked worktree: its git dir sits under the common dir's worktrees/,
+    // and the common dir is itself a repository's own .git.
+    const worktrees = join(resolvedCommon, "worktrees");
+    return resolvedCommon.endsWith(`${sep}.git`) && resolvedGitDir.startsWith(`${worktrees}${sep}`);
   } catch {
     return false;
   }

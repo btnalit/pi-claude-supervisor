@@ -1853,7 +1853,7 @@ export class Supervisor {
     // the task cwd; a repository whose Git directory was moved elsewhere
     // (`--separate-git-dir`, refused for the Worker but not for whoever made
     // the clone) keeps its transport configuration where no guard looks.
-    if (!(await repositoryGitDirectoryIsLocal(task.cwd))) {
+    if (!(await repositoryGitDirectoryIsLocal(task.cwd, signal))) {
       await this.#notePublishShortfall(handle.id, { reason: "the repository's Git directory is not the task directory's own .git, so its configuration and hooks are outside the publish boundary" });
       return false;
     }

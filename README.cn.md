@@ -224,7 +224,7 @@ Worker 推自己的分支;`pr` 还允许它开 PR。**push 由 Worker 自己执�
 Worker 在发布轮里再提交的内容会留在本地("Everything up-to-date"),搭不上这次授权。
 **`-C` 是必需的且必须是绝对路径**,两侧都按内核解析后比较——因为 Claude 的 Bash 工具
 会在多次调用之间保留工作目录,而 `cd` 属于普通本地操作,没有 `-C` 的话授权可能被花在
-任何别的克隆上;相对写法 `-C .`(或 `/proc/self/cwd`)则会按 Supervisor 进程而不是 Worker 的 shell 解析。
+任何别的克隆上;目录必须在字面上和经内核解析后都等于任务目录:`/proc/self/cwd`(或指向它的 symlink)会解析成 Supervisor 自己的进程目录,而 `<cwd>/link/..` 字面上是任务目录、git 却会走到别处。
 这条命令上**钉死了 hooks 路径**,所以 Worker 通过任何途径(`git init --template=`、
 解压归档、`chmod`)装进去的 `pre-push` hook 都不会在授权的 push 里以 Worker 的凭据执行。
 `pr` 下另加 `gh pr create --repo <钉住的 remote URL> --head <候选分支> …`(只允许
@@ -236,7 +236,7 @@ title / body / base / draft / assignee / label):PR 只会开在授权 remote 对
 也能原样通过策略。
 
 授权只会发给"就是已验证工作树"的那个 commit:工作树必须干净(含未跟踪文件——新文件也可能
-是被验证行为的一部分),且 HEAD 自 Reviewer 评审的证据被读取以来没有移动过。仓库的 `.git` 必须是自己的目录(不能是 `--separate-git-dir` 留下的 `gitdir:` 指针)。工作树不干净
+是被验证行为的一部分),且 HEAD 自 Reviewer 评审的证据被读取以来没有移动过。仓库的 Git 目录必须是自己的 `.git` 或 linked worktree 的 `.git/worktrees/<name>`(不能是 `--separate-git-dir` 指针)。工作树不干净
 会先花一轮修复让 Worker 把属于候选的内容提交掉;只有修复轮用尽或 HEAD 移动过,任务才以本地
 候选结束并在通知里写明 `not published:` 原因,而不是发授权。核实时 remote 连不上,发布只是
 "未确认"(候选仍可交付),绝不会被说成"没推上去"。

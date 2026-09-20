@@ -337,17 +337,18 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
     // work, so without an explicit directory the grant could be spent in any
     // clone the Worker had wandered into. The directory must be absolute: a
     // relative one (`.`, `''`, `src/..`) would resolve against *this* process,
-    // not the Worker's shell, and pass while git ran somewhere else. Both sides
-    // then resolve through the kernel, the way git will, so `<cwd>/link/..`
-    // cannot pass either.
+    // not the Worker's shell, and pass while git ran somewhere else. It must
+    // then equal the task directory *both* lexically and through the kernel:
+    // lexically, because `/proc/self/cwd` — or a symlink to it inside the task
+    // directory — resolves to *this* process's cwd here and to the Worker's
+    // shell's under git; through the kernel, because `<cwd>/link/..` spells
+    // the task directory while git follows the link and ends up elsewhere.
+    // The instruction spells the exact directory, so `<cwd>/src/..` is the
+    // only latitude a Worker needs.
     if (words[1] !== "-C") return undefined;
     const directory = words[2];
-    if (directory === undefined || !isAbsolute(directory) || !sameDirectory(directory, grant.cwd)) return undefined;
-    // `/proc/self/cwd` (and `/proc/thread-self/cwd`, `/dev/fd/…`) resolve to
-    // *this* process's directory here and to the Worker's shell's under git,
-    // so they compare equal while git runs somewhere else; only a plain path
-    // names one directory for both.
-    if (/^\/(?:proc|dev)(?:\/|$)/iu.test(resolve(directory))) return undefined;
+    if (directory === undefined || !isAbsolute(directory)) return undefined;
+    if (resolve(directory) !== resolve(grant.cwd) || !sameDirectory(directory, grant.cwd)) return undefined;
     // `-c core.hooksPath=/dev/null` is required too: a `pre-push` hook runs
     // inside the granted push with the Worker's credentials where no policy
     // sees it, and hooks can arrive by more doors than a write denial can

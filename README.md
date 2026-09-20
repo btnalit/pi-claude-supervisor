@@ -277,8 +277,9 @@ turn stays local ("Everything up-to-date") instead of riding the grant. `-C` is
 **required and absolute**, and both sides are resolved through the kernel,
 because Claude's Bash tool keeps its working directory between calls and `cd` is
 ordinary local work — without it the grant could be spent in any other clone,
-and a relative `-C .` — or `/proc/self/cwd` — would resolve against the Supervisor's
-process rather than the Worker's shell. The hooks path is **pinned** on that one command so no
+and the directory must equal the task's both lexically and through the kernel:
+`/proc/self/cwd` (or a symlink to it) resolves to the Supervisor's own process,
+and `<cwd>/link/..` spells the task directory while git ends up elsewhere. The hooks path is **pinned** on that one command so no
 `pre-push` hook a Worker could have installed (by any door: `git init
 --template=`, an archive, a `chmod`) runs inside the granted push with the
 Worker's credentials. For `pr` a `gh pr create --repo <pinned remote URL>
@@ -295,8 +296,8 @@ round-trips through the policy.
 The grant is only issued for a commit that *is* the verified tree: the working
 tree must be clean (untracked files included — a new file may be part of the
 verified behavior), and HEAD must not have moved since the evidence the Reviewer
-judged was read. The repository's `.git` must be its own directory (not a `gitdir:` pointer
-left by `--separate-git-dir`). A dirty tree first costs a repair round asking the Worker to
+judged was read. The repository's Git directory must be its own `.git` or a linked worktree's
+`.git/worktrees/<name>` (not a `--separate-git-dir` pointer). A dirty tree first costs a repair round asking the Worker to
 commit what belongs to the candidate; only when none is left, or when HEAD
 moved, does the task end at the local candidate with a `not published:` reason
 instead of a grant. A remote that cannot be reached at confirmation time leaves
