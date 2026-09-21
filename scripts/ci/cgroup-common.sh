@@ -133,12 +133,46 @@ ci_root_command() {
   /usr/bin/sudo -n "$@"
 }
 
+# Delegate the new cgroup to the runner so the workload can create the
+# Supervisor-owned child cgroups used by the actual tests. Root is used only
+# for this ownership handoff when the runner created the directory itself.
+ci_delegate_cgroup() {
+  local target=${1-}
+  local owner="$(id -u):$(id -g)"
+  local -a controls=(
+    "$target"
+    "$target/cgroup.procs"
+    "$target/cgroup.threads"
+    "$target/cgroup.subtree_control"
+    "$target/cgroup.kill"
+    "$target/cgroup.events"
+  )
+  local control
+  for control in "${controls[@]}"; do
+    [[ -e "$control" ]] || ci_cgroup_fail "delegated cgroup control is missing: $control"
+  done
+  if ! chown -- "$owner" "${controls[@]}" 2>/dev/null; then
+    ci_root_command /usr/bin/chown -- "$owner" "${controls[@]}" \
+      || ci_cgroup_fail "could not delegate cgroup controls to the runner: $target"
+  fi
+}
+
+ci_probe_nested_cgroup() {
+  local target=${1-}
+  local probe="$target/pi-claude-supervisor-ci-probe-$BASHPID"
+  if ! mkdir -- "$probe" 2>/dev/null; then
+    ci_cgroup_fail "delegated cgroup does not permit runner-owned child cgroups: $target"
+  fi
+  rmdir -- "$probe" \
+    || ci_cgroup_fail "delegated cgroup probe could not be removed: $probe"
+}
+
 # The privileged fallback is deliberately limited to a single cgroupfs write.
 # Never pass a shell or a command string to sudo from these helpers.
 ci_write_cgroup_value() {
   local path=${1-}
   local value=${2-}
-  if printf '%s\n' "$value" > "$path" 2>/dev/null; then
+  if { printf '%s\n' "$value" > "$path"; } 2>/dev/null; then
     return 0
   fi
   [[ -x /usr/bin/tee ]] || return 1

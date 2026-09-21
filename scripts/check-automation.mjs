@@ -56,6 +56,7 @@ for (const command of ["npm run check", "npm run test:install", "npm run build"]
   assert.ok(ci.jobs.checks_npm_latest.steps.some((step) => step.run === command || step.run?.includes(`run-in-cgroup.sh ${command}`)), `Explicit npm lanes must run ${command}`);
 }
 for (const jobName of ["checks", "checks_npm_latest"]) {
+  assert.equal(ci.jobs[jobName].env.PI_CLAUDE_SUPERVISOR_NODE, "/usr/bin/node", `${jobName} must use the trusted system Node for Supervisor helpers`);
   const steps = ci.jobs[jobName].steps;
   assert.ok(steps.some((step) => step.run === "bash scripts/ci/prepare-cgroup.sh"), `${jobName} must prepare a delegated cgroup`);
   assert.ok(steps.some((step) => step.run?.includes("run-in-cgroup.sh npm run check")), `${jobName} must run the suite in the delegated cgroup`);

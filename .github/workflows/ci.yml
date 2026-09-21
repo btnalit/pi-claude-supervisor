@@ -58,6 +58,12 @@ jobs:
     name: Node ${{ matrix.node }} checks
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # actions/setup-node's toolcache is runner-owned and therefore not a
+    # trusted executable for Supervisor-created Node helper processes. Use the
+    # immutable system runtime for those helpers while the matrix Node still
+    # runs the test commands themselves.
+    env:
+      PI_CLAUDE_SUPERVISOR_NODE: /usr/bin/node
     strategy:
       fail-fast: false
       matrix:
@@ -101,6 +107,8 @@ jobs:
     name: Node 24 / npm ${{ matrix.npm }} checks
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      PI_CLAUDE_SUPERVISOR_NODE: /usr/bin/node
     strategy:
       fail-fast: false
       matrix:

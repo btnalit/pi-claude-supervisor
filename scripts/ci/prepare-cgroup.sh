@@ -18,10 +18,11 @@ if ! mkdir -- "$cgroup" 2>/dev/null; then
     || ci_cgroup_fail "could not create delegated cgroup: $cgroup"
 fi
 
-# Revalidate the exact path after creation. Leave it root-owned when sudo made
-# it: the later privileged fallback writes one validated cgroupfs file, while a
-# test process cannot replace the directory with a symlink.
+# Revalidate the exact path after creation, then delegate the directory and
+# cgroup controls so the workload can create its own child boundaries.
 ci_assert_owned_target "$cgroup" "$parent"
+ci_delegate_cgroup "$cgroup"
+ci_probe_nested_cgroup "$cgroup"
 
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   printf 'PI_CLAUDE_SUPERVISOR_CI_CGROUP=%s\n' "$cgroup" >> "$GITHUB_ENV"
