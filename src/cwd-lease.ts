@@ -5,6 +5,7 @@ import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rm, rmdir, rena
 import { basename, join, resolve } from "node:path";
 import { promisify, TextDecoder } from "node:util";
 import { redactSensitive } from "./redaction.ts";
+import { trustedExecutablePath } from "./worker/environment.ts";
 
 export type CwdLeaseTransport = "process-pipe" | "jsonl" | "pty" | "tmux";
 
@@ -1192,7 +1193,8 @@ async function tmuxSessionGone(socket: string, session: string): Promise<boolean
     return (error as NodeJS.ErrnoException).code === "ENOENT";
   }
   try {
-    await execFileAsync("tmux", ["-S", socket, "has-session", "-t", session], { timeout: 5_000, maxBuffer: 8 * 1024 });
+    const tmuxCommand = await trustedExecutablePath("tmux");
+    await execFileAsync(tmuxCommand, ["-S", socket, "has-session", "-t", session], { timeout: 5_000, maxBuffer: 8 * 1024 });
     return false;
   } catch (error) {
     const details = error as NodeJS.ErrnoException & { stderr?: string };

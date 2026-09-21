@@ -46,7 +46,9 @@ How the loop works, once a task starts:
 ## Quick start
 
 Requirements: Pi 0.85+, Node.js 22.19+, Claude Code 2.1.270+ (interactive
-hooks verified on 2.1.273), Linux for the cgroup and tmux features.
+hooks verified on 2.1.273), Linux for the cgroup and tmux features. The
+interactive hook mode is Linux-only and also requires a trusted `python3`
+executable for native Unix-socket peer credentials.
 
 Install it like any other Pi extension:
 

@@ -1,4 +1,4 @@
-import { constants as fsConstants, existsSync, statSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, realpathSync, statSync } from "node:fs";
 import { access, open, realpath, stat, type FileHandle } from "node:fs/promises";
 import { TextDecoder } from "node:util";
 import { homedir } from "node:os";
@@ -374,6 +374,21 @@ export async function trustedExecutablePath(command: string): Promise<string> {
   return trustedExecutableCandidate(candidate);
 }
 
+/** Synchronous equivalent for startup cleanup paths that cannot await preflight. */
+export function trustedExecutablePathSync(command: string): string {
+  if (!/^[A-Za-z0-9._-]+$/u.test(command)) throw new Error("Supervisor helper executable must be a bare command name");
+  for (const directory of (process.env.PATH ?? "").split(delimiter).filter(Boolean)) {
+    const candidate = join(resolve(directory), command);
+    try {
+      accessSync(candidate, fsConstants.X_OK);
+      return trustedExecutableCandidateSync(candidate);
+    } catch {
+      // Continue to the next PATH entry.
+    }
+  }
+  throw new Error(`Supervisor helper executable could not be resolved from PATH: ${command}`);
+}
+
 /** Verify an explicitly configured absolute helper, such as a test harness's tmux wrapper. */
 export async function trustedAbsoluteExecutablePath(command: string): Promise<string> {
   if (!isAbsolute(command) || command.includes("\0")) throw new Error("Supervisor helper executable path must be absolute");
@@ -384,6 +399,13 @@ async function trustedExecutableCandidate(candidate: string): Promise<string> {
   const resolved = await realpath(candidate);
   await assertSecureExecutablePath(candidate);
   if (candidate !== resolved) await assertSecureExecutablePath(resolved);
+  return resolved;
+}
+
+function trustedExecutableCandidateSync(candidate: string): string {
+  const resolved = realpathSync(candidate);
+  assertSecureExecutablePathSync(candidate);
+  if (candidate !== resolved) assertSecureExecutablePathSync(resolved);
   return resolved;
 }
 
@@ -426,5 +448,27 @@ async function assertSecureExecutablePath(path: string): Promise<void> {
       if (parent === directory) break;
       directory = parent;
     }
+  }
+}
+
+function assertSecureExecutablePathSync(path: string): void {
+  accessSync(path, fsConstants.X_OK);
+  const executable = statSync(path);
+  if (!executable.isFile()) throw new Error("resolved helper executable is not a regular file");
+  if (process.platform === "win32") return;
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if ((executable.mode & 0o022) !== 0 || (uid !== undefined && executable.uid !== uid && executable.uid !== 0)) {
+    throw new Error("resolved helper executable is writable by or owned by an untrusted user");
+  }
+  let directory = dirname(path);
+  while (true) {
+    const info = statSync(directory);
+    const stickySharedDirectory = (info.mode & 0o1000) !== 0 && (info.mode & 0o002) !== 0 && info.uid === 0;
+    if (((info.mode & 0o022) !== 0 && !stickySharedDirectory) || (uid !== undefined && info.uid !== uid && info.uid !== 0)) {
+      throw new Error("a directory containing the resolved helper executable is writable by or owned by an untrusted user");
+    }
+    const parent = dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
   }
 }

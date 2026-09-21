@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createConnection } from "node:net";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readlink, realpath, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readlink, realpath, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { hookSocketDirectory, HookServer } from "./server.ts";
@@ -37,8 +37,8 @@ function byCwdPath(directory: string, cwd: string): string {
 function request(cwd: string, overrides: Partial<ClaudeHookEvent> = {}): HookRelayRequest {
   return {
     version: 1,
-    pid: 1234,
-    ppid: 1,
+    pid: process.pid,
+    ppid: process.ppid,
     event: {
       hook_event_name: "PreToolUse",
       session_id: "session-1",
@@ -135,6 +135,29 @@ test("10 concurrent requests for different cwds are all answered without seriali
   });
 });
 
+test("a forged client pid or parent pid cannot route a hook request", async () => {
+  await withServer(async (server) => {
+    await withTempCwd(async (cwd) => {
+      let called = false;
+      const unsubscribe = await server.subscribe(cwd, async () => {
+        called = true;
+        return { permissionDecision: "allow" };
+      });
+      try {
+        const forgedPid = request(cwd, { tool_use_id: "forged-pid" });
+        forgedPid.pid += 1;
+        assert.deepEqual(JSON.parse((await send(server.socketPath!, JSON.stringify(forgedPid))).reply), {});
+        const forgedParent = request(cwd, { tool_use_id: "forged-ppid" });
+        forgedParent.ppid += 1;
+        assert.deepEqual(JSON.parse((await send(server.socketPath!, JSON.stringify(forgedParent))).reply), {});
+        assert.equal(called, false);
+      } finally {
+        await unsubscribe();
+      }
+    });
+  });
+});
+
 test("a request for a cwd with no subscriber gets an empty reply", async () => {
   await withServer(async (server) => {
     await withTempCwd(async (cwd) => {
@@ -213,6 +236,23 @@ test("close removes the socket file and every by-cwd symlink pointing at it", as
     });
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a symlinked runtime socket directory is rejected", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-cs-hook-runtime-parent-"));
+  const target = await mkdtemp(join(tmpdir(), "pi-cs-hook-runtime-target-"));
+  const runtime = join(parent, "runtime");
+  await symlink(target, runtime);
+  const state = await mkdtemp(join(tmpdir(), "pi-cs-hook-state-"));
+  const server = new HookServer({ directory: state, socketDirectory: runtime });
+  try {
+    await assert.rejects(() => server.listen(), /hook socket directory (is not a real directory|contains a symlink)/);
+  } finally {
+    await server.close();
+    await rm(parent, { recursive: true, force: true });
+    await rm(target, { recursive: true, force: true });
+    await rm(state, { recursive: true, force: true });
   }
 });
 

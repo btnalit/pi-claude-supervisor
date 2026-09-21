@@ -39,7 +39,8 @@ merge、deploy 或 release。
 ## 快速开始
 
 需要 Pi 0.85+、Node.js 22.19+、Claude Code 2.1.270+(交互式 hooks 已在 2.1.273
-上验证),cgroup 和 tmux 相关功能需要 Linux。
+上验证),cgroup 和 tmux 相关功能需要 Linux。交互式 hook 模式仅支持 Linux,还需要受信任的
+`python3` 可执行文件,用于读取 Unix socket 的原生 peer 凭据。
 
 像安装任何其他 Pi 扩展一样安装它:
 

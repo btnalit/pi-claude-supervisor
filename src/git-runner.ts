@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { TextDecoder } from "node:util";
 import { promisify } from "node:util";
-import { workerEnvironment } from "./worker/environment.ts";
+import { trustedExecutablePath, workerEnvironment } from "./worker/environment.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -99,7 +99,8 @@ export async function supervisorGitCommandArgs(cwd: string, args: readonly strin
 export async function runSupervisorGit(cwd: string, args: readonly string[], options: SupervisorGitOptions = {}): Promise<{ stdout: string; stderr: string }> {
   const timeout = options.timeout ?? 30_000;
   const maxBuffer = options.maxBuffer ?? 8 * 1024 * 1024;
-  const result = await execFileAsync("git", await supervisorGitCommandArgs(cwd, args, options), {
+  const gitCommand = await trustedExecutablePath("git");
+  const result = await execFileAsync(gitCommand, await supervisorGitCommandArgs(cwd, args, options), {
     cwd,
     timeout,
     maxBuffer,
@@ -126,7 +127,8 @@ export async function runSupervisorGit(cwd: string, args: readonly string[], opt
 async function localFilterSettings(cwd: string, signal: AbortSignal | undefined, timeout: number): Promise<string[]> {
   let stdout = "";
   try {
-    const result = await execFileAsync("git", [
+    const gitCommand = await trustedExecutablePath("git");
+    const result = await execFileAsync(gitCommand, [
       "--no-pager", "--no-optional-locks", "--no-replace-objects",
       "-c", "core.hooksPath=/dev/null",
       "config", "--local", "--name-only", "--get-regexp", "^filter\\..*\\.(clean|smudge|process|required)$",

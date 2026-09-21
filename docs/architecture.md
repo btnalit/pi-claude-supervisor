@@ -217,6 +217,12 @@ request fails open to "no decision" so a relay or Supervisor bug never wedges
 Claude. `HookServer` (`src/hooks/server.ts`) is one socket per Pi process, with
 `subscribe(cwd, handler)` installing the per-cwd symlink; a Supervisor session
 subscribes for the lifetime of its task and unsubscribes on stop/release.
+On Linux, `HookServer` resolves a trusted `python3` helper at startup and
+uses the kernel's `SO_PEERCRED` result for the accepted socket to bind each
+request to its native peer PID and UID; the reported PPID is cross-checked
+while the peer is still present. There is no client-identity fallback, and
+missing peer-credential support fails closed. Interactive hook mode is
+therefore Linux-only and requires a trusted system `python3`.
 `installUserHooks`/`uninstallUserHooks` (`src/hooks/install.ts`, exposed as
 `/supervise install-hooks`/`uninstall-hooks`) register the relay for all seven
 events in the user's real `~/.claude/settings.json` (or

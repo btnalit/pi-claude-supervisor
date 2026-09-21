@@ -19,7 +19,7 @@ import type { ClaudeHookEvent, HookEventSource, HookRelayReply, HookRelayRequest
 import { HOOK_TIMEOUT_SECONDS } from "../hooks/types.ts";
 import { assertSafeWorkerCommand, sameDirectory, shellQuote } from "../policy.ts";
 import { redactSensitive } from "../redaction.ts";
-import { automaticWorkerEnvironment, claudeConfigDir, trustedAbsoluteExecutablePath, trustedExecutablePath, workerEnvironment } from "./environment.ts";
+import { automaticWorkerEnvironment, claudeConfigDir, trustedAbsoluteExecutablePath, trustedExecutablePath, trustedExecutablePathSync, workerEnvironment } from "./environment.ts";
 import { assertCgroupDirectory, claudeJsonlArgs, cleanupCgroup, currentCgroupPath, preflightCgroupContainment } from "./process-adapter.ts";
 import { isClaudeLauncherProcess, readProcess, type ProcessTreeEntry } from "./process-tree.ts";
 import { nodeScriptCommand } from "./runtime.ts";
@@ -916,7 +916,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       if (record.owned) {
         await this.#stopGuardian(record).catch((error) => { record.cleanupError ??= asError(error); });
         await this.#run(record, ["kill-server"], undefined, undefined, true).catch(() => {});
-        removeDeadTmuxSocket(record.handle.tmuxSocket);
+        removeDeadTmuxSocket(record.handle.tmuxSocket, this.#trustedTmuxBinary);
       } else await this.#detachPipe(record);
     }
     const deadline = Date.now() + 25_000;
@@ -1869,7 +1869,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       if (isMissingSession(error)) record.serverKilled = true;
       else record.cleanupError = asError(error);
     }
-    if (record.serverKilled) removeDeadTmuxSocket(record.handle.tmuxSocket);
+    if (record.serverKilled) removeDeadTmuxSocket(record.handle.tmuxSocket, this.#trustedTmuxBinary);
     if (!record.serverKilled) await this.#ensurePaneGone(record);
     if (record.cgroupPath) {
       try {
@@ -2745,20 +2745,22 @@ function normalizeForMatch(value: string): string {
  * answers on it. `sweepDeadTmuxSockets` does the same for every socket the
  * adapter's naming scheme left behind in the temp directory.
  */
-function removeDeadTmuxSocket(socketPath: string | undefined): void {
+function removeDeadTmuxSocket(socketPath: string | undefined, tmuxBinary?: string): void {
   if (!socketPath || !/[\\/]pi-cs-[0-9a-f-]+\.sock$/u.test(socketPath)) return;
   try {
     const info = lstatSync(socketPath);
     if (!info.isSocket() || (typeof process.getuid === "function" && info.uid !== process.getuid())) return;
-    const probe = spawnSync("tmux", ["-S", socketPath, "list-sessions"], { stdio: "ignore", timeout: 2_000 });
+    const trustedTmux = tmuxBinary ?? trustedExecutablePathSync("tmux");
+    const probe = spawnSync(trustedTmux, ["-S", socketPath, "list-sessions"], { stdio: "ignore", timeout: 2_000 });
     // A server that answers, or a socket something else holds open (the probe
-    // timed out), is left alone.
-    if (probe.status === 0 || probe.signal) return;
+    // timed out or failed to start), is left alone.
+    if (probe.status === 0 || probe.signal || probe.error) return;
     unlinkSync(socketPath);
   } catch { /* already gone, or not ours to remove */ }
 }
 
-export function sweepDeadTmuxSockets(directory = tmpdir()): number {
+export function sweepDeadTmuxSockets(directory = tmpdir(), tmuxBinary?: string): number {
+  const trustedTmux = tmuxBinary ?? trustedExecutablePathSync("tmux");
   let removed = 0;
   let names: string[];
   try { names = readdirSync(directory); } catch { return 0; }
@@ -2768,8 +2770,8 @@ export function sweepDeadTmuxSockets(directory = tmpdir()): number {
     try {
       const info = lstatSync(socketPath);
       if (!info.isSocket() || (typeof process.getuid === "function" && info.uid !== process.getuid())) continue;
-      const probe = spawnSync("tmux", ["-S", socketPath, "list-sessions"], { stdio: "ignore", timeout: 2_000 });
-      if (probe.status === 0 || probe.signal) continue;
+      const probe = spawnSync(trustedTmux, ["-S", socketPath, "list-sessions"], { stdio: "ignore", timeout: 2_000 });
+      if (probe.status === 0 || probe.signal || probe.error) continue;
       unlinkSync(socketPath);
       removed += 1;
     } catch { /* skip */ }

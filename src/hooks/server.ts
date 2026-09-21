@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { TextDecoder } from "node:util";
 import { createServer, type Server, type Socket } from "node:net";
-import { chmod, lstat, mkdir, readdir, readlink, realpath, rename, rm, symlink, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, symlink, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { trustedExecutablePath } from "../worker/environment.ts";
 import type { ClaudeHookEvent, ClaudeHookEventName, HookEventSource, HookRelayReply, HookRelayRequest } from "./types.ts";
 
 const MAX_LINE_BYTES = 1024 * 1024;
@@ -11,6 +13,19 @@ const MAX_HOOK_STRING_BYTES = 256 * 1024;
 const MAX_HOOK_VALUE_BYTES = 512 * 1024;
 const MAX_CONNECTION_IDLE_MS = 180_000;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+const PEER_CREDENTIAL_TIMEOUT_MS = 2_000;
+const PEER_CREDENTIAL_SCRIPT = [
+  "import os, socket, struct, sys",
+  "try:",
+  "    peer = socket.socket(fileno=3)",
+  "    pid, uid, gid = struct.unpack('3i', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))",
+  "    print(pid, uid, gid, flush=True)",
+  "except Exception:",
+  "    sys.exit(125)",
+].join("\n");
+
+type PeerCredentials = { pid: number; uid: number; gid: number };
+type SocketWithHandle = Socket & { _handle?: { fd?: number } };
 
 const VALID_EVENT_NAMES: ReadonlySet<string> = new Set<ClaudeHookEventName>([
   "SessionStart",
@@ -61,9 +76,10 @@ export class HookServer implements HookEventSource {
   #socketPath: string | undefined;
 
   readonly #socketDirectory: string;
+  #peerCredentialCommand: string | undefined;
 
   constructor(options: { directory: string; socketDirectory?: string }) {
-    this.#socketDirectory = options.socketDirectory ?? hookSocketRuntimeDirectory();
+    this.#socketDirectory = resolve(options.socketDirectory ?? hookSocketRuntimeDirectory());
     this.#directory = resolve(options.directory);
   }
 
@@ -77,14 +93,21 @@ export class HookServer implements HookEventSource {
 
   async listen(): Promise<void> {
     if (this.#server) throw new Error("hook server is already listening");
+    // Node's public net API does not expose native Unix peer credentials. The
+    // hook boundary therefore supports Linux only: use a Supervisor-resolved
+    // helper to ask the kernel for the accepted socket's peer pid/uid/gid;
+    // unsupported platforms and missing helpers fail closed, never falling
+    // back to client-supplied identity fields.
+    if (process.platform !== "linux") throw new Error("hook server requires Linux native Unix-socket peer credentials");
+    this.#peerCredentialCommand = await trustedExecutablePath("python3");
     await mkdir(this.#directory, { recursive: true, mode: 0o700 });
     await assertPrivateDirectory(this.#directory, "hook state directory");
     await chmod(this.#directory, 0o700);
+    await assertPrivatePermissions(this.#directory, "hook state directory");
     await mkdir(this.#socketDirectory, { recursive: true, mode: 0o700 });
-    const socketDirectoryInfo = await lstat(this.#socketDirectory);
-    if (!socketDirectoryInfo.isDirectory() || socketDirectoryInfo.isSymbolicLink()) throw new Error(`hook socket directory is not a real directory: ${this.#socketDirectory}`);
-    if (typeof process.getuid === "function" && socketDirectoryInfo.uid !== process.getuid()) throw new Error(`hook socket directory is owned by another user: ${this.#socketDirectory}`);
+    await assertPrivateDirectory(this.#socketDirectory, "hook socket directory");
     await chmod(this.#socketDirectory, 0o700);
+    await assertPrivatePermissions(this.#socketDirectory, "hook socket directory");
     const socketPath = join(this.#socketDirectory, `${process.pid}.sock`);
     if (Buffer.byteLength(socketPath, "utf8") > MAX_SOCKET_PATH_BYTES) throw new Error(`hook socket path exceeds the unix socket limit: ${socketPath}`);
     await removeStaleSocket(socketPath);
@@ -187,6 +210,7 @@ export class HookServer implements HookEventSource {
     await mkdir(byCwdDir, { recursive: true, mode: 0o700 });
     await assertPrivateDirectory(byCwdDir, "hook by-cwd directory");
     await chmod(byCwdDir, 0o700);
+    await assertPrivatePermissions(byCwdDir, "hook by-cwd directory");
     const target = join(byCwdDir, hash);
     const temporary = join(byCwdDir, `${hash}.tmp.${process.pid}.${randomUUID()}`);
     try {
@@ -228,6 +252,9 @@ export class HookServer implements HookEventSource {
 
   #handleConnection(socket: Socket): void {
     this.#sockets.add(socket);
+    // A client may connect and never send a line; consume lookup failures here
+    // so resource or descriptor errors cannot become unhandled rejections.
+    const peer = readPeerCredentials(socket, this.#peerCredentialCommand!).catch(() => undefined);
     // A relay's blocking timeout is slightly shorter than this. The server
     // must not retain an attacker-controlled connection and up to 1 MiB of
     // partial input forever if the peer never sends a newline.
@@ -264,15 +291,16 @@ export class HookServer implements HookEventSource {
         socket.destroy();
         return;
       }
-      void this.#respond(socket, line);
+      void this.#respond(socket, line, peer);
     });
   }
 
-  async #respond(socket: Socket, line: string): Promise<void> {
+  async #respond(socket: Socket, line: string, peerPromise: Promise<PeerCredentials | undefined>): Promise<void> {
     let reply: HookRelayReply | Record<string, never> = {};
     try {
+      const peer = await peerPromise;
       const request = parseRequest(line);
-      if (request) {
+      if (request && await peerBindsToRequest(peer, request)) {
         // Capability routing is preferred when present: a persistent Claude
         // session may report the cwd of a subdirectory after `cd`, while its
         // original by-cwd symlink remains the discovery route.
@@ -308,14 +336,101 @@ async function assertPrivateDirectory(path: string, label: string): Promise<void
   const info = await lstat(path);
   if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`${label} is not a real directory: ${path}`);
   if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error(`${label} is owned by another user: ${path}`);
+  if (await realpath(path) !== resolve(path)) throw new Error(`${label} contains a symlink: ${path}`);
+}
+
+async function assertPrivatePermissions(path: string, label: string): Promise<void> {
+  const info = await lstat(path);
+  if ((info.mode & 0o077) !== 0) throw new Error(`${label} is not private: ${path}`);
 }
 
 async function removeStaleSocket(path: string): Promise<void> {
   try {
     const info = await lstat(path);
-    if (info.isSocket()) await unlink(path);
+    if (info.isSocket()
+      && (typeof process.getuid !== "function" || info.uid === process.getuid())
+      && info.nlink === 1) await unlink(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+async function readPeerCredentials(socket: Socket, command: string): Promise<PeerCredentials> {
+  const fd = (socket as SocketWithHandle)._handle?.fd;
+  if (typeof fd !== "number" || !Number.isSafeInteger(fd) || fd < 0) throw new Error("hook socket peer descriptor is unavailable");
+  const descriptor = fd;
+  return new Promise<PeerCredentials>((resolvePeer, rejectPeer) => {
+    let settled = false;
+    let output = Buffer.alloc(0);
+    const child = spawn(command, ["-c", PEER_CREDENTIAL_SCRIPT], {
+      env: { PATH: "/usr/bin:/bin", LC_ALL: "C", PYTHONNOUSERSITE: "1", PYTHONSAFEPATH: "1" },
+      stdio: ["ignore", "pipe", "pipe", descriptor],
+    });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill("SIGKILL"); } catch { /* already exited */ }
+      rejectPeer(new Error("hook socket peer credential lookup timed out"));
+    }, PEER_CREDENTIAL_TIMEOUT_MS);
+    timer.unref();
+    child.stderr?.resume();
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      if (settled) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      output = Buffer.concat([output, bytes]);
+      if (output.byteLength > 1024) {
+        settled = true;
+        clearTimeout(timer);
+        try { child.kill("SIGKILL"); } catch { /* already exited */ }
+        rejectPeer(new Error("hook socket peer credential output exceeded the safety bound"));
+      }
+    });
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      rejectPeer(error);
+    });
+    child.once("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        rejectPeer(new Error(`hook socket peer credential lookup failed (${code ?? "unknown"})`));
+        return;
+      }
+      let text: string;
+      try { text = new TextDecoder("utf-8", { fatal: true }).decode(output).trim(); }
+      catch (error) {
+        rejectPeer(new Error("hook socket peer credential output was not valid UTF-8", { cause: error }));
+        return;
+      }
+      const fields = text.split(/\s+/u);
+      const values = fields.map(Number);
+      if (fields.length !== 3 || values.some((value) => !Number.isSafeInteger(value) || value < 0) || values[0] === 0) {
+        rejectPeer(new Error("hook socket peer credentials were malformed"));
+        return;
+      }
+      resolvePeer({ pid: values[0]!, uid: values[1]!, gid: values[2]! });
+    });
+  });
+}
+
+async function peerBindsToRequest(peer: PeerCredentials | undefined, request: HookRelayRequest): Promise<boolean> {
+  if (!peer || request.pid !== peer.pid || (typeof process.getuid === "function" && peer.uid !== process.getuid())) return false;
+  try {
+    const statText = await readFile(`/proc/${peer.pid}/stat`, "utf8");
+    const closeParen = statText.lastIndexOf(")");
+    if (closeParen < 0) return false;
+    const fields = statText.slice(closeParen + 2).trim().split(/\s+/u);
+    const ppid = Number(fields[1]);
+    return Number.isSafeInteger(ppid) && ppid > 0 && ppid === request.ppid;
+  } catch (error) {
+    // Non-blocking hooks intentionally close their relay process immediately
+    // after writing. Native SO_PEERCRED already bound the request to that
+    // process; its /proc entry may disappear before this supplemental PPID
+    // check, which is not grounds to discard an authenticated event.
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
   }
 }
 
