@@ -5,16 +5,77 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { supervisorGitEnvironment } from "./git-runner.ts";
+import { runSupervisorGit, supervisorGitEnvironment } from "./git-runner.ts";
 import { remoteBranchHead, remoteUrl, repositoryClean, repositoryGitDirectoryIsLocal, repositorySlug, sameDestination } from "./verifier.ts";
 
 const execFileAsync = promisify(execFile);
 
 test("Supervisor Git isolates mutable global and system configuration", () => {
-  const environment = supervisorGitEnvironment(true);
-  assert.equal(environment.GIT_CONFIG_GLOBAL, "/dev/null");
-  assert.equal(environment.GIT_CONFIG_SYSTEM, "/dev/null");
-  assert.equal(environment.GIT_CONFIG_NOSYSTEM, "1");
+  const keys = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_SSH_COMMAND"] as const;
+  const before = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  process.env.GIT_CONFIG_GLOBAL = "/operator/global.gitconfig";
+  process.env.GIT_CONFIG_SYSTEM = "/operator/system.gitconfig";
+  process.env.GIT_CONFIG_NOSYSTEM = "operator-value";
+  process.env.GIT_SSH_COMMAND = "operator-ssh";
+  try {
+    const environment = supervisorGitEnvironment(true);
+    assert.equal(environment.GIT_CONFIG_GLOBAL, "/dev/null");
+    assert.equal(environment.GIT_CONFIG_SYSTEM, "/dev/null");
+    assert.equal(environment.GIT_CONFIG_NOSYSTEM, "1");
+    assert.equal(environment.GIT_SSH_COMMAND, undefined);
+    assert.equal(process.env.GIT_CONFIG_GLOBAL, "/operator/global.gitconfig");
+    assert.equal(process.env.GIT_CONFIG_SYSTEM, "/operator/system.gitconfig");
+    assert.equal(process.env.GIT_CONFIG_NOSYSTEM, "operator-value");
+    assert.equal(process.env.GIT_SSH_COMMAND, "operator-ssh");
+  } finally {
+    for (const key of keys) {
+      const value = before[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("Supervisor Git isolation does not change a sibling Git process", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-git-scope-"));
+  const globalConfig = join(base, "global.gitconfig");
+  const cwd = join(base, "repo");
+  const previous = process.env.GIT_CONFIG_GLOBAL;
+  const previousSystem = process.env.GIT_CONFIG_SYSTEM;
+  const previousNoSystem = process.env.GIT_CONFIG_NOSYSTEM;
+  try {
+    await execFileAsync("git", ["init", "-q", cwd]);
+    await writeFile(globalConfig, "[user]\n\tname = sibling-visible\n", { mode: 0o600 });
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    process.env.GIT_CONFIG_SYSTEM = "/dev/null";
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+
+    const ordinary = await execFileAsync("git", ["config", "--global", "--get", "user.name"], { cwd, env: process.env });
+    assert.equal(ordinary.stdout.trim(), "sibling-visible");
+
+    const isolated = supervisorGitEnvironment(true);
+    await assert.rejects(
+      execFileAsync("git", ["config", "--global", "--get", "user.name"], { cwd, env: isolated }),
+      (error: unknown) => (error as { code?: unknown }).code === 1,
+      "the Supervisor's child environment must not read the sibling's global config",
+    );
+    assert.equal(process.env.GIT_CONFIG_GLOBAL, globalConfig);
+    assert.equal(process.env.GIT_CONFIG_SYSTEM, "/dev/null");
+    assert.equal(process.env.GIT_CONFIG_NOSYSTEM, "1");
+    await assert.rejects(
+      runSupervisorGit(cwd, ["config", "--global", "--get", "user.name"], { network: true }),
+      (error: unknown) => (error as { code?: unknown }).code === 1,
+      "Supervisor Git itself must use the isolated child environment",
+    );
+  } finally {
+    if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = previous;
+    if (previousSystem === undefined) delete process.env.GIT_CONFIG_SYSTEM;
+    else process.env.GIT_CONFIG_SYSTEM = previousSystem;
+    if (previousNoSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+    else process.env.GIT_CONFIG_NOSYSTEM = previousNoSystem;
+    await rm(base, { recursive: true, force: true });
+  }
 });
 
 test("a remote URL becomes the host/owner/repo gh accepts, or nothing", async () => {
