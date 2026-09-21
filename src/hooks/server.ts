@@ -6,6 +6,7 @@ import { chmod, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm,
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { trustedExecutablePath } from "../worker/environment.ts";
+import { BLOCKING_HOOK_EVENTS } from "./types.ts";
 import type { ClaudeHookEvent, ClaudeHookEventName, HookEventSource, HookRelayReply, HookRelayRequest } from "./types.ts";
 
 const MAX_LINE_BYTES = 1024 * 1024;
@@ -45,7 +46,7 @@ export function hookSocketDirectory(stateDir: string): string {
   return join(resolve(stateDir), "hooks");
 }
 
-/** Linux limits a unix socket path to 108 bytes (`sun_path`); leave headroom for the pid suffix. */
+/** Linux limits a unix socket path to 108 bytes (`sun_path`); leave headroom for the pid/start-time suffix. */
 const MAX_SOCKET_PATH_BYTES = 100;
 
 /**
@@ -108,7 +109,8 @@ export class HookServer implements HookEventSource {
     await assertPrivateDirectory(this.#socketDirectory, "hook socket directory");
     await chmod(this.#socketDirectory, 0o700);
     await assertPrivatePermissions(this.#socketDirectory, "hook socket directory");
-    const socketPath = join(this.#socketDirectory, `${process.pid}.sock`);
+    const startTime = await processStartTime(process.pid);
+    const socketPath = join(this.#socketDirectory, `${process.pid}-${startTime}.sock`);
     if (Buffer.byteLength(socketPath, "utf8") > MAX_SOCKET_PATH_BYTES) throw new Error(`hook socket path exceeds the unix socket limit: ${socketPath}`);
     await removeStaleSocket(socketPath);
     const server = createServer((socket) => this.#handleConnection(socket));
@@ -332,6 +334,16 @@ async function canonicalize(cwd: string): Promise<string> {
   }
 }
 
+async function processStartTime(pid: number): Promise<string> {
+  const statText = await readFile(`/proc/${pid}/stat`, "utf8");
+  const closeParen = statText.lastIndexOf(")");
+  if (closeParen < 0) throw new Error("hook server process identity is unavailable");
+  const fields = statText.slice(closeParen + 2).trim().split(/\s+/u);
+  const start = fields[19];
+  if (!start || !/^\d+$/u.test(start)) throw new Error("hook server process start time is unavailable");
+  return start;
+}
+
 async function assertPrivateDirectory(path: string, label: string): Promise<void> {
   const info = await lstat(path);
   if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`${label} is not a real directory: ${path}`);
@@ -429,8 +441,10 @@ async function peerBindsToRequest(peer: PeerCredentials | undefined, request: Ho
     // Non-blocking hooks intentionally close their relay process immediately
     // after writing. Native SO_PEERCRED already bound the request to that
     // process; its /proc entry may disappear before this supplemental PPID
-    // check, which is not grounds to discard an authenticated event.
-    return (error as NodeJS.ErrnoException).code === "ENOENT";
+    // check. Blocking decisions fail closed when PPID cannot be confirmed;
+    // fire-and-forget lifecycle events can use the native PID/UID binding.
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      && !BLOCKING_HOOK_EVENTS.has(request.event.hook_event_name);
   }
 }
 

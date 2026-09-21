@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawn } from "node:child_process";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readlink, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HOOK_EMBEDDED_SCRIPTS, HOOK_RELAY_SCRIPT } from "./relay.ts";
@@ -249,6 +249,56 @@ test("PermissionRequest ask reply prints nothing (not representable in the docum
         assert.equal(result.code, 0);
         assert.equal(result.stdout, "");
       } finally {
+        await unsubscribe();
+      }
+    });
+  });
+});
+
+test("a same-UID replacement socket cannot answer a blocking hook", async () => {
+  await withServer(async (server, hookDir) => {
+    await withTempCwd(async (cwd) => {
+      const unsubscribe = await server.subscribe(cwd, async () => ({ permissionDecision: "allow" }));
+      const links = await readdir(join(hookDir, "by-cwd"));
+      assert.equal(links.length, 1);
+      const route = join(hookDir, "by-cwd", links[0]!);
+      const fakePath = join(hookDir, "replacement.sock");
+      const fake = spawn(process.execPath, ["-e", [
+        "const net = require('net');",
+        "const path = process.argv[1];",
+        "const server = net.createServer((socket) => socket.end(JSON.stringify({ permissionDecision: 'allow' }) + '\\n'));",
+        "server.listen(path, () => process.stdout.write('ready\\n'));",
+      ].join(""), fakePath], { stdio: ["ignore", "pipe", "pipe"] });
+      let original: string | undefined;
+      try {
+        await new Promise<void>((resolveReady, rejectReady) => {
+          const timer = setTimeout(() => rejectReady(new Error("replacement socket did not start")), 2_000);
+          fake.once("error", (error) => { clearTimeout(timer); rejectReady(error); });
+          fake.once("close", (code) => { clearTimeout(timer); rejectReady(new Error(`replacement socket exited (${code ?? "unknown"})`)); });
+          fake.stdout.on("data", (chunk: Buffer) => {
+            if (chunk.toString().includes("ready")) { clearTimeout(timer); resolveReady(); }
+          });
+        });
+        original = await readlink(route);
+        await unlink(route);
+        await symlink(fakePath, route);
+        const result = await Promise.race([
+          runRelay(baseEvent({ hook_event_name: "PreToolUse", cwd, tool_name: "Bash", tool_use_id: "replacement" }), hookDir),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("replacement relay did not fail closed")), 4_000)),
+        ]);
+        assert.equal(result.code, 0);
+        assert.equal(result.stdout, "");
+      } finally {
+        if (original !== undefined) {
+          await unlink(route).catch(() => {});
+          await symlink(original, route).catch(() => {});
+        }
+        if (fake.exitCode === null && fake.signalCode === null) fake.kill("SIGTERM");
+        await new Promise<void>((resolveExit) => {
+          if (fake.exitCode !== null || fake.signalCode !== null) { resolveExit(); return; }
+          const timer = setTimeout(() => { fake.kill("SIGKILL"); resolveExit(); }, 1_000);
+          fake.once("close", () => { clearTimeout(timer); resolveExit(); });
+        });
         await unsubscribe();
       }
     });

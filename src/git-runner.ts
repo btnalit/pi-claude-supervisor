@@ -21,10 +21,12 @@ const UNSAFE_LOADER_VARIABLE = /^(?:LD_(?:PRELOAD|LIBRARY_PATH(?:_32|_64)?|AUDIT
  * command, redirect the repository, or make an inspection incomplete is pinned
  * on the command line or disabled below.
  *
- * Network confirmation deliberately keeps the operator's normal global Git
- * config so URL rewrites already in force are observed. Repository-local
- * command settings remain bounded by the command-line pins and remote lookups
- * use an explicit upload-pack.
+ * Network confirmation never consults mutable system/global Git config. A
+ * Worker shares the Supervisor's UID and can otherwise rewrite ~/.gitconfig
+ * between a baseline check and a grant. Operator-selected URL rewrites must
+ * therefore be expressed as the repository's recorded remote or rejected;
+ * repository-local command settings remain bounded by the command-line pins
+ * and remote lookups use an explicit upload-pack.
  */
 export function supervisorGitEnvironment(network = false): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = network
@@ -34,14 +36,14 @@ export function supervisorGitEnvironment(network = false): NodeJS.ProcessEnv {
     if (REPOSITORY_RELOCATING_GIT_VARIABLE.test(name) || UNSAFE_GIT_VARIABLE.test(name) || UNSAFE_GIT_EXECUTION_VARIABLE.test(name) || UNSAFE_LOADER_VARIABLE.test(name)) delete result[name];
   }
   result.GIT_TERMINAL_PROMPT = "0";
-  // System configuration is never needed for a task boundary. Network URL
-  // discovery is the exception only for the operator's default global file:
-  // its pre-existing url.*.insteadOf rewrite must be recorded and pinned.
+  // System/global configuration is never trusted for a task boundary. In
+  // particular, a Worker must not be able to rewrite url.*.insteadOf,
+  // credential helpers, proxies, or transport commands in the shared home
+  // between verification steps. Explicit destination URLs and the caller's
+  // already-inherited credential environment are the only network inputs.
   result.GIT_CONFIG_NOSYSTEM = "1";
-  if (!network) {
-    result.GIT_CONFIG_GLOBAL = "/dev/null";
-    result.GIT_CONFIG_SYSTEM = "/dev/null";
-  }
+  result.GIT_CONFIG_GLOBAL = "/dev/null";
+  result.GIT_CONFIG_SYSTEM = "/dev/null";
   result.GIT_ATTR_NOSYSTEM = "1";
   result.GIT_OPTIONAL_LOCKS = "0";
   return result;

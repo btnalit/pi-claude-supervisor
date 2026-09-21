@@ -332,6 +332,12 @@ export function grantedPushSettings(grant: RemoteGrant): string[] {
     "ssh.variant=ssh",
     "push.gpgSign=false",
     `${remotePrefix}.mirror=false`,
+    // The command spells the remote by name for Git's normal multi-destination
+    // behavior, so pin both URL namespaces on the command line. A Worker can
+    // rewrite repository config between authorization and exec, but it cannot
+    // override these highest-precedence values or redirect the grant.
+    `${remotePrefix}.url=`,
+    ...pushUrls.map((url) => `${remotePrefix}.url=${url}`),
     `${remotePrefix}.pushurl=`,
     ...pushUrls.map((url) => `${remotePrefix}.pushurl=${url}`),
     `${remotePrefix}.proxy=`,

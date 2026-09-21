@@ -59,7 +59,7 @@ function assertTrustedExecutable(path: string): void {
   const paths = new Set([path, realpathSync(path)]);
   for (const candidate of paths) {
     const executable = statSync(candidate);
-    if (!executable.isFile() || (executable.mode & 0o022) !== 0 || (uid !== undefined && executable.uid !== uid && executable.uid !== 0)) {
+    if (!executable.isFile() || executable.nlink !== 1 || (executable.mode & 0o022) !== 0 || (uid !== undefined && executable.uid !== uid && executable.uid !== 0)) {
       throw new Error(`Node runtime is writable by or owned by an untrusted user: ${candidate}`);
     }
     let directory = dirname(candidate);

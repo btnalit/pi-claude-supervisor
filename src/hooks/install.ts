@@ -216,6 +216,7 @@ async function mutateSettings(settingsPath: string, mutate: (document: SettingsD
   const parentInfo = await lstat(parent);
   if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink()) throw new Error(`hook settings parent is not a real directory: ${parent}`);
   if (typeof process.getuid === "function" && parentInfo.uid !== process.getuid()) throw new Error(`hook settings parent is owned by another user: ${parent}`);
+  if ((parentInfo.mode & 0o077) !== 0) throw new Error(`hook settings parent is not private: ${parent}`);
   if (await realpath(parent) !== parent) throw new Error(`hook settings parent contains a symlink: ${parent}`);
   try {
     const targetInfo = await lstat(target);

@@ -431,7 +431,7 @@ async function resolveExecutable(command: string, pathValue: string | undefined)
 async function assertSecureExecutablePath(path: string): Promise<void> {
   await access(path, fsConstants.X_OK);
   const executable = await stat(path);
-  if (!executable.isFile()) throw new Error("resolved Claude executable is not a regular file");
+  if (!executable.isFile() || executable.nlink !== 1) throw new Error("resolved Claude executable is not a unique regular file");
   if (process.platform !== "win32") {
     const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
     if ((executable.mode & 0o022) !== 0 || (uid !== undefined && executable.uid !== uid && executable.uid !== 0)) {
@@ -454,7 +454,7 @@ async function assertSecureExecutablePath(path: string): Promise<void> {
 function assertSecureExecutablePathSync(path: string): void {
   accessSync(path, fsConstants.X_OK);
   const executable = statSync(path);
-  if (!executable.isFile()) throw new Error("resolved helper executable is not a regular file");
+  if (!executable.isFile() || executable.nlink !== 1) throw new Error("resolved helper executable is not a unique regular file");
   if (process.platform === "win32") return;
   const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
   if ((executable.mode & 0o022) !== 0 || (uid !== undefined && executable.uid !== uid && executable.uid !== 0)) {

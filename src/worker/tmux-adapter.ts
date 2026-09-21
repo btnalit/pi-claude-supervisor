@@ -1761,9 +1761,11 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     const parent = await processIdentity(process.pid);
     if (!parent?.startTime) throw new Error("cannot start tmux parent-death guardian without a parent process identity");
     const encode = (value: string) => Buffer.from(value, "utf8").toString("base64");
+    const trustedTmux = this.#trustedTmuxBinary;
+    if (!trustedTmux) throw new Error("tmux guardian cannot start before trusted executable preflight");
     const env: NodeJS.ProcessEnv = {
       PATH: process.env.PATH ?? "",
-      [GUARDIAN_KEYS.tmux]: encode(this.#trustedTmuxBinary ?? this.#tmuxBinary),
+      [GUARDIAN_KEYS.tmux]: encode(trustedTmux),
       [GUARDIAN_KEYS.socket]: encode(socketPath),
       [GUARDIAN_KEYS.session]: encode(record.sessionName),
       [GUARDIAN_KEYS.cgroup]: encode(record.cgroupPath ?? ""),
@@ -1950,7 +1952,9 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     const tmuxArgs = record.socketPath
       ? [...((record.structured || record.interactive) ? ["-f", "/dev/null"] : []), "-S", record.socketPath, ...args]
       : args;
-    const result = await runCommand(this.#trustedTmuxBinary ?? this.#tmuxBinary, tmuxArgs, input, env, this.#commandTimeoutMs);
+    const trustedTmux = this.#trustedTmuxBinary;
+    if (!trustedTmux) throw new Error("tmux command cannot run before trusted executable preflight");
+    const result = await runCommand(trustedTmux, tmuxArgs, input, env, this.#commandTimeoutMs);
     if (record.abortRequested && !ignoreAbort) throw new Error("tmux worker startup was aborted");
     return result;
   }

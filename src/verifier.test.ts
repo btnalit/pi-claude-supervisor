@@ -5,9 +5,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
+import { supervisorGitEnvironment } from "./git-runner.ts";
 import { remoteBranchHead, remoteUrl, repositoryClean, repositoryGitDirectoryIsLocal, repositorySlug, sameDestination } from "./verifier.ts";
 
 const execFileAsync = promisify(execFile);
+
+test("Supervisor Git isolates mutable global and system configuration", () => {
+  const environment = supervisorGitEnvironment(true);
+  assert.equal(environment.GIT_CONFIG_GLOBAL, "/dev/null");
+  assert.equal(environment.GIT_CONFIG_SYSTEM, "/dev/null");
+  assert.equal(environment.GIT_CONFIG_NOSYSTEM, "1");
+});
 
 test("a remote URL becomes the host/owner/repo gh accepts, or nothing", async () => {
   for (const [url, expected] of [

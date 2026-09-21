@@ -296,7 +296,11 @@ async function resolveSshHostname(alias: string, signal?: AbortSignal): Promise<
     // `ssh` here would let an untrusted PATH entry influence the repository
     // identity before the grant pins the real helper.
     const sshCommand = await trustedExecutablePath("ssh");
-    const result = await execFileAsync(sshCommand, ["-G", "--", alias], { timeout: 10_000, maxBuffer: 64 * 1024, signal, encoding: "buffer", env: { ...remoteReadEnvironment(), SSH_ASKPASS: "" } });
+    // Do not consult the mutable user SSH config here. A PR repository name is
+    // a grant input, not a reason to let a Worker rewrite Host/HostName in
+    // ~/.ssh/config between verification and publication; aliases that need
+    // that config remain unresolvable and fail closed.
+    const result = await execFileAsync(sshCommand, ["-F", "/dev/null", "-G", "--", alias], { timeout: 10_000, maxBuffer: 64 * 1024, signal, encoding: "buffer", env: { ...remoteReadEnvironment(), SSH_ASKPASS: "" } });
     const line = decodeUtf8(result.stdout).split("\n").find((entry) => entry.startsWith("hostname "));
     const host = line?.slice("hostname ".length).trim();
     return host && /^[A-Za-z0-9.-]+$/u.test(host) ? host : undefined;

@@ -17,6 +17,7 @@ export const HOOK_RELAY_SCRIPT = `
 (function () {
   "use strict";
   var fs = require("fs");
+  var childProcess = require("child_process");
 
   function sleepMs(ms) {
     try {
@@ -78,6 +79,21 @@ export const HOOK_RELAY_SCRIPT = `
   var path = require("path");
   var os = require("os");
   var crypto = require("crypto");
+  // The Supervisor's listening socket is named <server-pid>-<start-time>.sock. Native
+  // SO_PEERCRED binds the connected endpoint back to that PID; checking the
+  // server, not just the relay client, prevents a same-UID process from
+  // replacing by-cwd with an allow-answering socket. This is deliberately an
+  // absolute system helper: a Worker-controlled PATH must not choose it.
+  var PEER_CREDENTIAL_COMMAND = "/usr/bin/python3";
+  var PEER_CREDENTIAL_SCRIPT = [
+    "import socket, struct, sys",
+    "try:",
+    "    peer = socket.socket(fileno=3)",
+    "    pid, uid, gid = struct.unpack('3i', peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))",
+    "    print(pid, uid, gid, flush=True)",
+    "except Exception:",
+    "    sys.exit(125)",
+  ].join("\\n");
 
   // The installed relay.js lives inside the hooks directory itself, so a
   // non-default state directory is found without any environment from Pi
@@ -136,11 +152,86 @@ export const HOOK_RELAY_SCRIPT = `
 
   socket.on("error", finish);
 
+  function verifyServerEndpoint(callback) {
+    var match = /(?:^|[\\/])([0-9]+)-([0-9]+)\\.sock$/.exec(connectPath);
+    var expectedPid = match ? Number(match[1]) : 0;
+    var expectedStart = match ? match[2] : "";
+    var fd = socket && socket._handle && socket._handle.fd;
+    if (!Number.isSafeInteger(expectedPid) || expectedPid <= 0 || !Number.isSafeInteger(fd) || fd < 0) {
+      callback(false);
+      return;
+    }
+    var output = Buffer.alloc(0);
+    var settled = false;
+    var child;
+    var deadline = setTimeout(function () {
+      if (settled) return;
+      settled = true;
+      try { child && child.kill("SIGKILL"); } catch (e) { /* best effort */ }
+      callback(false);
+    }, 2000);
+    if (deadline.unref) deadline.unref();
+    try {
+      child = childProcess.spawn(PEER_CREDENTIAL_COMMAND, ["-c", PEER_CREDENTIAL_SCRIPT], {
+        env: { PATH: "/usr/bin:/bin", LC_ALL: "C", PYTHONNOUSERSITE: "1", PYTHONSAFEPATH: "1" },
+        stdio: ["ignore", "pipe", "ignore", fd],
+      });
+      child.stdout.on("data", function (chunk) {
+        if (settled) return;
+        output = Buffer.concat([output, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
+        if (output.length > 1024) {
+          settled = true;
+          clearTimeout(deadline);
+          try { child.kill("SIGKILL"); } catch (e) { /* best effort */ }
+          callback(false);
+        }
+      });
+      child.once("error", function () {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
+        callback(false);
+      });
+      child.once("close", function (code) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
+        if (code !== 0) { callback(false); return; }
+        var fields = output.toString("utf8").trim().split(/\\s+/);
+        var values = fields.map(Number);
+        var uid = typeof process.getuid === "function" ? process.getuid() : -1;
+        var serverStart;
+        try {
+          var statText = fs.readFileSync("/proc/" + expectedPid + "/stat", "utf8");
+          var closeParen = statText.lastIndexOf(")");
+          var statFields = closeParen < 0 ? [] : statText.slice(closeParen + 2).trim().split(/\\s+/);
+          serverStart = statFields[19];
+        } catch (e) {
+          callback(false);
+          return;
+        }
+        callback(fields.length === 3 && values.every(function (value) { return Number.isSafeInteger(value) && value >= 0; })
+          && values[0] === expectedPid && serverStart === expectedStart && (uid < 0 || values[1] === uid));
+      });
+    } catch (e) {
+      settled = true;
+      clearTimeout(deadline);
+      callback(false);
+    }
+  }
+
+  function afterVerifiedConnect(send) {
+    verifyServerEndpoint(function (trusted) {
+      if (!trusted) { finish(); return; }
+      send();
+    });
+  }
+
   if (!blocking) {
-    // Fire-and-forget: hand the payload to the kernel and exit without
-    // waiting for a reply.
+    // Fire-and-forget: authenticate the endpoint before handing the payload
+    // to the kernel, then exit without waiting for a reply.
     socket.on("connect", function () {
-      socket.write(payload, function () { finish(); });
+      afterVerifiedConnect(function () { socket.write(payload, function () { finish(); }); });
     });
     return;
   }
@@ -149,7 +240,7 @@ export const HOOK_RELAY_SCRIPT = `
   if (timer.unref) timer.unref();
 
   var buffer = Buffer.alloc(0);
-  socket.on("connect", function () { socket.write(payload); });
+  socket.on("connect", function () { afterVerifiedConnect(function () { socket.write(payload); }); });
   socket.on("data", function (chunk) {
     if (finished) return;
     var bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);

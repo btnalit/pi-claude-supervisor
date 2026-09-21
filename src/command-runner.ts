@@ -4,6 +4,7 @@ import { access, mkdir, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { TextDecoder } from "node:util";
 import { cleanupCgroup, processGroupHasLiveMember } from "./worker/process-adapter.ts";
+import { nodeScriptCommand } from "./worker/runtime.ts";
 
 const COMMAND_CGROUP_ENV = "PI_CLAUDE_SUPERVISOR_INTERNAL_VERIFICATION_CGROUP";
 const COMMAND_CGROUP_GUARDIAN = String.raw`
@@ -85,7 +86,7 @@ export async function runBoundedCommand(command: string, args: readonly string[]
     const childEnvironment = guarded
       ? { ...options.env, [COMMAND_CGROUP_ENV]: cgroupPath }
       : options.env;
-    child = spawn(guarded ? process.execPath : command, guarded
+    child = spawn(guarded ? nodeScriptCommand() : command, guarded
       ? ["-e", COMMAND_CGROUP_GUARDIAN, command, JSON.stringify(args)]
       : [...args], {
       cwd: options.cwd,

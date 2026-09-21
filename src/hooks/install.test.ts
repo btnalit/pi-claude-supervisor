@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { lstat, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { installUserHooks, uninstallUserHooks } from "./install.ts";
@@ -143,6 +143,16 @@ test("an unrelated hook whose command merely mentions relay.js is left alone", a
   assert.ok(after.hooks.Stop.some((group) => group.hooks.some((entry) => entry.command === foreign.command)), "foreign entry preserved by uninstall");
   assert.ok(!after.hooks.Stop.some((group) => group.hooks.some((entry) => /\/hooks\/relay\.js['"]?$/u.test(entry.command))), "our entry removed");
   await rm(stateDir, { recursive: true, force: true });
+});
+
+test("an existing settings parent must be private", async () => {
+  await withTempDir(async (dir) => {
+    await chmod(dir, 0o755);
+    await assert.rejects(
+      () => installUserHooks({ settingsPath: join(dir, "settings.json"), stateDir: join(dir, "state") }),
+      /hook settings parent is not private/,
+    );
+  });
 });
 
 test("installing under a settings directory that does not yet exist creates it", async () => {
