@@ -1,32 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$(uname -s)" != "Linux" ]]; then
-  printf '%s\n' 'CI safety gate: automatic cgroup tests require Linux' >&2
-  exit 1
-fi
+source "$(dirname -- "${BASH_SOURCE[0]}")/cgroup-common.sh"
 
-parent=$(awk -F: '$1 == "0" { print "/sys/fs/cgroup" $3; exit }' /proc/self/cgroup)
-if [[ -z "$parent" || ! -d "$parent" ]]; then
-  printf '%s\n' 'CI safety gate: cgroup v2 parent was not found' >&2
-  exit 1
-fi
-
-name="pi-claude-supervisor-ci-${GITHUB_JOB:-local}-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-1}"
-name=${name//[^A-Za-z0-9_.-]/-}
+ci_require_linux
+ci_require_cgroup_mount
+parent=$(ci_current_cgroup_path)
+ci_assert_cgroup_directory "$parent"
+name=$(ci_expected_cgroup_name)
 cgroup="$parent/$name"
-owner="$(id -u):$(id -g)"
+ci_assert_new_target "$cgroup" "$parent"
 
-if [[ ! -e "$cgroup" ]]; then
-  mkdir "$cgroup" 2>/dev/null || sudo mkdir "$cgroup"
+# The runner normally owns a delegated parent. If it does not, root may create
+# this one cgroup only; the workload itself is never executed through sudo.
+if ! mkdir -- "$cgroup" 2>/dev/null; then
+  ci_root_command /bin/mkdir -- "$cgroup" \
+    || ci_cgroup_fail "could not create delegated cgroup: $cgroup"
 fi
-chown "$owner" "$cgroup" "$cgroup/cgroup.procs" "$cgroup/cgroup.kill" "$cgroup/cgroup.events" 2>/dev/null \
-  || sudo chown "$owner" "$cgroup" "$cgroup/cgroup.procs" "$cgroup/cgroup.kill" "$cgroup/cgroup.events"
 
-if [[ ! -w "$cgroup/cgroup.procs" ]]; then
-  printf 'CI safety gate: delegated cgroup is not writable: %s\n' "$cgroup" >&2
-  exit 1
-fi
+# Revalidate the exact path after creation. Leave it root-owned when sudo made
+# it: the later privileged fallback writes one validated cgroupfs file, while a
+# test process cannot replace the directory with a symlink.
+ci_assert_owned_target "$cgroup" "$parent"
 
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   printf 'PI_CLAUDE_SUPERVISOR_CI_CGROUP=%s\n' "$cgroup" >> "$GITHUB_ENV"

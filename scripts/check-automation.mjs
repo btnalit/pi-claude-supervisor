@@ -4,6 +4,21 @@ import { readFileSync, readdirSync } from "node:fs";
 import { parse } from "yaml";
 
 const read = (path) => readFileSync(path, "utf8");
+const cgroupCommon = read("scripts/ci/cgroup-common.sh");
+const cgroupPrepare = read("scripts/ci/prepare-cgroup.sh");
+const cgroupRun = read("scripts/ci/run-in-cgroup.sh");
+const cgroupCleanup = read("scripts/ci/cleanup-cgroup.sh");
+for (const [name, script] of Object.entries({ cgroupCommon, cgroupPrepare, cgroupRun, cgroupCleanup })) {
+  assert.doesNotMatch(script, /sudo\s+(?:sh|bash|env|setpriv)\b/u, `${name} must not run arbitrary commands as root`);
+  assert.doesNotMatch(script, /rm\s+-rf/u, `${name} must not recursively remove cgroup paths`);
+}
+assert.match(cgroupCommon, /cgroup2fs/u, "CI cgroup setup must verify cgroup v2");
+assert.match(cgroupCommon, /cgroup\.procs/u, "CI cgroup setup must use cgroup.procs");
+assert.match(cgroupCommon, /sudo -n/u, "CI cgroup fallback must be noninteractive");
+assert.match(cgroupCommon, /tee --/u, "CI cgroup fallback must write through a bounded tee");
+assert.match(cgroupCommon, /readlink -e/u, "CI cgroup paths must be canonicalized");
+assert.match(cgroupRun, /exec --/u, "CI workload arguments must be passed without a shell");
+assert.match(cgroupCommon, /rmdir --/u, "CI cgroup cleanup must be non-recursive");
 const pkg = JSON.parse(read("package.json"));
 assert.equal(pkg.scripts.test, "node scripts/run-tests.mjs", "The test runner must enforce the CI skip gate");
 assert.equal(JSON.parse(read(".release-please-manifest.json"))["."], pkg.version, "Release manifest/version drift");

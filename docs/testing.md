@@ -17,6 +17,15 @@ npm run build
 content assertions. `npm run build` creates an installable npm archive; Pi loads
 the published TypeScript source directly and there is no second runtime bundle.
 
+The CI checks jobs run `npm run check` through `scripts/ci/run-in-cgroup.sh`.
+The wrapper moves its own PID into a validated child of the current cgroup-v2
+parent before `exec`; if the runner keeps `cgroup.procs` root-owned, the only
+privileged fallback is noninteractive `sudo -n tee` for that one PID write.
+Cgroup paths are canonicalized and symlink-checked, membership is verified from
+`/proc/self/cgroup`, and cleanup uses `cgroup.kill` plus non-recursive `rmdir`.
+With `PI_CLAUDE_SUPERVISOR_FAIL_ON_TEST_SKIP=1`, setup, attachment, verification,
+and cleanup failures fail the job rather than silently skipping automatic tests.
+
 ## Test layers
 
 - `policy.test.ts`: deterministic local allow and hard-boundary deny behavior; legacy approval cannot override denial.
