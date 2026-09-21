@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, readFile, readdir, realpath, rm, rmdir, stat, writeFile, rename } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rm, rmdir, rename } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
-import { promisify } from "node:util";
+import { promisify, TextDecoder } from "node:util";
 import { redactSensitive } from "./redaction.ts";
 
 export type CwdLeaseTransport = "process-pipe" | "jsonl" | "pty" | "tmux";
@@ -119,6 +120,7 @@ type TakeoverTransaction = {
 const execFileAsync = promisify(execFile);
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 5_000;
+const MAX_LEASE_FILE_BYTES = 1 * 1024 * 1024;
 
 /**
  * Cross-process working-directory lease registry.
@@ -318,7 +320,7 @@ export class CwdLeaseStore {
           if (!existing) throw new Error("cwd lease disappeared before release");
           if (existing.cwd !== current.cwd || existing.taskId !== current.taskId) throw new Error("cwd lease identity changed; refusing release");
           if (existing.worker?.retainCgroupUntilLeaseRelease) await releaseRetainedCgroup(existing.worker);
-          await rm(this.#path(existing.leaseId), { force: true });
+          await removeLeaseFileSecure(this.#path(existing.leaseId), existing.leaseId);
         });
         released = true;
       },
@@ -339,20 +341,19 @@ export class CwdLeaseStore {
       let lease: CwdLeaseRecord;
       try {
         const leaseInfo = await lstat(leasePath);
-        if (!leaseInfo.isFile()) {
-          // A directory or symlink is never renamed or followed as part of
-          // quarantine; just skip it in place and let an operator inspect it.
-          console.error(`pi-claude-supervisor skipped a non-regular cwd lease entry: ${redactText(name)}`);
-          continue;
+        if (!leaseInfo.isFile() || leaseInfo.isSymbolicLink()) {
+          // A non-regular entry could hide an active lease or redirect a
+          // recovery read. Do not skip it: an uncertain registry must block
+          // acquisition until an operator removes the entry.
+          throw new Error(`cwd lease registry contains a non-regular entry: ${redactText(name)}`);
         }
-        const value = JSON.parse(await readFile(leasePath, "utf8")) as Partial<CwdLeaseRecord>;
+        const value = JSON.parse(await readLeaseFileSecure(leasePath)) as Partial<CwdLeaseRecord>;
         lease = normalizeLease(value);
       } catch (error) {
-        if (isTransientIoError(error)) throw error;
-        // One unreadable or incompatible record (disk full, truncated write,
-        // a schema this build no longer accepts) must not block every other
-        // cwd lease in the registry. Quarantine it out of the directory this
-        // scan reads instead, and keep going.
+        if (!isLeaseRecordCorruption(error)) throw error;
+        // A syntactically/schema-invalid record can be quarantined so it does
+        // not block unrelated paths. I/O, permission and resource failures
+        // are not corruption evidence and must fail closed instead.
         await this.#quarantine(name, leasePath, error);
         continue;
       }
@@ -360,16 +361,18 @@ export class CwdLeaseStore {
         try {
           // A takeover transaction is not usable until the old cgroup/session
           // and any socket marker have been independently confirmed clean.
-          const cgroupCleanedBefore = lease.pendingCleanup.cgroupCleaned === true;
-          let cleanupComplete = await cleanupPendingLease(lease.pendingCleanup);
-          // Reconciliation may have removed the cgroup successfully but failed
-          // on a later marker operation. Persist that stage before returning a
-          // still-pending record, so the next reader can continue fail-closed.
-          if (!cgroupCleanedBefore && lease.pendingCleanup.cgroupCleaned === true) {
-            await this.#write({ ...lease, updatedAt: new Date().toISOString() });
-            // The first pass deliberately stops before socket-marker removal;
-            // the cleanup stage must be durable before that second proof.
+          let cleanupComplete = false;
+          // Each proof transition (socket reservation, cgroup removal) is
+          // written before the next cleanup step. A crash between passes then
+          // leaves a durable marker from which recovery can continue.
+          for (let pass = 0; pass < 4; pass += 1) {
+            const cgroupCleanedBefore = lease.pendingCleanup.cgroupCleaned === true;
+            const markerBefore = lease.pendingCleanup.socketMarkerIdentity?.inode;
             cleanupComplete = await cleanupPendingLease(lease.pendingCleanup);
+            const markerChanged = markerBefore === undefined && lease.pendingCleanup.socketMarkerIdentity !== undefined;
+            const cgroupChanged = !cgroupCleanedBefore && lease.pendingCleanup.cgroupCleaned === true;
+            if (!markerChanged && !cgroupChanged) break;
+            await this.#write({ ...lease, updatedAt: new Date().toISOString() });
           }
           if (cleanupComplete) {
             if (lease.pendingCleanup.phase === "replacement") {
@@ -380,18 +383,16 @@ export class CwdLeaseStore {
             } else {
               // The old record was still in the preparation phase, so no new
               // Worker lease exists to retain after cleanup.
-              await rm(leasePath, { force: true });
+              await removeLeaseFileSecure(leasePath, lease.leaseId);
               continue;
             }
           }
         } catch (error) {
-          if (isTransientIoError(error)) throw error;
           // A reconciliation failure is not proof the record itself is
-          // corrupt, and quarantining it would discard a durable
-          // pendingCleanup transaction a later read could still finish. Skip
-          // it for this read only and leave the file in place.
-          console.error(`pi-claude-supervisor skipped a cwd lease record with a failed pendingCleanup reconciliation: ${redactText(name)}: ${errorMessage(error)}`);
-          continue;
+          // corrupt, and quarantining or skipping it could let a second
+          // Worker acquire the still-reserved cwd. Keep the durable marker
+          // and block all registry decisions until cleanup is proven.
+          throw new Error(`cwd lease pending cleanup could not be reconciled: ${redactText(name)}: ${errorMessage(error)}`, { cause: error });
         }
       }
       // A missing cwd is registry evidence that this lease's directory is
@@ -417,12 +418,17 @@ export class CwdLeaseStore {
     const quarantineDir = this.#quarantineDirectory();
     try {
       await mkdir(quarantineDir, { recursive: true, mode: 0o700 });
+      const quarantineInfo = await lstat(quarantineDir);
+      if (!quarantineInfo.isDirectory() || quarantineInfo.isSymbolicLink()) throw new Error("cwd lease quarantine is not a real directory");
+      if (typeof process.getuid === "function" && quarantineInfo.uid !== process.getuid()) throw new Error("cwd lease quarantine is owned by another user");
+      await chmod(quarantineDir, 0o700);
       await rename(leasePath, join(quarantineDir, `${name}.${Date.now()}`));
-    } catch {
-      // If the rename itself fails, leave the file in place and skip it for
-      // this read; the next read will retry rather than lose it silently.
-      console.error(`pi-claude-supervisor could not quarantine an unreadable cwd lease record: ${redactText(name)}: ${message}`);
-      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      // If the rename itself fails for any other reason, preserve the record
+      // and surface the I/O failure; silently skipping it could release an
+      // active cwd lease.
+      throw error;
     }
     console.error(`pi-claude-supervisor quarantined an unreadable cwd lease record: ${redactText(name)}: ${message}`);
   }
@@ -435,9 +441,14 @@ export class CwdLeaseStore {
     await this.#ensureDirectory();
     const target = this.#path(lease.leaseId);
     const temporary = `${target}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(lease, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    await rename(temporary, target);
-    await chmod(target, 0o600);
+    const encoded = `${JSON.stringify(lease, null, 2)}\n`;
+    if (Buffer.byteLength(encoded, "utf8") > MAX_LEASE_FILE_BYTES) throw new Error("cwd lease record exceeds the safe size limit");
+    try {
+      await writeFileSecure(temporary, encoded, 0o600);
+      await rename(temporary, target);
+    } finally {
+      await rm(temporary, { force: true }).catch(() => {});
+    }
   }
 
   #path(leaseId: string): string {
@@ -453,12 +464,15 @@ export class CwdLeaseStore {
     while (true) {
       try {
         await mkdir(lockPath);
-        await writeFile(join(lockPath, "owner.json"), JSON.stringify({
+        const lockInfo = await lstat(lockPath);
+        if (!lockInfo.isDirectory() || lockInfo.isSymbolicLink()) throw new Error("cwd lease lock is not a real directory");
+        if (typeof process.getuid === "function" && lockInfo.uid !== process.getuid()) throw new Error("cwd lease lock is owned by another user");
+        await writeFileSecure(join(lockPath, "owner.json"), JSON.stringify({
           pid: process.pid,
           startTime: await processStartTime(process.pid),
           token: lockToken,
           at: new Date().toISOString(),
-        }), { mode: 0o600 });
+        }), 0o600);
         const acquired = await lstat(lockPath);
         if (!acquired.isDirectory()) throw new Error("cwd lease lock is not a directory");
         lockIdentity = { device: acquired.dev, inode: acquired.ino, token: lockToken };
@@ -480,7 +494,8 @@ export class CwdLeaseStore {
   async #ensureDirectory(): Promise<void> {
     await mkdir(this.#directory, { recursive: true, mode: 0o700 });
     const info = await lstat(this.#directory);
-    if (!info.isDirectory()) throw new Error(`cwd lease registry is not a directory: ${redactText(this.#directory)}`);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`cwd lease registry is not a directory (or is a symlink): ${redactText(this.#directory)}`);
+    if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error(`cwd lease registry is owned by another user: ${redactText(this.#directory)}`);
     await chmod(this.#directory, 0o700);
   }
 }
@@ -514,58 +529,90 @@ export async function workerIdentity(worker: WorkerIdentityInput): Promise<Worke
 }
 
 async function removeStaleLock(lockPath: string): Promise<boolean> {
+  let lockInfo;
   try {
-    const lockInfo = await lstat(lockPath);
+    lockInfo = await lstat(lockPath);
     if (!lockInfo.isDirectory()) throw new Error("cwd lease lock is not a directory");
-    const ownerPath = join(lockPath, "owner.json");
-    const ownerInfo = await lstat(ownerPath);
-    if (!ownerInfo.isFile()) throw new Error("cwd lease lock owner is not a regular file");
-    const info = await stat(ownerPath);
-    if (Date.now() - info.mtimeMs < STALE_LOCK_MS) return false;
-    const owner = JSON.parse(await readFile(ownerPath, "utf8")) as { pid?: unknown; startTime?: unknown; token?: unknown };
-    if (typeof owner.token !== "string" || owner.token.length === 0) return false;
-    if (typeof owner.pid === "number") {
-      const currentStart = await processStartTime(owner.pid);
-      if (currentStart && typeof owner.startTime === "string" && currentStart === owner.startTime) return false;
-      try {
-        process.kill(owner.pid, 0);
-        return false;
-      } catch (error) {
-        if (error instanceof Error && /EPERM/u.test(error.message)) return false;
-      }
-    }
+  } catch (error) {
+    return error instanceof Error && /ENOENT/u.test(error.message);
+  }
 
-    // Never recursively remove the path that was inspected. Move exactly that
-    // lock-directory instance to a private quarantine name first; another
-    // acquirer may create a new lock at lockPath while quarantine is removed.
-    // The inode and optional owner token bind cleanup to the observed owner.
-    const quarantine = `${lockPath}.reap-${process.pid}-${randomUUID()}`;
-    try {
-      await rename(lockPath, quarantine);
-    } catch (error) {
-      if (error instanceof Error && /ENOENT/u.test(error.message)) return true;
-      return false;
-    }
-    try {
-      const restore = () => rename(quarantine, lockPath).catch(() => {});
-      const quarantinedInfo = await lstat(quarantine);
-      if (!quarantinedInfo.isDirectory() || quarantinedInfo.dev !== lockInfo.dev || quarantinedInfo.ino !== lockInfo.ino) {
-        await restore();
-        return false;
+  // The owner file is written immediately after mkdir. A missing or torn owner
+  // after this grace period is therefore an abandoned lock, not permission to
+  // leave the registry wedged until every caller's deadline expires. Read
+  // errors that are not an ordinary missing/malformed record remain fail-closed.
+  const ownerPath = join(lockPath, "owner.json");
+  let ownerMtime = lockInfo.mtimeMs;
+  try {
+    const ownerInfo = await lstat(ownerPath);
+    if (ownerInfo.isFile()) ownerMtime = ownerInfo.mtimeMs;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") return false;
+  }
+  if (Date.now() - ownerMtime < STALE_LOCK_MS) return false;
+  let observedToken: string | undefined;
+  try {
+    const ownerInfo = await lstat(ownerPath);
+    if (!ownerInfo.isFile()) return false;
+    const owner = JSON.parse(await readLeaseFileSecure(ownerPath)) as { pid?: unknown; startTime?: unknown; token?: unknown } | null;
+    if (owner && typeof owner.token === "string" && owner.token.length > 0) {
+      observedToken = owner.token;
+      if (typeof owner.pid === "number") {
+        const currentStart = await processStartTime(owner.pid);
+        if (currentStart && typeof owner.startTime === "string" && currentStart === owner.startTime) return false;
+        try {
+          process.kill(owner.pid, 0);
+          return false;
+        } catch (error) {
+          if (error instanceof Error && /EPERM/u.test(error.message)) return false;
+        }
       }
-      const quarantinedOwner = JSON.parse(await readFile(join(quarantine, "owner.json"), "utf8")) as { token?: unknown };
-      if (quarantinedOwner.token !== owner.token) {
-        await restore();
-        return false;
-      }
-      await rm(quarantine, { recursive: true, force: true });
-      return true;
-    } catch (error) {
-      if (error instanceof Error && /ENOENT/u.test(error.message)) return true;
-      return false;
     }
   } catch (error) {
-    if (error instanceof Error && /ENOENT/u.test(error.message)) return true;
+    const code = (error as NodeJS.ErrnoException).code;
+    // ENOENT, a torn JSON record and a schema-invalid owner are reclaimable
+    // only after the lock-directory grace period checked above. EACCES/EIO/
+    // resource failures are not evidence of staleness.
+    if (code && code !== "ENOENT") return false;
+    if (!code && error instanceof SyntaxError) {
+      // The exact lock inode below still binds the removal to this instance.
+    } else if (code !== "ENOENT") {
+      return false;
+    }
+  }
+
+  // Never recursively remove the path that was inspected. Move exactly that
+  // lock-directory instance to a private quarantine name first; another
+  // acquirer may create a new lock at lockPath while quarantine is removed.
+  // The inode and optional owner token bind cleanup to the observed owner.
+  const quarantine = `${lockPath}.reap-${process.pid}-${randomUUID()}`;
+  try {
+    await rename(lockPath, quarantine);
+  } catch (error) {
+    return error instanceof Error && /ENOENT/u.test(error.message);
+  }
+  const restore = () => rename(quarantine, lockPath).catch(() => {});
+  try {
+    const quarantinedInfo = await lstat(quarantine);
+    if (!quarantinedInfo.isDirectory() || quarantinedInfo.dev !== lockInfo.dev || quarantinedInfo.ino !== lockInfo.ino) {
+      await restore();
+      return false;
+    }
+    if (observedToken !== undefined) {
+      const quarantinedOwner = JSON.parse(await readLeaseFileSecure(join(quarantine, "owner.json"))) as { token?: unknown };
+      if (quarantinedOwner.token !== observedToken) {
+        await restore();
+        return false;
+      }
+    }
+    await rm(quarantine, { recursive: true, force: true });
+    return true;
+  } catch {
+    // Verification or deletion after the rename is inconclusive. Restore the
+    // exact lock instance where possible; never report a failed verification as
+    // a successful reap merely because the original path is now absent.
+    await restore();
     return false;
   }
 }
@@ -578,7 +625,7 @@ async function removeOwnedLock(lockPath: string, identity: LockIdentity): Promis
   try {
     const current = await lstat(lockPath);
     if (!current.isDirectory() || current.dev !== identity.device || current.ino !== identity.inode) return;
-    const owner = JSON.parse(await readFile(join(lockPath, "owner.json"), "utf8")) as { token?: unknown };
+    const owner = JSON.parse(await readLeaseFileSecure(join(lockPath, "owner.json"))) as { token?: unknown };
     if (owner.token !== identity.token) return;
     await rename(lockPath, quarantine);
     const restore = () => rename(quarantine, lockPath).catch(() => {});
@@ -587,7 +634,7 @@ async function removeOwnedLock(lockPath: string, identity: LockIdentity): Promis
       await restore();
       return;
     }
-    const quarantinedOwner = JSON.parse(await readFile(join(quarantine, "owner.json"), "utf8")) as { token?: unknown };
+    const quarantinedOwner = JSON.parse(await readLeaseFileSecure(join(quarantine, "owner.json"))) as { token?: unknown };
     if (quarantinedOwner.token !== identity.token) {
       await restore();
       return;
@@ -596,6 +643,53 @@ async function removeOwnedLock(lockPath: string, identity: LockIdentity): Promis
   } catch {
     // Another process may already have quarantined or removed this instance.
     // Any uncertain ownership is intentionally left for stale-lock handling.
+  }
+}
+
+async function readLeaseFileSecure(path: string): Promise<string> {
+  if (typeof fsConstants.O_NOFOLLOW !== "number") throw new Error("secure cwd lease opening is unavailable");
+  let handle;
+  try {
+    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const info = await handle.stat();
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error("cwd lease entry is not a regular file");
+    if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error("cwd lease entry is owned by another user");
+    if (info.nlink > 1) throw new Error("cwd lease entry is a hard-link alias");
+    if (info.size > MAX_LEASE_FILE_BYTES) throw new Error("cwd lease record exceeds the safe size limit");
+    return new TextDecoder("utf-8", { fatal: true }).decode(await handle.readFile());
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function removeLeaseFileSecure(path: string, expectedLeaseId: string): Promise<void> {
+  const info = await lstat(path);
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error("cwd lease entry is not a regular file");
+  const current = normalizeLease(JSON.parse(await readLeaseFileSecure(path)) as Partial<CwdLeaseRecord>);
+  if (current.leaseId !== expectedLeaseId) throw new Error("cwd lease identity changed before removal");
+  const quarantine = `${path}.remove-${process.pid}-${randomUUID()}`;
+  await rename(path, quarantine);
+  try {
+    const moved = await lstat(quarantine);
+    if (!moved.isFile() || moved.isSymbolicLink() || moved.dev !== info.dev || moved.ino !== info.ino) throw new Error("cwd lease identity changed during removal");
+    const movedLease = normalizeLease(JSON.parse(await readLeaseFileSecure(quarantine)) as Partial<CwdLeaseRecord>);
+    if (movedLease.leaseId !== expectedLeaseId) throw new Error("cwd lease identity changed during removal");
+    await rm(quarantine, { force: true });
+  } catch (error) {
+    await rename(quarantine, path).catch(() => {});
+    throw error;
+  }
+}
+
+async function writeFileSecure(path: string, contents: string, mode: number): Promise<void> {
+  if (typeof fsConstants.O_NOFOLLOW !== "number") throw new Error("secure cwd writing is unavailable");
+  let handle;
+  try {
+    handle = await open(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, mode);
+    await handle.writeFile(contents, "utf8");
+    await handle.chmod(mode);
+  } finally {
+    await handle?.close().catch(() => {});
   }
 }
 
@@ -726,7 +820,7 @@ async function canTakeoverLease(lease: CwdLeaseRecord): Promise<TakeoverProof | 
     return {
       pendingCleanup,
       reserve: async () => {
-        reservation = await reserveTmuxSocket(worker.tmuxSocket!);
+        reservation = await reserveTmuxSocket(worker.tmuxSocket!, worker.tmuxServerPid, worker.tmuxServerStartTime);
         if (!reservation) return false;
         pendingCleanup.socketMarkerIdentity = reservation.identity;
         return true;
@@ -811,7 +905,7 @@ async function startupResourceTakeoverProof(worker: CwdLeaseWorker): Promise<Tak
     return {
       pendingCleanup,
       reserve: async () => {
-        reservation = await reserveTmuxSocket(worker.tmuxSocket!);
+        reservation = await reserveTmuxSocket(worker.tmuxSocket!, worker.tmuxServerPid, worker.tmuxServerStartTime);
         if (!reservation) return false;
         pendingCleanup.socketMarkerIdentity = reservation.identity;
         return true;
@@ -830,14 +924,24 @@ async function startupResourceTakeoverProof(worker: CwdLeaseWorker): Promise<Tak
 
 async function cleanupPendingLease(cleanup: CwdLeaseCleanup): Promise<boolean> {
   if (!isCgroupPath(cleanup.cgroupPath) || !matchesGeneratedCgroupName(cleanup.cgroupPath, cleanup.transport, cleanup.workerId)) return false;
+  let markerWasMissing = false;
   if (cleanup.transport === "tmux") {
     if (!cleanup.sessionName || !cleanup.tmuxSocket) return false;
     if (!cleanup.startupResource) {
       if (!cleanup.tmuxServerPid || !cleanup.tmuxServerStartTime) return false;
       if (await processIdentityLive(cleanup.tmuxServerPid, cleanup.tmuxServerStartTime)) return false;
     }
+    if (!cleanup.socketMarkerIdentity) {
+      const reservation = await reserveTmuxSocket(cleanup.tmuxSocket, cleanup.tmuxServerPid, cleanup.tmuxServerStartTime);
+      if (!reservation) return false;
+      cleanup.socketMarkerIdentity = reservation.identity;
+      // The caller persists this newly observed marker before the next pass;
+      // never remove a stale socket or cgroup based on an unrecorded marker.
+      markerWasMissing = true;
+    }
     if (!await tmuxSessionGoneOrReserved(cleanup.tmuxSocket, cleanup.sessionName, cleanup.socketMarkerIdentity)) return false;
   }
+  if (markerWasMissing) return false;
   const cgroupWasCleaned = cleanup.cgroupCleaned === true;
   if (!await cgroupGoneOrCleaned(cleanup)) return false;
   // Persist cgroupCleaned before removing a tmux marker. A crash after marker
@@ -1026,12 +1130,27 @@ async function releaseRetainedCgroup(worker: CwdLeaseWorker): Promise<void> {
   }
 }
 
-async function reserveTmuxSocket(socket: string): Promise<SocketReservation | undefined> {
+async function reserveTmuxSocket(socket: string, serverPid?: number, serverStartTime?: string): Promise<SocketReservation | undefined> {
   try {
     const existing = await lstat(socket);
-    // A private socket must have disappeared before it can be reserved. Do
-    // not unlink a live or replaced socket as part of takeover.
-    if (existing) return undefined;
+    // A directory is an existing recovery marker and cannot be claimed by a
+    // second transaction. A stale regular/socket node may be reclaimed only
+    // with the recorded server identity already proven dead.
+    if (existing.isDirectory() || serverPid === undefined || serverStartTime === undefined) return undefined;
+    if (await processIdentityLive(serverPid, serverStartTime)) return undefined;
+    const quarantine = `${socket}.reap-${process.pid}-${randomUUID()}`;
+    await rename(socket, quarantine);
+    try {
+      const moved = await lstat(quarantine);
+      if (moved.dev !== existing.dev || moved.ino !== existing.ino || moved.isDirectory()) {
+        await rename(quarantine, socket).catch(() => {});
+        return undefined;
+      }
+      await rm(quarantine, { force: true });
+    } catch {
+      await rename(quarantine, socket).catch(() => {});
+      return undefined;
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
   }
@@ -1064,7 +1183,11 @@ async function tmuxSessionGone(socket: string, session: string): Promise<boolean
   if (!socket.startsWith("/") || socket.includes("\0") || !/^[A-Za-z0-9_.-]+$/u.test(session)) return false;
   try {
     const socketInfo = await lstat(socket);
-    if (!socketInfo.isSocket()) return false;
+    if (!socketInfo.isSocket()) {
+      // A regular stale node is reclaimed by reserveTmuxSocket after the
+      // recorded tmux server identity has been checked dead.
+      return true;
+    }
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "ENOENT";
   }
@@ -1240,14 +1363,11 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/**
- * A transient condition (resource exhaustion, a concurrent lock) is not
- * evidence a lease record is corrupt. Rethrow it instead of quarantining or
- * skipping the record on its account.
- */
-function isTransientIoError(error: unknown): boolean {
+function isLeaseRecordCorruption(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException | undefined)?.code;
-  return code === "EAGAIN" || code === "EBUSY";
+  if (code !== undefined) return false;
+  if (error instanceof SyntaxError) return true;
+  return error instanceof Error && /^(?:invalid cwd lease record|invalid cwd lease worker identity|invalid cwd lease startup state|invalid cwd lease cleanup state)/u.test(error.message);
 }
 
 function delay(ms: number): Promise<void> {

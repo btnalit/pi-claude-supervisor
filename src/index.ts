@@ -2,8 +2,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { accessSync, chmodSync, constants as fsConstants, lstatSync, mkdirSync } from "node:fs";
-import { chmod, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { accessSync, chmodSync, constants as fsConstants, lstatSync, mkdirSync, realpathSync } from "node:fs";
+import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
+import { TextDecoder } from "node:util";
 import { EventLog } from "./events.ts";
 import { redactSensitive } from "./redaction.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
@@ -12,7 +13,7 @@ import { TmuxWorkerAdapter, attachCommand, sweepDeadTmuxSockets } from "./worker
 import { Supervisor, extendedDeadlineMs, type DecisionSessionClosedInfo, type HumanInterventionNotice, type SupervisorProgress, type SupervisorTokenUsage } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
-import { autoInstallHooks, autonomyDefaults, closeWorkerOnCompletion, deadlineGraceMs, deadlineMs, deadlineWarningMs, decisionCompactionTokens, decisionModel, decisionSessionRetentionDays, eventLogMaxBytes, formatDurationMs, loadSupervisorEnvironment, noOutputTimeoutMs, parseDurationMs, progressHeartbeatMs, reviewTimeoutMs, reviewerModel, tmuxMode, workerAutocompactTokens, workerMcpConfigPath, workerModel } from "./config.ts";
+import { autoInstallHooks, automationEnabled, autonomyDefaults, cgroupMode, closeWorkerOnCompletion, deadlineGraceMs, deadlineMs, deadlineWarningMs, decisionCompactionTokens, decisionModel, decisionSessionRetentionDays, eventLogMaxBytes, formatDurationMs, loadSupervisorEnvironment, noOutputTimeoutMs, parseDurationMs, progressHeartbeatMs, reviewTimeoutMs, reviewerModel, supervisorTransport, tmuxMode, webhookFormat, workerAutocompactTokens, workerMcpConfigPath, workerModel } from "./config.ts";
 import { DecisionSessionStore, type DecisionSessionRecord } from "./decision-session-store.ts";
 import { CwdLeaseStore, type CwdLeaseHandle, leaseOwnerLive, pathsOverlap, workerIdentity } from "./cwd-lease.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
@@ -34,18 +35,48 @@ function claudeUserSettingsPath(): string {
 
 /** `src/hooks/install.ts` does not export its relay-script writer; this mirrors it for an owned launch's static relay path. */
 async function writeRelayScript(path: string): Promise<void> {
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temporary, HOOK_RELAY_SCRIPT, { encoding: "utf8", mode: 0o600, flag: "wx" });
-  await rename(temporary, path);
-  await chmod(path, 0o600);
+  const target = resolve(path);
+  const parent = dirname(target);
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  const parentInfo = await lstat(parent);
+  if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink() || (typeof process.getuid === "function" && parentInfo.uid !== process.getuid()) || (parentInfo.mode & 0o077) !== 0) throw new Error("hook relay parent is not a private directory");
+  if (await realpath(parent) !== parent) throw new Error("hook relay parent contains a symlink");
+  try {
+    const existing = await lstat(target);
+    if (existing.isSymbolicLink() || !existing.isFile()) throw new Error("hook relay target is not a regular file");
+    if (typeof process.getuid === "function" && existing.uid !== process.getuid()) throw new Error("hook relay target is owned by another user");
+    if (existing.nlink > 1) throw new Error("hook relay target is a hard-link alias");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (typeof fsConstants.O_NOFOLLOW !== "number") throw new Error("secure hook relay writing is unavailable");
+  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  let handle;
+  try {
+    handle = await open(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    await handle.writeFile(HOOK_RELAY_SCRIPT, "utf8");
+    await handle.chmod(0o600);
+    await handle.sync();
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => {});
+    throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+  try {
+    await rename(temporary, target);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => {});
+  }
 }
 
 /** True when the user's Claude Code settings already register our relay for at least one hook event. */
 async function userHooksInstalled(settingsPath: string): Promise<boolean> {
   let raw: string;
   try {
-    raw = await readFile(settingsPath, "utf8");
+    const bytes = await readFile(settingsPath);
+    if (bytes.byteLength > 4 * 1024 * 1024) return false;
+    raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
     return false;
   }
@@ -75,34 +106,33 @@ async function userHooksInstalled(settingsPath: string): Promise<boolean> {
  */
 export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   loadSupervisorEnvironment();
-  const automation = process.env.PI_CLAUDE_SUPERVISOR_MODE === "auto" || process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION === "1";
+  const automation = automationEnabled(process.env);
   const stateDir = process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR ?? join(homedir(), ".pi", "agent", "claude-supervisor");
-  const configuredTransport = process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
-  const transport = configuredTransport ?? (automation ? "jsonl" : "process-pipe");
-  const cgroupMode = process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE ?? "auto";
+  const leaseDir = process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR ?? join(homedir(), ".pi", "agent", "claude-supervisor", "cwd-leases");
+  assertRuntimeDirectory(stateDir, "state");
+  assertRuntimeDirectory(leaseDir, "lease");
+  const transport = supervisorTransport(process.env, automation);
+  const configuredCgroupMode = cgroupMode(process.env);
   if (!(["process-pipe", "jsonl", "tmux"] as string[]).includes(transport)) {
     throw new Error(`Unsupported PI_CLAUDE_SUPERVISOR_TRANSPORT: ${transport}; expected process-pipe, jsonl, or tmux`);
   }
-  if (!["off", "auto", "required"].includes(cgroupMode)) {
-    throw new Error(`Unsupported PI_CLAUDE_SUPERVISOR_CGROUP_MODE: ${cgroupMode}; expected off, auto, or required`);
-  }
-  if (transport === "tmux" && cgroupMode === "required" && !automation) {
+  if (transport === "tmux" && configuredCgroupMode === "required" && !automation) {
     throw new Error("PI_CLAUDE_SUPERVISOR_CGROUP_MODE=required is unsupported with manual tmux; use automatic mode or cgroup mode auto/off");
   }
   if (automation && !["jsonl", "tmux"].includes(transport)) {
     throw new Error("automatic supervision requires PI_CLAUDE_SUPERVISOR_TRANSPORT=jsonl or tmux; process-pipe is manual-only");
   }
   const adapter = transport === "tmux"
-    ? new TmuxWorkerAdapter({ stateDir, cgroupMode: automation ? "required" : cgroupMode as "off" | "auto" | "required" })
+    ? new TmuxWorkerAdapter({ stateDir, cgroupMode: automation ? "required" : configuredCgroupMode })
     : new ProcessWorkerAdapter({
       // Automatic decisions require Claude's structured event stream. The pipe
       // transport remains available for manual/compatibility sessions.
       mode: automation || transport === "jsonl" ? "claude-jsonl" : "process-pipe",
-      cgroupMode: automation ? "required" : cgroupMode as "off" | "auto" | "required",
+      cgroupMode: automation ? "required" : configuredCgroupMode,
     });
   const humanWebhook = new HumanWebhookNotifier({
     url: process.env.PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL,
-    format: process.env.PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_FORMAT === "wecom" ? "wecom" : "generic",
+    format: webhookFormat(process.env),
     secret: process.env.PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_SECRET,
   });
   const onHumanRequired = (ctx: ExtensionContext) => async (notice: HumanInterventionNotice): Promise<void> => {
@@ -133,8 +163,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   if (transport === "tmux") sweepDeadTmuxSockets();
   if (hookServer) {
     hookServerReady = (async () => {
-      await writeRelayScript(relayPath);
       await hookServer.listen();
+      await writeRelayScript(relayPath);
       if (autoInstallHooks()) {
         try {
           const installed = await installUserHooks({ stateDir, settingsPath: claudeUserSettingsPath() });
@@ -148,9 +178,6 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
       console.error(`pi-claude-supervisor hook server startup failed: ${redactText(error instanceof Error ? error.message : String(error))}`);
     });
   }
-  const leaseDir = process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR ?? join(homedir(), ".pi", "agent", "claude-supervisor", "cwd-leases");
-  assertRuntimeDirectory(stateDir, "state");
-  assertRuntimeDirectory(leaseDir, "lease");
   const events = new EventLog(join(stateDir, "events.jsonl"), { maxBytes: eventLogMaxBytes() });
   const decisionStore = new DecisionSessionStore(join(stateDir, "decision-sessions"));
   const retentionDays = decisionSessionRetentionDays();
@@ -439,6 +466,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           });
           pendingStartSessions.add(session);
           let startupCleanupCompleted = false;
+          let startupCleanupAttempted = false;
           const hookSettingsPath = interactive && !tmuxSession ? join(hookSocketDirectory(stateDir), `settings-${taskId}.json`) : undefined;
           const startOperation = (async () => {
             try {
@@ -565,6 +593,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 if (handle.ownership !== "adopted") {
                   try {
                     await stopSession(session, "cwd lease metadata registration failed");
+                    startupCleanupAttempted = true;
                     startupCleanupCompleted = await releaseLease(taskId);
                   } catch (cleanupError) {
                     const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
@@ -608,13 +637,22 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 sessions.set(failedTaskId, session);
                 reservedCwds.set(failedTaskId, cwdKey);
                 activeTaskId = failedTaskId;
-              } else if (!cleanupRequired && !startupCleanupCompleted) {
+              } else if (!cleanupRequired && !startupCleanupCompleted && !startupCleanupAttempted) {
+                startupCleanupAttempted = true;
                 const released = await releaseLease(taskId);
+                startupCleanupCompleted = released;
                 if (!released && failedTaskId) {
                   sessions.set(failedTaskId, session);
                   reservedCwds.set(failedTaskId, cwdKey);
                   activeTaskId = failedTaskId;
                 }
+              } else if (!cleanupRequired && startupCleanupAttempted && !startupCleanupCompleted && failedTaskId) {
+                // The inner start operation already owns the one cleanup
+                // attempt. Retain the failed session for the shutdown/reap
+                // sweep instead of calling release a second time.
+                sessions.set(failedTaskId, session);
+                reservedCwds.set(failedTaskId, cwdKey);
+                activeTaskId = failedTaskId;
               }
               throw error;
             }
@@ -634,13 +672,19 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
               sessions.set(failedTaskId, session);
               reservedCwds.set(failedTaskId, cwdKey);
               activeTaskId = failedTaskId;
-            } else if (!cleanupRequired && !startupCleanupCompleted) {
+            } else if (!cleanupRequired && !startupCleanupCompleted && !startupCleanupAttempted) {
+              startupCleanupAttempted = true;
               const released = await releaseLease(taskId);
+              startupCleanupCompleted = released;
               if (!released && failedTaskId) {
                 sessions.set(failedTaskId, session);
                 reservedCwds.set(failedTaskId, cwdKey);
                 activeTaskId = failedTaskId;
               }
+            } else if (!cleanupRequired && startupCleanupAttempted && !startupCleanupCompleted && failedTaskId) {
+              sessions.set(failedTaskId, session);
+              reservedCwds.set(failedTaskId, cwdKey);
+              activeTaskId = failedTaskId;
             }
             throw error;
           } finally {
@@ -1190,7 +1234,20 @@ function selectedWorkerEnvironment(automatic = false): NodeJS.ProcessEnv {
 
 async function readTaskSpecFile(path: string, cwd: string): Promise<TaskSpec> {
   const file = resolve(cwd, path.replace(/^['"]|['"]$/gu, ""));
-  const value = JSON.parse(await readFile(file, "utf8")) as unknown;
+  if (typeof fsConstants.O_NOFOLLOW !== "number") throw new Error("secure task specification opening is unavailable");
+  const handle = await open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let contents: Buffer;
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error("task specification is not a regular file");
+    if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error("task specification is owned by another user");
+    if (info.nlink > 1) throw new Error("task specification is a hard-link alias");
+    if (info.size > 1 * 1024 * 1024) throw new Error("task specification exceeds the safe size limit");
+    contents = await handle.readFile();
+  } finally {
+    await handle.close().catch(() => {});
+  }
+  const value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(contents)) as unknown;
   // A spec that omits an autonomy key inherits the operator's environment
   // default for it, the way a plain-text task does.
   return normalizeTaskSpec(value, "", autonomyDefaults());
@@ -1214,6 +1271,8 @@ function assertRuntimeDirectory(path: string, label: string): void {
     mkdirSync(path, { recursive: true, mode: 0o700 });
     const info = lstatSync(path);
     if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`${label} directory is not a real directory`);
+    if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error(`${label} directory is owned by another user`);
+    if (realpathSync.native(path) !== resolve(path)) throw new Error(`${label} directory contains a symlink`);
     chmodSync(path, 0o700);
     accessSync(path, fsConstants.R_OK | fsConstants.W_OK | fsConstants.X_OK);
   } catch (error) {

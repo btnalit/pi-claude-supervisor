@@ -30,10 +30,12 @@ test("automatic Worker environment preserves credentials, helpers and custom set
     GIT_CONFIG_PARAMETERS: "credential.helper=store",
     RANDOM_LOCAL_SETTING: "not-allowlisted",
     CLAUDECODE: "1",
+    PI_CLAUDE_SUPERVISOR_WEBHOOK_SECRET: "supervisor-secret",
   }, {
     PATH: "/bin",
     BASE_ONLY_SETTING: "inherited",
     CLAUDECODE: "parent",
+    PI_CLAUDE_SUPERVISOR_STATE_DIR: "/tmp/supervisor-state",
   });
   assert.equal(result.ANTHROPIC_API_KEY, "provider-key");
   assert.equal(result.CLAUDE_CODE_OAUTH_TOKEN, "oauth-token");
@@ -44,7 +46,7 @@ test("automatic Worker environment preserves credentials, helpers and custom set
   assert.equal(result.GITHUB_ENTERPRISE_TOKEN, "github-enterprise-token");
   assert.equal(result.CODEARTIFACT_AUTH_TOKEN, "registry-token");
   assert.equal(result.HUGGINGFACE_TOKEN, "hub-token");
-  assert.equal(result.GIT_CONFIG_PARAMETERS, "credential.helper=store");
+  assert.equal(result.GIT_CONFIG_PARAMETERS, undefined, "automatic Workers cannot inject Git configuration through the environment");
   assert.equal(result.RANDOM_LOCAL_SETTING, "not-allowlisted");
   assert.equal(result.PATH, "/bin");
   assert.equal(result.BASE_ONLY_SETTING, "inherited");
@@ -52,6 +54,8 @@ test("automatic Worker environment preserves credentials, helpers and custom set
   assert.equal(result.GIT_CONFIG_NOSYSTEM, undefined);
   assert.equal(result.GIT_SSH_COMMAND, undefined);
   assert.equal(result.GIT_TERMINAL_PROMPT, undefined);
+  assert.equal(result.PI_CLAUDE_SUPERVISOR_WEBHOOK_SECRET, undefined);
+  assert.equal(result.PI_CLAUDE_SUPERVISOR_STATE_DIR, undefined);
 });
 
 test("automatic Claude args preserve the full Claude Code argument surface", () => {

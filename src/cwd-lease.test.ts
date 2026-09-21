@@ -687,7 +687,7 @@ test("a corrupt lease record is quarantined and does not block other cwds", asyn
   await rm(root, { recursive: true, force: true });
 });
 
-test("a non-regular lease entry is skipped", async () => {
+test("a non-regular lease entry blocks acquisition", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-nonregular-"));
   const leaseDir = join(root, "leases");
   const cwd = join(root, "repo");
@@ -695,9 +695,11 @@ test("a non-regular lease entry is skipped", async () => {
   await mkdir(cwd);
   await mkdir(join(leaseDir, "weird.json"));
   const store = new CwdLeaseStore(leaseDir);
-  const handle = await store.acquire(cwd, "50000000-0000-4000-8000-000000000001", "process-pipe");
+  await assert.rejects(
+    () => store.acquire(cwd, "50000000-0000-4000-8000-000000000001", "process-pipe"),
+    /non-regular entry/u,
+  );
   await access(join(leaseDir, "weird.json"));
-  await handle.release();
   await rm(root, { recursive: true, force: true });
 });
 

@@ -4,7 +4,7 @@ import { createConnection } from "node:net";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readlink, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { hookSocketDirectory, HookServer } from "./server.ts";
 import type { ClaudeHookEvent, HookRelayReply, HookRelayRequest } from "./types.ts";
 
@@ -71,6 +71,8 @@ test("a deep state directory still yields a connectable socket (unix sun_path li
   await server.listen();
   try {
     assert.ok(Buffer.byteLength(server.socketPath ?? "") <= 100);
+    assert.equal((await stat(dirname(server.socketPath!))).mode & 0o077, 0, "hook socket directory must be private");
+    assert.equal((await lstat(server.socketPath!)).mode & 0o077, 0, "hook socket must be private");
     const cwd = await mkdtemp(join(tmpdir(), "pi-cs-cwd-"));
     const unsubscribe = await server.subscribe(cwd, async () => ({ permissionDecision: "deny", permissionDecisionReason: "deep" }));
     try {
@@ -175,6 +177,23 @@ test("subscribe creates a by-cwd symlink and unsubscribe removes it", async () =
       assert.equal(link, server.socketPath);
       await unsubscribe();
       await assert.rejects(() => lstat(linkPath), /ENOENT/);
+    });
+  });
+});
+
+test("concurrent takeover and unsubscribe preserve the successor cwd route", async () => {
+  await withServer(async (server) => {
+    await withTempCwd(async (cwd) => {
+      const [unsubscribeOld, unsubscribeNew] = await Promise.all([
+        server.subscribe(cwd, async () => ({ permissionDecision: "deny" })),
+        server.subscribe(cwd, async () => ({ permissionDecision: "allow" })),
+      ]);
+      const event = JSON.stringify(request(cwd));
+      assert.equal(JSON.parse((await send(server.socketPath!, event)).reply).permissionDecision, "allow");
+      await unsubscribeOld();
+      assert.equal(JSON.parse((await send(server.socketPath!, event)).reply).permissionDecision, "allow");
+      await unsubscribeNew();
+      await assert.rejects(() => lstat(byCwdPath(server.directory, cwd)), /ENOENT/);
     });
   });
 });

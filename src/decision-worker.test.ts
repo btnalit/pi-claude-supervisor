@@ -333,6 +333,26 @@ test("event prompts are compact even when the underlying event payload is large"
   await worker.close();
 });
 
+test("a permission decision must bind to the request in its event", async () => {
+  const mismatched = JSON.stringify({ action: "allow_permission", requestId: "perm-other", toolUseId: "tool-other", reason: "wrong request" });
+  const { session } = createFakeSession([
+    { stopReason: "stop", text: "ack" },
+    { stopReason: "stop", text: mismatched },
+    { stopReason: "stop", text: mismatched },
+  ]);
+  const actions: DecisionAction[] = [];
+  const worker = new PiDecisionWorker(baseOptions({
+    onAction: (action) => { actions.push(action); },
+    sessionFactory: async () => ({ session }),
+  }));
+  await worker.start();
+  worker.notify(permissionRequestEvent("Bash", { command: "printf ok" }));
+  while (actions.length === 0) await flush();
+  assert.equal(actions[0]?.action, "park");
+  assert.match(actions[0]?.reason ?? "", /does not match the current request/u);
+  await worker.close();
+});
+
 test("a large turn_completed result is bounded to a compact tail", async () => {
   const largeResult = "y".repeat(50 * 1024);
   const { session, prompts } = createFakeSession([

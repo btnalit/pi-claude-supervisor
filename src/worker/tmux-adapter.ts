@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
+import { TextDecoder } from "node:util";
 import { constants as fsConstants, lstatSync, readdirSync, unlinkSync } from "node:fs";
-import { access, chmod, lstat, mkdir, open, readdir, readFile, realpath, rm, rmdir, stat, truncate, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, open, readdir, readFile, realpath, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type {
   PermissionDecision,
   WorkerAdapter,
@@ -18,8 +19,8 @@ import type { ClaudeHookEvent, HookEventSource, HookRelayReply, HookRelayRequest
 import { HOOK_TIMEOUT_SECONDS } from "../hooks/types.ts";
 import { assertSafeWorkerCommand, sameDirectory, shellQuote } from "../policy.ts";
 import { redactSensitive } from "../redaction.ts";
-import { automaticWorkerEnvironment, claudeConfigDir, workerEnvironment } from "./environment.ts";
-import { claudeJsonlArgs, cleanupCgroup, currentCgroupPath, preflightCgroupContainment } from "./process-adapter.ts";
+import { automaticWorkerEnvironment, claudeConfigDir, trustedAbsoluteExecutablePath, trustedExecutablePath, workerEnvironment } from "./environment.ts";
+import { assertCgroupDirectory, claudeJsonlArgs, cleanupCgroup, currentCgroupPath, preflightCgroupContainment } from "./process-adapter.ts";
 import { isClaudeLauncherProcess, readProcess, type ProcessTreeEntry } from "./process-tree.ts";
 import { nodeScriptCommand } from "./runtime.ts";
 
@@ -53,6 +54,8 @@ interface TmuxRecord {
   outputBytes: number;
   outputTruncated: boolean;
   structured: boolean;
+  /** Keeps multibyte PTY characters intact and rejects malformed output. */
+  outputDecoder: TextDecoder;
   eventBuffer: string;
   seenResultIds: Set<string>;
   seenPermissionRequestIds: Set<string>;
@@ -134,7 +137,9 @@ interface TmuxRecord {
   sessionStartReceived: boolean;
   /** Messages the adapter itself pasted, awaiting UserPromptSubmit acknowledgement. */
   pendingSentMessages: string[];
-  pendingPermissionRequests: Map<string, { phase: "pre" | "prompt"; resolve: (reply: HookRelayReply) => void }>;
+  pendingPermissionRequests: Map<string, { phase: "pre" | "prompt"; fingerprint?: string; resolve: (reply: HookRelayReply) => void }>;
+  /** Per-worker capability carried by the relay, when this launch supplied one. */
+  hookCapability?: string;
   /** Hook requests that did not bind to this pane's identity, for diagnostics. */
   ignoredHookRequests: number;
 }
@@ -154,6 +159,7 @@ const BRIDGE_KEYS = {
 const BRIDGE_EVENT_START = "\u001bPPI_CLAUDE_SUPERVISOR_EVENT;";
 const BRIDGE_INPUT_START = "\u001bPPI_CLAUDE_SUPERVISOR_INPUT;";
 const BRIDGE_EVENT_END = "\u001b\\";
+const BRIDGE_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 /**
  * A single process in the tmux pane owns both the interactive display and the
@@ -176,6 +182,7 @@ setInterval(() => {}, 10_000).unref();
 
 const TMUX_BRIDGE_SCRIPT = `
 const { randomBytes } = require("node:crypto");
+const { TextDecoder } = require("node:util");
 const { spawn } = require("node:child_process");
 const { readFileSync, writeFileSync } = require("node:fs");
 const { dirname, join, resolve } = require("node:path");
@@ -214,6 +221,12 @@ if (cgroup) {
 // bridge, even if it reaches the replacement pane after the PID check.
 const bridgeGeneration = randomBytes(32).toString("hex");
 const supervisorControlPrefix = "@pi:control ";
+const supervisorChunkPrefix = "@pi:chunk ";
+const supervisorChunks = new Map();
+const MAX_SUPERVISOR_CHUNKS = 4096;
+const MAX_SUPERVISOR_CHUNK_BYTES = 2 * 1024 * 1024;
+const MAX_SUPERVISOR_BUFFER_BYTES = 4 * 1024 * 1024;
+const MAX_CLAUDE_LINE_BYTES = 2 * 1024 * 1024;
 writeEvent({ type: "bridge_generation", generation: bridgeGeneration });
 const prompt = () => output("\\n> ");
 const decodeLine = (value) => Buffer.from(value, "base64").toString("utf8");
@@ -348,24 +361,57 @@ const processLine = (line) => {
   writeEvent(record);
   render(record);
 };
-child.stdout.setEncoding("utf8");
+const stdoutDecoder = new TextDecoder("utf-8", { fatal: true });
+const stderrDecoder = new TextDecoder("utf-8", { fatal: true });
+let invalidUtf8 = false;
+const failInvalidUtf8 = (label, error) => {
+  if (invalidUtf8) return;
+  invalidUtf8 = true;
+  writeEvent({ type: "bridge_exit", code: 125, error: label + ": " + (error instanceof Error ? error.message : String(error)) });
+  try { child.kill("SIGTERM"); } catch {}
+};
 child.stdout.on("data", (chunk) => {
-  stdoutBuffer += String(chunk);
+  let decoded;
+  try { decoded = stdoutDecoder.decode(chunk, { stream: true }); }
+  catch (error) { failInvalidUtf8("Claude JSONL output was not valid UTF-8", error); return; }
+  stdoutBuffer += decoded;
+  if (Buffer.byteLength(stdoutBuffer, "utf8") > MAX_CLAUDE_LINE_BYTES) {
+    stdoutBuffer = "";
+    writeEvent({ type: "bridge_exit", code: 125, error: "Claude JSONL output line exceeded the safety bound" });
+    try { child.kill("SIGTERM"); } catch {}
+    return;
+  }
   let newline;
   while ((newline = stdoutBuffer.indexOf("\\n")) >= 0) {
-    processLine(stdoutBuffer.slice(0, newline).replace(/\\r$/u, ""));
+    const line = stdoutBuffer.slice(0, newline).replace(/\\r$/u, "");
     stdoutBuffer = stdoutBuffer.slice(newline + 1);
+    if (Buffer.byteLength(line, "utf8") > MAX_CLAUDE_LINE_BYTES) {
+      writeEvent({ type: "bridge_exit", code: 125, error: "Claude JSONL output line exceeded the safety bound" });
+      try { child.kill("SIGTERM"); } catch {}
+      return;
+    }
+    processLine(line);
   }
 });
-child.stderr.setEncoding("utf8");
-child.stderr.on("data", (chunk) => output("\\n[claude stderr] " + String(chunk)));
+child.stderr.on("data", (chunk) => {
+  try { output("\\n[claude stderr] " + stderrDecoder.decode(chunk, { stream: true })); }
+  catch (error) { failInvalidUtf8("Claude stderr was not valid UTF-8", error); }
+});
 child.once("error", (error) => {
   writeEvent({ type: "bridge_exit", code: 127, error: error.message });
   process.exit(127);
 });
 child.once("exit", (code, signal) => {
-  if (stdoutBuffer.trim()) processLine(stdoutBuffer.trim());
-  writeEvent({ type: "bridge_exit", code, signal });
+  try {
+    const tail = stdoutDecoder.decode();
+    stdoutBuffer += tail;
+    const stderrTail = stderrDecoder.decode();
+    if (stderrTail) output("\\n[claude stderr] " + stderrTail);
+  } catch (error) {
+    failInvalidUtf8("Claude output ended with incomplete UTF-8", error);
+  }
+  if (!invalidUtf8 && stdoutBuffer.trim()) processLine(stdoutBuffer.trim());
+  if (!invalidUtf8) writeEvent({ type: "bridge_exit", code, signal });
   output("\\n[Claude exited " + String(code === null ? signal : code) + "]\\n");
   process.exit(code ?? 1);
 });
@@ -386,6 +432,47 @@ const forwardSupervisorCommand = (commandLine) => {
   }
   output("\\n[invalid Supervisor control command]\\n");
 };
+const rejectSupervisorChunks = (chunkId) => {
+  if (chunkId) supervisorChunks.delete(chunkId);
+  output("\\n[invalid Supervisor input chunks rejected]\\n");
+};
+const forwardSupervisorChunk = (line) => {
+  const fields = line.slice(supervisorChunkPrefix.length).split(" ");
+  if (fields.length !== 4) return rejectSupervisorChunks();
+  const [chunkId, indexText, totalText, payload] = fields;
+  const index = Number(indexText);
+  const total = Number(totalText);
+  if (!/^[A-Za-z0-9_-]{1,64}$/u.test(chunkId) || !Number.isSafeInteger(index) || !Number.isSafeInteger(total)
+    || total < 1 || total > MAX_SUPERVISOR_CHUNKS || index < 0 || index >= total
+    || !/^[A-Za-z0-9+/]*={0,2}$/u.test(payload) || payload.length === 0) return rejectSupervisorChunks(chunkId);
+  let state = supervisorChunks.get(chunkId);
+  if (index === 0) {
+    if (state) return rejectSupervisorChunks(chunkId);
+    state = { total, next: 0, parts: [], bytes: 0 };
+    supervisorChunks.set(chunkId, state);
+  }
+  if (!state || state.total !== total || state.next !== index) return rejectSupervisorChunks(chunkId);
+  state.parts.push(payload);
+  state.next += 1;
+  state.bytes += payload.length;
+  const bufferedBytes = Array.from(supervisorChunks.values()).reduce((sum, pending) => sum + pending.bytes, 0);
+  if (state.bytes > MAX_SUPERVISOR_CHUNK_BYTES * 2 || bufferedBytes > MAX_SUPERVISOR_BUFFER_BYTES) {
+    supervisorChunks.clear();
+    return rejectSupervisorChunks(chunkId);
+  }
+  if (state.next !== total) return;
+  supervisorChunks.delete(chunkId);
+  try {
+    const encoded = state.parts.join("");
+    if (encoded.length % 4 !== 0) throw new Error("invalid base64 length");
+    const decoded = Buffer.from(encoded, "base64");
+    if (decoded.byteLength > MAX_SUPERVISOR_CHUNK_BYTES) throw new Error("Supervisor input is too large");
+    const commandLine = new TextDecoder("utf-8", { fatal: true }).decode(decoded);
+    forwardSupervisorCommand(commandLine);
+  } catch {
+    rejectSupervisorChunks(chunkId);
+  }
+};
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 input.on("line", (line) => {
   if (line.startsWith(supervisorControlPrefix)) {
@@ -397,7 +484,11 @@ input.on("line", (line) => {
       output("\\n[stale Supervisor input rejected]\\n");
       return;
     }
-    forwardSupervisorCommand(commandLine);
+    if (commandLine.startsWith(supervisorChunkPrefix)) {
+      forwardSupervisorChunk(commandLine);
+    } else {
+      forwardSupervisorCommand(commandLine);
+    }
     return;
   }
   if (!line.trim()) return;
@@ -417,6 +508,7 @@ const GUARDIAN_KEYS = {
   parentStart: "PI_CLAUDE_SUPERVISOR_TMUX_PARENT_START",
 } as const;
 
+const HOOK_CAPABILITY_KEY = "PI_CLAUDE_SUPERVISOR_HOOK_CAPABILITY";
 const INTERACTIVE_KEYS = {
   ...BRIDGE_KEYS,
   settings: "PI_CLAUDE_SUPERVISOR_TMUX_SETTINGS",
@@ -500,7 +592,7 @@ const timer = setInterval(() => {
           return;
         }
       }
-      setTimeout(reap, 50).unref();
+      setTimeout(reap, 50);
     };
     reap();
   } else process.exit(0);
@@ -525,6 +617,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   readonly #records = new Map<string, TmuxRecord>();
   readonly #stateDir: string;
   readonly #tmuxBinary: string;
+  #trustedTmuxBinary?: string;
   readonly #startupTimeoutMs: number;
   readonly #pollIntervalMs: number;
   readonly #terminationGraceMs: number;
@@ -550,7 +643,9 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     await assertDirectory(input.cwd);
     if (process.platform !== "linux") throw new Error("tmux supervision currently requires Linux process identity and cleanup support");
     await assertExecutableAvailable(input.command, input.env?.PATH ?? process.env.PATH);
-    await assertExecutableAvailable(this.#tmuxBinary, process.env.PATH);
+    this.#trustedTmuxBinary = this.#tmuxBinary.includes("/") || this.#tmuxBinary.includes("\\")
+      ? await trustedAbsoluteExecutablePath(this.#tmuxBinary)
+      : await trustedExecutablePath(this.#tmuxBinary);
     if (input.automatic) {
       if (process.platform !== "linux") throw new Error("automatic tmux supervision requires Linux cgroup v2 and a parent-death guardian");
       if (this.#cgroupMode === "off") throw new Error("automatic tmux supervision requires cgroup containment");
@@ -561,6 +656,8 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     await mkdir(this.#stateDir, { recursive: true, mode: 0o700 });
     const stateInfo = await lstat(this.#stateDir);
     if (!stateInfo.isDirectory() || stateInfo.isSymbolicLink()) throw new Error(`tmux state directory is not a real directory: ${this.#stateDir}`);
+    if (typeof process.getuid === "function" && stateInfo.uid !== process.getuid()) throw new Error(`tmux state directory is owned by another user: ${this.#stateDir}`);
+    if (await realpath(this.#stateDir) !== this.#stateDir) throw new Error(`tmux state directory contains a symlink: ${this.#stateDir}`);
     await chmod(this.#stateDir, 0o700);
   }
 
@@ -577,6 +674,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   }
 
   async start(input: WorkerStartInput): Promise<WorkerHandle> {
+    await this.preflight(input);
     const id = randomUUID();
     const owned = !input.tmuxSession;
     const interactive = Boolean(input.automatic && input.interactive);
@@ -620,6 +718,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       outputBytes: 0,
       outputTruncated: false,
       structured,
+      outputDecoder: new TextDecoder("utf-8", { fatal: true }),
       eventBuffer: "",
       seenResultIds: new Set(),
       seenPermissionRequestIds: new Set(),
@@ -641,6 +740,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       released: false,
       cleanupComplete: false,
       interactive,
+      hookCapability: interactive && owned ? (input.hookCapability ?? randomUUID()) : input.hookCapability,
       sessionStartReceived: false,
       pendingSentMessages: [],
       pendingPermissionRequests: new Map(),
@@ -657,8 +757,18 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     let cgroupIdentityPersisted = false;
 
     try {
+      await mkdir(dirname(runtimeDir), { recursive: true, mode: 0o700 });
+      const runtimeParentInfo = await lstat(dirname(runtimeDir));
+      if (!runtimeParentInfo.isDirectory() || runtimeParentInfo.isSymbolicLink()) throw new Error(`tmux runtime parent is not a real directory: ${dirname(runtimeDir)}`);
+      if (typeof process.getuid === "function" && runtimeParentInfo.uid !== process.getuid()) throw new Error(`tmux runtime parent is owned by another user: ${dirname(runtimeDir)}`);
+      if (await realpath(dirname(runtimeDir)) !== dirname(runtimeDir)) throw new Error(`tmux runtime parent contains a symlink: ${dirname(runtimeDir)}`);
       await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
-      await writeFile(logPath, "", { mode: 0o600 });
+      const runtimeInfo = await lstat(runtimeDir);
+      if (!runtimeInfo.isDirectory() || runtimeInfo.isSymbolicLink()) throw new Error(`tmux runtime directory is not a real directory: ${runtimeDir}`);
+      if (typeof process.getuid === "function" && runtimeInfo.uid !== process.getuid()) throw new Error(`tmux runtime directory is owned by another user: ${runtimeDir}`);
+      if (await realpath(runtimeDir) !== runtimeDir) throw new Error(`tmux runtime directory contains a symlink: ${runtimeDir}`);
+      await chmod(runtimeDir, 0o700);
+      await writeFile(logPath, "", { mode: 0o600, flag: "wx" });
       if ((structured || interactive) && owned) {
         handle.cgroupPath = await this.#plannedCgroupPath(id);
         if (input.retainCgroupUntilLeaseRelease) handle.retainCgroupUntilLeaseRelease = true;
@@ -694,7 +804,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         const bridgeEnv = structured
           ? bridgeEnvironment(env, input.cwd, input.command, workerArgs, record.cgroupPath)
           : interactive
-            ? bridgeEnvironment(env, input.cwd, input.command, workerArgs, record.cgroupPath, input.hookSettingsPath)
+            ? bridgeEnvironment(env, input.cwd, input.command, workerArgs, record.cgroupPath, input.hookSettingsPath, record.hookCapability)
             : env;
         // Arm the guardian before creating the session. If the Supervisor dies
         // in the tmux startup window, the guardian removes any server created
@@ -706,7 +816,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         const paneBootstrap = [nodeScriptCommand(), "-e", TMUX_PANE_BOOTSTRAP_SCRIPT];
         await this.#run(record, ["new-session", "-d", "-s", sessionName, "-x", "140", "-y", "40", "-c", input.cwd, "--", ...paneBootstrap], undefined, bridgeEnv);
         record.sessionCreated = true;
-        if (interactive) record.hookUnsubscribe = await input.hookSource!.subscribe(input.cwd, (request) => this.#handleHookRequest(record, request));
+        if (interactive) record.hookUnsubscribe = await input.hookSource!.subscribe(input.cwd, (request) => this.#handleHookRequest(record, request), { capability: record.hookCapability });
         await this.#rememberServerIdentity(record);
         // Persist the server identity while pendingStartup is still present;
         // a crash before the final pre-spawn callback can then use normal
@@ -737,7 +847,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       } else {
         await this.#assertExistingSession(record, input.cwd, input.approval);
         await this.#rememberServerIdentity(record);
-        if (interactive) record.hookUnsubscribe = await input.hookSource!.subscribe(input.cwd, (request) => this.#handleHookRequest(record, request));
+        if (interactive) record.hookUnsubscribe = await input.hookSource!.subscribe(input.cwd, (request) => this.#handleHookRequest(record, request), { capability: record.hookCapability });
         const pipe = await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_pipe}"]);
         if (pipe.stdout.trim() === "1") throw new Error("cannot adopt a tmux pane that already has an output pipe");
         await this.#attachPipe(record);
@@ -881,8 +991,20 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   async restoreOutput(handle: WorkerHandle, chunks: WorkerOutputChunk[]): Promise<void> {
     const record = this.#record(handle);
     await this.#withOutputLock(record, async () => {
-      record.output.unshift(...chunks);
-      record.outputBytes += chunks.reduce((total, chunk) => total + Buffer.byteLength(chunk.text, "utf8"), 0);
+      const restored: WorkerOutputChunk[] = [];
+      for (const chunk of chunks) {
+        if (!chunk || typeof chunk.text !== "string" || typeof chunk.stream !== "string" || typeof chunk.at !== "string") continue;
+        const text = Buffer.byteLength(chunk.text, "utf8") > this.#maxOutputBytes ? utf8Tail(chunk.text, this.#maxOutputBytes) : chunk.text;
+        restored.push({ ...chunk, text });
+        record.outputBytes += Buffer.byteLength(text, "utf8");
+      }
+      record.output.unshift(...restored);
+      while (record.outputBytes > this.#maxOutputBytes) {
+        const removed = record.output.pop();
+        if (!removed) break;
+        record.outputBytes -= Buffer.byteLength(removed.text, "utf8");
+        record.outputTruncated = true;
+      }
     });
   }
 
@@ -937,7 +1059,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     if (pane.dead) throw new Error("cannot pause a dead tmux pane");
     await this.#rememberPaneIdentity(record, pane.pid);
     if (!pane.pid) throw new Error("tmux worker pane pid is unavailable");
-    signalProcessGroup(pane.pid, "SIGSTOP");
+    await signalProcessGroup(pane.pid, record.paneStartTime, record.paneCommand, "SIGSTOP");
   }
 
   async resume(handle: WorkerHandle): Promise<void> {
@@ -947,7 +1069,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     if (pane.dead) throw new Error("cannot resume a dead tmux pane");
     await this.#rememberPaneIdentity(record, pane.pid);
     if (!pane.pid) throw new Error("tmux worker pane pid is unavailable");
-    signalProcessGroup(pane.pid, "SIGCONT");
+    await signalProcessGroup(pane.pid, record.paneStartTime, record.paneCommand, "SIGCONT");
   }
 
   async stop(handle: WorkerHandle, _reason: string): Promise<void> {
@@ -1159,8 +1281,30 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
 
   async #sendLine(record: TmuxRecord, line: string): Promise<void> {
     const safeLine = safeTmuxMessage(line);
+    if (!record.bridgeGeneration) throw new Error("tmux bridge generation is not established for control input");
+    // Linux's PTY line discipline caps a single canonical input line at about
+    // 4 KiB. Send a base64-framed Supervisor command as several short lines so
+    // a large task or permission payload cannot be silently truncated in the
+    // pane before the bridge sees it.
+    const controlPrefix = `@pi:control ${record.bridgeGeneration} `;
+    if (!safeLine.startsWith(controlPrefix)) throw new Error("tmux bridge control frame has an invalid generation prefix");
+    const encoded = Buffer.from(safeLine.slice(controlPrefix.length), "utf8").toString("base64");
+    const chunkSize = 1_800;
+    if (encoded.length > chunkSize) {
+      const chunkId = randomUUID().replaceAll("-", "");
+      const total = Math.ceil(encoded.length / chunkSize);
+      if (total > 4_096) throw new Error("tmux bridge input is too large to deliver safely");
+      for (let index = 0; index < total; index += 1) {
+        await this.#sendPhysicalLine(record, `${supervisorChunkLinePrefix(record.bridgeGeneration, chunkId, index, total)}${encoded.slice(index * chunkSize, (index + 1) * chunkSize)}`);
+      }
+      return;
+    }
+    await this.#sendPhysicalLine(record, safeLine);
+  }
+
+  async #sendPhysicalLine(record: TmuxRecord, line: string): Promise<void> {
     const bufferName = `pi-cs-${record.handle.id}`;
-    await this.#run(record, ["load-buffer", "-b", bufferName, "-"], safeLine);
+    await this.#run(record, ["load-buffer", "-b", bufferName, "-"], line);
     // A pane can be respawned between any two tmux commands. Check again
     // immediately before each command that delivers the buffered line.
     await this.#assertControlPaneIdentity(record);
@@ -1214,6 +1358,32 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       }
       if (pane.exitCode !== undefined) record.exitCode = pane.exitCode;
       if (pane.dead) {
+        // `respawn-pane -k` briefly exposes a dead pane while tmux replaces
+        // the process. Do not tear down the private server on that transient
+        // observation: a queued control response still needs to reach the
+        // identity check, which must reject a replacement rather than race a
+        // Supervisor-owned cleanup. A second dead read is the exit proof.
+        await delay(Math.max(25, this.#pollIntervalMs));
+        let replacement: TmuxPaneStatus;
+        try {
+          replacement = await this.#paneStatus(record);
+        } catch (error) {
+          if (isMissingSession(error)) {
+            await this.#cleanup(record, false);
+            this.#emit(record, { type: "exited", handle: record.handle, exitCode: record.exitCode, signal: record.signal });
+            return;
+          }
+          throw error;
+        }
+        if (!replacement.dead) {
+          record.paneDead = false;
+          record.panePid = replacement.pid;
+          if (replacement.pid) record.handle.pid = replacement.pid;
+          if (replacement.exitCode !== undefined) record.exitCode = replacement.exitCode;
+          try { await this.#rememberPaneIdentity(record, replacement.pid); }
+          catch (error) { if (isPaneIdentityError(error)) record.cleanupError = asError(error); else throw error; }
+          return;
+        }
         await this.#cleanup(record, false);
         this.#emit(record, { type: "exited", handle: record.handle, exitCode: record.exitCode, signal: record.signal });
         return;
@@ -1394,6 +1564,8 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     record.claudePid = claudePid;
     record.claudeStartTime = claudeStartTime;
     record.claudeConfigDir = await processConfigDir(claudePid);
+    if (record.interactive && !record.hookCapability) record.hookCapability = await processEnvironmentValue(claudePid, HOOK_CAPABILITY_KEY);
+    if (record.interactive && !record.hookCapability) throw new Error("automatic interactive tmux adoption requires a Supervisor hook capability in the Claude process");
     if (expected?.startTime && record.paneStartTime !== expected.startTime) throw new Error("tmux pane process start time changed; refusing identity-unverified handoff");
     if (expected?.paneStartTime && record.paneStartTime !== expected.paneStartTime) throw new Error("tmux pane identity changed; refusing identity-unverified handoff");
     if (expected?.paneCommand && record.paneCommand !== expected.paneCommand) throw new Error("tmux pane command changed; refusing identity-unverified handoff");
@@ -1491,8 +1663,9 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       const closeParen = statText.lastIndexOf(")");
       const fields = closeParen >= 0 ? statText.slice(closeParen + 2).trim().split(/\s+/u) : [];
       const startTime = fields[19];
+      const pgid = Number(fields[2]);
       const command = (await readFile(`/proc/${pid}/comm`, "utf8")).trim();
-      if (!startTime) throw new Error(`cannot identify tmux pane pid ${pid}`);
+      if (!startTime || pgid !== pid) throw new Error(`cannot identify tmux pane process group ${pid}`);
       if (record.paneStartTime && (record.paneStartTime !== startTime || record.paneCommand !== command)) {
         throw new Error("tmux pane identity changed; refusing to control a replacement process");
       }
@@ -1508,12 +1681,23 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
 
   async #plannedCgroupPath(id: string): Promise<string> {
     const parent = await currentCgroupPath();
+    await assertCgroupDirectory(parent);
     return `${parent}/pi-claude-supervisor-tmux-${id}`;
   }
 
   async #createCgroup(id: string, plannedPath?: string): Promise<string> {
     const path = plannedPath ?? await this.#plannedCgroupPath(id);
+    if (basename(resolve(path)) !== `pi-claude-supervisor-tmux-${id}`) throw new Error("tmux cgroup identity has an unexpected name");
+    await assertCgroupDirectory(dirname(resolve(path)));
     await mkdir(path);
+    try {
+      await access(join(path, "cgroup.procs"), fsConstants.R_OK | fsConstants.W_OK);
+      await access(join(path, "cgroup.events"), fsConstants.R_OK);
+      await access(join(path, "cgroup.kill"), fsConstants.W_OK);
+    } catch (error) {
+      await rmdir(path).catch(() => {});
+      throw new Error(`tmux cgroup controls are unavailable: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+    }
     return path;
   }
 
@@ -1579,7 +1763,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     const encode = (value: string) => Buffer.from(value, "utf8").toString("base64");
     const env: NodeJS.ProcessEnv = {
       PATH: process.env.PATH ?? "",
-      [GUARDIAN_KEYS.tmux]: encode(this.#tmuxBinary),
+      [GUARDIAN_KEYS.tmux]: encode(this.#trustedTmuxBinary ?? this.#tmuxBinary),
       [GUARDIAN_KEYS.socket]: encode(socketPath),
       [GUARDIAN_KEYS.session]: encode(record.sessionName),
       [GUARDIAN_KEYS.cgroup]: encode(record.cgroupPath ?? ""),
@@ -1725,14 +1909,14 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       await this.#markReplacement(record, pid);
       return;
     }
-    signalProcessGroup(pid, "SIGTERM");
+    await signalProcessGroup(pid, record.paneStartTime, record.paneCommand, "SIGTERM");
     for (let attempt = 0; attempt < 10 && isPidAlive(pid); attempt += 1) await delay(50);
     if (isPidAlive(pid) && !(await isZombie(pid))) {
       if (!(await sameProcess(record, pid))) {
         await this.#markReplacement(record, pid);
         return;
       }
-      signalProcessGroup(pid, "SIGKILL");
+      await signalProcessGroup(pid, record.paneStartTime, record.paneCommand, "SIGKILL");
     }
     for (let attempt = 0; attempt < 10 && isPidAlive(pid); attempt += 1) await delay(50);
     if (isPidAlive(pid) && !(await isZombie(pid))) {
@@ -1766,7 +1950,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     const tmuxArgs = record.socketPath
       ? [...((record.structured || record.interactive) ? ["-f", "/dev/null"] : []), "-S", record.socketPath, ...args]
       : args;
-    const result = await runCommand(this.#tmuxBinary, tmuxArgs, input, env, this.#commandTimeoutMs);
+    const result = await runCommand(this.#trustedTmuxBinary ?? this.#tmuxBinary, tmuxArgs, input, env, this.#commandTimeoutMs);
     if (record.abortRequested && !ignoreAbort) throw new Error("tmux worker startup was aborted");
     return result;
   }
@@ -1781,7 +1965,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     for (let attempt = 0; attempt < 20 && stableReads < 2; attempt += 1) {
       await this.#collectOutput(record);
       try {
-        const size = (await stat(record.logPath)).size;
+        const info = await lstat(record.logPath);
+        assertOwnedLogFile(info);
+        if (!info.isFile() || info.isSymbolicLink()) throw new Error("tmux worker log is not a regular file");
+        const size = info.size;
         stableReads = size === previousSize ? stableReads + 1 : 0;
         previousSize = size;
       } catch (error) {
@@ -1794,27 +1981,41 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
 
   async #collectOutputUnlocked(record: TmuxRecord): Promise<WorkerOutputChunk[]> {
     try {
-      const initial = await stat(record.logPath);
+      const initial = await lstat(record.logPath);
+      assertOwnedLogFile(initial);
+      if (!initial.isFile() || initial.isSymbolicLink()) throw new Error("tmux worker log is not a regular file");
       if (initial.size > this.#maxLogBytes) {
-        await truncate(record.logPath, 0);
+        await truncateRegular(record.logPath, initial);
         record.outputOffset = 0;
+        record.outputDecoder = new TextDecoder("utf-8", { fatal: true });
         record.outputTruncated = true;
       }
-      const snapshot = await stat(record.logPath);
-      if (record.outputOffset > snapshot.size) record.outputOffset = 0;
+      const snapshot = await lstat(record.logPath);
+      assertOwnedLogFile(snapshot);
+      if (!snapshot.isFile() || snapshot.isSymbolicLink()) throw new Error("tmux worker log is not a regular file");
+      assertSameLogIdentity(initial, snapshot);
+      if (record.outputOffset > snapshot.size) {
+        record.outputOffset = 0;
+        record.outputDecoder = new TextDecoder("utf-8", { fatal: true });
+      }
       const start = Math.max(record.outputOffset, snapshot.size - this.#maxLogBytes);
       if (start > record.outputOffset) {
         record.outputOffset = start;
+        record.outputDecoder = new TextDecoder("utf-8", { fatal: true });
         record.outputTruncated = true;
       }
       const length = snapshot.size - start;
       if (length > 0) {
-        const file = await open(record.logPath, "r");
+        const file = await open(record.logPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
         try {
+          const fileInfo = await file.stat();
+          assertOwnedLogFile(fileInfo);
+          if (!fileInfo.isFile() || fileInfo.isSymbolicLink()) throw new Error("tmux worker log is not a regular file");
+          assertSameLogIdentity(snapshot, fileInfo);
           const buffer = Buffer.alloc(length);
           const { bytesRead } = await file.read(buffer, 0, length, start);
           if (bytesRead > 0) {
-            const rawText = buffer.subarray(0, bytesRead).toString("utf8");
+            const rawText = record.outputDecoder.decode(buffer.subarray(0, bytesRead), { stream: true });
             record.outputOffset = start + bytesRead;
             record.lastOutputAt = new Date().toISOString();
             const text = record.structured ? this.#consumeBridgeStream(record, rawText) : rawText;
@@ -1824,12 +2025,17 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
           await file.close();
         }
       }
-      const after = await stat(record.logPath);
+      const after = await lstat(record.logPath);
+      assertOwnedLogFile(after);
+      if (!after.isFile() || after.isSymbolicLink()) throw new Error("tmux worker log is not a regular file");
+      assertSameLogIdentity(snapshot, after);
       if (after.size > this.#maxLogBytes) {
-        await truncate(record.logPath, 0);
+        await truncateRegular(record.logPath, after);
         record.outputOffset = 0;
+        record.outputDecoder = new TextDecoder("utf-8", { fatal: true });
         record.outputTruncated = true;
       }
+      if (record.exitCode !== undefined) record.outputDecoder.decode();
     } catch (error) {
       if (!isMissingFile(error)) throw error;
     }
@@ -1871,7 +2077,8 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       record.eventBuffer = record.eventBuffer.slice(end + BRIDGE_EVENT_END.length);
       if (!candidate.structured) continue;
       try {
-        const parsed = JSON.parse(Buffer.from(payload, "base64").toString("utf8")) as unknown;
+        if (payload.length > Math.ceil(this.#maxLogBytes * 4 / 3) || payload.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/u.test(payload)) throw new Error("invalid tmux bridge frame encoding");
+        const parsed = JSON.parse(BRIDGE_UTF8_DECODER.decode(Buffer.from(payload, "base64"))) as unknown;
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) this.#handleStructuredEvent(record, parsed as Record<string, unknown>);
       } catch {
         record.outputTruncated = true;
@@ -1936,7 +2143,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   #appendOutput(record: TmuxRecord, chunk: WorkerOutputChunk): void {
     let text = chunk.text;
     if (Buffer.byteLength(text, "utf8") > this.#maxOutputBytes) {
-      text = Buffer.from(text, "utf8").subarray(-this.#maxOutputBytes).toString("utf8");
+      text = utf8Tail(text, this.#maxOutputBytes);
       record.outputTruncated = true;
     }
     record.output.push({ ...chunk, text });
@@ -1973,11 +2180,21 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   }
 
   async #bindsToRecord(record: TmuxRecord, request: HookRelayRequest): Promise<boolean> {
-    // The relay's ppid is kernel-provided and cannot be forged by another
-    // same-uid process, so descent from the pane's Claude (or its launcher) is
-    // the binding proof. claudePid (pinned by #assertExistingSession recovery)
-    // is the verified Claude process itself; panePid is the pane's occupant,
-    // which may be a launcher one or more hops above Claude in the chain.
+    // A capability is generated for Supervisor-owned interactive launches and
+    // is copied only into that Claude process's hook environment. It is an
+    // additional task binding, not a replacement for process identity.
+    if (record.hookCapability !== undefined && request.capability !== record.hookCapability) return false;
+    // A bound process may report a child cwd after `cd`, but it must remain
+    // inside the leased task root. Do this check at the adapter boundary too;
+    // the socket route is discovery, not an authorization decision.
+    const expectedCwd = await realpath(record.handle.cwd).catch(() => resolve(record.handle.cwd));
+    const eventCwd = await realpath(request.event.cwd).catch(() => resolve(request.event.cwd));
+    const relativeCwd = relative(expectedCwd, eventCwd);
+    if (relativeCwd !== "" && (relativeCwd.startsWith("..") || isAbsolute(relativeCwd))) return false;
+    // The relay's ppid is transported as untrusted JSON. Descent from the
+    // pinned Claude process (or its launcher) is the local identity check;
+    // the capability above prevents a hook from another task crossing the cwd
+    // route even when both sessions share a user and pane server.
     const anchor = record.claudePid ?? record.panePid;
     if (anchor !== undefined) return this.#ppidDescendsFrom(request.ppid, anchor);
     // Pre-identity window (owned startup, a few hundred ms): the pane id is the
@@ -2003,6 +2220,14 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     }
     record.lastOutputAt = new Date().toISOString();
     const event = request.event;
+    // Hook lifecycle events belong to one Claude session. A missing initial
+    // SessionStart is normal during adoption, so the first bound event pins the
+    // session id; later mismatches cannot mutate this task's state.
+    if (record.claudeSessionId !== undefined && record.claudeSessionId !== event.session_id) {
+      record.ignoredHookRequests += 1;
+      return {};
+    }
+    record.claudeSessionId ??= event.session_id;
     // Every hook event carries `transcript_path`, and an adopted session never
     // replays SessionStart, so capture it here rather than only at startup:
     // it is what locates Claude's own per-project memory directory below.
@@ -2013,10 +2238,9 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     if (!record.transcriptPath && isSafeAbsolutePath(event.transcript_path) && memoryRootFor(event.transcript_path, record.handle.cwd, record.claudeConfigDir ?? claudeConfigDir())) record.transcriptPath = event.transcript_path;
     switch (event.hook_event_name) {
       case "SessionStart": {
-        record.claudeSessionId ??= event.session_id;
         record.handle.sessionId = event.session_id;
-        if (isSafeAbsolutePath(event.transcript_path)) record.transcriptPath = event.transcript_path;
-        if (isSafeAbsolutePath(event.scratchpad_dir)) record.scratchpadDir = event.scratchpad_dir;
+        if (!record.transcriptPath && isSafeAbsolutePath(event.transcript_path)) record.transcriptPath = event.transcript_path;
+        if (!record.scratchpadDir && isSafeScratchpadPath(event.scratchpad_dir)) record.scratchpadDir = event.scratchpad_dir;
         record.sessionStartReceived = true;
         return {};
       }
@@ -2037,14 +2261,19 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         record.lastInputAt = new Date().toISOString();
         return {};
       }
-      case "PreToolUse":
-        return this.#awaitPermissionDecision(record, event, "pre", event.tool_use_id ?? randomUUID());
+      case "PreToolUse": {
+        const requestId = event.tool_use_id ?? randomUUID();
+        return this.#awaitPermissionDecision(record, event, "pre", requestId, `pre:${requestId}`);
+      }
       case "PermissionRequest": {
         const digest = createHash("sha256").update(`${event.session_id}${event.tool_name ?? ""}${JSON.stringify(event.tool_input ?? null)}`).digest("hex").slice(0, 16);
-        // A per-record sequence keeps byte-identical repeats (the same `npm test`
-        // after a repair round) distinct: the Supervisor dedupes events by requestId.
+        const fingerprint = `prompt:${digest}`;
+        // Keep byte-identical requests distinct after the previous one has been
+        // answered, but never supersede a still-pending request. A duplicate
+        // hook invocation gets no decision while the original remains open.
+        if ([...record.pendingPermissionRequests.values()].some((pending) => pending.fingerprint === fingerprint)) return {};
         record.promptSequence += 1;
-        return this.#awaitPermissionDecision(record, event, "prompt", `prompt:${digest}:${record.promptSequence}`);
+        return this.#awaitPermissionDecision(record, event, "prompt", `${fingerprint}:${record.promptSequence}`, fingerprint);
       }
       case "Stop": {
         this.#completeTurn(record, { subtype: "stop", result: event.last_assistant_message ?? "", stop_hook_active: Boolean(event.stop_hook_active) });
@@ -2078,16 +2307,9 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     }
   }
 
-  async #awaitPermissionDecision(record: TmuxRecord, event: ClaudeHookEvent, phase: "pre" | "prompt", requestId: string): Promise<HookRelayReply> {
-    const existing = record.pendingPermissionRequests.get(requestId);
-    if (existing) {
-      record.pendingPermissionRequests.delete(requestId);
-      existing.resolve({});
-    }
-    // A PermissionRequest id is a deterministic digest of session/tool/input,
-    // so the same tool invoked twice in a session reuses it. A fresh request
-    // supersedes any prior answer, or the second occurrence would dedupe
-    // itself away in respondPermission and hang the relay.
+  async #awaitPermissionDecision(record: TmuxRecord, event: ClaudeHookEvent, phase: "pre" | "prompt", requestId: string, fingerprint?: string): Promise<HookRelayReply> {
+    if (record.permissionResponses.has(requestId) || record.pendingPermissionRequests.has(requestId)) return {};
+    if (fingerprint && [...record.pendingPermissionRequests.values()].some((pending) => pending.fingerprint === fingerprint)) return {};
     record.permissionResponses.delete(requestId);
     const toolUseId = event.tool_use_id ?? requestId;
     const writeRoots = writeRootsOf(record);
@@ -2114,6 +2336,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       timer.unref?.();
       record.pendingPermissionRequests.set(requestId, {
         phase,
+        ...(fingerprint ? { fingerprint } : {}),
         resolve: (reply) => { clearTimeout(timer); resolve(reply); },
       });
     });
@@ -2161,7 +2384,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   }
 }
 
-function bridgeEnvironment(env: NodeJS.ProcessEnv, cwd: string, command: string, args: readonly string[], cgroupPath?: string, hookSettingsPath?: string): NodeJS.ProcessEnv {
+function bridgeEnvironment(env: NodeJS.ProcessEnv, cwd: string, command: string, args: readonly string[], cgroupPath?: string, hookSettingsPath?: string, hookCapability?: string): NodeJS.ProcessEnv {
   const encode = (value: string) => Buffer.from(value, "utf8").toString("base64");
   const result: NodeJS.ProcessEnv = {
     ...env,
@@ -2171,6 +2394,7 @@ function bridgeEnvironment(env: NodeJS.ProcessEnv, cwd: string, command: string,
     [BRIDGE_KEYS.cgroup]: encode(cgroupPath ?? ""),
   };
   if (hookSettingsPath !== undefined) result[INTERACTIVE_KEYS.settings] = encode(hookSettingsPath);
+  if (hookCapability !== undefined) result[HOOK_CAPABILITY_KEY] = hookCapability;
   return result;
 }
 
@@ -2209,6 +2433,12 @@ export function memoryRootFor(transcriptPath: string | undefined, cwd: string, c
   const projectsDir = dirname(sessionDir);
   if (!sameDirectory(projectsDir, join(configDir, "projects"), "lexical")) return undefined;
   if (basename(sessionDir) !== claudeProjectSlug(cwd)) return undefined;
+  // The configured Claude directory itself may be a deliberate symlink, but a
+  // symlink at `projects`, the project slug, or its memory child would turn a
+  // hook-reported transcript into an arbitrary extra write root. Missing
+  // components are allowed because Claude creates `memory` on first write;
+  // existing components must be inspected without following them.
+  if (!isNonSymlinkDirectory(projectsDir) || !isNonSymlinkDirectory(sessionDir) || !isNonSymlinkDirectory(join(sessionDir, "memory"))) return undefined;
   return join(sessionDir, "memory");
 }
 
@@ -2218,6 +2448,18 @@ export function memoryRootFor(transcriptPath: string | undefined, cwd: string, c
  * undefined when it cannot be read — then this process's own derivation
  * applies, which is right for every session this Supervisor started.
  */
+async function processEnvironmentValue(pid: number, name: string): Promise<string | undefined> {
+  try {
+    const raw = await readFile(`/proc/${pid}/environ`, "utf8");
+    for (const entry of raw.split("\0")) {
+      if (entry.startsWith(`${name}=`)) return entry.slice(name.length + 1);
+    }
+  } catch {
+    // A process can exit or hide its environment during adoption.
+  }
+  return undefined;
+}
+
 async function processConfigDir(pid: number): Promise<string | undefined> {
   try {
     const raw = await readFile(`/proc/${pid}/environ`);
@@ -2239,9 +2481,47 @@ async function processConfigDir(pid: number): Promise<string | undefined> {
  * The directories outside the task cwd that the Worker may still write: its own
  * per-session scratchpad, and Claude's per-project memory directory.
  */
+function isNonSymlinkDirectory(path: string): boolean {
+  try {
+    const info = lstatSync(path);
+    return info.isDirectory() && !info.isSymbolicLink();
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
+}
+
+function isSafeScratchpadPath(value: unknown): value is string {
+  if (!isSafeAbsolutePath(value)) return false;
+  const tempRoot = resolve(tmpdir());
+  if (!isNonSymlinkDirectory(tempRoot)) return false;
+  const candidate = resolve(value);
+  const remainder = relative(tempRoot, candidate);
+  if (!remainder || remainder.startsWith("..") || isAbsolute(remainder)) return false;
+  const parts = remainder.split(/[\\/]+/u).filter(Boolean);
+  const uid = typeof process.getuid === "function" ? String(process.getuid()) : undefined;
+  if (!uid || parts[0] !== `claude-${uid}` || parts.at(-1) !== "scratchpad") return false;
+  // The scratchpad root is reported by the Worker-side hook, so accept only
+  // Claude's conventional per-user temporary tree, and never a symlinked
+  // component that would turn the advertised root into another directory.
+  let current = tempRoot;
+  for (const part of parts) {
+    current = join(current, part);
+    try {
+      const info = lstatSync(current);
+      if (info.isSymbolicLink()) return false;
+      if (!info.isDirectory() && part !== parts.at(-1)) return false;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") break;
+      return false;
+    }
+  }
+  return true;
+}
+
 export function writeRootsOf(record: { scratchpadDir?: string; transcriptPath?: string; claudeConfigDir?: string; handle?: { cwd: string } }, configDir: string = record.claudeConfigDir ?? claudeConfigDir()): string[] {
   const roots: string[] = [];
-  if (record.scratchpadDir) roots.push(record.scratchpadDir);
+  if (isSafeScratchpadPath(record.scratchpadDir)) roots.push(record.scratchpadDir);
   const memory = memoryRootFor(record.transcriptPath, record.handle?.cwd ?? "", configDir);
   if (memory) roots.push(memory);
   return roots;
@@ -2252,12 +2532,38 @@ export function attachCommand(handle: Pick<WorkerHandle, "tmuxSocket" | "session
   return handle.tmuxSocket ? `tmux -S ${shellQuote(handle.tmuxSocket)} attach -t ${target}` : `tmux attach -t ${target}`;
 }
 
+const MAX_TMUX_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024;
+
 function runCommand(command: string, args: string[], input: string | undefined, env: NodeJS.ProcessEnv, timeoutMs: number): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { env, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
     let settled = false;
+    const decoders = { stdout: new TextDecoder("utf-8", { fatal: true }), stderr: new TextDecoder("utf-8", { fatal: true }) };
+    const append = (kind: "stdout" | "stderr", chunk: Buffer | string): void => {
+      if (settled) return;
+      const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      if (kind === "stdout") stdoutBytes += bytes.byteLength; else stderrBytes += bytes.byteLength;
+      if (stdoutBytes + stderrBytes > MAX_TMUX_COMMAND_OUTPUT_BYTES) {
+        settled = true;
+        clearTimeout(timer);
+        child.kill("SIGKILL");
+        reject(new Error(`tmux command output exceeded ${MAX_TMUX_COMMAND_OUTPUT_BYTES} bytes`));
+        return;
+      }
+      try {
+        const text = decoders[kind].decode(bytes, { stream: true });
+        if (kind === "stdout") stdout += text; else stderr += text;
+      } catch (error) {
+        settled = true;
+        clearTimeout(timer);
+        child.kill("SIGKILL");
+        reject(new Error(`tmux command emitted invalid UTF-8: ${error instanceof Error ? error.message : String(error)}`, { cause: error }));
+      }
+    };
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
@@ -2265,10 +2571,8 @@ function runCommand(command: string, args: string[], input: string | undefined, 
       reject(new Error(`tmux command timed out after ${timeoutMs}ms: ${args.join(" ")}`));
     }, timeoutMs);
     timer.unref();
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += String(chunk); });
-    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.stdout.on("data", (chunk: Buffer | string) => append("stdout", chunk));
+    child.stderr.on("data", (chunk: Buffer | string) => append("stderr", chunk));
     child.once("error", (error) => {
       if (settled) return;
       settled = true;
@@ -2277,13 +2581,46 @@ function runCommand(command: string, args: string[], input: string | undefined, 
     });
     child.once("close", (code, signal) => {
       if (settled) return;
-      settled = true;
       clearTimeout(timer);
-      if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(`tmux command failed (${code ?? signal ?? "unknown"}): ${stderr.trim() || args.join(" ")}`));
+      if (code === 0) {
+        try {
+          stdout += decoders.stdout.decode();
+          stderr += decoders.stderr.decode();
+          settled = true;
+          resolve({ stdout, stderr });
+        } catch (error) {
+          settled = true;
+          reject(new Error(`tmux command emitted incomplete UTF-8: ${error instanceof Error ? error.message : String(error)}`, { cause: error }));
+        }
+      } else {
+        settled = true;
+        reject(new Error(`tmux command failed (${code ?? signal ?? "unknown"}): ${stderr.trim() || args.join(" ")}`));
+      }
     });
     child.stdin.end(input);
   });
+}
+
+function assertOwnedLogFile(info: { isFile(): boolean; isSymbolicLink(): boolean; uid: number; nlink: number }): void {
+  if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error("tmux worker log is owned by another user");
+  if (info.nlink > 1) throw new Error("tmux worker log is a hard-link alias");
+}
+
+function assertSameLogIdentity(first: { dev: number; ino: number }, second: { dev: number; ino: number }): void {
+  if (first.dev !== second.dev || first.ino !== second.ino) throw new Error("tmux worker log was replaced during collection");
+}
+
+async function truncateRegular(path: string, expected?: { dev: number; ino: number }): Promise<void> {
+  const file = await open(path, fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const info = await file.stat();
+    assertOwnedLogFile(info);
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error("tmux worker log is not a regular file");
+    if (expected) assertSameLogIdentity(expected, info);
+    await file.truncate(0);
+  } finally {
+    await file.close().catch(() => {});
+  }
 }
 
 function isReadyScreen(screen: string): boolean {
@@ -2339,6 +2676,10 @@ function redactSensitiveText(value: string): string {
   return String(redactSensitive(value));
 }
 
+function supervisorChunkLinePrefix(generation: string, chunkId: string, index: number, total: number): string {
+  return `@pi:control ${generation} @pi:chunk ${chunkId} ${index} ${total} `;
+}
+
 function safeTmuxMessage(value: string): string {
   const normalized = value.replaceAll(String.fromCharCode(13, 10), "\n");
   for (const character of normalized) {
@@ -2354,6 +2695,7 @@ function stripInternalBridgeEcho(value: string): string {
   return value
     .replaceAll("\u001b[1A\r\u001b[2K\u001b[1B\r", "")
     .replace(/(?:^|\r?\n)[^\r\n]*@pi:(?:user|json) [A-Za-z0-9+/=]+\r?(?=\n|$)/gu, "\n")
+    .replace(/(?:^|\r?\n)[^\r\n]*@pi:chunk [A-Za-z0-9_-]+ \d+ \d+ [A-Za-z0-9+/=]+\r?(?=\n|$)/gu, "\n")
     .replace(/(?:^|\r?\n)[^\r\n]*@pi:stop\r?(?=\n|$)/gu, "\n");
 }
 
@@ -2365,14 +2707,32 @@ function partialFramePrefixLength(value: string, prefix: string): number {
   return 0;
 }
 
+function utf8Tail(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.byteLength <= maxBytes) return value;
+  let start = bytes.byteLength - maxBytes;
+  while (start < bytes.byteLength && (bytes[start]! & 0xc0) === 0x80) start += 1;
+  return bytes.subarray(start).toString("utf8");
+}
+
 function boundText(value: string, maxBytes: number): string {
   const bytes = Buffer.from(value, "utf8");
-  return bytes.byteLength <= maxBytes ? value : bytes.subarray(-maxBytes).toString("utf8");
+  return bytes.byteLength <= maxBytes ? value : utf8Tail(value, maxBytes);
 }
 
 function boundTextHead(value: string, maxBytes: number): string {
   const bytes = Buffer.from(value, "utf8");
-  return bytes.byteLength <= maxBytes ? value : bytes.subarray(0, maxBytes).toString("utf8");
+  if (bytes.byteLength <= maxBytes) return value;
+  let end = maxBytes;
+  while (end > 0) {
+    let start = end - 1;
+    while (start > 0 && (bytes[start]! & 0xc0) === 0x80) start -= 1;
+    const first = bytes[start]!;
+    const width = first < 0x80 ? 1 : (first & 0xe0) === 0xc0 ? 2 : (first & 0xf0) === 0xe0 ? 3 : 4;
+    if (start + width <= end) break;
+    end = start;
+  }
+  return bytes.subarray(0, end).toString("utf8");
 }
 
 function normalizeForMatch(value: string): string {
@@ -2388,6 +2748,8 @@ function normalizeForMatch(value: string): string {
 function removeDeadTmuxSocket(socketPath: string | undefined): void {
   if (!socketPath || !/[\\/]pi-cs-[0-9a-f-]+\.sock$/u.test(socketPath)) return;
   try {
+    const info = lstatSync(socketPath);
+    if (!info.isSocket() || (typeof process.getuid === "function" && info.uid !== process.getuid())) return;
     const probe = spawnSync("tmux", ["-S", socketPath, "list-sessions"], { stdio: "ignore", timeout: 2_000 });
     // A server that answers, or a socket something else holds open (the probe
     // timed out), is left alone.
@@ -2404,7 +2766,8 @@ export function sweepDeadTmuxSockets(directory = tmpdir()): number {
     if (!/^pi-cs-[0-9a-f-]+\.sock$/u.test(name)) continue;
     const socketPath = join(directory, name);
     try {
-      if (!lstatSync(socketPath).isSocket()) continue;
+      const info = lstatSync(socketPath);
+      if (!info.isSocket() || (typeof process.getuid === "function" && info.uid !== process.getuid())) continue;
       const probe = spawnSync("tmux", ["-S", socketPath, "list-sessions"], { stdio: "ignore", timeout: 2_000 });
       if (probe.status === 0 || probe.signal) continue;
       unlinkSync(socketPath);
@@ -2426,9 +2789,10 @@ function isClaudeRuntimePrompt(prompt: string): boolean {
 
 /**
  * A UserPromptSubmit hook reports the prompt as Claude's TUI captured it,
- * which can reflow long pasted text. Treat it as the adapter's own send when
- * it matches exactly (after whitespace normalization) or shares the same
- * first 200 characters.
+ * which can reflow long pasted text. Treat it as the adapter's own send only
+ * when the complete normalized text matches. A prefix match would let a human
+ * who repeats the beginning of a Supervisor instruction bypass human-takeover
+ * detection; a formatting mismatch fails closed as human input.
  */
 function describeHookError(error: unknown): string {
   if (typeof error === "string") return error.slice(0, 2_000);
@@ -2444,27 +2808,25 @@ function describeHookError(error: unknown): string {
 function matchesPendingMessage(pending: string, prompt: string): boolean {
   const normalizedPending = normalizeForMatch(pending);
   const normalizedPrompt = normalizeForMatch(prompt);
-  if (!normalizedPending || !normalizedPrompt) return false;
-  if (normalizedPending === normalizedPrompt) return true;
-  const prefixLength = 200;
-  return normalizedPending.slice(0, prefixLength) === normalizedPrompt.slice(0, prefixLength);
+  return Boolean(normalizedPending && normalizedPrompt && normalizedPending === normalizedPrompt);
 }
 
-function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
+async function signalProcessGroup(pid: number, expectedStartTime: string | undefined, expectedCommand: string | undefined, signal: NodeJS.Signals): Promise<void> {
+  const identity = await processIdentity(pid);
+  if (!identity) return;
+  if (identity.pgid !== pid || (expectedStartTime !== undefined && identity.startTime !== expectedStartTime) || (expectedCommand !== undefined && identity.command !== expectedCommand)) {
+    throw new Error(`tmux pane identity changed; refusing to signal process group ${pid}`);
+  }
   try { process.kill(-pid, signal); }
   catch (error) {
-    if (error instanceof Error && /ESRCH/u.test(error.message)) {
-      try { process.kill(pid, signal); } catch (fallback) {
-        if (!(fallback instanceof Error) || !/ESRCH/u.test(fallback.message)) throw fallback;
-      }
-      return;
-    }
+    if (error instanceof Error && /ESRCH/u.test(error.message)) return;
     throw error;
   }
 }
 
 interface ProcessIdentity {
   startTime: string;
+  pgid: number;
   command: string;
 }
 
@@ -2485,8 +2847,9 @@ async function processIdentity(pid: number): Promise<ProcessIdentity | undefined
     const closeParen = statText.lastIndexOf(")");
     const fields = closeParen >= 0 ? statText.slice(closeParen + 2).trim().split(/\s+/u) : [];
     const startTime = fields[19];
+    const pgid = Number(fields[2]);
     const command = (await readFile(`/proc/${pid}/comm`, "utf8")).trim();
-    return startTime && command ? { startTime, command } : undefined;
+    return startTime && Number.isSafeInteger(pgid) && command ? { startTime, pgid, command } : undefined;
   } catch {
     return undefined;
   }
@@ -2537,14 +2900,14 @@ function asError(error: unknown): Error {
 }
 
 function isPaneIdentityError(error: unknown): boolean {
-  return error instanceof Error && /tmux pane identity changed|pane identity unavailable|cannot identify tmux pane pid/iu.test(error.message);
+  return error instanceof Error && /tmux pane identity changed|pane identity unavailable|cannot identify tmux pane (?:pid|process group)/iu.test(error.message);
 }
 
 function isMissingSession(error: unknown): boolean {
   // tmux leaves its socket behind on exit ("no server running") unless it was
   // unlinked, in which case it reports "error connecting … (No such file or
   // directory)"; both mean the same thing here.
-  return error instanceof Error && /(can't find session|no server running|session not found|failed to connect|error connecting to [^\n]*No such file or directory)/iu.test(error.message);
+  return error instanceof Error && /(can't find session|no server running|session not found|target pane has exited|failed to connect|error connecting to [^\n]*No such file or directory)/iu.test(error.message);
 }
 
 function isMissingFile(error: unknown): boolean {

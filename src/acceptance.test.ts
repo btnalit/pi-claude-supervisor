@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { link, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { normalizeTaskSpec } from "./acceptance.ts";
-import { collectRepositoryEvidence, verifyAll } from "./verifier.ts";
+import { currentCgroupPath } from "./worker/process-adapter.ts";
+import { collectRepositoryEvidence, repositoryClean, verifyAll } from "./verifier.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -117,6 +118,65 @@ test("repository evidence includes commits after an explicit task baseline", asy
     assert.match(evidence.diff, /candidate/u);
   } finally {
     await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("Supervisor Git evidence ignores repository-controlled attributes, textconv and fsmonitor", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-evidence-git-boundary-"));
+  const cwd = join(base, "work");
+  const marker = join(base, "executed");
+  try {
+    await execFileAsync("git", ["init", "-q", "-b", "main", cwd]);
+    await execFileAsync("git", ["-C", cwd, "config", "user.email", "test@example.invalid"]);
+    await execFileAsync("git", ["-C", cwd, "config", "user.name", "Test"]);
+    await writeFile(join(cwd, "payload.txt"), "baseline\\n");
+    await execFileAsync("git", ["-C", cwd, "add", "payload.txt"]);
+    await execFileAsync("git", ["-C", cwd, "commit", "-qm", "base"]);
+    const baseCommit = (await execFileAsync("git", ["-C", cwd, "rev-parse", "HEAD"])).stdout.trim();
+    const attributes = join(base, "attributes");
+    const textconv = join(base, "textconv.sh");
+    const fsmonitor = join(base, "fsmonitor.sh");
+    await writeFile(attributes, "*.txt diff=hidden\\n");
+    await writeFile(textconv, `#!/bin/sh\\nprintf invoked > ${JSON.stringify(marker)}\\ncat >/dev/null\\n`);
+    await writeFile(fsmonitor, `#!/bin/sh\\nprintf invoked > ${JSON.stringify(marker)}\\n`);
+    await chmod(textconv, 0o700);
+    await chmod(fsmonitor, 0o700);
+    await execFileAsync("git", ["-C", cwd, "config", "core.attributesFile", attributes]);
+    await execFileAsync("git", ["-C", cwd, "config", "diff.hidden.textconv", textconv]);
+    await execFileAsync("git", ["-C", cwd, "config", "core.fsmonitor", fsmonitor]);
+    await writeFile(join(cwd, "payload.txt"), "PAYLOAD evil.example\\n");
+
+    const evidence = await collectRepositoryEvidence(cwd, { baseRef: baseCommit });
+    assert.equal(evidence.complete, true);
+    assert.match(evidence.diff, /PAYLOAD evil\.example/u);
+    assert.equal(await repositoryClean(cwd), false);
+    await assert.rejects(() => readFile(marker), /ENOENT/u);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("acceptance cleanup kills a detached descendant in the Supervisor cgroup", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-acceptance-cgroup-"));
+  try {
+    const marker = join(base, "child.pid");
+    const script = `const {spawn}=require("node:child_process"); const {writeFileSync}=require("node:fs"); const child=spawn(process.execPath,["-e","setInterval(()=>{},10000)"],{detached:true,stdio:"ignore"}); writeFileSync(${JSON.stringify(marker)},String(child.pid)); setTimeout(()=>process.exit(0),20);`;
+    const report = await verifyAll(base, [{ id: "daemon", name: "daemon", command: process.execPath, args: ["-e", script], required: true, timeoutMs: 1_000 }], { cgroupParentPath: await currentCgroupPath() });
+    assert.equal(report.ok, true, report.output);
+    const pid = Number(await readFile(marker, "utf8"));
+    const live = async (): Promise<boolean> => {
+      try {
+        const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+        const close = stat.lastIndexOf(")");
+        return close >= 0 && stat.slice(close + 2).trim().split(/\\s+/u)[0] !== "Z";
+      } catch {
+        return false;
+      }
+    };
+    for (let attempt = 0; attempt < 20 && await live(); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(await live(), false, `detached acceptance child ${pid} survived cleanup`);
+  } finally {
+    await rm(base, { recursive: true, force: true });
   }
 });
 

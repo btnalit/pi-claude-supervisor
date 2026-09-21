@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { chmod, copyFile, mkdtemp, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { tmpdir } from "node:os";
 import test from "node:test";
 import { nodeScriptCommand } from "./runtime.ts";
 
@@ -10,7 +9,7 @@ test("node script helper keeps the real Node executable on a Node host", () => {
 });
 
 test("node script helper resolves Node when Pi runs as a compiled non-Node binary", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-runtime-test-"));
+  const root = await mkdtemp(join(process.cwd(), ".pi-claude-supervisor-runtime-test-"));
   const nodeName = process.platform === "win32" ? "node.exe" : "node";
   const nodePath = join(root, nodeName);
   try {
@@ -23,7 +22,7 @@ test("node script helper resolves Node when Pi runs as a compiled non-Node binar
 });
 
 test("node script helper honors an explicitly configured runtime", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-runtime-configured-test-"));
+  const root = await mkdtemp(join(process.cwd(), ".pi-claude-supervisor-runtime-configured-test-"));
   const nodeName = process.platform === "win32" ? "node.exe" : "node";
   const nodePath = join(root, nodeName);
   try {

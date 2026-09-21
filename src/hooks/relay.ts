@@ -24,8 +24,17 @@ export const HOOK_RELAY_SCRIPT = `
     } catch (e) { /* best effort; a missed sleep just spins the retry loop */ }
   }
 
+  function decodeUtf8(bytes) {
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch (e) {
+      return undefined;
+    }
+  }
+
   function readStdin() {
     var chunks = [];
+    var totalBytes = 0;
     var buf = Buffer.alloc(65536);
     var eagainAttempts = 0;
     while (true) {
@@ -46,9 +55,14 @@ export const HOOK_RELAY_SCRIPT = `
         return undefined;
       }
       if (!bytesRead) break;
+      totalBytes += bytesRead;
+      // Match the server's line bound before allocating an unbounded JSON
+      // string. Keep bytes intact until EOF so a multibyte sequence split
+      // across read(2) calls is decoded exactly once, not per chunk.
+      if (totalBytes > 1024 * 1024) return undefined;
       chunks.push(Buffer.from(buf.slice(0, bytesRead)));
     }
-    return Buffer.concat(chunks).toString("utf8");
+    return decodeUtf8(Buffer.concat(chunks));
   }
 
   var raw = readStdin();
@@ -97,6 +111,7 @@ export const HOOK_RELAY_SCRIPT = `
     pid: process.pid,
     ppid: process.ppid,
     tmuxPane: process.env.TMUX_PANE,
+    capability: process.env.PI_CLAUDE_SUPERVISOR_HOOK_CAPABILITY,
     event: event,
   }) + "\\n";
 
@@ -133,17 +148,18 @@ export const HOOK_RELAY_SCRIPT = `
   timer = setTimeout(finish, ${(HOOK_TIMEOUT_SECONDS - 5) * 1000});
   if (timer.unref) timer.unref();
 
-  var buffer = "";
-  socket.setEncoding("utf8");
+  var buffer = Buffer.alloc(0);
   socket.on("connect", function () { socket.write(payload); });
   socket.on("data", function (chunk) {
     if (finished) return;
-    buffer += chunk;
-    var newlineIndex = buffer.indexOf("\\n");
+    var bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    buffer = Buffer.concat([buffer, bytes]);
+    if (buffer.length > 1024 * 1024) { finish(); return; }
+    var newlineIndex = buffer.indexOf(0x0a);
     if (newlineIndex === -1) return;
-    var line = buffer.slice(0, newlineIndex);
+    var line = decodeUtf8(buffer.subarray(0, newlineIndex));
     clearTimeout(timer);
-    handleReply(line);
+    if (line !== undefined) handleReply(line);
     finish();
   });
   socket.on("close", finish);

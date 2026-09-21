@@ -1,7 +1,10 @@
 import { constants as fsConstants, existsSync, statSync } from "node:fs";
-import { access, readFile, realpath, stat } from "node:fs/promises";
+import { access, open, realpath, stat, type FileHandle } from "node:fs/promises";
+import { TextDecoder } from "node:util";
 import { homedir } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+
+const MAX_CLAUDE_SETTINGS_BYTES = 4 * 1024 * 1024;
 
 const inheritedNames = [
   "PATH",
@@ -16,6 +19,12 @@ const inheritedNames = [
   "TERM",
   "COLORTERM",
 ] as const;
+
+// These variables can replace Git's command, repository, or transport
+// boundary without appearing in argv. Automatic Workers start with a clean
+// copy, and the granted publish command clears the same names again in case a
+// Worker exported one during an earlier turn.
+const unsafeGitEnvironment = /^(?:GIT_(?:DIR|WORK_TREE|COMMON_DIR|NAMESPACE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|CONFIG(?:_GLOBAL|_SYSTEM|_NOSYSTEM|_COUNT|_KEY_\d+|_VALUE_\d+|_PARAMETERS)?|CEILING_DIRECTORIES|DISCOVERY_ACROSS_FILESYSTEM|EXEC_PATH|TEMPLATE_DIR|SSH(?:_COMMAND|_VARIANT)?|ASKPASS|PROXY_COMMAND|EDITOR|SEQUENCE_EDITOR|EXTERNAL_DIFF|DIFF_OPTS|TRACE(?:2)?(?:_EVENTS)?|TRACE_PERFORMANCE|TRACE_SETUP|TRACE_PACKET|TRACE_PACK_ACCESS|TRACE_CURL(?:_NO_DATA)?|PUSH_OPTION(?:_\d+)?|PUSH_OPTION_COUNT)|GIT_SSH|SSH_ASKPASS)$/u;
 
 /**
  * Build the baseline Worker environment. The small inherited set keeps manual
@@ -47,23 +56,26 @@ export function workerEnvironment(
 }
 
 /**
- * Automatic mode intentionally does not filter credentials, network settings,
- * package-manager configuration or Claude extensions. It inherits the full
- * explicit environment so Claude Code, MCP servers and nested agents retain
- * their normal capabilities. CLAUDECODE is removed because Claude Code uses it
- * to reject a deliberately nested session; process/cgroup cleanup still owns
- * every descendant of the Worker.
+ * Automatic mode preserves the operator's provider/network/package-manager
+ * environment, but Supervisor-owned variables are never passed to Claude.
+ * Those names include state directories, webhook URLs/secrets, authority and
+ * control-plane settings; exposing them would let a Worker read or spoof the
+ * Supervisor's own control plane. CLAUDECODE is also removed because Claude
+ * Code uses it to reject a deliberately nested session.
  */
 export function automaticWorkerEnvironment(
   explicit: NodeJS.ProcessEnv = {},
   inherited: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = {};
+  const allowed = (name: string): boolean => name !== "CLAUDECODE"
+    && !name.startsWith("PI_CLAUDE_SUPERVISOR_")
+    && !unsafeGitEnvironment.test(name);
   for (const [name, value] of Object.entries(inherited)) {
-    if (value !== undefined && name !== "CLAUDECODE") result[name] = value;
+    if (value !== undefined && allowed(name)) result[name] = value;
   }
   for (const [name, value] of Object.entries(explicit)) {
-    if (value !== undefined && name !== "CLAUDECODE") result[name] = value;
+    if (value !== undefined && allowed(name)) result[name] = value;
   }
   return result;
 }
@@ -205,13 +217,9 @@ async function automaticClaudeSettings(cwd: string, args: readonly string[], env
     }
     if (typeof value !== "string") throw new Error(`automatic supervision could not inspect Claude settings (${label})`);
     try {
-      settings.push({ value: JSON.parse(value), label });
-    } catch {
-      try {
-        settings.push({ value: JSON.parse(await readFile(value, "utf8")), label });
-      } catch (error) {
-        throw new Error(`automatic supervision could not inspect Claude settings (${label})`, { cause: error });
-      }
+      settings.push({ value: JSON.parse(await readClaudeSettingsFile(value)), label });
+    } catch (error) {
+      throw new Error(`automatic supervision could not inspect Claude settings (${label})`, { cause: error });
     }
   }
 
@@ -230,7 +238,7 @@ async function automaticClaudeSettings(cwd: string, args: readonly string[], env
   }
   for (const path of paths) {
     try {
-      const value = JSON.parse(await readFile(path, "utf8")) as unknown;
+      const value = JSON.parse(await readClaudeSettingsFile(path)) as unknown;
       settings.push({ value, label: path });
     } catch (error) {
       if (error instanceof Error && /ENOENT/u.test(error.message)) continue;
@@ -238,6 +246,23 @@ async function automaticClaudeSettings(cwd: string, args: readonly string[], env
     }
   }
   return settings;
+}
+
+async function readClaudeSettingsFile(path: string): Promise<string> {
+  const resolved = await realpath(path);
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(resolved, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const info = await handle.stat();
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error("Claude settings is not a regular file");
+    if (typeof process.getuid === "function" && info.uid !== process.getuid() && info.uid !== 0) throw new Error("Claude settings is owned by an untrusted user");
+    if ((info.mode & 0o022) !== 0) throw new Error("Claude settings is writable by an untrusted user");
+    if (info.nlink > 1) throw new Error("Claude settings is a hard-link alias");
+    if (info.size > MAX_CLAUDE_SETTINGS_BYTES) throw new Error("Claude settings exceeds the safe size limit");
+    return new TextDecoder("utf-8", { fatal: true }).decode(await handle.readFile());
+  } finally {
+    await handle?.close().catch(() => {});
+  }
 }
 
 function explicitSettings(args: readonly string[], cwd: string): Array<{ value: unknown; label: string }> {
@@ -286,21 +311,34 @@ function isUnsafePermissionMode(value: string): boolean {
   return normalized === "auto" || normalized === "bypasspermissions" || normalized === "dontask";
 }
 
+/** The launch spelling and immutable identity of the Claude executable. */
+export interface TrustedAutomaticClaudeExecutable {
+  /** The PATH entry to execute. Keep a mise/asdf/npm shim's argv[0] intact. */
+  launchCommand: string;
+  /** The real file identity persisted across recovery. */
+  resolvedPath: string;
+}
+
 /**
  * Resolve and pin the executable used by automatic mode before preflight and
  * spawn. A bare command is resolved from the supervisor's own PATH; explicit
- * paths and writable/untrusted executable locations are rejected. Operators
- * who do not want PATH to be the trust root can set
- * PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE to the expected executable path.
+ * paths and writable/untrusted executable locations are rejected. The launch
+ * spelling is deliberately retained: realpath'ing a mise/asdf/npm shim before
+ * spawn changes argv[0] and can make the version manager select a different
+ * runtime or fail to locate Claude's resources. The realpath is the identity
+ * that is persisted and compared on recovery.
  */
-export async function assertTrustedAutomaticClaudeExecutable(command: string, expectedPath?: string): Promise<string> {
+export async function trustedAutomaticClaudeExecutable(command: string, expectedPath?: string): Promise<TrustedAutomaticClaudeExecutable> {
   if (!isDirectClaudeName(command)) {
     throw new Error("automatic supervision requires the direct Claude executable command name; custom executable paths need their own host boundary");
   }
   const candidate = await resolveExecutable(command, process.env.PATH);
   if (!candidate) throw new Error("automatic supervision could not resolve the trusted Claude executable from PATH");
   const resolved = await realpath(candidate);
-  await assertSecureExecutablePath(resolved);
+  // Check both spellings. stat follows a symlink, while the directory walk on
+  // the launch spelling also protects the PATH shim directory from replacement.
+  await assertSecureExecutablePath(candidate);
+  if (candidate !== resolved) await assertSecureExecutablePath(resolved);
   const configured = expectedPath?.trim() || process.env.PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE?.trim();
   if (configured) {
     let expected: string;
@@ -315,6 +353,37 @@ export async function assertTrustedAutomaticClaudeExecutable(command: string, ex
       throw new Error("resolved Claude executable does not match the expected pinned identity");
     }
   }
+  return { launchCommand: candidate, resolvedPath: resolved };
+}
+
+/** Backwards-compatible identity-only assertion used by callers that do not spawn. */
+export async function assertTrustedAutomaticClaudeExecutable(command: string, expectedPath?: string): Promise<string> {
+  return (await trustedAutomaticClaudeExecutable(command, expectedPath)).resolvedPath;
+}
+
+/**
+ * Resolve another Supervisor-owned helper without retaining a Worker-controlled
+ * PATH spelling. Publish commands use this for `env`, `git` and (when needed)
+ * `gh`; the resolved file and every containing directory must have the same
+ * ownership/mode guarantees as the automatic Claude executable.
+ */
+export async function trustedExecutablePath(command: string): Promise<string> {
+  if (!/^[A-Za-z0-9._-]+$/u.test(command)) throw new Error("Supervisor helper executable must be a bare command name");
+  const candidate = await resolveExecutable(command, process.env.PATH);
+  if (!candidate) throw new Error(`Supervisor helper executable could not be resolved from PATH: ${command}`);
+  return trustedExecutableCandidate(candidate);
+}
+
+/** Verify an explicitly configured absolute helper, such as a test harness's tmux wrapper. */
+export async function trustedAbsoluteExecutablePath(command: string): Promise<string> {
+  if (!isAbsolute(command) || command.includes("\0")) throw new Error("Supervisor helper executable path must be absolute");
+  return trustedExecutableCandidate(command);
+}
+
+async function trustedExecutableCandidate(candidate: string): Promise<string> {
+  const resolved = await realpath(candidate);
+  await assertSecureExecutablePath(candidate);
+  if (candidate !== resolved) await assertSecureExecutablePath(resolved);
   return resolved;
 }
 
@@ -326,7 +395,7 @@ function isDirectClaudeName(command: string): boolean {
 
 async function resolveExecutable(command: string, pathValue: string | undefined): Promise<string | undefined> {
   for (const directory of (pathValue ?? "").split(delimiter).filter(Boolean)) {
-    const candidate = join(directory, command);
+    const candidate = join(resolve(directory), command);
     try {
       await access(candidate, fsConstants.X_OK);
       return candidate;
@@ -349,7 +418,8 @@ async function assertSecureExecutablePath(path: string): Promise<void> {
     let directory = dirname(path);
     while (true) {
       const info = await stat(directory);
-      if ((info.mode & 0o022) !== 0 || (uid !== undefined && info.uid !== uid && info.uid !== 0)) {
+      const stickySharedDirectory = (info.mode & 0o1000) !== 0 && (info.mode & 0o002) !== 0 && info.uid === 0;
+      if (((info.mode & 0o022) !== 0 && !stickySharedDirectory) || (uid !== undefined && info.uid !== uid && info.uid !== 0)) {
         throw new Error("a directory containing the resolved Claude executable is writable by or owned by an untrusted user");
       }
       const parent = dirname(directory);

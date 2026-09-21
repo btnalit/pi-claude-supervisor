@@ -58,8 +58,9 @@ hardening:
 
 - Automatic mode intentionally does not provide a host-level network sandbox or
   low-privilege account. Known direct remote push/main operations remain policy
-  denied, but nested agents, plugins and MCP servers are trusted capabilities and
-  need an independent repository/host boundary for absolute enforcement.
+  denied outside the exact verified-candidate publish grant, but nested agents,
+  plugins and MCP servers are trusted capabilities and need an independent
+  repository/host boundary for absolute enforcement.
 - Event contents can contain worker output or user messages; common credential
   patterns are redacted and sequence recovery is persisted, but broader structured
   secret coverage remains follow-up work.

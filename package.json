@@ -47,7 +47,7 @@
     "typebox": "*"
   },
   "scripts": {
-    "test": "node --test \"src/**/*.test.ts\" \"scripts/*.test.mjs\"",
+    "test": "node scripts/run-tests.mjs",
     "typecheck": "tsc --noEmit",
     "check:package": "node scripts/check-package.mjs",
     "check:docs": "node scripts/check-docs.mjs",

@@ -1,6 +1,6 @@
 # Architecture
 
-> The confirmed target is fully unattended local development with an independent remote/main boundary. Automatic mode implements the local editing, testing, repair, acceptance, Review and local-commit loop; unresolved work becomes a parked candidate. Legacy human/takeover APIs remain compatibility controls only. See [autonomy-target.md](autonomy-target.md).
+> The default target is fully unattended local development with an independent remote/main boundary. Automatic mode implements the local editing, testing, repair, acceptance, Review and local-commit loop; unresolved work becomes a parked candidate. An explicitly configured publish task may receive the separate one-shot `RemoteGrant` described below; it never grants merge or protected-branch authority. Legacy human/takeover APIs remain compatibility controls only. See [autonomy-target.md](autonomy-target.md).
 
 ## Control boundary
 
@@ -48,10 +48,12 @@ artifacts. Child Workers must communicate through validated evidence and event
 references rather than another Worker's control channel. Each child is accepted
 independently; the parent can complete only after aggregate acceptance and
 independent Review. Integration and conflict resolution remain separate from the local development
-loop. The Worker cannot push remotely or merge into `main`/an integration branch;
-the independent integration boundary may combine read-only review, CI and an
-authorized integration action in a separate integration worktree. Rejection or
-shutdown leaves the candidate local.
+loop. The Worker cannot merge into `main`/an integration branch. By default it
+also cannot push remotely; an explicit publish task is the only path to the
+narrow, verified-commit `RemoteGrant` described below. The independent
+integration boundary may combine read-only review, CI and an authorized
+integration action in a separate integration worktree. Rejection or shutdown
+leaves the candidate local.
 
 Recovery and shutdown must be graph-aware: a parent with an unknown child state
 cannot complete, cancellation must propagate within a bounded budget, and Pi
@@ -345,7 +347,8 @@ advisory and the Worker commonly branches mid-task on its own. A protected branc
 name (`main`, `master`, `trunk`, `integration`, `develop`) is never itself a reason
 to refuse a start or park a candidate; only a remote push/merge/PR or a destructive
 rewrite of a protected branch (`reset`, `update-ref`, `symbolic-ref`, or `branch`
-with a delete/move/force flag) remains denied by policy. The resolved Claude
+with a delete/move/force flag) remains denied by policy; remote actions remain
+denied except for the explicit one-shot publish grant described below. The resolved Claude
 executable is checked for an operator-owned, non-writable path and then pinned by
 absolute path; `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE` can pin the expected identity. The initial repository HEAD is captured, and the repository boundary immediately
 before the Worker adapter starts must report that exact same HEAD (recovery captures
@@ -457,22 +460,30 @@ authority the granted command is answered by the policy (`PolicyResult.granted`)
 rather than escalated to the Decision Worker. The returning turn skips
 acceptance and the Reviewer when HEAD is unchanged — they already passed on that
 tree — and `#settlePublish` confirms the result read-only (`#confirmPublish`:
-both pinned remote URLs unchanged, `git ls-remote` carrying the verified commit,
-plus `gh pr list` for `pr`) before completing, or blocks the candidate when it
-cannot; that candidate keeps `deliverable: true`, since it passed and is intact
+both pinned remote URL lists unchanged, `git ls-remote` against every pinned
+push destination carrying the verified commit, plus `gh pr list` for `pr`)
+before completing, or blocks the candidate when it cannot; that candidate keeps `deliverable: true`, since it passed and is intact
 on its branch, and an unreachable remote is reported as *unconfirmed*
 (`RemoteBranchLookup` tells `absent` from `unreachable`), never as a missing
 commit or a repointed remote. A tree that changed during the publish turn — an uncommitted edit included — voids
 the grant and is re-verified in full, with the same confirmation deciding whether the notice
 says the verified commit landed first. The grant is cleared on every terminal
 path, so it never outlives the turn it was issued for, and
-`permittedRemoteCommand` admits a single literal shape —
-`git -C '<task dir>' -c core.hooksPath=/dev/null -c push.followTags=false push <remote> <commit>:refs/heads/<branch>`
-with no other option, and `gh pr create --repo <pinned URL> --head <branch> …`
-— so no force, delete, mirror, tags, push-options, other `-c`, branch or `HEAD`
-source, other remote, branch or repository, relative `-C`, shell wrapper,
-dynamic word or second statement; the pinned hooks path keeps any installed
-`pre-push` out of the granted command and the pinned `push.followTags=false` keeps any tag out of it. `git config` writes to
+`permittedRemoteCommand` admits one Supervisor-generated literal shape — a
+loader-clearing prefix, absolute `env`/`git`, the exact `-C '<task dir>'`,
+Supervisor-pinned environment/config/transport settings including every
+resolved `pushurl`, the fixed `--receive-pack=git-receive-pack`, and
+`<commit>:refs/heads/<branch>` — with no other option, force, delete, mirror,
+tags, push-options, other `-c`, branch or `HEAD` source, other remote, relative
+`-C`, shell wrapper, dynamic word or second statement.
+The `pr` form uses a trusted absolute `env`/`gh` prefix that clears Worker-
+controlled GH/XDG routing and credential selectors, pins `PATH`/`HOME`, and
+still requires the pinned `--repo`/`--head` shape. SSH destinations use a
+Supervisor-resolved `ssh -F /dev/null`, disabling repository/user SSH config
+and proxy commands. The pinned hooks path keeps any installed `pre-push` out
+of the granted command, while the push-option, submodule, receive-pack, proxy,
+credential and URL-specific HTTP pins keep unreviewed repository config from
+adding server-side effects. `git config` writes to
 transport-affecting keys (including `include.*` and `init.*`), `git config
 --edit`, `git init --template`, and any statement naming `.git/config` or
 `.git/hooks` in any spelling (`namesGitMetadata` normalizes the path and matches a glob segment by segment, so only a
@@ -509,7 +520,8 @@ retries deferred lifecycle events, classifies a Worker that exited without an ex
 event, and starts verification for it. Permission and other actions pass through the configured autonomy policy and
 are recorded. The local development loop must not require synchronous human
 approval for ordinary actions; a task that cannot safely produce a candidate is
-parked or failed without granting remote/main authority. Model/API failures are
+parked or failed without granting remote/main authority. Only a verified,
+explicitly configured publish phase can issue its narrow `RemoteGrant`. Model/API failures are
 detected from the Pi `stopReason` (a provider error resolves the prompt normally
 rather than throwing); if the Decision Worker
 API/model call fails, the system records `decision_worker_failed`, applies the
@@ -615,7 +627,7 @@ limit, so a normal large test report is not misclassified as a failed command.
 
 ## Deliberate non-goals
 
-- giving the Worker remote push or main/integration merge authority;
+- giving the Worker implicit remote push or any main/integration merge authority; an explicit `RemoteGrant` is limited to its verified commit and destination;
 - unauthenticated inbound webhook commands; outbound notifications are optional,
   do not grant permission and do not replace the remote/main independent boundary;
 - treating an unknown Claude interactive question as safe without task evidence or configured authorization;

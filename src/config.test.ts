@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
+  automationEnabled,
   autonomyDefaults,
+  cgroupMode,
   deadlineGraceMs,
   deadlineMs,
   deadlineWarningMs,
@@ -12,15 +17,65 @@ import {
   evidenceMaxUntrackedFiles,
   eventLogMaxBytes,
   formatDurationMs,
+  loadSupervisorEnvironment,
   noOutputTimeoutMs,
   parseDurationMs,
   progressHeartbeatMs,
   reviewerModel,
   reviewTimeoutMs,
+  supervisorTransport,
   workerAutocompactTokens,
   workerMcpConfigPath,
   workerModel,
+  webhookFormat,
 } from "./config.ts";
+
+test("environment file parsing is strict and secures the file", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-config-"));
+  const envFile = join(root, "env");
+  const fileKey = "PI_CLAUDE_SUPERVISOR_ENV_FILE";
+  const keys = [fileKey, "PI_CLAUDE_SUPERVISOR_MODE", "PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT"];
+  const previous = new Map(keys.map((key) => [key, process.env[key]]));
+  try {
+    process.env[fileKey] = envFile;
+    delete process.env.PI_CLAUDE_SUPERVISOR_MODE;
+    delete process.env.PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT;
+    await writeFile(envFile, "# safe settings\nexport PI_CLAUDE_SUPERVISOR_MODE=manual\nPI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=1\n", { mode: 0o644 });
+    assert.equal(loadSupervisorEnvironment(), envFile);
+    assert.equal(process.env.PI_CLAUDE_SUPERVISOR_MODE, "manual");
+    assert.equal(process.env.PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT, "1");
+    assert.equal((await stat(envFile)).mode & 0o077, 0);
+
+    await writeFile(envFile, "PI_CLAUDE_SUPERVISOR_UNKNOWN=1\n");
+    assert.throws(() => loadSupervisorEnvironment(), /invalid Supervisor env entry/u);
+    await writeFile(envFile, "PI_CLAUDE_SUPERVISOR_MODE=\"manual\n");
+    assert.throws(() => loadSupervisorEnvironment(), /unterminated Supervisor env value/u);
+    await writeFile(envFile, "PI_CLAUDE_SUPERVISOR_MODE=manual\nPI_CLAUDE_SUPERVISOR_MODE=auto\n");
+    assert.throws(() => loadSupervisorEnvironment(), /duplicate Supervisor env entry/u);
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("mode, transport, cgroup and webhook configuration reject typos", () => {
+  assert.equal(automationEnabled({}), false);
+  assert.equal(automationEnabled({ PI_CLAUDE_SUPERVISOR_MODE: "auto" }), true);
+  assert.equal(automationEnabled({ PI_CLAUDE_SUPERVISOR_AUTOMATION: "1" }), true);
+  assert.throws(() => automationEnabled({ PI_CLAUDE_SUPERVISOR_MODE: "automatic" }), /must be auto or manual/u);
+  assert.throws(() => automationEnabled({ PI_CLAUDE_SUPERVISOR_AUTOMATION: "maybe" }), /invalid boolean/u);
+  assert.equal(supervisorTransport({}, true), "jsonl");
+  assert.equal(supervisorTransport({ PI_CLAUDE_SUPERVISOR_TRANSPORT: "tmux" }), "tmux");
+  assert.throws(() => supervisorTransport({ PI_CLAUDE_SUPERVISOR_TRANSPORT: "socket" }), /must be process-pipe/u);
+  assert.equal(cgroupMode({}), "auto");
+  assert.throws(() => cgroupMode({ PI_CLAUDE_SUPERVISOR_CGROUP_MODE: "best-effort" }), /must be off/u);
+  assert.equal(webhookFormat({}), "generic");
+  assert.equal(webhookFormat({ PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_FORMAT: "wecom" }), "wecom");
+  assert.throws(() => webhookFormat({ PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_FORMAT: "slack" }), /must be generic/u);
+});
 
 test("autonomy environment defaults are unattended and bounded", () => {
   assert.deepEqual(autonomyDefaults({}), { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
@@ -29,23 +84,23 @@ test("autonomy environment defaults are unattended and bounded", () => {
     PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT: "false",
     PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES: "4",
   }), { unattended: false, requireLocalCommit: false, maxDecisionRetries: 4, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
-  assert.deepEqual(autonomyDefaults({
+  assert.throws(() => autonomyDefaults({
     PI_CLAUDE_SUPERVISOR_UNATTENDED: "not-a-boolean",
     PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES: "99",
-  }), { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
+  }), /invalid boolean Supervisor configuration value/u);
 });
 
 test("reviewTimeoutMs defaults and rejects out-of-range overrides", () => {
   assert.equal(reviewTimeoutMs({}), 600_000);
   assert.equal(reviewTimeoutMs({ PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS: "120000" }), 120_000);
-  assert.equal(reviewTimeoutMs({ PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS: "1000" }), 600_000);
-  assert.equal(reviewTimeoutMs({ PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS: "9999999" }), 600_000);
+  assert.throws(() => reviewTimeoutMs({ PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS: "1000" }), /must be between/u);
+  assert.throws(() => reviewTimeoutMs({ PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS: "9999999" }), /must be between/u);
 });
 
 test("eventLogMaxBytes defaults and rejects out-of-range overrides", () => {
   assert.equal(eventLogMaxBytes({}), 64 * 1024 * 1024);
   assert.equal(eventLogMaxBytes({ PI_CLAUDE_SUPERVISOR_EVENT_LOG_MAX_BYTES: String(2 * 1024 * 1024) }), 2 * 1024 * 1024);
-  assert.equal(eventLogMaxBytes({ PI_CLAUDE_SUPERVISOR_EVENT_LOG_MAX_BYTES: "100" }), 64 * 1024 * 1024);
+  assert.throws(() => eventLogMaxBytes({ PI_CLAUDE_SUPERVISOR_EVENT_LOG_MAX_BYTES: "100" }), /must be between/u);
 });
 
 test("workerModel, workerMcpConfigPath, decisionModel and reviewerModel trim or omit", () => {
@@ -64,44 +119,44 @@ test("workerAutocompactTokens defaults, honors an explicit 0 opt-out and rejects
   assert.equal(workerAutocompactTokens({}), 200_000);
   assert.equal(workerAutocompactTokens({ PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS: "300000" }), 300_000);
   assert.equal(workerAutocompactTokens({ PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS: "0" }), 0);
-  assert.equal(workerAutocompactTokens({ PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS: "50000" }), 200_000);
-  assert.equal(workerAutocompactTokens({ PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS: "2000000" }), 200_000);
-  assert.equal(workerAutocompactTokens({ PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS: "" }), 200_000);
-  assert.equal(workerAutocompactTokens({ PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS: "0e5" }), 200_000);
+  assert.throws(() => workerAutocompactTokens({ PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS: "50000" }), /must be between/u);
+  assert.throws(() => workerAutocompactTokens({ PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS: "2000000" }), /must be between/u);
+  assert.throws(() => workerAutocompactTokens({ PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS: "" }), /must be between/u);
+  assert.throws(() => workerAutocompactTokens({ PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS: "0e5" }), /must be between/u);
 });
 
 test("decisionCompactionTokens defaults, honors an explicit 0 opt-out and rejects out-of-range overrides", () => {
   assert.equal(decisionCompactionTokens({}), 60_000);
   assert.equal(decisionCompactionTokens({ PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS: "100000" }), 100_000);
   assert.equal(decisionCompactionTokens({ PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS: "0" }), 0);
-  assert.equal(decisionCompactionTokens({ PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS: "5000" }), 60_000);
-  assert.equal(decisionCompactionTokens({ PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS: "9999999" }), 60_000);
-  assert.equal(decisionCompactionTokens({ PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS: "" }), 60_000);
+  assert.throws(() => decisionCompactionTokens({ PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS: "5000" }), /must be between/u);
+  assert.throws(() => decisionCompactionTokens({ PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS: "9999999" }), /must be between/u);
+  assert.throws(() => decisionCompactionTokens({ PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS: "" }), /must be between/u);
 });
 
 test("progressHeartbeatMs defaults and rejects out-of-range overrides", () => {
   assert.equal(progressHeartbeatMs({}), 60_000);
   assert.equal(progressHeartbeatMs({ PI_CLAUDE_SUPERVISOR_PROGRESS_HEARTBEAT_MS: "10000" }), 10_000);
-  assert.equal(progressHeartbeatMs({ PI_CLAUDE_SUPERVISOR_PROGRESS_HEARTBEAT_MS: "1000" }), 60_000);
-  assert.equal(progressHeartbeatMs({ PI_CLAUDE_SUPERVISOR_PROGRESS_HEARTBEAT_MS: "9999999" }), 60_000);
+  assert.throws(() => progressHeartbeatMs({ PI_CLAUDE_SUPERVISOR_PROGRESS_HEARTBEAT_MS: "1000" }), /must be between/u);
+  assert.throws(() => progressHeartbeatMs({ PI_CLAUDE_SUPERVISOR_PROGRESS_HEARTBEAT_MS: "9999999" }), /must be between/u);
 });
 
 test("decisionSessionRetentionDays defaults, allows 0 within range and rejects out-of-range overrides", () => {
   assert.equal(decisionSessionRetentionDays({}), 30);
   assert.equal(decisionSessionRetentionDays({ PI_CLAUDE_SUPERVISOR_DECISION_SESSION_RETENTION_DAYS: "0" }), 0);
   assert.equal(decisionSessionRetentionDays({ PI_CLAUDE_SUPERVISOR_DECISION_SESSION_RETENTION_DAYS: "7" }), 7);
-  assert.equal(decisionSessionRetentionDays({ PI_CLAUDE_SUPERVISOR_DECISION_SESSION_RETENTION_DAYS: "-1" }), 30);
-  assert.equal(decisionSessionRetentionDays({ PI_CLAUDE_SUPERVISOR_DECISION_SESSION_RETENTION_DAYS: "99999" }), 30);
+  assert.throws(() => decisionSessionRetentionDays({ PI_CLAUDE_SUPERVISOR_DECISION_SESSION_RETENTION_DAYS: "-1" }), /must be between/u);
+  assert.throws(() => decisionSessionRetentionDays({ PI_CLAUDE_SUPERVISOR_DECISION_SESSION_RETENTION_DAYS: "99999" }), /must be between/u);
 });
 
 test("evidenceMaxBytes and evidenceMaxUntrackedFiles default and reject out-of-range overrides", () => {
   assert.equal(evidenceMaxBytes({}), 1024 * 1024);
   assert.equal(evidenceMaxBytes({ PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES: String(2 * 1024 * 1024) }), 2 * 1024 * 1024);
-  assert.equal(evidenceMaxBytes({ PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES: "100" }), 1024 * 1024);
+  assert.throws(() => evidenceMaxBytes({ PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES: "100" }), /must be between/u);
   assert.equal(evidenceMaxUntrackedFiles({}), 512);
   assert.equal(evidenceMaxUntrackedFiles({ PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES: "100" }), 100);
-  assert.equal(evidenceMaxUntrackedFiles({ PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES: "1" }), 512);
-  assert.equal(evidenceMaxUntrackedFiles({ PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES: "99999" }), 512);
+  assert.throws(() => evidenceMaxUntrackedFiles({ PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES: "1" }), /must be between/u);
+  assert.throws(() => evidenceMaxUntrackedFiles({ PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES: "99999" }), /must be between/u);
 });
 
 test("parseDurationMs accepts unit suffixes, compounds and plain milliseconds", () => {
@@ -110,6 +165,9 @@ test("parseDurationMs accepts unit suffixes, compounds and plain milliseconds", 
   assert.equal(parseDurationMs("2h30m"), 150 * 60_000);
   assert.equal(parseDurationMs("45s"), 45_000);
   assert.equal(parseDurationMs("1.5h"), 90 * 60_000);
+  assert.equal(parseDurationMs("1.1h"), 3_960_000);
+  assert.equal(parseDurationMs("1.4d"), 120_960_000);
+  assert.equal(parseDurationMs("2.2h"), 7_920_000);
   assert.equal(parseDurationMs("250ms"), 250);
   assert.equal(parseDurationMs(" 1d "), 24 * 60 * 60_000);
   assert.equal(parseDurationMs("14400000"), 14_400_000);
@@ -139,14 +197,14 @@ test("deadline budgets default, accept durations and honor the zero opt-out", ()
   assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "0" }), 0);
   assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "0h" }), 0, "any zero duration is the opt-out");
   assert.equal(deadlineGraceMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_GRACE_MS: "0m" }), 0);
-  assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "1m" }), 4 * 60 * 60_000, "below the 5-minute floor keeps the default");
-  assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "8d" }), 4 * 60 * 60_000, "above the 7-day ceiling keeps the default");
-  assert.equal(deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "soon" }), 4 * 60 * 60_000);
+  assert.throws(() => deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "1m" }), /must be/u);
+  assert.throws(() => deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "8d" }), /must be/u);
+  assert.throws(() => deadlineMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_MS: "soon" }), /must be/u);
 
   assert.equal(deadlineGraceMs({}), 30 * 60_000);
   assert.equal(deadlineGraceMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_GRACE_MS: "1h" }), 60 * 60_000);
   assert.equal(deadlineGraceMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_GRACE_MS: "0" }), 0);
-  assert.equal(deadlineGraceMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_GRACE_MS: "2d" }), 30 * 60_000);
+  assert.throws(() => deadlineGraceMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_GRACE_MS: "2d" }), /must be/u);
 
   assert.equal(deadlineWarningMs({}), 15 * 60_000);
   assert.equal(deadlineWarningMs({ PI_CLAUDE_SUPERVISOR_DEADLINE_WARNING_MS: "30m" }), 30 * 60_000);
@@ -155,7 +213,7 @@ test("deadline budgets default, accept durations and honor the zero opt-out", ()
   assert.equal(noOutputTimeoutMs({}), 20 * 60_000);
   assert.equal(noOutputTimeoutMs({ PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS: "45m" }), 45 * 60_000);
   assert.equal(noOutputTimeoutMs({ PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS: "0" }), 0);
-  assert.equal(noOutputTimeoutMs({ PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS: "10s" }), 20 * 60_000, "below the 1-minute floor keeps the default");
+  assert.throws(() => noOutputTimeoutMs({ PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS: "10s" }), /must be/u);
 });
 
 test("remote authority never defaults on and only accepts the two grants", () => {

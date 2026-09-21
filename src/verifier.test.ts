@@ -47,6 +47,8 @@ test("a remote branch lookup tells an absent branch from a remote that cannot be
     assert.deepEqual(await remoteBranchHead(cwd, "origin", "feat/x"), { outcome: "absent" });
     await execFileAsync("git", ["-C", cwd, "push", "-q", "origin", `${head}:refs/heads/feat/x`]);
     assert.deepEqual(await remoteBranchHead(cwd, "origin", "feat/x"), { outcome: "found", head });
+    await execFileAsync("git", ["-C", cwd, "push", "-q", "origin", `${head}:refs/heads/notmain`]);
+    assert.deepEqual(await remoteBranchHead(cwd, "origin", "main"), { outcome: "absent" }, "a similarly suffixed remote ref is not the requested branch");
 
     // The remote is gone: that is not a fact about the branch.
     await rm(remote, { recursive: true, force: true });
@@ -92,6 +94,18 @@ test("a remote destination lists every URL git would push to, and compares as a 
     await execFileAsync("git", ["-C", cwd, "remote", "add", "origin", "/srv/real.git"]);
     const before = await remoteUrl(cwd, "origin");
     assert.deepEqual(before, { fetch: ["/srv/real.git"], push: ["/srv/real.git"] });
+    // An explicit URL is still rewritten by local `url.*.pushInsteadOf` (and
+    // by its fetch/push cousin), so a grant cannot safely pin it. The whole
+    // remote is rejected before a Worker can receive a publish command.
+    await execFileAsync("git", ["-C", cwd, "config", "url./srv/evil.pushInsteadOf", "/srv/real.git"]);
+    assert.equal(await remoteUrl(cwd, "origin"), undefined);
+    await execFileAsync("git", ["-C", cwd, "config", "--unset-all", "url./srv/evil.pushInsteadOf"]);
+    await execFileAsync("git", ["-C", cwd, "config", "url./srv/evil.insteadOf", "/srv/real.git"]);
+    assert.equal(await remoteUrl(cwd, "origin"), undefined);
+    await execFileAsync("git", ["-C", cwd, "config", "--unset-all", "url./srv/evil.insteadOf"]);
+    await execFileAsync("git", ["-C", cwd, "config", "remote.origin.url", "https://example.invalid/a\nb"]);
+    assert.equal(await remoteUrl(cwd, "origin"), undefined, "a control character in a raw remote value cannot become a second destination");
+    await execFileAsync("git", ["-C", cwd, "config", "remote.origin.url", "/srv/real.git"]);
     // `git remote get-url --push` would still print only the first; git
     // pushes to both, so the second one is a second destination.
     await execFileAsync("git", ["-C", cwd, "config", "--add", "remote.origin.pushurl", "/srv/real.git"]);
@@ -102,6 +116,15 @@ test("a remote destination lists every URL git would push to, and compares as a 
     assert.equal(sameDestination(before, { fetch: ["/srv/real.git"], push: ["/srv/real.git"] }), true);
     assert.equal(sameDestination(before, undefined), false);
     assert.equal(await remoteUrl(cwd, "nope"), undefined);
+
+    // Remote-helper protocols and credential-bearing URLs are not safe to
+    // copy into the Worker-owned publish instruction.
+    await execFileAsync("git", ["-C", cwd, "remote", "add", "helper", "ext::sh -c echo"], { cwd: base });
+    assert.equal(await remoteUrl(cwd, "helper"), undefined);
+    await execFileAsync("git", ["-C", cwd, "remote", "add", "secret", "https://user:token@example.com/acme/repo"], { cwd: base });
+    assert.equal(await remoteUrl(cwd, "secret"), undefined);
+    await execFileAsync("git", ["-C", cwd, "remote", "add", "secret-ssh", "ssh://git:token@example.com/acme/repo"], { cwd: base });
+    assert.equal(await remoteUrl(cwd, "secret-ssh"), undefined);
   } finally {
     await rm(base, { recursive: true, force: true });
   }

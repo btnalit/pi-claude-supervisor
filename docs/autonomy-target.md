@@ -35,9 +35,12 @@ JSONL Worker or Supervisor-owned tmux bridge, and by default requires a local co
 Automatic Worker supervision uses either the structured JSONL transport or a
 Supervisor-owned tmux bridge. The bridge runs Claude's stream-json protocol inside the live
 PTY, renders a human-readable display, and returns private framed records through the same
-PTY; adopted tmux sessions remain manual-only. Automatic local work still has no Supervisor API
-for remote push or merging into `main` or another protected integration branch. It also refuses
-known direct Bash forms of those operations, protected Git metadata writes and package publication.
+PTY. Adopted tmux sessions may be supervised only after their hook capability and process
+identity bind successfully; an explicit publish task still requires the same one-shot grant.
+Automatic local work has no implicit authority for remote push or merging into `main` or another
+protected integration branch. It refuses known direct Bash forms of those operations, protected
+Git metadata writes and package publication; only a verified candidate's explicit `RemoteGrant`
+may admit its exact push (and, for `pr`, its pinned pull-request creation).
 Starting candidate work directly on a protected integration branch remains refused; automatic
 repositories use a non-protected local branch.
 
@@ -74,8 +77,9 @@ inspection. “Parked for later inspection” is not the same as requiring a hum
 other tasks can proceed.
 
 A task that reaches `blocked`, `review_pending` or `candidate_failed` must not be pushed or merged.
-The same rule applies to a ready local candidate until the independent remote/main boundary accepts it.
-It may be resumed, repaired or discarded later without weakening the remote/main boundary.
+A ready local candidate also has no remote authority until its explicitly configured publish phase
+issues a valid grant after acceptance and independent Review. It may be resumed, repaired or
+discarded later without weakening the remote/main boundary.
 
 ## 4. Acceptance and independent review
 
@@ -116,7 +120,8 @@ again during recovery.
 
 Legacy `humanRequired`, takeover and approval fields remain for compatibility and explicit operator
 control. They are not entered by ordinary uncertainty, and a legacy approval object cannot override
-the deterministic known-command remote push/main merge denial. The existing independent Review
+the deterministic known-command remote push/main merge denial; only the separate
+Supervisor-issued publish grant can admit its exact command. The existing independent Review
 and protected CI/release paths remain the final external checks. Automatic Claude workers preserve
 Claude Code's normal environment, network, tool, agent and MCP surface; `CLAUDECODE` is removed
 only to permit intentional nested Claude sessions. The Supervisor-owned cgroup remains a cleanup
@@ -134,7 +139,8 @@ responsibility.
 
 This target does not authorize:
 
-- remote push from the Worker;
+- implicit or unreviewed remote push from the Worker (the separate verified-candidate `RemoteGrant`
+  is documented and deliberately narrower);
 - merge into `main` from the Worker;
 - bypassing the independent integration boundary;
 - silently treating incomplete evidence as success;

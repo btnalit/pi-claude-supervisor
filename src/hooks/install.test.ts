@@ -14,9 +14,9 @@ async function withTempDir<T>(run: (dir: string) => Promise<T>): Promise<T> {
   }
 }
 
-const EVENT_NAMES = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "Stop", "Notification"];
+const EVENT_NAMES = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "Stop", "StopFailure", "Notification"];
 
-test("a fresh settings file gains all seven hook events", async () => {
+test("a fresh settings file gains all eight hook events", async () => {
   await withTempDir(async (dir) => {
     const settingsPath = join(dir, "settings.json");
     const stateDir = join(dir, "state");
@@ -117,6 +117,17 @@ test("a symlinked settings file is written through, not replaced", async () => {
     assert.equal(document.hooks.Stop.length, 1);
     assert.deepEqual(document.hooks.UserPromptSubmit[0], { hooks: [{ type: "command", command: "echo hi" }] });
   });
+});
+
+test("an unrelated executable at a relay.js path is left alone", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-cs-install-"));
+  const settingsPath = join(stateDir, "settings.json");
+  const foreign = { type: "command", command: `python /home/me/hooks/relay.js`, timeout: 5 };
+  await writeFile(settingsPath, JSON.stringify({ hooks: { Stop: [{ hooks: [foreign] }] } }), "utf8");
+  await uninstallUserHooks({ stateDir, settingsPath });
+  const after = JSON.parse(await readFile(settingsPath, "utf8")) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> };
+  assert.equal(after.hooks.Stop[0]?.hooks[0]?.command, foreign.command);
+  await rm(stateDir, { recursive: true, force: true });
 });
 
 test("an unrelated hook whose command merely mentions relay.js is left alone", async () => {

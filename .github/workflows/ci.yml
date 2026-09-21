@@ -29,6 +29,9 @@ concurrency:
 
 env:
   CHECKOUT_REF: ${{ inputs.ref || github.sha }}
+  # The test runner fails if any automatic-path test is skipped. The checks
+  # jobs place the test process in a delegated cgroup before running it.
+  PI_CLAUDE_SUPERVISOR_FAIL_ON_TEST_SKIP: '1'
 
 jobs:
   policy:
@@ -79,15 +82,20 @@ jobs:
           echo "$GITHUB_WORKSPACE/.ci-bin" >> "$GITHUB_PATH"
       - name: Install tmux transport test dependency
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y tmux
+      - name: Prepare delegated cgroup for automatic tests
+        run: bash scripts/ci/prepare-cgroup.sh
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
         with:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci --ignore-scripts
-      - run: npm run check
+      - run: bash scripts/ci/run-in-cgroup.sh npm run check
       - run: npm run test:pi
       - run: npm run test:install
       - run: npm audit --audit-level=high
+      - name: Remove delegated cgroup
+        if: always()
+        run: bash scripts/ci/cleanup-cgroup.sh
 
   checks_npm_latest:
     name: Node 24 / npm ${{ matrix.npm }} checks
@@ -114,6 +122,8 @@ jobs:
           echo "$GITHUB_WORKSPACE/.ci-bin" >> "$GITHUB_PATH"
       - name: Install tmux transport test dependency
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y tmux
+      - name: Prepare delegated cgroup for automatic tests
+        run: bash scripts/ci/prepare-cgroup.sh
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
         with:
           node-version: '24'
@@ -125,9 +135,12 @@ jobs:
           npm install --global --ignore-scripts "npm@$NPM_VERSION"
           node --input-type=module -e 'import {execFileSync} from "node:child_process"; if (execFileSync("npm", ["--version"], {encoding:"utf8"}).trim().split(".")[0] !== process.env.NPM_VERSION) throw new Error("npm major mismatch");'
       - run: npm ci --ignore-scripts
-      - run: npm run check
+      - run: bash scripts/ci/run-in-cgroup.sh npm run check
       - run: npm run test:install
       - run: npm run build
+      - name: Remove delegated cgroup
+        if: always()
+        run: bash scripts/ci/cleanup-cgroup.sh
 
   integration:
     name: Pi installation and integration

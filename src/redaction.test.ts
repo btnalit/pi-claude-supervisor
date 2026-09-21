@@ -29,6 +29,17 @@ test("dotted secrets are redacted whole rather than leaking their tail", () => {
   assert.equal(redactSensitive("token=ABCDEFGH"), "token=[REDACTED]");
 });
 
+test("redacts URLs, JSON credentials, webhook assignments and PEM blocks", () => {
+  const pem = "-----BEGIN PRIVATE KEY-----\nsecret-material\n-----END PRIVATE KEY-----";
+  const input = `https://user:pass@example.invalid/x?api_key=query-secret&token=query-token {"api_key":"json-secret","nested":{"password":"json-password"}} SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/secret -u user:password ${pem}`;
+  const output = String(redactSensitive(input));
+  for (const secret of ["pass@example", "query-secret", "query-token", "json-secret", "json-password", "T000/B000/secret", "user:password", "secret-material"]) {
+    assert.equal(output.includes(secret), false, secret);
+  }
+  assert.equal(output.includes("[REDACTED]"), true);
+  assert.equal(redactSensitive(output), output, "redaction is idempotent");
+});
+
 test("token counts under a sensitive-looking key are numbers, not secrets", () => {
   assert.deepEqual(
     redactSensitive({ role: "decision", input: 3156, totalTokens: 3324, contextTokens: 8000, token: "abc123def456ghi789", tokens: ["abc123def456ghi789"] }),

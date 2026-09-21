@@ -16,13 +16,16 @@ extension is a single `pi install`: Pi discovers and loads it itself, there is
 no separate build or binary, and there is nothing to configure inside Pi
 beyond environment variables.
 
-There is a hard boundary the Worker can never cross, regardless of its own
-permission settings: it may not push to a remote, merge into `main` or an
-integration branch, open a pull request, or run a remote CLI mutation;
+By default there is a hard boundary the Worker cannot cross, regardless of
+its own permission settings: it may not push to a remote, merge into `main` or
+an integration branch, open a pull request, or run a remote CLI mutation;
 `.git` metadata writes and destructive rewrites of protected branches are
-denied outright. Everything else — edits, tests, shell commands, local
-commits — follows the policy you configure. The extension itself never
-merges, deploys, releases, or publishes anything at runtime.
+denied outright. An explicit `REMOTE_AUTHORITY=push` or `pr` task can instead
+receive one narrow, Supervisor-generated publish grant after acceptance and
+independent Review; only that exact push (and, for `pr`, the matching
+`gh pr create`) is admitted. Everything else — edits, tests, shell commands,
+local commits — follows the policy you configure. The extension never merges,
+deploys or releases anything at runtime.
 
 How the loop works, once a task starts:
 
@@ -144,9 +147,10 @@ Decision Worker; its judgment applies only where Claude would have asked
 *you*. The hard boundary (remote push/merge/PR, remote CLI mutation, `.git`
 writes, destructive protected-branch rewrites) is enforced by `PreToolUse`
 regardless of permission mode — verified against `auto` mode on Claude Code
-2.1.273 — and is the only guarantee this mode makes beyond your own
-settings. Use headless (`bridge`) mode when every `Bash` call must be visible
-to the Supervisor.
+2.1.273. An explicit publish task is the exception: `PreToolUse` admits only
+the live, Supervisor-generated one-shot command described below. This is the
+only guarantee this mode makes beyond your own settings. Use headless
+(`bridge`) mode when every `Bash` call must be visible to the Supervisor.
 
 **Adopting an idle session.** `adopt-tmux` types the task into the session
 only when Claude is idle at its prompt; a session caught mid-turn keeps its
@@ -202,10 +206,13 @@ Supervisor being able to see it, or when you don't need to attach.
 
 ## Safety boundary
 
-- Always denied, regardless of policy or permission mode: remote push,
-  merge/PR into `main` or an integration branch, other remote CLI mutations,
-  `.git` metadata writes, and destructive rewrites of protected branches
-  (`reset`, `update-ref`, `symbolic-ref`, or a delete/move/force `branch`).
+- Denied regardless of policy or permission mode unless the Supervisor has
+  issued the current one-shot publish grant: remote push, pull-request
+  creation, merge/PR into `main` or an integration branch, other remote CLI
+  mutations, `.git` metadata writes, and destructive rewrites of protected
+  branches (`reset`, `update-ref`, `symbolic-ref`, or a delete/move/force
+  `branch`). A grant admits only its exact verified-commit push, plus the
+  explicitly pinned `gh pr create` for `pr` authority; it never admits merge.
   A shell argument the policy cannot see through (`$VAR`, `$(…)`, a glob)
   is vetoed, best-effort, only on the commands where it could reach that
   boundary — git, gh, npm/pnpm/yarn, curl/wget/ssh, a nested `claude`, or an
@@ -269,10 +276,16 @@ the pull request URL. A publish that cannot be confirmed blocks the candidate,
 which stays deliverable locally.
 
 The grant is deliberately unforgiving, and both commands are matched literally —
-an option nobody reviewed is refused rather than assumed harmless. It admits
-exactly `git -C '<task directory>' -c core.hooksPath=/dev/null -c push.followTags=false push <remote> <verified commit>:refs/heads/<branch>`,
-with no other option. The refspec names the **verified commit**, not the branch:
-git pushes exactly that object, so a commit the Worker makes during the publish
+an option nobody reviewed is refused rather than assumed harmless. The
+Supervisor-generated push command includes loader clearing before an absolute
+`env`, clears Worker-controlled Git/config/SSH/proxy variables, pins global and
+system Git config to `/dev/null`, uses Supervisor-resolved `git` and an exact
+`-C '<task directory>'`, pins hooks, push options, recursive submodules,
+receive-pack and the complete resolved `pushurl` list, and finally names only
+`<verified commit>:refs/heads/<branch>`. The Worker must use that generated
+command; the long prefix is intentional and is not an invitation to add
+assignments. The refspec names the **verified commit**, not the branch: git
+pushes exactly that object, so a commit the Worker makes during the publish
 turn stays local ("Everything up-to-date") instead of riding the grant. `-C` is
 **required, absolute and byte for byte the task directory** — no normalization,
 no realpath — because Claude's Bash tool keeps its working directory between
@@ -284,20 +297,20 @@ lexically while the kernel follows the link). The instruction spells the exact
 directory, so no other spelling is needed. The hooks path is **pinned** on that one command so no
 `pre-push` hook a Worker could have installed (by any door: `git init
 --template=`, an archive, a `chmod`) runs inside the granted push with the
-Worker's credentials, and `push.followTags=false` is pinned so a
-`followTags=true` set through any file the policy never sees cannot make the
-one push also plant a tag the grant never named (a tag is what release
-automation keys on). Both are ref and hook selection, not transport, so they
-override no legitimate per-repository setting. For `pr` a `gh pr create --repo <pinned remote URL>
+Worker's credentials. For `pr` the Supervisor similarly uses a trusted absolute `env`/`gh`
+prefix, clears Worker-controlled Git, proxy, credential, GH and XDG selectors,
+pins `PATH`/`HOME`, and then runs `gh pr create --repo <pinned remote URL>
 --head <candidate branch> …` limited to title, body, base, draft, assignee and
 label: the pull request opens in the granted remote's repository, full stop —
 without `--repo`, gh picks a base repository from the remotes (`upstream` on a
 fork) that the grant never named and the confirmation never reads. The
 repository is the `host/owner/repo` behind the remote's URL (an SSH-config host
 alias is translated through `ssh -G`, as gh does); a remote whose URL is not
-one — a local path, an alias with no translation — gets no `pr` grant. Every
-word the grant supplies is shell-quoted, so a branch named `feat/$ticket` still
-round-trips through the policy.
+one — a local path, an alias with no translation — gets no `pr` grant. For an
+SSH push destination, the push pin also uses a Supervisor-resolved `ssh -F
+/dev/null`, so repository/user SSH config cannot add a proxy or command.
+Every word the grant supplies is shell-quoted, so a branch named `feat/$ticket`
+still round-trips through the policy.
 
 The grant is only issued for a commit that *is* the verified tree: the working
 tree must be clean (untracked files included — a new file may be part of the
@@ -309,14 +322,15 @@ moved, does the task end at the local candidate with a `not published:` reason
 instead of a grant. A remote that cannot be reached at confirmation time leaves
 the publish *unconfirmed* (the candidate stays deliverable), never "refuted".
 
-Refused with or without a grant: every push option (`-u`, `--force`,
+Refused with or without a grant: every unpinned push option (`-u`, `--force`,
 `--force-with-lease`, `--delete`, `--mirror`, `--all`, `--tags`, `--no-verify`,
-`--push-option`, `--receive-pack`, …), any `-c` but the two pins (in that order), a
-branch or `HEAD` as the refspec source, a bare `git push`, another remote,
-branch or commit, a protected branch, a shell wrapper (`sh -c`, and a heredoc
-piped into a shell), a dynamic word, a second statement, `git push` without
-`-C`, a `-C` that is not the task directory byte for byte (another directory, a
-relative path, `/proc/self/cwd`, a symlink or `..` inside it),
+`--push-option`, a non-Supervisor `--receive-pack`, …); the generated
+`--receive-pack=git-receive-pack` is the sole fixed exception, followed by any
+`-c` not one of the Supervisor's pins, a branch or `HEAD` as the refspec source, a bare `git push`, another
+remote, branch or commit, a protected branch, a shell wrapper (`sh -c`, and a
+heredoc piped into a shell), a dynamic word, a second statement, `git push`
+without `-C`, a `-C` that is not the task directory byte for byte (another
+directory, a relative path, `/proc/self/cwd`, a symlink or `..` inside it),
 `gh pr create` without `--repo <pinned URL>` or without `--head <candidate
 branch>` (a `--head` swallowed as another option's value does not count),
 `gh pr create --body-file/-F/--template` (which would post the contents of an
@@ -337,11 +351,12 @@ the remote's resolved fetch and push URLs — **every** one of them
 not only the first it prints), rewrites applied — are recorded when the task
 **starts**, before the Worker runs a command, and required unchanged both
 when the grant is issued *and* at the moment the granted push is authorized.
-So a `pushInsteadOf`, `pushurl` or extra destination added during the task by
-*any* means (`~/.gitconfig`, a script, an include the policy never saw), even
-as the first command of the publish turn, refuses the push and revokes the
-grant, while an operator's pre-existing rewrite, already in the baseline, is
-not. A recovered task keeps its recorded baseline and never takes a new one;
+So a local `url.*.insteadOf`/`pushInsteadOf` rule is rejected rather than
+being treated as a stable destination. A `pushurl` or extra destination added
+during the task by *any* means (`~/.gitconfig`, a script, an include the policy
+never saw), even as the first command of the publish turn, refuses the push and
+revokes the grant. An operator's pre-existing **global** rewrite is resolved
+into the baseline and pinned; local rewrite rules never receive a grant. A recovered task keeps its recorded baseline and never takes a new one;
 a remote that could not be resolved at the first start is recorded as such and
 never granted. This is a policy over the command text: a script the Worker writes
 and runs is outside what it can see, as [autonomy-target.md](docs/autonomy-target.md)

@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
+import { TextDecoder } from "node:util";
 import { constants as fsConstants, readFileSync } from "node:fs";
-import { access, mkdir, readFile, readdir, rmdir, stat, writeFile } from "node:fs/promises";
-import { delimiter, isAbsolute, join } from "node:path";
+import { access, lstat, mkdir, readFile, readdir, rmdir, stat, writeFile } from "node:fs/promises";
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import type {
   WorkerAdapter,
   WorkerCapabilities,
@@ -60,6 +61,8 @@ interface ProcessRecord {
   seenPermissionRequestIds: Set<string>;
   protocolBuffer: string;
   discardProtocolLine: boolean;
+  stdoutDecoder: TextDecoder;
+  stderrDecoder: TextDecoder;
   exitCode?: number | null;
   signal?: NodeJS.Signals;
   spawnError?: Error;
@@ -259,6 +262,8 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       seenPermissionRequestIds: new Set(),
       protocolBuffer: "",
       discardProtocolLine: false,
+      stdoutDecoder: new TextDecoder("utf-8", { fatal: true }),
+      stderrDecoder: new TextDecoder("utf-8", { fatal: true }),
       exited,
       resolveExit,
       sentKeys: new Set(),
@@ -287,13 +292,26 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     this.#records.set(handle.id, record);
     if (input.abortSignal?.aborted) abortListener();
     const capture = (stream: "stdout" | "stderr") => (chunk: Buffer | string) => {
-      let text = String(chunk);
+      const raw = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8");
+      let text: string;
+      try {
+        text = (stream === "stdout" ? record.stdoutDecoder : record.stderrDecoder).decode(raw, { stream: true });
+      } catch (error) {
+        record.runtimeError ??= new Error(`worker emitted invalid UTF-8 on ${stream}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+        record.stopping = true;
+        try { record.child.kill("SIGKILL"); } catch { /* exit lifecycle remains authoritative */ }
+        text = "[invalid UTF-8 output]\n";
+      }
       if (guardedLaunch && stream === "stderr" && text.includes(BOOTSTRAP_READY_MARKER)) {
         text = text.replaceAll(`${BOOTSTRAP_READY_MARKER}\n`, "").replaceAll(BOOTSTRAP_READY_MARKER, "");
         bootstrapReady = true;
         resolveSpawn();
       }
       if (!text) return;
+      if (Buffer.byteLength(text, "utf8") > this.#maxOutputBytes) {
+        text = utf8Tail(text, this.#maxOutputBytes);
+        record.outputTruncated = true;
+      }
       record.lastOutputAt = new Date().toISOString();
       const outputChunk = { stream, text, at: record.lastOutputAt } as WorkerOutputChunk;
       this.#appendOutput(record, outputChunk);
@@ -331,6 +349,14 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       }
     });
     child.once("exit", (code, signal) => {
+      for (const [stream, decoder] of [["stdout", record.stdoutDecoder], ["stderr", record.stderrDecoder]] as const) {
+        try {
+          const tail = decoder.decode();
+          if (tail) capture(stream)(tail);
+        } catch (error) {
+          record.runtimeError ??= new Error(`worker emitted incomplete UTF-8 on ${stream}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+        }
+      }
       if (guardedLaunch && !bootstrapReady && !record.spawnError) {
         const error = new Error("worker bootstrap exited before reporting readiness");
         record.spawnError = error;
@@ -522,11 +548,11 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   }
 
   async pause(handle: WorkerHandle): Promise<void> {
-    this.#signal(handle, "SIGSTOP");
+    await this.#signal(handle, "SIGSTOP");
   }
 
   async resume(handle: WorkerHandle): Promise<void> {
-    this.#signal(handle, "SIGCONT");
+    await this.#signal(handle, "SIGCONT");
   }
 
   async stop(handle: WorkerHandle, _reason: string): Promise<void> {
@@ -684,7 +710,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
   #appendOutput(record: ProcessRecord, chunk: WorkerOutputChunk): void {
     let text = chunk.text;
     if (Buffer.byteLength(text, "utf8") > this.#maxOutputBytes) {
-      text = Buffer.from(text, "utf8").subarray(-this.#maxOutputBytes).toString("utf8");
+      text = utf8Tail(text, this.#maxOutputBytes);
       record.outputTruncated = true;
     }
     const retained = { ...chunk, text };
@@ -704,11 +730,14 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
 
   async #plannedCgroupPath(id: string): Promise<string> {
     const parent = this.#cgroupParentPath ?? await currentCgroupPath();
+    await assertCgroupDirectory(parent);
     return `${parent}/pi-claude-supervisor-${id}`;
   }
 
   async #createCgroup(id: string, plannedPath?: string): Promise<string> {
     const path = plannedPath ?? await this.#plannedCgroupPath(id);
+    if (basename(resolve(path)) !== `pi-claude-supervisor-${id}`) throw new Error("worker cgroup identity has an unexpected name");
+    await assertCgroupDirectory(dirname(resolve(path)));
     await mkdir(path);
     try {
       await access(`${path}/cgroup.procs`, fsConstants.R_OK | fsConstants.W_OK);
@@ -757,7 +786,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     const pid = record.handle.pid;
     if (!pid) return;
     if (process.platform === "linux") {
-      await assertProcessGroupIdentity(record, pid);
+      if (!await assertProcessGroupIdentity(record, pid)) return;
     }
     try {
       // detached:true binds this worker's process group to its handle PID;
@@ -775,9 +804,10 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     throw new Error(`worker process group ${pid} did not exit before cleanup deadline`);
   }
 
-  #signal(handle: WorkerHandle, signal: NodeJS.Signals): void {
+  async #signal(handle: WorkerHandle, signal: NodeJS.Signals): Promise<void> {
     const record = this.#record(handle);
     if (record.exitCode !== undefined || !record.handle.pid) return;
+    if (process.platform === "linux" && !await assertProcessGroupIdentity(record, record.handle.pid)) return;
     process.kill(-record.handle.pid, signal);
   }
 }
@@ -860,7 +890,7 @@ const finishAfterCgroup = (code, signal, retainCgroup) => {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") { finish(); return; }
     }
     if (empty || Date.now() >= deadline) { finish(); return; }
-    setTimeout(reap, 25).unref();
+    setTimeout(reap, 25);
   };
   reap();
 };
@@ -875,7 +905,7 @@ const stopParentlessWorker = () => {
   try { child?.kill("SIGTERM"); } catch {}
   // Move the bootstrap out first so cgroup.kill cannot kill the cleanup code.
   moveOutOfCgroup();
-  setTimeout(() => finishAfterCgroup(143, undefined, true), 250).unref();
+  setTimeout(() => finishAfterCgroup(143, undefined, true), 250);
 };
 try {
   if (cgroup) writeFileSync(cgroup + "/cgroup.procs", String(process.pid) + "\\n");
@@ -894,7 +924,8 @@ try {
 if (child) {
 process.stderr.write("${BOOTSTRAP_READY_MARKER}\\n");
 parentWatch = setInterval(() => { if (!parentAlive()) stopParentlessWorker(); }, 100);
-parentWatch.unref();
+// Keep the parent-death watcher referenced: after the child exits it owns the
+// only remaining cleanup path and must finish the cgroup reap before exiting.
 const forwardedSignals = ["SIGTERM", "SIGINT", "SIGQUIT"];
 for (const signal of forwardedSignals) process.on(signal, () => { try { child.kill(signal); } catch {} });
 child.once("error", (error) => {
@@ -986,10 +1017,25 @@ async function assertExecutable(command: string, pathValue: string | undefined):
 export async function currentCgroupPath(): Promise<string> {
   const contents = await readFile("/proc/self/cgroup", "utf8");
   const match = contents.match(/^0::([^\n]*)$/mu);
-  if (!match) throw new Error("cgroup v2 is not active");
+  if (!match || !match[1]!.startsWith("/")) throw new Error("cgroup v2 is not active");
   // /proc/self/cgroup uses the same escaped component spelling as the cgroup
   // filesystem (for example, a literal `\\x2d` in a systemd scope name).
-  return `/sys/fs/cgroup${match[1]}`;
+  const path = `/sys/fs/cgroup${match[1]}`;
+  await assertCgroupDirectory(path);
+  return path;
+}
+
+export async function assertCgroupDirectory(path: string): Promise<void> {
+  const root = resolve("/sys/fs/cgroup");
+  const candidate = resolve(path);
+  if (candidate !== root && !candidate.startsWith(`${root}/`)) throw new Error("cgroup path is outside the kernel cgroup root");
+  let current = root;
+  for (const component of candidate.slice(root.length + 1).split("/")) {
+    if (!component) continue;
+    current = join(current, component);
+    const info = await lstat(current);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("cgroup path is not a real directory");
+  }
 }
 
 export async function preflightCgroupContainment(parentPath?: string): Promise<void> {
@@ -998,6 +1044,7 @@ export async function preflightCgroupContainment(parentPath?: string): Promise<v
   let probeChild: ChildProcess | undefined;
   try {
     const parent = parentPath ?? await currentCgroupPath();
+    await assertCgroupDirectory(parent);
     await access(parent, fsConstants.W_OK);
     probePath = `${parent}/pi-claude-supervisor-preflight-${process.pid}-${randomUUID()}`;
     await mkdir(probePath);
@@ -1080,7 +1127,7 @@ async function readProcessGroupIdentity(pid: number): Promise<ProcessGroupIdenti
   return parseProcessGroupIdentity(await readFile(`/proc/${pid}/stat`, "utf8"), pid);
 }
 
-async function assertProcessGroupIdentity(record: ProcessRecord, pid: number): Promise<void> {
+async function assertProcessGroupIdentity(record: ProcessRecord, pid: number): Promise<boolean> {
   const identity = record.processGroupIdentity;
   if (record.processGroupIdentityError) throw new Error(`worker process-group identity unavailable: ${record.processGroupIdentityError.message}`);
   if (!identity || identity.pid !== pid || identity.pgid !== pid) throw new Error(`worker process-group identity was not established for ${pid}`);
@@ -1089,8 +1136,9 @@ async function assertProcessGroupIdentity(record: ProcessRecord, pid: number): P
     if (current.startTime !== identity.startTime || current.pgid !== identity.pgid) {
       throw new Error(`worker process-group identity changed for ${pid}`);
     }
+    return true;
   } catch (error) {
-    if (error instanceof Error && /ENOENT/u.test(error.message)) return;
+    if (error instanceof Error && /ENOENT/u.test(error.message)) return false;
     throw error;
   }
 }
@@ -1132,6 +1180,12 @@ async function removeEmptyCgroupChildDirectories(path: string): Promise<void> {
 }
 
 export async function cleanupCgroup(path: string, graceMs: number, retainDirectory = false): Promise<void> {
+  try {
+    await assertCgroupDirectory(path);
+  } catch (error) {
+    if (error instanceof Error && /ENOENT/u.test(error.message)) return;
+    throw error;
+  }
   try {
     await stat(path);
   } catch (error) {
@@ -1193,6 +1247,14 @@ function isPermissionRequest(event: Record<string, unknown>, request: unknown): 
     && typeof value.tool_use_id === "string"
     && typeof value.tool_name === "string"
     && "input" in value;
+}
+
+function utf8Tail(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.byteLength <= maxBytes) return value;
+  let start = bytes.byteLength - maxBytes;
+  while (start < bytes.byteLength && (bytes[start]! & 0xc0) === 0x80) start += 1;
+  return bytes.subarray(start).toString("utf8");
 }
 
 function delay(ms: number): Promise<void> {

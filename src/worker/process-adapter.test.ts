@@ -75,7 +75,7 @@ test("automatic process adapter inherits capability variables when input env is 
   const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-process-environment-test-"));
   const capture = join(root, "environment.json");
   const fakeClaude = join(root, "claude.mjs");
-  const key = "PI_CLAUDE_SUPERVISOR_PROCESS_TEST_CAPABILITY";
+  const key = "PI_WORKER_PROCESS_TEST_CAPABILITY";
   const previous = process.env[key];
   process.env[key] = "inherited-process-capability";
   await writeFile(fakeClaude, `#!/usr/bin/env node
@@ -628,6 +628,36 @@ test("claude-jsonl ignores malformed lines and duplicate result records", async 
     assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
   } finally {
     await adapter.stop(handle, "malformed/duplicate test complete");
+  }
+});
+
+test("claude-jsonl preserves UTF-8 when a JSON line splits inside a code point", async () => {
+  const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
+  const events: import("../types.ts").WorkerEvent[] = [];
+  const handle = await adapter.start({
+    task: "utf8 split test",
+    cwd: process.cwd(),
+    command: process.execPath,
+    eventListener: (event) => { events.push(event); },
+    args: ["-e", `
+      process.stdin.once('data', () => {
+        const bytes = Buffer.from(JSON.stringify({type:'result', uuid:'utf8-result', result:'你好🙂'}) + String.fromCharCode(10));
+        const split = bytes.indexOf(0xE4) + 1;
+        process.stdout.write(bytes.subarray(0, split));
+        setTimeout(() => process.stdout.write(bytes.subarray(split)), 10);
+      });
+      setInterval(() => {}, 1000);
+    `, "--"],
+  });
+  try {
+    for (let attempt = 0; attempt < 50 && events.filter((event) => event.type === "turn_completed").length < 1; attempt += 1) {
+      await adapter.readOutput(handle);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const completed = events.find((event): event is Extract<import("../types.ts").WorkerEvent, { type: "turn_completed" }> => event.type === "turn_completed");
+    assert.equal(completed?.result && (completed.result as { result?: string }).result, "你好🙂");
+  } finally {
+    await adapter.stop(handle, "utf8 split test complete");
   }
 });
 

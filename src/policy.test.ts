@@ -3,7 +3,7 @@ import { link, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { assertSafeWorkerCommand, evaluateCommand, evaluatePermission, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, sameDirectory, shellQuote } from "./policy.ts";
+import { assertSafeWorkerCommand, evaluateCommand, evaluatePermission, grantedPushEnvironment, grantedPushSettings, grantedPushShellAssignments, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, sameDirectory, shellQuote } from "./policy.ts";
 
 function bash(command: string) {
   return { command };
@@ -16,6 +16,20 @@ test("policy denies destructive commands", () => {
 test("policy hard-denies Git alias redefinition", () => {
   assert.equal(evaluateCommand("git config alias.c checkout").decision, "deny");
   assert.equal(evaluateCommand("git -c alias.c=checkout c main").decision, "deny");
+});
+
+test("policy parses command position instead of joined-text keywords", () => {
+  assert.equal(evaluateCommand("git commit -m 'fix: merge two loops'").decision, "allow");
+  assert.equal(evaluateCommand("grep -R shutdown src/").decision, "allow");
+  assert.equal(evaluateCommand("cat .git/HEAD").decision, "allow");
+  assert.equal(evaluateCommand("shutdown -h now").decision, "deny");
+  assert.equal(evaluateCommand("env GIT_DIR=.git git remote set-url origin https://evil.invalid/repo").decision, "deny");
+  assert.equal(evaluateCommand("command git push origin main").decision, "deny");
+  assert.equal(evaluateCommand("nice -n 5 git config remote.origin.pushurl https://evil.invalid/repo").decision, "deny");
+  assert.equal(evaluateCommand("timeout 10 git merge main").decision, "deny");
+  assert.equal(evaluateCommand("sudo ls").decision, "deny");
+  assert.equal(evaluateCommand("env FOO=1 sudo ls").decision, "deny");
+  assert.equal(evaluateCommand(`echo ${"x".repeat(70_000)}`).decision, "deny");
 });
 
 test("policy hard-denies publication and remote/integration writes", () => {
@@ -554,9 +568,12 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
   const head = "02ab45aafc8afde10d156575743afc4861adfa16";
   const refspec = `${head}:refs/heads/${branch}`;
   const repository = "github.com/acme/console";
-  const push = { authority: "push" as const, remoteName: "origin", branch, head, cwd: process.cwd(), repository };
-  const pr = { authority: "pr" as const, remoteName: "origin", branch, head, cwd: process.cwd(), repository };
-  const hooks = "-c core.hooksPath=/dev/null -c push.followTags=false";
+  const push = { authority: "push" as const, remoteName: "origin", branch, head, cwd: process.cwd(), repository, pushUrls: ["https://github.com/acme/console.git"] };
+  const pr = { authority: "pr" as const, remoteName: "origin", branch, head, cwd: process.cwd(), repository, pushUrls: ["https://github.com/acme/console.git"] };
+  const hooks = grantedPushSettings(push).map(shellQuote).map((setting) => `-c ${setting}`).join(" ");
+  const shell = grantedPushShellAssignments().join(" ");
+  const env = grantedPushEnvironment(push).map(shellQuote).join(" ");
+  const receivePack = "--receive-pack=git-receive-pack";
   const create = `gh pr create --repo ${repository} --head ${branch}`;
 
   // The verified commit is the refspec source: git pushes exactly that object,
@@ -564,9 +581,9 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
   // the grant. The directory may be quoted — the instruction quotes it so a
   // space in the path survives the Worker's shell as one word.
   for (const command of [
-    `git -C ${process.cwd()} ${hooks} push origin ${refspec}`,
-    `git -C '${process.cwd()}' ${hooks} push origin ${refspec}`,
-    `git -C "${process.cwd()}" ${hooks} push origin ${refspec}`,
+    `${shell} env ${env} git -C ${process.cwd()} ${hooks} push ${receivePack} origin ${refspec}`,
+    `${shell} env ${env} git -C '${process.cwd()}' ${hooks} push ${receivePack} origin ${refspec}`,
+    `${shell} env ${env} git -C "${process.cwd()}" ${hooks} push ${receivePack} origin ${refspec}`,
   ]) {
     const result = evaluateCommand(command, [], push);
     assert.equal(result.decision, "allow", command);
@@ -582,9 +599,14 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
   // round-trip through the parser, or a change to either side produces an
   // instruction the policy refuses and the only symptom is a blocked publish.
   assert.equal(evaluatePermission("Bash", { command: publishCommand(push) }, process.cwd(), { remote: push }).granted, true);
+  const sshPush = { ...push, sshCommand: "/usr/bin/ssh -F /dev/null" };
+  assert.equal(evaluatePermission("Bash", { command: publishCommand(sshPush) }, process.cwd(), { remote: sshPush }).granted, true);
+  const spacedSsh = { ...push, sshCommand: "'/tmp/trusted ssh/ssh' -F /dev/null" };
+  assert.equal(evaluatePermission("Bash", { command: publishCommand(spacedSsh) }, process.cwd(), { remote: spacedSsh }).granted, true, "the SSH helper path is quoted inside core.sshCommand");
   assert.equal(evaluatePermission("Bash", { command: `${pullRequestCommand(pr)} --title t --body b` }, process.cwd(), { remote: pr }).granted, true);
   const spaced = { ...push, cwd: "/tmp/it's a dir" };
-  assert.match(publishCommand(spaced), /^git -C '\/tmp\/it'\\''s a dir' -c core\.hooksPath=\/dev\/null -c push\.followTags=false push origin /u);
+  assert.ok(publishCommand(spaced).includes("-c 'core.hooksPath=/dev/null'"));
+  assert.ok(publishCommand(spaced).includes("push --receive-pack=git-receive-pack origin '02ab45aafc8afde10d156575743afc4861adfa16:refs/heads/s6/console-completion'"));
   assert.equal(evaluatePermission("Bash", { command: publishCommand(spaced) }, process.cwd(), { remote: push }).decision, "deny", "another grant's directory is not this grant's");
   // Every word the grant supplies is quoted: a legal branch name may carry
   // `$`, `{}` or a quote, which unquoted the lexer reads as dynamic and the
@@ -712,7 +734,7 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
   // lexically while the kernel follows the link. The instruction spells the
   // exact directory; a quoted spelling of it is the same word to the lexer.
   assert.equal(evaluateCommand(`git ${hooks} push origin ${refspec}`, [], push).decision, "deny", "no -C");
-  assert.equal(evaluateCommand(`git -C '${process.cwd()}' ${hooks} push origin ${refspec}`, [], push).decision, "allow", "quoted, the same word");
+  assert.equal(evaluateCommand(`git -C '${process.cwd()}' ${hooks} push ${receivePack} origin ${refspec}`, [], push).decision, "allow", "quoted, the same word");
   for (const directory of ["/tmp", "/", `${process.cwd()}/src`, `${process.cwd()}/src/..`, `${process.cwd()}/`, ".", "''", "src/..", "./", `'${process.cwd()}/../${process.cwd().split("/").at(-1)}/src/..'`, "/proc/self/cwd", "/proc/thread-self/cwd", `/proc/${process.pid}/cwd`, "/dev/fd/3"]) {
     assert.equal(evaluateCommand(`git -C ${directory} ${hooks} push origin ${refspec}`, [], push).decision, "deny", directory);
   }
@@ -728,7 +750,7 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
     await symlink(elsewhere, join(task, "link"));
     await symlink("/proc/self/cwd", join(task, "proc"));
     const inside = { ...push, cwd: task };
-    assert.equal(evaluateCommand(`git -C ${task} ${hooks} push origin ${refspec}`, [], inside).decision, "allow");
+    assert.equal(evaluateCommand(`${shell} env ${env} git -C ${task} ${hooks} push ${receivePack} origin ${refspec}`, [], inside).decision, "allow");
     assert.equal(evaluatePermission("Bash", { command: publishCommand(inside) }, task, { remote: inside }).granted, true);
     for (const directory of [`${task}/link/..`, `${task}/link`, `${task}/proc`, `${task}/proc/..`, `${task}/./`, `${task}/.`]) {
       assert.equal(evaluateCommand(`git -C ${directory} ${hooks} push origin ${refspec}`, [], inside).decision, "deny", directory);
@@ -897,10 +919,10 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
   // evaluatePermission threads the grant from the permission options, and
   // under hybrid authority a granted publish is routine — the Supervisor's own
   // decision, answered locally, never escalated to a Decision Worker.
-  assert.equal(evaluatePermission("Bash", { command: `git -C ${process.cwd()} ${hooks} push origin ${refspec}` }, process.cwd(), { remote: push }).decision, "allow");
-  assert.equal(evaluatePermission("Bash", { command: `git -C ${process.cwd()} ${hooks} push origin ${refspec}` }, process.cwd(), { remote: push }).granted, true);
-  assert.equal(evaluatePermission("Bash", { command: `git -C ${process.cwd()} ${hooks} push origin ${refspec}` }, process.cwd()).decision, "deny");
-  assert.equal(isRoutinePermission("Bash", { command: `git -C ${process.cwd()} ${hooks} push origin ${refspec}` }, process.cwd(), { remote: push }), true);
+  assert.equal(evaluatePermission("Bash", { command: `git -C ${process.cwd()} ${hooks} push ${receivePack} origin ${refspec}` }, process.cwd(), { remote: push }).decision, "allow");
+  assert.equal(evaluatePermission("Bash", { command: `git -C ${process.cwd()} ${hooks} push ${receivePack} origin ${refspec}` }, process.cwd(), { remote: push }).granted, true);
+  assert.equal(evaluatePermission("Bash", { command: `git -C ${process.cwd()} ${hooks} push ${receivePack} origin ${refspec}` }, process.cwd()).decision, "deny");
+  assert.equal(isRoutinePermission("Bash", { command: `git -C ${process.cwd()} ${hooks} push ${receivePack} origin ${refspec}` }, process.cwd(), { remote: push }), true);
   assert.equal(isRoutinePermission("Bash", { command: `${create} --title x --body y` }, process.cwd(), { remote: pr }), true);
   assert.equal(isRoutinePermission("Bash", { command: `git -C ${process.cwd()} ${hooks} push origin ${refspec}` }, process.cwd()), false);
   assert.equal(isRoutinePermission("Bash", { command: `git -C ${process.cwd()} ${hooks} push --force origin ${refspec}` }, process.cwd(), { remote: push }), false);

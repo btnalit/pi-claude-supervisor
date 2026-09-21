@@ -1,5 +1,5 @@
-import { accessSync, constants as fsConstants } from "node:fs";
-import { basename, delimiter, isAbsolute, join } from "node:path";
+import { accessSync, constants as fsConstants, realpathSync, statSync } from "node:fs";
+import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 
 /**
  * Pi's distributed Linux executable is a Bun-compiled binary. In that mode
@@ -12,16 +12,23 @@ export function nodeScriptCommand(env: NodeJS.ProcessEnv = process.env, execPath
   if (configured) {
     const resolved = findExecutable(configured, env.PATH);
     if (!resolved) throw new Error(`configured Node runtime is not executable: ${configured}`);
+    assertTrustedExecutable(resolved);
     return resolved;
   }
 
-  if (!process.versions.bun && isNodeExecutable(execPath)) return execPath;
+  if (!process.versions.bun && isNodeExecutable(execPath)) {
+    assertTrustedExecutable(execPath);
+    return execPath;
+  }
 
   const names = process.platform === "win32" ? ["node.exe", "node.cmd", "node"] : ["node", "nodejs"];
   for (const directory of (env.PATH ?? "").split(delimiter).filter(Boolean)) {
     for (const name of names) {
       const candidate = join(directory, name);
-      if (isExecutable(candidate)) return candidate;
+      if (isExecutable(candidate)) {
+        assertTrustedExecutable(candidate);
+        return candidate;
+      }
     }
   }
 
@@ -43,6 +50,28 @@ function isExecutable(path: string): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+function assertTrustedExecutable(path: string): void {
+  if (process.platform === "win32") return;
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  const paths = new Set([path, realpathSync(path)]);
+  for (const candidate of paths) {
+    const executable = statSync(candidate);
+    if (!executable.isFile() || (executable.mode & 0o022) !== 0 || (uid !== undefined && executable.uid !== uid && executable.uid !== 0)) {
+      throw new Error(`Node runtime is writable by or owned by an untrusted user: ${candidate}`);
+    }
+    let directory = dirname(candidate);
+    while (true) {
+      const info = statSync(directory);
+      if ((info.mode & 0o022) !== 0 || (uid !== undefined && info.uid !== uid && info.uid !== 0)) {
+        throw new Error(`a directory containing the Node runtime is writable by or owned by an untrusted user: ${directory}`);
+      }
+      const parent = dirname(directory);
+      if (parent === directory) break;
+      directory = parent;
+    }
   }
 }
 

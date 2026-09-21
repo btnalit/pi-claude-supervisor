@@ -160,6 +160,33 @@ test("automatic supervision rejects a detached or bare repository", async () => 
   }
 });
 
+test("automatic supervision rejects a separate Git directory before Worker startup", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-separate-git-start-"));
+  const gitDirectory = join(cwd, "..", "separate-git-dir");
+  try {
+    await execFileAsync("git", ["init", "-q", "-b", "worker/separate", "--separate-git-dir", gitDirectory, cwd]);
+    await execFileAsync("git", ["config", "user.email", "test@example.invalid"], { cwd });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd });
+    await writeFile(join(cwd, "base.txt"), "base\n");
+    await execFileAsync("git", ["add", "base.txt"], { cwd });
+    await execFileAsync("git", ["commit", "-qm", "base"], { cwd });
+    const supervisor = new Supervisor(new ProcessWorkerAdapter({ mode: "claude-jsonl" }), undefined, { reviewer: automaticReviewer() });
+    await assert.rejects(() => supervisor.start({
+      task: "separate Git directory",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: automaticSpec(),
+    }), /Git directory.*task directory.*\.git/u);
+    assert.equal(supervisor.handle, undefined);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+    await rm(gitDirectory, { recursive: true, force: true });
+  }
+});
+
 test("automatic supervision rejects a non-Claude executable after repository validation", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-custom-worker-start-"));
   try {
@@ -3186,7 +3213,27 @@ test("with push authority the verified candidate is handed back to publish, and 
     const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repo.cwd })).stdout.trim();
     fixture.adapter.send = async (_handle, message) => {
       fixture.state.sent.push(message);
-      if (message.includes("Publish it")) await execFileAsync("git", ["-C", repo.cwd, "-c", "core.hooksPath=/dev/null", "-c", "push.followTags=false", "push", "origin", `${head}:refs/heads/${branch}`], { cwd: repo.cwd });
+      if (message.includes("Publish it")) {
+        const command = message.match(/`([^`]+)`/u)?.[1];
+        assert.ok(command, "the publish instruction contains the generated literal command");
+        // Simulate repository configuration planted after the grant was
+        // issued. The command-line pins must override it, and the fixture
+        // restores the file before Supervisor confirmation reads the remote.
+        await execFileAsync("git", ["-C", repo.cwd, "config", "remote.origin.mirror", "true"]);
+        await execFileAsync("git", ["-C", repo.cwd, "config", "remote.origin.receivepack", "not-a-real-receive-pack"]);
+        await execFileAsync("git", ["-C", repo.cwd, "config", "credential.helper", "!printf planted"]);
+        await execFileAsync("git", ["-C", repo.cwd, "config", "--add", "remote.origin.pushurl", repo.remote]);
+        try {
+          // Execute the exact Supervisor-generated command, not a hand-written
+          // approximation, so the environment/config pins are exercised against
+          // a real Git remote and the subsequent confirmation checks the result.
+          await execFileAsync("bash", ["-c", command!], { cwd: repo.cwd });
+        } finally {
+          for (const key of ["remote.origin.mirror", "remote.origin.receivepack", "credential.helper", "remote.origin.pushurl"]) {
+            await execFileAsync("git", ["-C", repo.cwd, "config", "--unset-all", key]).catch(() => {});
+          }
+        }
+      }
     };
     await supervisor.start({
       task: "publish the verified candidate",
@@ -3203,16 +3250,15 @@ test("with push authority the verified candidate is handed back to publish, and 
     fixture.state.listener?.(first);
     await supervisor.poll();
     await fixture.state.onAction?.({ action: "verify", reason: "work is done" }, first);
-
     // Verification passed, so the task is not finished: the Worker was asked to publish.
     const requested = events.events.find((event) => event.type === "publish_requested");
     assert.ok(requested, "the verified candidate is handed back to publish");
     assert.equal(requested?.data?.branch, branch);
     assert.equal(supervisor.state, "running");
-    const expected = publishCommand({ authority: "push", remoteName: "origin", branch, head, cwd: repo.cwd });
+    const expected = publishCommand({ authority: "push", remoteName: "origin", branch, head, cwd: repo.cwd, pushUrls: [repo.remote], envCommand: "/usr/bin/env", gitCommand: "/usr/bin/git", trustedPath: "/usr/bin:/bin", trustedHome: process.env.HOME ?? "/" });
     assert.ok(fixture.state.sent.some((message) => message.includes(`\`${expected}\``)),
       "the instruction spells out the one shape the grant admits: an absolute -C, the hooks path pinned, and the verified commit as the refspec source");
-    assert.match(expected, /^git -C \S+ -c core\.hooksPath=\/dev\/null -c push\.followTags=false push origin '[0-9a-f]{40}:refs\/heads\/worker\/publish-ok'$/u);
+    assert.match(expected, /^LD_PRELOAD= LD_LIBRARY_PATH= LD_LIBRARY_PATH_32= .* GCONV_PATH= \/usr\/bin\/env .* \/usr\/bin\/git -C \S+ -c 'core\.hooksPath=\/dev\/null' .* push --receive-pack=git-receive-pack origin '[0-9a-f]{40}:refs\/heads\/worker\/publish-ok'$/u);
     assert.equal(candidates.length, 0, "no candidate is announced until the publish settles");
 
     // The publish turn comes back; acceptance is not re-run on the unchanged tree.
@@ -3438,7 +3484,7 @@ test("a destination changed after the grant refuses the granted push at the mome
     // config here); its second is the exact granted push.
     await execFileAsync("git", ["config", `url.${evil}.pushInsteadOf`, repo.remote], { cwd: repo.cwd });
     const head = String(requested?.data?.head);
-    const granted = publishCommand({ authority: "push", remoteName: "origin", branch, head, cwd: repo.cwd });
+    const granted = publishCommand({ authority: "push", remoteName: "origin", branch, head, cwd: repo.cwd, pushUrls: [repo.remote], envCommand: "/usr/bin/env", gitCommand: "/usr/bin/git", trustedPath: "/usr/bin:/bin", trustedHome: process.env.HOME ?? "/" });
     fixture.state.listener?.({ type: "permission_request", handle: fixture.handle, request: { requestId: "req-diverted-push", toolUseId: "tool-diverted-push", toolName: "Bash", input: { command: granted }, raw: {} } });
     await supervisor.poll();
     assert.equal(responded.at(-1)?.requestId, "req-diverted-push");
@@ -3455,7 +3501,7 @@ test("a destination changed after the grant refuses the granted push at the mome
     await supervisor.poll();
     await fixture.state.onAction?.({ action: "verify", reason: "tried to push" }, second);
     assert.equal(supervisor.state, "blocked");
-    assert.match(String(candidates.at(-1)?.reason), /may have gone to the rewritten destination/u);
+    assert.match(String(candidates.at(-1)?.reason), /could not be read to confirm the publish|may have gone to the rewritten destination/u);
     for (const remote of [repo.remote, evil]) {
       const { stdout } = await execFileAsync("git", ["ls-remote", "--heads", remote], { cwd: repo.cwd });
       assert.equal(stdout.trim(), "", `nothing reached ${remote}`);
@@ -3742,7 +3788,7 @@ test("the publish grant dies with its turn, so a later unverified push is refuse
     // Supervisor's own decision: answered by the policy, never escalated to a
     // Decision Worker whose standing rule is to refuse a push.
     const head = String(events.events.find((event) => event.type === "publish_requested")?.data?.head);
-    const granted = { requestId: "req-granted-push", toolUseId: "tool-granted-push", toolName: "Bash", input: { command: publishCommand({ authority: "push", remoteName: "origin", branch, head, cwd: repo.cwd }) }, raw: {} };
+    const granted = { requestId: "req-granted-push", toolUseId: "tool-granted-push", toolName: "Bash", input: { command: publishCommand({ authority: "push", remoteName: "origin", branch, head, cwd: repo.cwd, pushUrls: [repo.remote], envCommand: "/usr/bin/env", gitCommand: "/usr/bin/git", trustedPath: "/usr/bin:/bin", trustedHome: process.env.HOME ?? "/" }) }, raw: {} };
     fixture.state.listener?.({ type: "permission_request", handle: fixture.handle, request: granted });
     await supervisor.poll();
     assert.deepEqual(responded.map((entry) => [entry.requestId, entry.behavior]), [["req-granted-push", "allow"]]);

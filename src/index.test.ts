@@ -37,7 +37,7 @@ test("index rejects an unknown worker transport instead of falling back", () => 
   const previous = process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
   process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "not-a-transport";
   try {
-    assert.throws(() => extension({} as never), /Unsupported PI_CLAUDE_SUPERVISOR_TRANSPORT/u);
+    assert.throws(() => extension({} as never), /PI_CLAUDE_SUPERVISOR_TRANSPORT must be process-pipe/u);
   } finally {
     if (previous === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT;
     else process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = previous;

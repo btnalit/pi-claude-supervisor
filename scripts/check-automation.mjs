@@ -5,6 +5,7 @@ import { parse } from "yaml";
 
 const read = (path) => readFileSync(path, "utf8");
 const pkg = JSON.parse(read("package.json"));
+assert.equal(pkg.scripts.test, "node scripts/run-tests.mjs", "The test runner must enforce the CI skip gate");
 assert.equal(JSON.parse(read(".release-please-manifest.json"))["."], pkg.version, "Release manifest/version drift");
 const lock = JSON.parse(read("package-lock.json"));
 assert.equal(lock.packages[""].version, pkg.version);
@@ -30,13 +31,20 @@ for (const file of readdirSync(".github/workflows")) {
   }
 }
 const ci = parse(read(".github/workflows/ci.yml"));
+assert.equal(ci.env.PI_CLAUDE_SUPERVISOR_FAIL_ON_TEST_SKIP, "1", "CI must fail when automatic-path tests skip");
 for (const event of ["pull_request", "push", "workflow_dispatch", "schedule", "workflow_call"]) assert.ok(event in ci.on);
 assert.equal(ci.jobs.gate.name, "Quality gate");
 assert.equal(ci.jobs.gate.if, "always()");
 assert.deepEqual([...ci.jobs.gate.needs].sort(), ["build", "checks", "checks_npm_latest", "integration", "policy"]);
 assert.deepEqual(ci.jobs.checks_npm_latest.strategy.matrix.npm, ["10", "12"]);
 for (const command of ["npm run check", "npm run test:install", "npm run build"]) {
-  assert.ok(ci.jobs.checks_npm_latest.steps.some((step) => step.run === command), `Explicit npm lanes must run ${command}`);
+  assert.ok(ci.jobs.checks_npm_latest.steps.some((step) => step.run === command || step.run?.includes(`run-in-cgroup.sh ${command}`)), `Explicit npm lanes must run ${command}`);
+}
+for (const jobName of ["checks", "checks_npm_latest"]) {
+  const steps = ci.jobs[jobName].steps;
+  assert.ok(steps.some((step) => step.run === "bash scripts/ci/prepare-cgroup.sh"), `${jobName} must prepare a delegated cgroup`);
+  assert.ok(steps.some((step) => step.run?.includes("run-in-cgroup.sh npm run check")), `${jobName} must run the suite in the delegated cgroup`);
+  assert.ok(steps.some((step) => step.run === "bash scripts/ci/cleanup-cgroup.sh"), `${jobName} must clean the delegated cgroup`);
 }
 assert.ok(ci.jobs.checks_npm_latest.steps.some((step) => step.run?.includes("npm install --global --ignore-scripts \"npm@$NPM_VERSION\"")), "npm major selection must actually run, not use an unsupported action input");
 assert.ok(!ci.on.pull_request.paths && !ci.on.pull_request["paths-ignore"], "Required checks cannot be skipped by path filters");

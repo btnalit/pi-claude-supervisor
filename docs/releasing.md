@@ -1,9 +1,11 @@
 # Releasing
 
-Local automation may develop, test, repair and commit a candidate, but it does not
-push to a remote or merge into `main`. Remote repository entry and main-branch
-integration are independent protected boundaries; this release workflow is the
-publication path after those boundaries pass. See [the confirmed autonomy target](autonomy-target.md).
+Local automation may develop, test, repair and commit a candidate. By default it
+does not push to a remote or merge into `main`; an explicitly configured task
+may use the Supervisor's narrow, verified-candidate `RemoteGrant`, but main-
+branch integration remains an independent protected boundary. This release
+workflow is the publication path after those boundaries pass. See [the
+confirmed autonomy target](autonomy-target.md).
 
 ## Pull request gate
 

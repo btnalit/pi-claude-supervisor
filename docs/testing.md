@@ -31,11 +31,12 @@ the published TypeScript source directly and there is no second runtime bundle.
   idempotent duplicate suppression work, and a child does not remain indefinitely
   in a running state.
 - `worker/tmux-adapter.test.ts`: an owned private tmux socket accepts multi-line
-  input, emits a stable-prompt turn event, preserves PTY output and cleans its
-  session on stop. It also verifies explicit idle startup does not submit a
-  blank turn, idle adoption emits no synthetic completion, adopted pipe
-  detachment permits re-adoption, and adopted stop preserves the user's
-  session.
+  input, reassembles a 5KB Supervisor bridge frame below the PTY line limit,
+  emits a stable-prompt turn event, preserves PTY output and cleans its session
+  on stop. It also verifies explicit idle startup does not submit a blank turn,
+  idle adoption emits no synthetic completion, capability-less automatic
+  adoption fails closed, adopted pipe detachment permits re-adoption, and
+  adopted stop preserves the user's session.
 - `worker/environment.test.ts`: manual environment inheritance remains minimal, while
   automatic mode merges explicit overrides onto the complete inherited environment,
   removes only `CLAUDECODE` so nested Claude can run, adds a safe default permission
@@ -151,7 +152,8 @@ local commit on the task branch (any branch, anchored to the baseline commit) an
 only to disable the local-commit deliverability check; automatic mode still requires a Git
 baseline (any branch, including `main`; the candidate must descend from it). The tmux bridge
 requires Supervisor ownership; the interactive tmux mode (the default `TMUX_MODE`) also adopts an
-existing session through the user-level hook relay. `process-pipe` remains the manual compatibility mode. Candidate/failure notification is optional and outbound-only through
+existing session through the user-level hook relay only when the Claude process carries the matching
+Supervisor hook capability; otherwise automatic adoption fails closed. `process-pipe` remains the manual compatibility mode. Candidate/failure notification is optional and outbound-only through
 `PI_CLAUDE_SUPERVISOR_HUMAN_WEBHOOK_URL`; it is not a synchronous approval
 callback. Approval callbacks are deliberately not accepted without a separately
 authenticated endpoint.
@@ -295,7 +297,8 @@ Required deterministic and integration coverage:
 - scheduler-owned children cannot grant permissions or send control input to another scheduled child;
   Claude-native Agent/Task/MCP descendants remain trusted inside their Worker's cleanup cgroup;
 - independent integration in a separate worktree; known direct remote push/main operations remain
-  policy-denied, while absolute enforcement for trusted nested/custom capabilities belongs to that boundary.
+  policy-denied outside the exact publish grant, while absolute enforcement for trusted nested/custom
+  capabilities belongs to that boundary.
 
 The multi-worker gate should be added only after the minimum-version single-worker
 stability and recovery gates pass. CI should use fake Workers and replay fixtures;

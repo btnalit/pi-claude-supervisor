@@ -357,12 +357,29 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
 
 function boundTailText(value: unknown, maxBytes: number): string {
   const text = String(value);
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  return `[DISPLAY_TRUNCATED]\n${Buffer.from(text, "utf8").subarray(-maxBytes).toString("utf8")}`;
+  const bytes = Buffer.from(text, "utf8");
+  const marker = Buffer.from("[DISPLAY_TRUNCATED]\n", "utf8");
+  if (bytes.byteLength <= maxBytes) return text;
+  return `${marker.toString("utf8")}${utf8Tail(bytes, Math.max(0, maxBytes - marker.byteLength))}`;
 }
 
 function boundText(value: unknown, maxBytes: number): string {
   const text = String(value);
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  return `${Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8")}\n[DISPLAY_TRUNCATED]`;
+  const bytes = Buffer.from(text, "utf8");
+  const marker = Buffer.from("\n[DISPLAY_TRUNCATED]", "utf8");
+  if (bytes.byteLength <= maxBytes) return text;
+  return `${utf8Head(bytes, Math.max(0, maxBytes - marker.byteLength))}${marker.toString("utf8")}`;
+}
+
+function utf8Head(value: Buffer, maxBytes: number): string {
+  let end = Math.min(value.byteLength, Math.max(0, maxBytes));
+  while (end > 0 && end < value.byteLength && (value[end]! & 0xc0) === 0x80) end -= 1;
+  return value.subarray(0, end).toString("utf8");
+}
+
+function utf8Tail(value: Buffer, maxBytes: number): string {
+  if (value.byteLength <= maxBytes) return value.toString("utf8");
+  let start = Math.max(0, value.byteLength - maxBytes);
+  while (start < value.byteLength && (value[start]! & 0xc0) === 0x80) start += 1;
+  return value.subarray(start).toString("utf8");
 }

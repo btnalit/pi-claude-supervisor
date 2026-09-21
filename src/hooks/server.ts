@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { TextDecoder } from "node:util";
 import { createServer, type Server, type Socket } from "node:net";
 import { chmod, lstat, mkdir, readdir, readlink, realpath, rename, rm, symlink, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -6,6 +7,10 @@ import { tmpdir } from "node:os";
 import type { ClaudeHookEvent, ClaudeHookEventName, HookEventSource, HookRelayReply, HookRelayRequest } from "./types.ts";
 
 const MAX_LINE_BYTES = 1024 * 1024;
+const MAX_HOOK_STRING_BYTES = 256 * 1024;
+const MAX_HOOK_VALUE_BYTES = 512 * 1024;
+const MAX_CONNECTION_IDLE_MS = 180_000;
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 const VALID_EVENT_NAMES: ReadonlySet<string> = new Set<ClaudeHookEventName>([
   "SessionStart",
@@ -14,6 +19,7 @@ const VALID_EVENT_NAMES: ReadonlySet<string> = new Set<ClaudeHookEventName>([
   "PreToolUse",
   "PermissionRequest",
   "Stop",
+  "StopFailure",
   "Notification",
 ]);
 
@@ -47,7 +53,10 @@ export function hookSocketRuntimeDirectory(env: NodeJS.ProcessEnv = process.env)
 export class HookServer implements HookEventSource {
   readonly #directory: string;
   readonly #handlers = new Map<string, HookHandler>();
+  /** Capability routing survives a Claude `cd` whose hook cwd no longer has a by-cwd link. */
+  readonly #capabilityHandlers = new Map<string, HookHandler>();
   readonly #sockets = new Set<Socket>();
+  #subscriptionTail: Promise<void> = Promise.resolve();
   #server: Server | undefined;
   #socketPath: string | undefined;
 
@@ -69,6 +78,7 @@ export class HookServer implements HookEventSource {
   async listen(): Promise<void> {
     if (this.#server) throw new Error("hook server is already listening");
     await mkdir(this.#directory, { recursive: true, mode: 0o700 });
+    await assertPrivateDirectory(this.#directory, "hook state directory");
     await chmod(this.#directory, 0o700);
     await mkdir(this.#socketDirectory, { recursive: true, mode: 0o700 });
     const socketDirectoryInfo = await lstat(this.#socketDirectory);
@@ -97,29 +107,52 @@ export class HookServer implements HookEventSource {
     this.#socketPath = socketPath;
   }
 
-  async subscribe(cwd: string, handler: HookHandler): Promise<() => Promise<void>> {
-    if (!this.#socketPath) throw new Error("hook server is not listening");
-    const socketPath = this.#socketPath;
+  async subscribe(cwd: string, handler: HookHandler, options: { capability?: string } = {}): Promise<() => Promise<void>> {
     const hash = hashCwd(await canonicalize(cwd));
-    this.#handlers.set(hash, handler);
-    await this.#linkByCwd(hash, socketPath);
-    let unsubscribed = false;
-    return async () => {
-      if (unsubscribed) return;
-      unsubscribed = true;
-      // Only ever remove a handler this call installed: a takeover could
-      // already have replaced it under the same hash.
-      if (this.#handlers.get(hash) === handler) this.#handlers.delete(hash);
-      await this.#unlinkByCwd(hash, socketPath);
-    };
+    const capability = options.capability;
+    return this.#withSubscriptionLock(async () => {
+      if (!this.#socketPath) throw new Error("hook server is not listening");
+      const socketPath = this.#socketPath;
+      if (capability !== undefined && !/^[A-Za-z0-9_-]{16,256}$/u.test(capability)) throw new Error("hook subscription capability has an invalid shape");
+      if (capability !== undefined && this.#capabilityHandlers.has(capability)) throw new Error("hook subscription capability is already in use");
+      this.#handlers.set(hash, handler);
+      if (capability !== undefined) this.#capabilityHandlers.set(capability, handler);
+      try {
+        await this.#linkByCwd(hash, socketPath);
+      } catch (error) {
+        if (this.#handlers.get(hash) === handler) this.#handlers.delete(hash);
+        if (capability !== undefined && this.#capabilityHandlers.get(capability) === handler) this.#capabilityHandlers.delete(capability);
+        throw error;
+      }
+      let unsubscribed = false;
+      return async () => {
+        if (unsubscribed) return;
+        await this.#withSubscriptionLock(async () => {
+          if (unsubscribed) return;
+          unsubscribed = true;
+          // Only ever remove a handler this call installed: a takeover could
+          // already have replaced it under the same hash. In particular, do
+          // not unlink a successor's cwd route when an older subscription is
+          // closing.
+          const ownsCwdRoute = this.#handlers.get(hash) === handler;
+          if (ownsCwdRoute) this.#handlers.delete(hash);
+          if (capability !== undefined && this.#capabilityHandlers.get(capability) === handler) this.#capabilityHandlers.delete(capability);
+          if (ownsCwdRoute) await this.#unlinkByCwd(hash, socketPath);
+        });
+      };
+    });
   }
 
   async close(): Promise<void> {
-    const server = this.#server;
-    const socketPath = this.#socketPath;
-    this.#server = undefined;
-    this.#socketPath = undefined;
-    this.#handlers.clear();
+    const { server, socketPath } = await this.#withSubscriptionLock(async () => {
+      const server = this.#server;
+      const socketPath = this.#socketPath;
+      this.#server = undefined;
+      this.#socketPath = undefined;
+      this.#handlers.clear();
+      this.#capabilityHandlers.clear();
+      return { server, socketPath };
+    });
     if (server) {
       // net.Server#close only resolves once every accepted socket has ended;
       // a relay parked on a slow handler must not pin Supervisor shutdown.
@@ -136,13 +169,32 @@ export class HookServer implements HookEventSource {
     }
   }
 
+  async #withSubscriptionLock<T>(operation: () => Promise<T>): Promise<T> {
+    let release!: () => void;
+    const gate = new Promise<void>((resolveGate) => { release = resolveGate; });
+    const previous = this.#subscriptionTail;
+    this.#subscriptionTail = previous.then(() => gate);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
   async #linkByCwd(hash: string, socketPath: string): Promise<void> {
     const byCwdDir = join(this.#directory, "by-cwd");
     await mkdir(byCwdDir, { recursive: true, mode: 0o700 });
+    await assertPrivateDirectory(byCwdDir, "hook by-cwd directory");
+    await chmod(byCwdDir, 0o700);
     const target = join(byCwdDir, hash);
     const temporary = join(byCwdDir, `${hash}.tmp.${process.pid}.${randomUUID()}`);
-    await symlink(socketPath, temporary);
-    await rename(temporary, target);
+    try {
+      await symlink(socketPath, temporary);
+      await rename(temporary, target);
+    } finally {
+      await rm(temporary, { force: true }).catch(() => {});
+    }
   }
 
   async #unlinkByCwd(hash: string, socketPath: string): Promise<void> {
@@ -176,27 +228,43 @@ export class HookServer implements HookEventSource {
 
   #handleConnection(socket: Socket): void {
     this.#sockets.add(socket);
-    socket.on("close", () => this.#sockets.delete(socket));
+    // A relay's blocking timeout is slightly shorter than this. The server
+    // must not retain an attacker-controlled connection and up to 1 MiB of
+    // partial input forever if the peer never sends a newline.
+    socket.setTimeout(MAX_CONNECTION_IDLE_MS, () => socket.destroy());
+    const connectionDeadline = setTimeout(() => socket.destroy(), MAX_CONNECTION_IDLE_MS);
+    connectionDeadline.unref?.();
+    socket.on("close", () => {
+      clearTimeout(connectionDeadline);
+      this.#sockets.delete(socket);
+    });
     socket.on("error", () => {
       try { socket.destroy(); } catch { /* already closed */ }
     });
-    let buffer = "";
+    let buffer = Buffer.alloc(0);
     let bytes = 0;
     let done = false;
-    socket.setEncoding("utf8");
-    socket.on("data", (chunk: string) => {
+    socket.on("data", (chunk: Buffer | string) => {
       if (done) return;
-      bytes += Buffer.byteLength(chunk, "utf8");
+      const bytesChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += bytesChunk.byteLength;
       if (bytes > MAX_LINE_BYTES) {
         done = true;
         socket.destroy();
         return;
       }
-      buffer += chunk;
-      const newlineIndex = buffer.indexOf("\n");
+      buffer = Buffer.concat([buffer, bytesChunk]);
+      const newlineIndex = buffer.indexOf(0x0a);
       if (newlineIndex === -1) return;
       done = true;
-      void this.#respond(socket, buffer.slice(0, newlineIndex));
+      let line: string;
+      try {
+        line = UTF8_DECODER.decode(buffer.subarray(0, newlineIndex));
+      } catch {
+        socket.destroy();
+        return;
+      }
+      void this.#respond(socket, line);
     });
   }
 
@@ -205,14 +273,19 @@ export class HookServer implements HookEventSource {
     try {
       const request = parseRequest(line);
       if (request) {
-        const handler = this.#handlers.get(hashCwd(await canonicalize(request.event.cwd)));
+        // Capability routing is preferred when present: a persistent Claude
+        // session may report the cwd of a subdirectory after `cd`, while its
+        // original by-cwd symlink remains the discovery route.
+        const handler = (request.capability ? this.#capabilityHandlers.get(request.capability) : undefined)
+          ?? this.#handlers.get(hashCwd(await canonicalize(request.event.cwd)));
         if (handler) reply = (await handler(request)) ?? {};
       }
     } catch {
       reply = {};
     }
     try {
-      socket.end(`${JSON.stringify(reply)}\n`);
+      const encoded = JSON.stringify(reply);
+      socket.end(`${Buffer.byteLength(encoded, "utf8") <= MAX_LINE_BYTES ? encoded : "{}"}\n`);
     } catch {
       /* the relay may already have disconnected (fire-and-forget events) */
     }
@@ -229,6 +302,12 @@ async function canonicalize(cwd: string): Promise<string> {
   } catch {
     return cwd;
   }
+}
+
+async function assertPrivateDirectory(path: string, label: string): Promise<void> {
+  const info = await lstat(path);
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`${label} is not a real directory: ${path}`);
+  if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error(`${label} is owned by another user: ${path}`);
 }
 
 async function removeStaleSocket(path: string): Promise<void> {
@@ -250,11 +329,56 @@ function parseRequest(line: string): HookRelayRequest | undefined {
   if (!value || typeof value !== "object") return undefined;
   const request = value as Partial<HookRelayRequest>;
   if (request.version !== 1) return undefined;
-  if (typeof request.pid !== "number" || typeof request.ppid !== "number") return undefined;
+  if (typeof request.pid !== "number" || !Number.isSafeInteger(request.pid) || request.pid <= 0) return undefined;
+  if (typeof request.ppid !== "number" || !Number.isSafeInteger(request.ppid) || request.ppid <= 0) return undefined;
+  if (request.tmuxPane !== undefined && !boundedHookString(request.tmuxPane, 256, true)) return undefined;
+  if (request.capability !== undefined && (typeof request.capability !== "string" || !/^[A-Za-z0-9_-]{16,256}$/u.test(request.capability))) return undefined;
   const event = request.event as Partial<ClaudeHookEvent> | undefined;
-  if (!event || typeof event !== "object") return undefined;
-  if (typeof event.cwd !== "string" || !event.cwd) return undefined;
+  if (!event || typeof event !== "object" || Array.isArray(event)) return undefined;
+  if (typeof event.cwd !== "string" || !boundedHookString(event.cwd, 4_096, true)) return undefined;
   if (typeof event.hook_event_name !== "string" || !VALID_EVENT_NAMES.has(event.hook_event_name)) return undefined;
-  if (typeof event.session_id !== "string") return undefined;
-  return request as HookRelayRequest;
+  if (typeof event.session_id !== "string" || !boundedHookString(event.session_id, 512, true)) return undefined;
+  const stringFields: Array<[keyof ClaudeHookEvent, number, boolean]> = [
+    ["transcript_path", 4_096, true], ["permission_mode", 256, true], ["source", 256, false], ["reason", 256, false],
+    ["prompt", MAX_HOOK_STRING_BYTES, false], ["tool_name", 256, true], ["tool_use_id", 512, true],
+    ["last_assistant_message", MAX_HOOK_STRING_BYTES, false], ["notification_type", 256, true], ["message", MAX_HOOK_STRING_BYTES, false],
+    ["scratchpad_dir", 4_096, true],
+  ];
+  for (const [field, limit, rejectControls] of stringFields) {
+    const fieldValue = event[field];
+    if (fieldValue !== undefined && !boundedHookString(fieldValue, limit, rejectControls)) return undefined;
+  }
+  if (event.stop_hook_active !== undefined && typeof event.stop_hook_active !== "boolean") return undefined;
+  for (const field of ["tool_input", "error"] as const) {
+    const fieldValue = event[field];
+    if (fieldValue === undefined) continue;
+    try {
+      if (Buffer.byteLength(JSON.stringify(fieldValue) ?? "null", "utf8") > MAX_HOOK_VALUE_BYTES) return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  // Drop extension fields before the event reaches the adapter and event log;
+  // the line bound is not a durable per-field bound, and Claude may add future
+  // fields containing arbitrary payloads.
+  const allowedFields = new Set<keyof ClaudeHookEvent>([
+    "hook_event_name", "session_id", "cwd", "transcript_path", "permission_mode", "source", "scratchpad_dir", "reason",
+    "prompt", "tool_name", "tool_input", "tool_use_id", "last_assistant_message", "stop_hook_active", "error", "notification_type", "message",
+  ]);
+  const sanitizedEvent = Object.fromEntries(Object.entries(event).filter(([field]) => allowedFields.has(field as keyof ClaudeHookEvent))) as unknown as ClaudeHookEvent;
+  return {
+    version: 1,
+    pid: request.pid,
+    ppid: request.ppid,
+    ...(request.tmuxPane !== undefined ? { tmuxPane: request.tmuxPane } : {}),
+    ...(request.capability !== undefined ? { capability: request.capability } : {}),
+    event: sanitizedEvent,
+  };
+}
+
+function boundedHookString(value: unknown, maxBytes: number, rejectControls: boolean): value is string {
+  return typeof value === "string"
+    && Buffer.byteLength(value, "utf8") <= maxBytes
+    && !value.includes("\0")
+    && (!rejectControls || !/[\u0001-\u001f\u007f]/u.test(value));
 }

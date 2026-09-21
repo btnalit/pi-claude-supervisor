@@ -51,6 +51,8 @@ export interface HookRelayRequest {
   ppid: number;
   /** Inherited from Claude's environment when it runs inside tmux. */
   tmuxPane?: string;
+  /** Per-worker capability supplied by the Supervisor-owned Claude launch. */
+  capability?: string;
   event: ClaudeHookEvent;
 }
 
@@ -81,5 +83,5 @@ export const HOOK_TIMEOUT_SECONDS = 180;
  */
 export interface HookEventSource {
   /** Route every event whose canonical cwd matches to this handler until unsubscribed. */
-  subscribe(cwd: string, handler: (request: HookRelayRequest) => Promise<HookRelayReply | undefined>): Promise<() => Promise<void>>;
+  subscribe(cwd: string, handler: (request: HookRelayRequest) => Promise<HookRelayReply | undefined>, options?: { capability?: string }): Promise<() => Promise<void>>;
 }

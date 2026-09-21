@@ -78,6 +78,8 @@ export interface WorkerStartInput {
   hookSource?: import("./hooks/types.ts").HookEventSource;
   /** Hook settings file the owned interactive launch passes as `--settings`. */
   hookSettingsPath?: string;
+  /** Per-worker capability included by the hook relay; generated for owned launches when omitted. */
+  hookCapability?: string;
   /** Keep an empty automatic cgroup until the owning cwd lease is finalized. */
   retainCgroupUntilLeaseRelease?: boolean;
   /** Persist the planned automatic resource identity before adapter setup. */

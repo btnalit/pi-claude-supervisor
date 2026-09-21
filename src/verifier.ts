@@ -2,11 +2,14 @@ import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { lstat, open, readlink, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { TextDecoder } from "node:util";
 import { promisify } from "node:util";
 import type { AcceptanceCheck, AcceptanceCheckResult, AcceptanceReport, VerificationResult } from "./types.ts";
 import { evidenceMaxBytes, evidenceMaxUntrackedFiles } from "./config.ts";
-import { assertSafeWorkerCommand, isCommitId } from "./policy.ts";
-import { workerEnvironment } from "./worker/environment.ts";
+import { assertSafeWorkerCommand, isCommitId, isSafeGrantedPushUrl, shellQuote } from "./policy.ts";
+import { runBoundedCommand } from "./command-runner.ts";
+import { runSupervisorGit, supervisorGitCommandArgs, supervisorGitEnvironment } from "./git-runner.ts";
+import { trustedExecutablePath } from "./worker/environment.ts";
 
 const execFileAsync = promisify(execFile);
 const MAX_UNTRACKED_FILE_BYTES = 256 * 1024;
@@ -26,6 +29,11 @@ function maxExecBufferBytes(): number {
   return Math.max(8 * 1024 * 1024, 8 * evidenceMaxBytes());
 }
 
+function decodeUtf8(value: Buffer | string): string {
+  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value, "utf8");
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
 function throwIfAborted(signal?: AbortSignal): void {
   if (!signal?.aborted) return;
   const error = new Error("verification aborted");
@@ -41,6 +49,8 @@ export interface VerificationCommand {
 export interface VerificationOptions {
   signal?: AbortSignal;
   onCheck?: (info: { check: AcceptanceCheck; result: AcceptanceCheckResult; index: number; total: number }) => void | Promise<void>;
+  /** Fresh cgroup parent for acceptance commands when automatic mode has one. */
+  cgroupParentPath?: string;
 }
 
 export interface RepositoryEvidence {
@@ -67,14 +77,8 @@ export interface RepositoryEvidence {
 /** Read the repository HEAD without invoking a shell. */
 export async function repositoryHead(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
   try {
-    const result = await execFileAsync("git", ["rev-parse", "--verify", "HEAD"], {
-      cwd,
-      timeout: 30_000,
-      maxBuffer: 1024,
-      signal,
-      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
-    });
-    const head = String(result.stdout).trim();
+    const result = await runSupervisorGit(cwd, ["rev-parse", "--verify", "HEAD"], { signal, maxBuffer: 1024 });
+    const head = result.stdout.trim();
     return isCommitId(head) ? head : undefined;
   } catch {
     return undefined;
@@ -91,33 +95,31 @@ export async function repositoryHead(cwd: string, signal?: AbortSignal): Promise
  * the prompts are forced off, so an unreadable remote fails fast instead of
  * hanging.
  */
-function remoteReadEnvironment(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "" };
-  // Inheriting the network and credential variables must not also inherit the
-  // ones that point git at another repository or inject configuration: with
-  // GIT_DIR or GIT_CONFIG_COUNT/KEY_n/VALUE_n set in the host's shell, the
-  // confirmation would pin and read a repository that is not the candidate's.
-  for (const name of Object.keys(env)) {
-    if (REPOSITORY_RELOCATING_GIT_VARIABLE.test(name)) delete env[name];
-  }
+export function remoteReadEnvironment(): NodeJS.ProcessEnv {
+  const env = supervisorGitEnvironment(true);
+  env.GIT_ASKPASS = "";
+  env.SSH_ASKPASS = "";
   return env;
 }
-
-const REPOSITORY_RELOCATING_GIT_VARIABLE = /^(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_NAMESPACE|GIT_INDEX_FILE|GIT_OBJECT_DIRECTORY|GIT_ALTERNATE_OBJECT_DIRECTORIES|GIT_CONFIG_GLOBAL|GIT_CONFIG_SYSTEM|GIT_CONFIG_NOSYSTEM|GIT_CONFIG_COUNT|GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+|GIT_CONFIG_PARAMETERS|GIT_CEILING_DIRECTORIES|GIT_DISCOVERY_ACROSS_FILESYSTEM)$/u;
 
 /**
  * Run a read-only inspection command without a shell, for confirming what the
  * Worker published. Never used for anything that mutates.
  */
-export async function runReadOnly(command: string, args: readonly string[], cwd: string, signal?: AbortSignal): Promise<{ stdout: string }> {
+export async function runReadOnly(command: string, args: readonly string[], cwd: string, signal?: AbortSignal, environment?: NodeJS.ProcessEnv): Promise<{ stdout: string }> {
+  if (command === "git") {
+    const result = await runSupervisorGit(cwd, args, { signal, timeout: 60_000, maxBuffer: 256 * 1024, network: true });
+    return { stdout: result.stdout };
+  }
   const result = await execFileAsync(command, [...args], {
     cwd,
     timeout: 60_000,
     maxBuffer: 256 * 1024,
     signal,
-    env: remoteReadEnvironment(),
+    env: environment ?? remoteReadEnvironment(),
+    encoding: "buffer",
   });
-  return { stdout: String(result.stdout) };
+  return { stdout: decodeUtf8(result.stdout) };
 }
 
 /** Where a remote name currently fetches from and pushes to, so a grant can be pinned to destinations rather than a name. */
@@ -126,6 +128,11 @@ export interface RemoteDestination {
   fetch: string[];
   /** Every push URL, in order — git pushes to *all* of them, so a second `pushurl` is a second destination. */
   push: string[];
+}
+
+/** Return false for Git's command-executing remote-helper URL forms. */
+function isSafeRemoteUrl(url: string): boolean {
+  return isSafeGrantedPushUrl(url);
 }
 
 /**
@@ -139,11 +146,37 @@ export interface RemoteDestination {
 export async function remoteUrl(cwd: string, remote: string, signal?: AbortSignal): Promise<RemoteDestination | undefined> {
   try {
     const lines = (text: string): string[] => text.split("\n").map((line) => line.trim()).filter((line) => line !== "");
-    const [fetch, push] = (await Promise.all([
+    const escapedRemote = remote.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    const remoteConfigPattern = `^remote\\.${escapedRemote}\\.(url|pushurl)$`;
+    const [fetch, push, localConfig, rawRemoteConfig] = (await Promise.all([
       runReadOnly("git", ["remote", "get-url", "--all", "--", remote], cwd, signal),
       runReadOnly("git", ["remote", "get-url", "--push", "--all", "--", remote], cwd, signal),
-    ])).map((result) => lines(result.stdout)) as [string[], string[]];
-    return fetch.length === 0 || push.length === 0 ? undefined : { fetch, push };
+      // Local config is Worker-controlled. `url.*.insteadOf` and
+      // `url.*.pushInsteadOf` still rewrite an explicit push URL, so a
+      // resolved destination would not remain pinned for the whole one-shot
+      // command. Name-only NUL output also handles subsection names without
+      // parsing values that could contain arbitrary bytes.
+      runReadOnly("git", ["config", "--local", "--name-only", "--null", "--list"], cwd, signal),
+      // `remote get-url` is line-delimited, so a config value containing a
+      // newline could otherwise be mistaken for two safe destinations. Read
+      // raw values with NUL termination and reject control bytes before
+      // splitting the resolved output.
+      runReadOnly("git", ["config", "--null", "--get-regexp", remoteConfigPattern], cwd, signal),
+    ])).map((result) => result.stdout) as [string, string, string, string];
+    const hasMalformedRemoteConfig = rawRemoteConfig.split("\0").filter(Boolean).some((entry) => {
+      const separator = entry.indexOf("\n");
+      return separator < 0 || /[\u0000-\u001f\u007f]/u.test(entry.slice(separator + 1));
+    });
+    const hasLocalUrlRewrite = localConfig.split("\0").some((key) => /^url\..+\.(?:insteadof|pushinsteadof)$/iu.test(key));
+    // Git remote helpers (`ext::`, `foo::`) are executable transport names.
+    // Do not even issue a later ls-remote/push grant for one, even when a
+    // repository or operator config supplied it at startup. A malformed or
+    // unreadable local config fails closed through the catch below.
+    const fetchUrls = lines(fetch);
+    const pushUrls = lines(push);
+    return hasMalformedRemoteConfig || hasLocalUrlRewrite || fetchUrls.length === 0 || pushUrls.length === 0 || [...fetchUrls, ...pushUrls].some((url) => !isSafeRemoteUrl(url))
+      ? undefined
+      : { fetch: fetchUrls, push: pushUrls };
   } catch {
     return undefined;
   }
@@ -164,10 +197,52 @@ export function sameDestination(first: RemoteDestination | undefined, second: Re
  */
 export type RemoteBranchLookup = { outcome: "found"; head: string } | { outcome: "absent" } | { outcome: "unreachable"; error: string };
 
-export async function remoteBranchHead(cwd: string, remote: string, branch: string, signal?: AbortSignal): Promise<RemoteBranchLookup> {
+function isSafeBranchName(branch: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/u.test(branch)
+    && !branch.includes("..")
+    && !branch.includes("//")
+    && !branch.includes("@{")
+    && !/(?:^|\/)\./u.test(branch)
+    && !/(?:^|\/)\.lock$/u.test(branch)
+    && !/[.]$/u.test(branch);
+}
+
+function isSshDestination(url: string): boolean {
+  if (/^ssh:\/\//iu.test(url)) return true;
+  const scp = url.match(/^(?:[^/\s@]+@)?([A-Za-z0-9._-]+):/u);
+  return Boolean(scp && !(scp[1]!.length === 1 && /^[A-Za-z]:[\\/]/u.test(url)));
+}
+
+export async function remoteBranchHead(cwd: string, remote: string, branch: string, signal?: AbortSignal, destinationAlreadyResolved = false): Promise<RemoteBranchLookup> {
   try {
-    const { stdout } = await runReadOnly("git", ["ls-remote", "--heads", "--", remote, branch], cwd, signal);
-    const line = stdout.split("\n").map((entry) => entry.trim()).find((entry) => entry.endsWith(`refs/heads/${branch}`));
+    if (!isSafeBranchName(branch) || (!destinationAlreadyResolved && !/^[A-Za-z0-9._-]+$/u.test(remote))) {
+      return { outcome: "unreachable", error: "remote branch selector is not safe to confirm" };
+    }
+    // Keep the historical helper behavior for callers that pass a remote name;
+    // Supervisor publish confirmation passes the already-resolved URL and sets
+    // the final flag so a relative local destination is not confused with a
+    // same-named remote.
+    const resolved = destinationAlreadyResolved ? remote : (await remoteUrl(cwd, remote, signal))?.fetch[0] ?? remote;
+    if (!isSafeGrantedPushUrl(resolved)) return { outcome: "unreachable", error: "remote destination is not safe to confirm" };
+    const destination = !/^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/|(?:[^/\s@]+@)?[A-Za-z0-9._-]+:|\/)/u.test(resolved)
+      ? resolve(cwd, resolved)
+      : resolved;
+    if (!isSafeGrantedPushUrl(destination)) return { outcome: "unreachable", error: "resolved remote destination is not safe to confirm" };
+    // Do not run this direct-URL confirmation inside the Worker's repository:
+    // local config can otherwise replace SSH, proxy, credential, URL-rewrite,
+    // or HTTP settings after the grant was issued. The URL has already been
+    // resolved and checked by remoteUrl; an outside cwd leaves only the
+    // Supervisor's operator configuration. SSH is pinned to the same trusted
+    // client and disabled user/repository SSH configuration as the grant.
+    const additionalConfig = isSshDestination(destination)
+      ? [`core.sshCommand=${shellQuote(await trustedExecutablePath("ssh"))} -F /dev/null`]
+      : [];
+    const { stdout } = await runSupervisorGit("/", ["ls-remote", "--heads", "--upload-pack=git-upload-pack", "--", destination, branch], { signal, timeout: 60_000, maxBuffer: 256 * 1024, network: true, isolateGlobalConfig: true, additionalConfig });
+    const expectedRef = `refs/heads/${branch}`;
+    const line = stdout.split("\n").map((entry) => entry.trim()).find((entry) => {
+      const fields = entry.split(/\s+/u);
+      return fields.length >= 2 && fields[1] === expectedRef;
+    });
     const sha = line?.split(/\s+/u)[0] ?? "";
     return isCommitId(sha) ? { outcome: "found", head: sha } : { outcome: "absent" };
   } catch (error) {
@@ -216,8 +291,13 @@ function parseRemoteUrl(url: string): { host: string; owner: string; repo: strin
 /** The real hostname behind an SSH-config alias (`ssh -G` prints `hostname <real>`), or undefined. */
 async function resolveSshHostname(alias: string, signal?: AbortSignal): Promise<string | undefined> {
   try {
-    const result = await execFileAsync("ssh", ["-G", "--", alias], { timeout: 10_000, maxBuffer: 64 * 1024, signal, env: { ...process.env, SSH_ASKPASS: "" } });
-    const line = String(result.stdout).split("\n").find((entry) => entry.startsWith("hostname "));
+    // This lookup runs while deciding whether a PR grant is safe. Resolve and
+    // validate the helper exactly as the later publish command does; a bare
+    // `ssh` here would let an untrusted PATH entry influence the repository
+    // identity before the grant pins the real helper.
+    const sshCommand = await trustedExecutablePath("ssh");
+    const result = await execFileAsync(sshCommand, ["-G", "--", alias], { timeout: 10_000, maxBuffer: 64 * 1024, signal, encoding: "buffer", env: { ...remoteReadEnvironment(), SSH_ASKPASS: "" } });
+    const line = decodeUtf8(result.stdout).split("\n").find((entry) => entry.startsWith("hostname "));
     const host = line?.slice("hostname ".length).trim();
     return host && /^[A-Za-z0-9.-]+$/u.test(host) ? host : undefined;
   } catch {
@@ -229,13 +309,7 @@ async function resolveSshHostname(alias: string, signal?: AbortSignal): Promise<
 export async function repositoryCommitExists(cwd: string, commit: string, signal?: AbortSignal): Promise<boolean> {
   if (!isCommitId(commit)) return false;
   try {
-    const result = await execFileAsync("git", ["cat-file", "-e", `${commit}^{commit}`], {
-      cwd,
-      timeout: 30_000,
-      maxBuffer: 1024,
-      signal,
-      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
-    });
+    const result = await runSupervisorGit(cwd, ["cat-file", "-e", `${commit}^{commit}`], { signal, maxBuffer: 1024 });
     return result.stderr.length === 0;
   } catch {
     return false;
@@ -245,13 +319,7 @@ export async function repositoryCommitExists(cwd: string, commit: string, signal
 /** Verify that `ancestor` is reachable from `descendant` (or is `descendant` itself) without invoking a shell. */
 export async function repositoryIsAncestor(cwd: string, ancestor: string, descendant: string, signal?: AbortSignal): Promise<boolean> {
   try {
-    await execFileAsync("git", ["merge-base", "--is-ancestor", ancestor, descendant], {
-      cwd,
-      timeout: 30_000,
-      maxBuffer: 1024,
-      signal,
-      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
-    });
+    await runSupervisorGit(cwd, ["merge-base", "--is-ancestor", ancestor, descendant], { signal, maxBuffer: 1024 });
     return true;
   } catch {
     return false;
@@ -265,14 +333,8 @@ export async function repositoryIsAncestor(cwd: string, ancestor: string, descen
  */
 export async function repositoryClean(cwd: string, signal?: AbortSignal): Promise<boolean | undefined> {
   try {
-    const result = await execFileAsync("git", ["status", "--porcelain", "--untracked-files=all"], {
-      cwd,
-      timeout: 30_000,
-      maxBuffer: 1024 * 1024,
-      signal,
-      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
-    });
-    return String(result.stdout).trim() === "";
+    const result = await runSupervisorGit(cwd, ["status", "--porcelain", "--untracked-files=all"], { signal, maxBuffer: 1024 * 1024 });
+    return result.stdout.trim() === "";
   } catch {
     return undefined;
   }
@@ -290,8 +352,8 @@ export async function repositoryClean(cwd: string, signal?: AbortSignal): Promis
 export async function repositoryGitDirectoryIsLocal(cwd: string, signal?: AbortSignal): Promise<boolean> {
   try {
     const read = async (args: string[]): Promise<string> => {
-      const result = await execFileAsync("git", args, { cwd, timeout: 30_000, maxBuffer: 4096, signal, env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }) });
-      return String(result.stdout).trim();
+      const result = await runSupervisorGit(cwd, args, { signal, maxBuffer: 4096 });
+      return result.stdout.trim();
     };
     const [gitDir, commonDir] = await Promise.all([read(["rev-parse", "--git-dir"]), read(["rev-parse", "--git-common-dir"])]);
     if (!gitDir || !commonDir) return false;
@@ -311,14 +373,8 @@ export async function repositoryGitDirectoryIsLocal(cwd: string, signal?: AbortS
 /** Determine whether cwd is a non-bare Git worktree without invoking a shell. */
 export async function repositoryWorkTree(cwd: string, signal?: AbortSignal): Promise<boolean | undefined> {
   try {
-    const result = await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], {
-      cwd,
-      timeout: 30_000,
-      maxBuffer: 1024,
-      signal,
-      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
-    });
-    const value = String(result.stdout).trim();
+    const result = await runSupervisorGit(cwd, ["rev-parse", "--is-inside-work-tree"], { signal, maxBuffer: 1024 });
+    const value = result.stdout.trim();
     return value === "true" ? true : value === "false" ? false : undefined;
   } catch {
     return undefined;
@@ -328,15 +384,9 @@ export async function repositoryWorkTree(cwd: string, signal?: AbortSignal): Pro
 /** Read the current symbolic branch without invoking a shell. */
 export async function repositoryBranch(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
   try {
-    const result = await execFileAsync("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], {
-      cwd,
-      timeout: 30_000,
-      maxBuffer: 1024,
-      signal,
-      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
-    });
-    const branch = String(result.stdout).trim();
-    return branch && /^[A-Za-z0-9._/-]+$/u.test(branch) ? branch : undefined;
+    const result = await runSupervisorGit(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"], { signal, maxBuffer: 1024 });
+    const branch = result.stdout.trim();
+    return isSafeBranchName(branch) ? branch : undefined;
   } catch {
     return undefined;
   }
@@ -357,7 +407,7 @@ export async function verify(
     required: true,
     timeoutMs,
   };
-  const result = await runCheck(cwd, check, options.signal);
+  const result = await runCheck(cwd, check, options);
   return {
     ok: result.ok && !options.signal?.aborted,
     command: [check.command, ...check.args].join(" "),
@@ -371,7 +421,7 @@ export async function verifyAll(cwd: string, checks: readonly AcceptanceCheck[],
   if (checks.length === 0) throw new Error("at least one acceptance check is required");
   const results: AcceptanceCheckResult[] = [];
   for (const [index, check] of checks.entries()) {
-    const result = await runCheck(cwd, check, options.signal);
+    const result = await runCheck(cwd, check, options);
     results.push(result);
     await options.onCheck?.({ check, result, index, total: checks.length });
     if (options.signal?.aborted) break;
@@ -395,10 +445,11 @@ export async function collectRepositoryEvidence(cwd: string, options: Pick<Verif
   const baseRef = options.baseRef;
   const diffRef = baseRef ?? "HEAD";
   const commitArgs = baseRef ? ["log", "--format=%h %s", "--no-decorate", `${baseRef}..HEAD`, "--"] : ["log", "--format=%h %s", "--no-decorate", "-20", "--"];
-  const [statusResult, diffResult, commitsResult, branchResult, untrackedResult, head] = await Promise.all([
+  const [statusResult, diffResult, diffPathsResult, commitsResult, branchResult, untrackedResult, head] = await Promise.all([
     readGitEvidence(cwd, ["status", "--short", "--untracked-files=all"], options.signal),
     // A baseline-relative diff includes committed, staged, and unstaged changes.
-    readGitEvidence(cwd, ["diff", "--no-ext-diff", "--unified=3", diffRef, "--"], options.signal),
+    readGitEvidence(cwd, ["diff", "--unified=3", diffRef, "--"], options.signal),
+    readGitEvidence(cwd, ["diff", "--name-only", diffRef, "--"], options.signal),
     readGitEvidence(cwd, commitArgs, options.signal),
     readGitEvidence(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"], options.signal),
     collectUntrackedEvidence(cwd, options.signal),
@@ -413,50 +464,47 @@ export async function collectRepositoryEvidence(cwd: string, options: Pick<Verif
     ...(baseRef ? { baseRef } : {}),
     ...(branchResult.text.trim() !== "(none)" ? { branch: branchResult.text.trim() } : {}),
     ...(head ? { head } : {}),
-    complete: statusResult.complete && diffResult.complete && commitsResult.complete && branchResult.complete && untrackedResult.complete,
-    truncated: statusResult.truncated || diffResult.truncated || commitsResult.truncated || branchResult.truncated || untrackedResult.truncated,
+    // A changed tracked path with an empty diff means Git refused to expose
+    // part of the candidate (attributes, textconv or a binary driver). Never
+    // call that evidence complete: the Reviewer must see content or the task
+    // must be repaired/parked.
+    complete: statusResult.complete && diffResult.complete && diffPathsResult.complete && commitsResult.complete && branchResult.complete && untrackedResult.complete
+      && (diffPathsResult.text === "(none)" || diffResult.text !== "(none)"),
+    truncated: statusResult.truncated || diffResult.truncated || diffPathsResult.truncated || commitsResult.truncated || branchResult.truncated || untrackedResult.truncated,
     collectedAt: new Date().toISOString(),
   };
 }
 
-async function runCheck(cwd: string, check: AcceptanceCheck, signal?: AbortSignal): Promise<AcceptanceCheckResult> {
-  throwIfAborted(signal);
+async function runCheck(cwd: string, check: AcceptanceCheck, options: VerificationOptions): Promise<AcceptanceCheckResult> {
+  throwIfAborted(options.signal);
   assertSafeWorkerCommand(check.command, check.args);
   const startedAt = new Date().toISOString();
-  try {
-    const result = await execFileAsync(check.command, check.args, {
-      cwd,
-      timeout: check.timeoutMs,
-      maxBuffer: maxExecBufferBytes(),
-      signal,
-      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
-    });
-    const finishedAt = new Date().toISOString();
-    return {
-      check,
-      status: "passed",
-      ok: true,
-      exitCode: 0,
-      output: boundOutput(`${result.stdout}${result.stderr}`),
-      startedAt,
-      finishedAt,
-    };
-  } catch (error) {
-    const failure = error as { code?: number | string; signal?: string; stdout?: string; stderr?: string; message?: string; killed?: boolean; name?: string };
-    const finishedAt = new Date().toISOString();
-    const cancelled = signal?.aborted === true || failure.name === "AbortError" || failure.code === "ABORT_ERR";
-    const timedOut = !cancelled && (failure.killed === true || failure.signal === "SIGTERM" || failure.code === "ETIMEDOUT");
-    const exitCode = typeof failure.code === "number" ? failure.code : 1;
-    return {
-      check,
-      status: cancelled ? "cancelled" : timedOut ? "timed_out" : "failed",
-      ok: false,
-      exitCode,
-      output: boundOutput(`${failure.stdout ?? ""}${failure.stderr ?? ""}${failure.message ?? ""}`),
-      startedAt,
-      finishedAt,
-    };
-  }
+  const isGit = check.command === "git";
+  const args = isGit
+    ? await supervisorGitCommandArgs(cwd, check.args, { signal: options.signal, timeout: check.timeoutMs, diff: check.args[0] === "diff" })
+    : check.args;
+  const result = await runBoundedCommand(check.command, args, {
+    cwd,
+    timeoutMs: check.timeoutMs,
+    signal: options.signal,
+    maxOutputBytes: maxOutputBytes(),
+    cgroupParentPath: options.cgroupParentPath,
+    env: supervisorGitEnvironment(false),
+  });
+  const finishedAt = new Date().toISOString();
+  const output = boundOutput(`${result.stdout}${result.stderr}${result.timedOut ? `\nverification timed out after ${check.timeoutMs}ms` : ""}${result.cancelled ? "\nverification cancelled" : ""}${result.decodeError ? `\nverification output was not valid UTF-8: ${result.decodeError.message}` : ""}${result.cleanupError ? `\nverification cleanup failed: ${result.cleanupError.message}` : ""}`);
+  const cancelled = result.cancelled || options.signal?.aborted === true;
+  const timedOut = !cancelled && result.timedOut;
+  const ok = !cancelled && !timedOut && !result.spawnError && !result.cleanupError && !result.decodeError && result.exitCode === 0 && result.signal === undefined;
+  return {
+    check,
+    status: cancelled ? "cancelled" : timedOut ? "timed_out" : ok ? "passed" : "failed",
+    ok,
+    exitCode: typeof result.exitCode === "number" ? result.exitCode : ok ? 0 : 1,
+    output,
+    startedAt,
+    finishedAt,
+  };
 }
 
 interface EvidencePart {
@@ -468,12 +516,11 @@ interface EvidencePart {
 async function readGitEvidence(cwd: string, args: string[], signal?: AbortSignal): Promise<EvidencePart> {
   throwIfAborted(signal);
   try {
-    const result = await execFileAsync("git", args, {
-      cwd,
-      timeout: 30_000,
-      maxBuffer: maxExecBufferBytes(),
+    const isDiff = args[0] === "diff";
+    const result = await runSupervisorGit(cwd, args, {
       signal,
-      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
+      maxBuffer: maxExecBufferBytes(),
+      diff: isDiff,
     });
     const bounded = boundEvidence(`${result.stdout}${result.stderr}`);
     return { ...bounded, text: bounded.text || "(none)" };
@@ -497,12 +544,9 @@ async function collectUntrackedEvidence(cwd: string, signal?: AbortSignal): Prom
     return { text: `[UNTRACKED EVIDENCE UNAVAILABLE] ${error instanceof Error ? error.message : String(error)}`, complete: false, truncated: false };
   }
   try {
-    const result = await execFileAsync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
-      cwd,
-      timeout: 30_000,
-      maxBuffer: maxOutputBytes(),
+    const result = await runSupervisorGit(cwd, ["ls-files", "--others", "--exclude-standard", "-z"], {
       signal,
-      env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }),
+      maxBuffer: maxOutputBytes(),
     });
     output = result.stdout;
     throwIfAborted(signal);
@@ -558,7 +602,13 @@ async function collectUntrackedEvidence(cwd: string, signal?: AbortSignal): Prom
         complete = false;
         sections.push(`--- ${JSON.stringify(path)} [binary file omitted]`);
       } else {
-        sections.push(`--- ${JSON.stringify(path)}${read.bytesRead > MAX_UNTRACKED_FILE_BYTES ? " [TRUNCATED]" : ""}\n${bytes.toString("utf8")}`);
+        try {
+          const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+          sections.push(`--- ${JSON.stringify(path)}${read.bytesRead > MAX_UNTRACKED_FILE_BYTES ? " [TRUNCATED]" : ""}\n${text}`);
+        } catch {
+          complete = false;
+          sections.push(`--- ${JSON.stringify(path)} [invalid UTF-8 omitted]`);
+        }
       }
     } catch (error) {
       complete = false;
@@ -604,14 +654,21 @@ function boundEvidence(value: string): EvidencePart {
   const encoded = Buffer.from(value, "utf8");
   if (encoded.byteLength <= maxOutputBytes()) return { text: value, complete: true, truncated: false };
   const marker = Buffer.from("\n[TRUNCATED]", "utf8");
-  const suffix = encoded.subarray(-Math.max(0, maxOutputBytes() - marker.byteLength));
-  return { text: `${suffix.toString("utf8")}${marker.toString("utf8")}`, complete: false, truncated: true };
+  const suffix = utf8Tail(encoded, Math.max(0, maxOutputBytes() - marker.byteLength));
+  return { text: `${suffix}${marker.toString("utf8")}`, complete: false, truncated: true };
 }
 
 function boundOutput(value: string): string {
   const encoded = Buffer.from(value, "utf8");
   if (encoded.byteLength <= maxOutputBytes()) return value;
   const marker = Buffer.from("\n[TRUNCATED]", "utf8");
-  const suffix = encoded.subarray(-Math.max(0, maxOutputBytes() - marker.byteLength));
-  return `${suffix.toString("utf8")}${marker.toString("utf8")}`;
+  const suffix = utf8Tail(encoded, Math.max(0, maxOutputBytes() - marker.byteLength));
+  return `${suffix}${marker.toString("utf8")}`;
+}
+
+function utf8Tail(value: Buffer, maxBytes: number): string {
+  if (value.byteLength <= maxBytes) return value.toString("utf8");
+  let start = Math.max(0, value.byteLength - maxBytes);
+  while (start < value.byteLength && (value[start]! & 0xc0) === 0x80) start += 1;
+  return value.subarray(start).toString("utf8");
 }

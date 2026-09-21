@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { lstat, open, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
-import { isDeepStrictEqual } from "node:util";
+import { isDeepStrictEqual, TextDecoder } from "node:util";
 import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { extractJsonObjects } from "./json-extract.ts";
 import type { PiUsageSample, TaskSpec, WorkerEvent } from "./types.ts";
@@ -10,6 +10,7 @@ import { redactSensitive } from "./redaction.ts";
 
 const MAX_DECISION_RESPONSE_BYTES = 32 * 1024;
 const MAX_DECISION_FIELD_BYTES = 8 * 1024;
+const MAX_DECISION_SESSION_FILE_BYTES = 32 * 1024 * 1024;
 
 export type DecisionAction =
   | { action: "continue" | "redirect" | "answer"; message: string; reason: string; confidence?: number }
@@ -430,13 +431,18 @@ function summarizeEvent(event: WorkerEvent): Record<string, unknown> {
       toolUseId,
       toolName,
       input: compactPermissionInput(toolName, input),
-      inputBytes: Buffer.byteLength(JSON.stringify(input) ?? "null", "utf8"),
+      inputBytes: safeJsonByteLength(input),
     };
   }
   if (event.type === "exited") {
     return { type: event.type, exitCode: event.exitCode, signal: event.signal };
   }
   return { type: event.type };
+}
+
+function safeJsonByteLength(value: unknown): number {
+  try { return Buffer.byteLength(JSON.stringify(value) ?? "null", "utf8"); }
+  catch { return Number.MAX_SAFE_INTEGER; }
 }
 
 function compactPermissionInput(toolName: string, input: unknown): Record<string, unknown> {
@@ -459,17 +465,34 @@ function compactPermissionInput(toolName: string, input: unknown): Record<string
 
 function boundedEventJson(event: WorkerEvent): string {
   const text = JSON.stringify(redactDecisionValue(summarizeEvent(event)), null, 2) ?? "null";
-  return text.length <= 8_000 ? text : `${text.slice(0, 8_000)}\n[TRUNCATED]`;
+  return truncateUtf8Text(text, 8_000);
 }
 
 function boundHead(value: string, maxBytes: number): string {
-  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
-  return `${Buffer.from(value, "utf8").subarray(0, maxBytes).toString("utf8")}\n[TRUNCATED]`;
+  const bytes = Buffer.from(value, "utf8");
+  const marker = Buffer.from("\n[TRUNCATED]", "utf8");
+  if (bytes.byteLength <= maxBytes) return value;
+  return `${utf8Head(bytes, Math.max(0, maxBytes - marker.byteLength))}${marker.toString("utf8")}`;
 }
 
 function boundTail(value: string, maxBytes: number): string {
-  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
-  return `[TRUNCATED]\n${Buffer.from(value, "utf8").subarray(-maxBytes).toString("utf8")}`;
+  const bytes = Buffer.from(value, "utf8");
+  const marker = Buffer.from("[TRUNCATED]\n", "utf8");
+  if (bytes.byteLength <= maxBytes) return value;
+  return `${marker.toString("utf8")}${utf8Tail(bytes, Math.max(0, maxBytes - marker.byteLength))}`;
+}
+
+function utf8Head(value: Buffer, maxBytes: number): string {
+  let end = Math.min(value.byteLength, Math.max(0, maxBytes));
+  while (end > 0 && end < value.byteLength && (value[end]! & 0xc0) === 0x80) end -= 1;
+  return value.subarray(0, end).toString("utf8");
+}
+
+function utf8Tail(value: Buffer, maxBytes: number): string {
+  if (value.byteLength <= maxBytes) return value.toString("utf8");
+  let start = Math.max(0, value.byteLength - maxBytes);
+  while (start < value.byteLength && (value[start]! & 0xc0) === 0x80) start += 1;
+  return value.subarray(start).toString("utf8");
 }
 
 interface PromptUsage {
@@ -634,6 +657,9 @@ function parseDecision(text: string, event: WorkerEvent): DecisionAction {
       const requestId = typeof value.requestId === "string" ? value.requestId : permission?.requestId;
       const toolUseId = typeof value.toolUseId === "string" ? value.toolUseId : permission?.toolUseId;
       if (!requestId || !toolUseId) throw new Error("permission requestId/toolUseId required");
+      if (permission && (requestId !== permission.requestId || toolUseId !== permission.toolUseId)) {
+        throw new Error("permission action does not match the current request");
+      }
       return { action: action as "allow_permission" | "deny_permission", requestId, toolUseId, reason, confidence };
     }
     if (action === "retry") {
@@ -674,7 +700,14 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
 
 function boundedJson(value: unknown): string {
   const text = JSON.stringify(redactDecisionValue(value), null, 2) ?? "null";
-  return text.length <= 32_000 ? text : `${text.slice(0, 32_000)}\n[TRUNCATED]`;
+  return truncateUtf8Text(text, 32_000);
+}
+
+function truncateUtf8Text(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  const marker = Buffer.from("\n[TRUNCATED]", "utf8");
+  if (bytes.byteLength <= maxBytes) return value;
+  return `${utf8Head(bytes, Math.max(0, maxBytes - marker.byteLength))}${marker.toString("utf8")}`;
 }
 
 function redactText(value: string): string {
@@ -749,7 +782,10 @@ async function readSessionFileSecure(path: string): Promise<string> {
     handle = await open(securePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     const info = await handle.stat();
     if (!info.isFile() || info.size <= 0) throw new Error("Decision Worker session file is not a non-empty regular file");
-    return await handle.readFile("utf8");
+    if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error("Decision Worker session file is owned by another user");
+    if (info.nlink > 1) throw new Error("Decision Worker session file is a hard-link alias");
+    if (info.size > MAX_DECISION_SESSION_FILE_BYTES) throw new Error("Decision Worker session file exceeds the safe size limit");
+    return new TextDecoder("utf-8", { fatal: true }).decode(await handle.readFile());
   } finally {
     await handle?.close().catch(() => {});
   }

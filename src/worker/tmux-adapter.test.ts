@@ -176,6 +176,7 @@ const stateDir = process.env.STATE_DIR;
 const pidFile = process.env.PID_FILE;
 const hookSettingsPath = process.env.HOOK_SETTINGS;
 const fakeClaude = process.env.FAKE_CLAUDE;
+const hookCapability = "test-hook-capability-0123456789";
 let handler;
 const hookSource = {
   subscribe: async (cwd, h) => { handler = h; return async () => { handler = undefined; }; },
@@ -191,6 +192,7 @@ const startPromise = adapter.start({
   interactive: true,
   hookSource,
   hookSettingsPath,
+  hookCapability,
   sendInitialInput: false,
 });
 let fakePid;
@@ -202,7 +204,7 @@ for (let attempt = 0; attempt < 200; attempt += 1) {
   await new Promise((resolve) => setTimeout(resolve, 20));
 }
 for (let attempt = 0; attempt < 200 && !handler; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 20));
-await handler({ version: 1, pid: fakePid + 1, ppid: fakePid, event: { hook_event_name: "SessionStart", session_id: "session-1", cwd: stateDir } });
+await handler({ version: 1, pid: fakePid + 1, ppid: fakePid, capability: hookCapability, event: { hook_event_name: "SessionStart", session_id: "session-1", cwd: stateDir } });
 const handle = await startPromise;
 // Simulate a normal completion: Supervisor releases the session (leaving it
 // open for the user) before the process later exits.
@@ -312,7 +314,7 @@ test("automated tmux carries structured Claude events through the live PTY", { s
     ANTHROPIC_API_KEY: "test-provider-key",
     CLAUDE_MCP_TEST_SERVER: "mcp://test-server",
     GIT_CONFIG_PARAMETERS: "credential.helper=store",
-    PI_CLAUDE_SUPERVISOR_TEST_CAPABILITY: "inherited-capability",
+    PI_WORKER_TEST_CAPABILITY: "inherited-capability",
   };
   const previousEnvironment = Object.fromEntries(Object.keys(inheritedCapability).map((key) => [key, process.env[key]]));
   Object.assign(process.env, inheritedCapability);
@@ -356,16 +358,33 @@ process.stdin.on("data", data => {
     assert.equal(events.find((event) => event.type === "turn_completed")?.result?.uuid, "hello");
     assert.ok(events.some((event) => event.type === "jsonl" && event.record?.type === "assistant"));
     const capturedEnvironment = JSON.parse(await readFile(envCapture, "utf8")) as Record<string, string | undefined>;
-    for (const [key, value] of Object.entries(inheritedCapability)) assert.equal(capturedEnvironment[key], value);
+    for (const [key, value] of Object.entries(inheritedCapability)) {
+      if (key === "GIT_CONFIG_PARAMETERS") assert.equal(capturedEnvironment[key], undefined);
+      else assert.equal(capturedEnvironment[key], value);
+    }
     const output = (await adapter.readOutput(handle)).map((chunk) => chunk.text).join("");
     assert.match(output, /ACK:hello/u);
     assert.doesNotMatch(output, /\u001bPPI_CLAUDE_SUPERVISOR_EVENT|@pi:user/u);
+    for (let attempt = 0; attempt < 100 && (await adapter.getStatus(handle)).activeRequests !== 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+
+    // A tmux PTY must not silently truncate a structured request at its line
+    // buffer boundary. The adapter chunks the Supervisor control frame below
+    // the PTY limit, then the bridge reassembles it before Claude sees it.
+    const longMessage = `long-next-${"x".repeat(5_000)}`;
+    await adapter.send(handle, longMessage, "long-next");
+    await waitFor(() => events.filter((event) => event.type === "turn_completed").length === 2);
+    assert.equal(events.filter((event) => event.type === "turn_completed")[1]?.result?.uuid, longMessage);
+
     const bufferName = `pi-cs-human-${handle.id}`;
     assert.equal(spawnSync("tmux", ["-S", handle.tmuxSocket!, "load-buffer", "-b", bufferName, "-"], { input: "human-next", stdio: ["pipe", "ignore", "pipe"] }).status, 0);
     assert.equal(spawnSync("tmux", ["-S", handle.tmuxSocket!, "paste-buffer", "-p", "-d", "-b", bufferName, "-t", handle.tmuxPaneId!], { stdio: "ignore" }).status, 0);
     assert.equal(spawnSync("tmux", ["-S", handle.tmuxSocket!, "send-keys", "-t", handle.tmuxPaneId!, "Enter"], { stdio: "ignore" }).status, 0);
-    await waitFor(() => events.filter((event) => event.type === "turn_completed").length === 2);
+    await waitFor(() => events.filter((event) => event.type === "turn_completed").length === 3);
     assert.match((await adapter.readOutput(handle)).map((chunk) => chunk.text).join(""), /ACK:human-next/u);
+
     await adapter.stop(handle, "bridge test complete");
     const status = await adapter.getStatus(handle);
     assert.equal(status.cleanupError, undefined);
@@ -447,6 +466,7 @@ test("automatic tmux prevents a queued permission response reaching a respawned 
   const fixture = join(stateDir, "fixture.mjs");
   const fakeClaude = join(stateDir, "claude");
   const firstDelivered = join(stateDir, "first-delivered");
+  const deliveryEnvironmentKey = "PI_WORKER_RACE_DELIVERED";
   const firstHold = join(stateDir, "first-hold");
   const firstRelease = join(stateDir, "first-release");
   const secondHold = join(stateDir, "second-hold");
@@ -465,7 +485,7 @@ process.stdin.on("data", data => {
     if (value.type === "user") for (const [requestId, toolUseId] of [["race-request-1", "race-tool-1"], ["race-request-2", "race-tool-2"]]) {
       process.stdout.write(JSON.stringify({ type: "control_request", request_id: requestId, request: { subtype: "can_use_tool", tool_use_id: toolUseId, tool_name: "Bash", input: { command: "printf RACE" } } }) + "\\n");
     }
-    if (value.type === "control_response" && ++responses === 1) writeFileSync(process.env.PI_CLAUDE_SUPERVISOR_RACE_DELIVERED, "delivered");
+    if (value.type === "control_response" && ++responses === 1) writeFileSync(process.env[${JSON.stringify(deliveryEnvironmentKey)}], "delivered");
   }
 });
 process.stdin.resume();
@@ -504,7 +524,7 @@ exec "$real" "$@"
       env: {
         HOME: join(stateDir, "home"),
         CLAUDE_CONFIG_DIR: join(stateDir, "config"),
-        PI_CLAUDE_SUPERVISOR_RACE_DELIVERED: firstDelivered,
+        [deliveryEnvironmentKey]: firstDelivered,
       },
       automatic: true,
       eventListener: (event) => { events.push(event); },
@@ -912,6 +932,7 @@ setInterval(() => {}, 10000);
       interactive: true,
       hookSource,
       hookSettingsPath,
+      hookCapability: TEST_HOOK_CAPABILITY,
       sendInitialInput: false,
       eventListener: (event) => { events.push(event); },
     });
@@ -980,6 +1001,7 @@ setInterval(() => {}, 10000);
       interactive: true,
       hookSource,
       hookSettingsPath,
+      hookCapability: TEST_HOOK_CAPABILITY,
       sendInitialInput: false,
       eventListener: (event) => { events.push(event); },
     });
@@ -1231,7 +1253,7 @@ test("SessionStart scratchpad_dir becomes an extra write root on permission requ
   const fixture = await startInteractiveOwnedFixture();
   const { adapter, handle, hookSource, events, stateDir, fakePid } = fixture;
   try {
-    const scratchpad = join(stateDir, "claude-scratchpad");
+    const scratchpad = join(tmpdir(), `claude-${process.getuid?.() ?? "test"}`, "pi-cs-test", "scratchpad");
     await hookSource.dispatch(stateDir, {
       version: 1,
       pid: fakePid + 1,
@@ -1332,6 +1354,36 @@ test("interactive mode never emits turn_completed from screen scraping", { skip:
   }
 });
 
+test("automatic interactive adoption fails closed without a Supervisor hook capability", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-adopt-no-capability-"));
+  const socketPath = join(stateDir, "tmux.sock");
+  const sessionName = `pi-adopt-no-capability-${process.pid}-${Date.now()}`;
+  const claudeScript = join(stateDir, "claude");
+  await writeFile(claudeScript, `#!/usr/bin/env node\nprocess.stdout.write("\\u276f \\n" + "\\u2500".repeat(40) + "\\n"); process.stdin.resume(); setInterval(() => {}, 10000);`);
+  await chmod(claudeScript, 0o700);
+  const envWithoutCapability = { ...process.env };
+  delete envWithoutCapability.PI_CLAUDE_SUPERVISOR_HOOK_CAPABILITY;
+  const created = spawnSync("tmux", ["-S", socketPath, "new-session", "-d", "-s", sessionName, "-c", stateDir, claudeScript], { encoding: "utf8", env: envWithoutCapability });
+  assert.equal(created.status, 0, created.stderr);
+  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+  try {
+    await assert.rejects(() => adapter.start({
+      task: "must reject an unbound interactive adoption",
+      cwd: stateDir,
+      command: "claude",
+      tmuxSession: sessionName,
+      tmuxSocket: socketPath,
+      automatic: true,
+      interactive: true,
+      hookSource: createFakeHookSource(),
+      sendInitialInput: false,
+    }), /requires a Supervisor hook capability/u);
+  } finally {
+    spawnSync("tmux", ["-S", socketPath, "kill-server"], { stdio: "ignore" });
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("adopting an interactive tmux session subscribes hooks, completes a Stop turn, and stop() only releases it", { skip: !tmuxAvailable, concurrency: false }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-adopt-interactive-"));
   const socketPath = join(stateDir, "tmux.sock");
@@ -1347,7 +1399,10 @@ process.stdin.resume();
 setInterval(() => {}, 10000);
 `);
   await chmod(claudeScript, 0o700);
-  const created = spawnSync("tmux", ["-S", socketPath, "new-session", "-d", "-s", sessionName, "-c", stateDir, claudeScript], { encoding: "utf8" });
+  const created = spawnSync("tmux", ["-S", socketPath, "new-session", "-d", "-s", sessionName, "-c", stateDir, claudeScript], {
+    encoding: "utf8",
+    env: { ...process.env, PI_CLAUDE_SUPERVISOR_HOOK_CAPABILITY: TEST_HOOK_CAPABILITY },
+  });
   assert.equal(created.status, 0, created.stderr);
   const hookSource = createFakeHookSource();
   const events: WorkerEvent[] = [];
@@ -1390,11 +1445,22 @@ setInterval(() => {}, 10000);
     });
     assert.deepEqual(spoofed, {});
     assert.equal(events.some((event) => event.type === "turn_completed"), false);
+    const wrongCapability = await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: 111_111,
+      ppid: handle.pid!,
+      tmuxPane: handle.tmuxPaneId,
+      capability: "wrong-hook-capability-0123456789",
+      event: { hook_event_name: "Stop", session_id: "session-1", cwd: stateDir, last_assistant_message: "wrong capability" },
+    });
+    assert.deepEqual(wrongCapability, {});
+    assert.equal(events.some((event) => event.type === "turn_completed"), false);
     const reply = await hookSource.dispatch(stateDir, {
       version: 1,
       pid: 111_111,
       ppid: handle.pid!,
       tmuxPane: handle.tmuxPaneId,
+      capability: TEST_HOOK_CAPABILITY,
       event: { hook_event_name: "Stop", session_id: "session-1", cwd: stateDir, last_assistant_message: "adopted turn done" },
     });
     assert.deepEqual(reply, {});
@@ -1412,6 +1478,8 @@ setInterval(() => {}, 10000);
 });
 
 /** A fake HookEventSource that routes synthetic requests directly to whatever subscribed for a cwd. */
+const TEST_HOOK_CAPABILITY = "test-hook-capability-0123456789";
+
 function createFakeHookSource(): HookEventSource & { dispatch: (cwd: string, request: HookRelayRequest) => Promise<HookRelayReply | undefined> } {
   const subscriptions = new Map<string, (request: HookRelayRequest) => Promise<HookRelayReply | undefined>>();
   return {
@@ -1422,7 +1490,7 @@ function createFakeHookSource(): HookEventSource & { dispatch: (cwd: string, req
     dispatch: async (cwd, request) => {
       const handler = subscriptions.get(cwd);
       if (!handler) throw new Error(`no hook subscription for cwd: ${cwd}`);
-      return handler(request);
+      return handler(request.capability === undefined ? { ...request, capability: TEST_HOOK_CAPABILITY } : request);
     },
   };
 }
@@ -1475,6 +1543,7 @@ setInterval(() => {}, 10000);
     interactive: true,
     hookSource,
     hookSettingsPath,
+    hookCapability: TEST_HOOK_CAPABILITY,
     sendInitialInput: false,
     retainCgroupUntilLeaseRelease: options.retainCgroupUntilLeaseRelease,
     eventListener: (event) => { events.push(event); },
@@ -1570,10 +1639,30 @@ test("the memory write root is accepted only for this project's own session tran
   assert.equal(memoryRootFor(`${configDir}/projects/-srv-foo-bar/1.jsonl`, "/srv/foo.bar", configDir), `${configDir}/projects/-srv-foo-bar/memory`);
 });
 
+test("memory roots reject symlinked Claude project components", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-memory-root-test-"));
+  const configDir = join(root, "claude");
+  const projectsDir = join(configDir, "projects");
+  const slug = "-mnt-work-Repo";
+  const outside = join(root, "outside");
+  try {
+    await mkdir(projectsDir, { recursive: true });
+    await mkdir(join(outside, slug), { recursive: true });
+    await symlink(join(outside, slug), join(projectsDir, slug));
+    assert.equal(memoryRootFor(join(projectsDir, slug, "1.jsonl"), "/mnt/work/Repo", configDir), undefined);
+    await rm(join(projectsDir, slug));
+    await mkdir(join(projectsDir, slug), { recursive: true });
+    await symlink(join(outside, "memory"), join(projectsDir, slug, "memory"));
+    assert.equal(memoryRootFor(join(projectsDir, slug, "1.jsonl"), "/mnt/work/Repo", configDir), undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("writeRoots carry the scratchpad and the project memory directory", () => {
   const cwd = "/mnt/work/Repo";
   const handle = { cwd };
-  const scratchpadDir = "/tmp/claude-1000/-mnt-work-Repo/abc/scratchpad";
+  const scratchpadDir = join(tmpdir(), `claude-${process.getuid?.() ?? "test"}`, "-mnt-work-Repo", "abc", "scratchpad");
   const transcriptPath = "/home/u/.claude/projects/-mnt-work-Repo/1234.jsonl";
 
   const configDir = "/home/u/.claude";

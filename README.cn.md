@@ -14,11 +14,13 @@ Claude Code 完成无人值守的本地开发。Pi 负责任务的生命周期�
 `pi install`：Pi 会自行发现并加载它，没有单独的构建步骤或二进制文件,在 Pi 内部
 除了环境变量之外也没有任何需要配置的地方。
 
-有一条 Worker 永远不能越过的硬边界，无论它自己的权限设置如何：它不能 push 到
+默认情况下有一条 Worker 无法越过的硬边界，无论它自己的权限设置如何：它不能 push 到
 远程仓库、合并进 `main` 或 integration 分支、创建 pull request，也不能执行任何
-远程 CLI 变更；`.git` 元数据写入和对受保护分支的破坏性改写一律拒绝。除此之外的
-一切——编辑、测试、shell 命令、本地提交——都按你配置的策略执行。扩展本身在运行时
-从不执行 merge、deploy、release 或 publish。
+远程 CLI 变更；`.git` 元数据写入和对受保护分支的破坏性改写一律拒绝。显式设置
+`REMOTE_AUTHORITY=push` 或 `pr` 的任务在验收和独立 Review 通过后，可以得到一条
+Supervisor 生成的一次性窄授权；除此之外仍全部拒绝,`pr` 还只允许对应的 `gh pr create`。
+一切编辑、测试、shell 命令、本地提交都按你配置的策略执行。扩展本身在运行时不执行
+merge、deploy 或 release。
 
 任务启动后,这个循环是这样运作的:
 
@@ -121,8 +123,9 @@ Pi 会在 Claude 结束一轮对话时(`Stop`;轮中 API/模型失败会以 `Sto
 已经放行的操作都不会到达 Decision Worker;它只在 Claude 本来要问*你*的地方做
 判断。硬边界(远程 push/merge/PR、远端 CLI 变更、`.git` 写入、受保护分支的
 破坏性改写)由 `PreToolUse` 强制执行,与权限模式无关——已在 Claude Code 2.1.273
-的 `auto` 模式下实测——这也是该模式在你自己的设置之外唯一的保证。需要让每个
-`Bash` 调用都经过 Supervisor 时,请使用 headless(`bridge`)模式。
+的 `auto` 模式下实测。显式发布任务是唯一例外:`PreToolUse` 只放行下面描述的
+Supervisor 一次性命令。需要让每个 `Bash` 调用都经过 Supervisor 时,请使用
+headless(`bridge`)模式。
 
 **接管空闲会话。** `adopt-tmux` 只在 Claude 空闲停在提示符时才把任务敲进去;
 接管时正在跑的一轮会保留其当前工作,等它下一次 `Stop` 再判断。
@@ -218,25 +221,23 @@ Worker 推自己的分支;`pr` 还允许它开 PR。**push 由 Worker 自己执�
 才把任务标记完成,候选通知里带上 PR 链接。核实不到则把候选标为 blocked,本地候选
 依然可交付。
 
-这个授权刻意严苛,而且两条命令都按字面匹配——没被审过的选项一律拒绝,而不是默认
-无害。它只认 `git -C '<任务目录>' -c core.hooksPath=/dev/null -c push.followTags=false push <remote> <已验证 commit>:refs/heads/<branch>`,
-不带其他任何选项。refspec 写的是**已验证的 commit** 而不是分支:git 只会推送这一个对象,
-Worker 在发布轮里再提交的内容会留在本地("Everything up-to-date"),搭不上这次授权。
+这个授权刻意严苛,而且命令都按字面匹配——没被审过的选项一律拒绝,而不是默认
+无害。Supervisor 生成的 push 命令会先清理动态加载器变量,再用绝对路径的 `env`/`git`,清除
+Worker 可控制的 Git/config/SSH/proxy 环境,把 global/system config 固定到 `/dev/null`,并钉住
+hooks、push option、submodule、receive-pack、proxy、credential 和完整的 `pushurl` 列表,最后只推送
+`<已验证 commit>:refs/heads/<branch>`。Worker 必须原样使用生成的长命令。
 **`-C` 是必需的、必须是绝对路径、且必须与任务目录逐字节相同**——不做规范化、不做 realpath——因为 Claude 的 Bash 工具
 会在多次调用之间保留工作目录,而 `cd` 属于普通本地操作,没有 `-C` 的话授权可能被花在
-任何别的克隆上;任何更宽松的比较都出现过 Supervisor 与 git 解析不一致的写法(相对路径 `.` 按 Supervisor 的目录解析、`/proc/self/cwd`,以及 `<cwd>/link/..`——Node 自己的 realpath 会按字面折叠而内核会跟随 symlink)。指令写的就是精确目录,不需要接受任何别的写法。
-这条命令上**钉死了 hooks 路径**,所以 Worker 通过任何途径(`git init --template=`、
-解压归档、`chmod`)装进去的 `pre-push` hook 都不会在授权的 push 里以 Worker 的凭据执行;也钉死了
-`push.followTags=false`,所以通过策略看不见的任何文件设的 `followTags=true` 都不能让这一次 push
-顺带推上授权没点名的 tag(tag 正是发布自动化的触发点)。两者都是 ref/hook 选择而非传输层,不会
-覆盖任何合理的仓库级设置。
-`pr` 下另加 `gh pr create --repo <钉住的 remote URL> --head <候选分支> …`(只允许
+任何别的克隆上。refspec 写的是**已验证的 commit** 而不是分支:git 只会推送这一个对象,
+Worker 在发布轮里再提交的内容会留在本地("Everything up-to-date"),搭不上这次授权。
+`pr` 下使用 Supervisor 信任的绝对 `env`/`gh` 前缀,清理 Worker 可控制的 GH/XDG 路由和凭据选择变量,
+钉住 `PATH`/`HOME`,再运行 `gh pr create --repo <钉住的 remote URL> --head <候选分支> …`(只允许
 title / body / base / draft / assignee / label):PR 只会开在授权 remote 对应的仓库里——
 不带 `--repo` 的话,gh 会从 remotes 里自己挑一个 base 仓库(fork 上是 `upstream`),
 那不是授权点名的仓库,核实也不会去查它。仓库取 remote URL 背后的 `host/owner/repo`
 (SSH config 里的 host 别名会像 gh 那样经 `ssh -G` 翻译);URL 不是仓库的 remote(本地路径、
-翻译不了的别名)不会拿到 `pr` 授权。授权提供的每个词都做了 shell 引用,分支叫 `feat/$ticket`
-也能原样通过策略。
+翻译不了的别名)不会拿到 `pr` 授权。SSH push 目的地使用 Supervisor 解析的 `ssh -F /dev/null`,因此仓库/用户
+SSH config 不能偷偷加入 proxy 或命令。授权提供的每个词都做了 shell 引用,分支叫 `feat/$ticket` 也能原样通过策略。
 
 授权只会发给"就是已验证工作树"的那个 commit:工作树必须干净(含未跟踪文件——新文件也可能
 是被验证行为的一部分),且 HEAD 自 Reviewer 评审的证据被读取以来没有移动过。仓库的 Git 目录必须是自己的 `.git` 或 linked worktree 的 `.git/worktrees/<name>`(不能是 `--separate-git-dir` 指针)。工作树不干净
@@ -244,9 +245,10 @@ title / body / base / draft / assignee / label):PR 只会开在授权 remote 对
 候选结束并在通知里写明 `not published:` 原因,而不是发授权。核实时 remote 连不上,发布只是
 "未确认"(候选仍可交付),绝不会被说成"没推上去"。
 
-有没有授权都拒绝:任何 push 选项(`-u`、`--force`、`--force-with-lease`、`--delete`、
-`--mirror`、`--all`、`--tags`、`--no-verify`、`--push-option`、`--receive-pack` 等)、
-除这两个钉死项(且顺序固定)以外的任何 `-c`、以分支或 `HEAD` 作为 refspec 来源、裸 `git push`、
+有没有授权都拒绝:任何未钉住的 push 选项(`-u`、`--force`、`--force-with-lease`、`--delete`、
+`--mirror`、`--all`、`--tags`、`--no-verify`、`--push-option`、非 Supervisor 的
+`--receive-pack` 等);生成的 `--receive-pack=git-receive-pack`是唯一固定例外,其余
+`-c`(除这些固定项且顺序固定)也拒绝,以分支或 `HEAD` 作为 refspec 来源、裸 `git push`、
 别的 remote、分支或 commit、保护分支、被 shell 包装(含 heredoc 管进 shell)、带动态参数、
 第二条语句、不带 `-C` 的 `git push`、`-C` 与任务目录不逐字节相同(别的目录、相对路径、`/proc/self/cwd`、其中的 symlink 或 `..`)、不带
 `--repo <钉住的 URL>` 或不带 `--head <候选分支>` 的 `gh pr create`(被别的选项当作值吞掉的
@@ -258,7 +260,7 @@ remote(`git remote set-url|add|rename|…`,藏在 git 自己的 `--git-dir`/`--w
 `include.path`/`includeIf.*`、`init.*`、`core.sshCommand`、`core.hooksPath`,`git config --edit`、
 `git init --template=…`、`git init|clone --separate-git-dir=…`,以及任何提到 `.git/config` 或 `.git/hooks` 的语句(除非它显然只读:
 `cat`、`grep`、`ls` 等)——否则授权认的 remote 会被偷换,连 Supervisor 的核实也会被骗过;
-核实同时钉住 fetch 和 push 两个 URL,并从自己的环境里剔除 `GIT_DIR`/`GIT_CONFIG_*`。这些文本规则之下还有一条不依赖它们的规则:remote 解析后的**全部** fetch/push URL(`git remote get-url --all` / `--push --all`;git 会推到每一个 `pushurl`,而不只是它打印的第一个;已应用改写)在任务**开始**、Worker 还没跑任何命令时记录,并在发放授权时和授权的 push 被批准的那一刻都要求原样不变。任务期间用任何手段(`~/.gitconfig`、脚本、策略看不见的 include)、哪怕在发布轮的第一条命令里加进来的 `pushInsteadOf`、`pushurl` 或额外目的地,都会让 push 被拒、授权作废;操作者原本就有的改写已在基线里,不受影响。恢复的任务沿用记录的基线、绝不重新采集;首次启动时解析不到的 remote 会被记录下来,永不授权。这是一层
+核实同时钉住 fetch 和 push 两个 URL,并从自己的环境里剔除 `GIT_DIR`/`GIT_CONFIG_*`。这些文本规则之下还有一条不依赖它们的规则:remote 解析后的**全部** fetch/push URL(`git remote get-url --all` / `--push --all`;git 会推到每一个 `pushurl`,而不只是它打印的第一个;已应用改写)在任务**开始**、Worker 还没跑任何命令时记录,并在发放授权时和授权的 push 被批准的那一刻都要求原样不变。本地 `url.*.insteadOf`/`pushInsteadOf` 会直接拒绝,不会被当作稳定目的地。任务期间用任何手段(`~/.gitconfig`、脚本、策略看不见的 include)、哪怕在发布轮的第一条命令里加进来的 `pushurl` 或额外目的地,都会让 push 被拒、授权作废;操作者原本就有的**全局**改写会在基线里解析并钉住,本地改写永不授权。恢复的任务沿用记录的基线、绝不重新采集;首次启动时解析不到的 remote 会被记录下来,永不授权。这是一层
 作用于命令文本的策略:Worker 自己写一个脚本再运行,策略看不见——如
 [autonomy-target.md](docs/autonomy-target.md) 对所有文本级规则所说,绝对隔离是 host 边界的事。
 

@@ -55,6 +55,18 @@ export interface RemoteGrant {
   head: string;
   /** The task working directory; a granted push must name it with an absolute `-C`, so the grant cannot be spent in another clone. */
   cwd: string;
+  /** Every resolved push destination recorded before the grant was issued. */
+  pushUrls: readonly string[];
+  /** Supervisor-resolved executable paths used by the one-shot publish command. */
+  envCommand?: string;
+  gitCommand?: string;
+  ghCommand?: string;
+  /** Worker-mutable environment values pinned back to the Supervisor's values. */
+  trustedPath?: string;
+  trustedHome?: string;
+  trustedSshAuthSock?: string;
+  /** Supervisor-resolved SSH command with repository/user SSH config disabled. */
+  sshCommand?: string;
   /**
    * The granted remote's repository as `host/owner/repo`, resolved from its
    * fetch URL when the grant was issued (an SSH-config host alias translated
@@ -81,14 +93,256 @@ export function isPlainRemoteName(value: unknown): value is string {
 export const GRANTED_HOOKS_PATH = "/dev/null";
 /**
  * The `-c` settings the granted push must carry, in this order: the hooks path
- * (no installed hook runs inside the command) and `push.followTags=false` (no
- * annotated tag rides along — `push.followTags=true` set through a file the
- * policy never sees would otherwise make the one granted push also plant a
- * tag the grant never named, and a tag is what release automation keys on).
- * Both are ref/hook selection, not transport, so pinning them overrides no
- * legitimate per-repository setting.
+ * (no installed hook runs inside the command), `push.followTags=false` (no
+ * annotated tag rides along), an empty `push.pushOption` (no server-side
+ * merge-request or other push option from local/global config), and
+ * `push.recurseSubmodules=no` (no recursive submodule pushes). Every setting
+ * is pinned on the one command because a Worker can change repository/global
+ * config through paths the permission policy never sees.
  */
-export const GRANTED_PUSH_SETTINGS = [`core.hooksPath=${GRANTED_HOOKS_PATH}`, "push.followTags=false"] as const;
+export const GRANTED_PUSH_SETTINGS = [
+  `core.hooksPath=${GRANTED_HOOKS_PATH}`,
+  "push.followTags=false",
+  "push.pushOption=",
+  "push.recurseSubmodules=no",
+] as const;
+/**
+ * Environment names a Worker can export between turns to replace Git's
+ * repository, executable, transport, proxy or dynamic-loader boundary. The
+ * command unsets these again immediately before Git starts. Values that the
+ * Supervisor deliberately retains are assigned again below, after the
+ * unsets, so an earlier `export` cannot win by ordering.
+ */
+export const GRANTED_PUSH_ENV_UNSETS = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_COMMON_DIR",
+  "GIT_NAMESPACE",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM",
+  "GIT_CONFIG_NOSYSTEM",
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_EXEC_PATH",
+  "GIT_TEMPLATE_DIR",
+  "GIT_EXTERNAL_DIFF",
+  "GIT_DIFF_OPTS",
+  "GIT_TRACE",
+  "GIT_TRACE2",
+  "GIT_TRACE2_EVENT",
+  "GIT_TRACE2_EVENT_NESTING",
+  "GIT_TRACE_PERFORMANCE",
+  "GIT_TRACE_SETUP",
+  "GIT_TRACE_PACKET",
+  "GIT_TRACE_PACK_ACCESS",
+  "GIT_TRACE_CURL",
+  "GIT_TRACE_CURL_NO_DATA",
+  "GIT_SSH",
+  "GIT_SSH_COMMAND",
+  "GIT_SSH_VARIANT",
+  "GIT_ASKPASS",
+  "SSH_ASKPASS",
+  "GIT_PROXY_COMMAND",
+  "GIT_EDITOR",
+  "GIT_SEQUENCE_EDITOR",
+  "GIT_PUSH_OPTION_COUNT",
+  "GIT_PUSH_OPTION_0",
+  "GIT_SSL_NO_VERIFY",
+  "GIT_SSL_CIPHER_LIST",
+  "GIT_SSL_VERSION",
+  "GIT_SSL_CAPATH",
+  "GIT_SSL_CERT",
+  "GIT_SSL_KEY",
+  "GIT_CURL_VERBOSE",
+  "CURL_CA_BUNDLE",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "GIT_TERMINAL_PROMPT",
+  "SSH_AUTH_SOCK",
+  "SSH_AGENT_PID",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "no_proxy",
+  "LD_PRELOAD",
+  "LD_LIBRARY_PATH",
+  "LD_LIBRARY_PATH_32",
+  "LD_LIBRARY_PATH_64",
+  "LD_AUDIT",
+  "LD_DEBUG",
+  "LD_DEBUG_OUTPUT",
+  "LD_ORIGIN_PATH",
+  "LD_PROFILE",
+  "LD_USE_LOAD_BIAS",
+  "LD_PREFER_MAP_32BIT_EXEC",
+  "LD_ASSUME_KERNEL",
+  "LD_HWCAP_MASK",
+  "LOCPATH",
+  "NLSPATH",
+  "GLIBC_TUNABLES",
+  "BASH_ENV",
+  "ENV",
+  "CDPATH",
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "PYTHONPATH",
+  "PYTHONHOME",
+  "PERL5OPT",
+  "RUBYOPT",
+  "GCONV_PATH",
+  "DISPLAY",
+  "WAYLAND_DISPLAY",
+  // gh-specific routing, credential and config selectors. The granted PR
+  // command uses the Supervisor-resolved helper and HOME, not a Worker
+  // shell's GH_* or XDG_* values.
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GH_ENTERPRISE_TOKEN",
+  "GITHUB_ENTERPRISE_TOKEN",
+  "GH_HOST",
+  "GH_REPO",
+  "GH_CONFIG_DIR",
+  "GITHUB_API_URL",
+  "GITHUB_GRAPHQL_URL",
+  "GITHUB_SERVER_URL",
+  "GITHUB_REPOSITORY",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_CACHE_HOME",
+  "GH_PAGER",
+  "GH_BROWSER",
+  "GH_EDITOR",
+  "GH_DEBUG",
+  "GH_FORCE_TTY",
+  "GH_PROMPT_DISABLED",
+  "GH_NO_UPDATE_NOTIFIER",
+  "GH_NO_EXTENSION_UPDATE_NOTIFIER",
+] as const;
+
+/**
+ * The environment prefix shared by the granted Git push and `gh pr create`.
+ * `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1` are assignments,
+ * not merely unsets: removing those variables would re-enable system/global
+ * configuration containing a credential helper, proxy or transport command.
+ */
+/** Shell-level assignments must run before `/usr/bin/env` itself is loaded. */
+export function grantedPushShellAssignments(): string[] {
+  return [
+    "LD_PRELOAD=", "LD_LIBRARY_PATH=", "LD_LIBRARY_PATH_32=", "LD_LIBRARY_PATH_64=",
+    "LD_AUDIT=", "LD_DEBUG=", "LD_DEBUG_OUTPUT=", "LD_ORIGIN_PATH=", "LD_PROFILE=",
+    "LD_USE_LOAD_BIAS=", "LD_PREFER_MAP_32BIT_EXEC=", "LD_ASSUME_KERNEL=", "LD_HWCAP_MASK=",
+    "LOCPATH=", "NLSPATH=", "GLIBC_TUNABLES=", "GCONV_PATH=",
+  ];
+}
+
+export function grantedPushEnvironment(grant: RemoteGrant): string[] {
+  const assignments = [
+    "GIT_CONFIG_NOSYSTEM=1",
+    "GIT_CONFIG_GLOBAL=/dev/null",
+    "GIT_CONFIG_SYSTEM=/dev/null",
+    "GIT_ATTR_NOSYSTEM=1",
+    "GIT_OPTIONAL_LOCKS=0",
+    `PATH=${grant.trustedPath ?? "/usr/bin:/bin"}`,
+    `HOME=${grant.trustedHome ?? "/"}`,
+    ...(grant.trustedSshAuthSock ? [`SSH_AUTH_SOCK=${grant.trustedSshAuthSock}`] : []),
+    "GIT_TERMINAL_PROMPT=0",
+  ];
+  // GNU/BSD `env` consumes assignments until the command; a `--` after
+  // assignments is treated as the command name on both implementations, not
+  // as an option terminator. The command is an absolute path, so no
+  // terminator is needed here.
+  return [...GRANTED_PUSH_ENV_UNSETS.flatMap((name) => ["-u", name]), ...assignments];
+}
+
+/**
+ * A resolved remote URL is safe to put in a literal Git config value. This is
+ * deliberately stricter than Git's URL parser: executable remote-helper forms
+ * and credential-bearing URLs must never become part of a Worker prompt.
+ */
+export function isSafeGrantedPushUrl(url: unknown): url is string {
+  if (typeof url !== "string" || url.length === 0 || url.length > 8_192 || url.startsWith("-") || /[\u0000-\u001f\u007f]/u.test(url)) return false;
+  if (/^[A-Za-z][A-Za-z0-9+.-]*::/u.test(url)) return false;
+  const scheme = url.match(/^([A-Za-z][A-Za-z0-9+.-]*):\/\//u)?.[1]?.toLowerCase();
+  if (scheme !== undefined) {
+    if (!new Set(["http", "https", "ssh", "git", "file"]).has(scheme) || /\s/u.test(url)) return false;
+    try {
+      const parsed = new URL(url);
+      if (parsed.password || ((scheme === "http" || scheme === "https") && parsed.username)) return false;
+      if (scheme !== "file" && (!parsed.hostname || parsed.hostname.startsWith("-"))) return false;
+    } catch {
+      return false;
+    }
+    return true;
+  }
+  // SCP-like SSH URLs and local paths are valid without a URL scheme. A
+  // `foo::bar` helper was rejected above; option-like and malformed host
+  // spellings are not valid grant destinations.
+  return !/^[A-Za-z][A-Za-z0-9+.-]*:/u.test(url) || /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\r\n]*$/u.test(url) || /^[A-Za-z0-9._-]+:[^\r\n]*$/u.test(url);
+}
+
+/** All Git settings pinned on the one granted push. */
+function httpScopedPushSettings(urls: readonly string[]): string[] {
+  const prefixes = new Set<string>();
+  for (const url of urls) {
+    const scheme = url.match(/^https?:\/\//u)?.[0];
+    if (!scheme) continue;
+    try {
+      const parsed = new URL(url);
+      const origin = parsed.origin;
+      if (origin === "null") continue;
+      const parts = parsed.pathname.split("/").filter(Boolean);
+      prefixes.add(`${origin}/`);
+      for (let index = 1; index <= parts.length; index += 1) prefixes.add(`${origin}/${parts.slice(0, index).join("/")}`);
+    } catch {
+      // isSafeGrantedPushUrl rejects this before a command can be admitted.
+    }
+  }
+  return [...prefixes].flatMap((prefix) => [
+    `http.${prefix}.extraHeader=`,
+    `http.${prefix}.proxy=`,
+    `credential.${prefix}.helper=`,
+    `http.${prefix}.sslVerify=true`,
+    `http.${prefix}.followRedirects=false`,
+    `http.${prefix}.sslCert=`,
+    `http.${prefix}.sslKey=`,
+    `http.${prefix}.sslCAInfo=`,
+    `http.${prefix}.sslCAPath=`,
+  ]);
+}
+
+export function grantedPushSettings(grant: RemoteGrant): string[] {
+  if (!isPlainRemoteName(grant.remoteName)) return [];
+  const remotePrefix = `remote.${grant.remoteName}`;
+  const pushUrls = Array.isArray(grant.pushUrls) ? grant.pushUrls : [];
+  return [
+    ...GRANTED_PUSH_SETTINGS,
+    `core.sshCommand=${grant.sshCommand ?? ""}`,
+    "core.gitProxy=",
+    "core.askPass=",
+    "credential.helper=",
+    "ssh.variant=ssh",
+    "push.gpgSign=false",
+    `${remotePrefix}.mirror=false`,
+    `${remotePrefix}.pushurl=`,
+    ...pushUrls.map((url) => `${remotePrefix}.pushurl=${url}`),
+    `${remotePrefix}.proxy=`,
+    "http.proxy=",
+    "https.proxy=",
+    "http.extraHeader=",
+    "http.sslVerify=true",
+    "http.followRedirects=false",
+    ...httpScopedPushSettings(pushUrls),
+  ];
+}
 
 /**
  * A word quoted for a POSIX shell: plain words pass through, anything else is
@@ -111,12 +365,21 @@ export function shellQuote(value: string): string {
  * and the verified commit is the refspec source.
  */
 export function publishCommand(grant: RemoteGrant): string {
-  return `git -C ${shellQuote(grant.cwd)} ${GRANTED_PUSH_SETTINGS.map((setting) => `-c ${setting}`).join(" ")} push ${shellQuote(grant.remoteName)} ${shellQuote(`${grant.head}:refs/heads/${grant.branch}`)}`;
+  const shellAssignments = grantedPushShellAssignments().join(" ");
+  const environment = grantedPushEnvironment(grant).map(shellQuote).join(" ");
+  const settings = grantedPushSettings(grant).map((setting) => `-c ${shellQuote(setting)}`).join(" ");
+  const envCommand = shellQuote(grant.envCommand ?? "env");
+  const gitCommand = shellQuote(grant.gitCommand ?? "git");
+  return `${shellAssignments} ${envCommand} ${environment} ${gitCommand} -C ${shellQuote(grant.cwd)} ${settings} push --receive-pack=git-receive-pack ${shellQuote(grant.remoteName)} ${shellQuote(`${grant.head}:refs/heads/${grant.branch}`)}`;
 }
 
 /** The one `gh pr create` prefix a `pr` grant admits; the Worker appends its title and body. */
 export function pullRequestCommand(grant: RemoteGrant): string {
-  return `gh pr create --repo ${shellQuote(grant.repository ?? "")} --head ${shellQuote(grant.branch)}`;
+  const shellAssignments = grantedPushShellAssignments().join(" ");
+  const environment = grantedPushEnvironment(grant).map(shellQuote).join(" ");
+  const envCommand = shellQuote(grant.envCommand ?? "env");
+  const ghCommand = shellQuote(grant.ghCommand ?? "gh");
+  return `${shellAssignments} ${envCommand} ${environment} ${ghCommand} pr create --repo ${shellQuote(grant.repository ?? "")} --head ${shellQuote(grant.branch)}`;
 }
 /**
  * The only options a granted `gh pr create` may carry. An allowlist, because an
@@ -290,7 +553,6 @@ const deniedPatterns = [
   /\bmkfs(?:\.|\s)/iu,
   /\bdd\s+if=/iu,
   /:\(\)\s*\{\s*:\|/u,
-  /\b(shutdown|reboot|poweroff)\b/iu,
 ];
 
 interface ShellToken {
@@ -339,12 +601,42 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
   if (tokens.some((token) => token.dynamic)) return undefined;
   const words = tokens.map((token) => token.value);
   if (words.length === 0) return undefined;
+  // Clear dynamic-loader variables in the shell before even the absolute
+  // `/usr/bin/env` helper is loaded. This prefix is structural, not a free
+  // assignment surface: only the exact fixed assignments generated below are
+  // accepted, and the remainder is matched recursively.
+  const shellAssignments = grantedPushShellAssignments();
+  if (words[0] === shellAssignments[0] || /^[A-Za-z_][A-Za-z0-9_]*=$/u.test(words[0] ?? "")) {
+    if (words.length <= shellAssignments.length || shellAssignments.some((value, index) => words[index] !== value)) return undefined;
+    return permittedRemoteCommand(tokens.slice(shellAssignments.length).map((token) => ({ ...token })), grant);
+  }
   const name = (words[0] ?? "").split(/[\\/]/u).at(-1)?.toLowerCase();
   if (isProtectedBranch(grant.branch)) return undefined;
   if (!isCommitId(grant.head)) return undefined;
+  if (!Array.isArray(grant.pushUrls) || grant.pushUrls.length === 0 || grant.pushUrls.some((url) => !isSafeGrantedPushUrl(url))) return undefined;
+  if (!isPlainRemoteName(grant.remoteName)) return undefined;
   const optionName = (word: string): string => word.split("=")[0] ?? word;
 
+  if (name === "env") {
+    // The Worker may export transport/configuration variables in an earlier
+    // turn. Clear every variable that can replace Git's repository, command,
+    // askpass, proxy, dynamic-loader or server-option boundary, then assign
+    // back only the Supervisor-owned values in the exact expected order.
+    if (words[0] !== (grant.envCommand ?? "env")) return undefined;
+    const expectedEnvironment = grantedPushEnvironment(grant);
+    if (expectedEnvironment.some((value, index) => words[index + 1] !== value)) return undefined;
+    const environmentCursor = 1 + expectedEnvironment.length;
+    const wrappedCommand = words[environmentCursor];
+    const allowedCommands = [grant.gitCommand ?? "git", ...(grant.authority === "pr" ? [grant.ghCommand ?? "gh"] : [])];
+    if (!allowedCommands.includes(wrappedCommand ?? "")) return undefined;
+    // Re-run the exact Git/gh matcher below against the suffix, without
+    // allowing a second wrapper or an alternate environment assignment.
+    const wrappedResult = permittedRemoteCommand(words.slice(environmentCursor).map((value) => ({ value, operator: false, dynamic: false })), grant);
+    return wrappedResult?.granted ? wrappedResult : undefined;
+  }
+
   if (name === "git") {
+    if (words[0] !== (grant.gitCommand ?? "git")) return undefined;
     // `-C <task directory>` is *required*, not merely tolerated. Claude's Bash
     // tool keeps its working directory between calls and `cd` is ordinary local
     // work, so without an explicit directory the grant could be spent in any
@@ -361,30 +653,36 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
     if (directory === undefined || !isAbsolute(directory) || directory !== grant.cwd) return undefined;
     // The pinned `-c` settings are required too, in order: a `pre-push` hook
     // runs inside the granted push with the Worker's credentials where no
-    // policy sees it, and `push.followTags=true` would push a tag along with
-    // the commit; both can arrive by more doors than a write denial can
-    // enumerate, so the one granted command is made immune instead.
+    // policy sees it; follow-tags, push options, recursive submodules,
+    // proxies, credentials and every configured push URL can arrive by more
+    // doors than a write denial can enumerate, so the one granted command is
+    // made immune instead. The receive-pack helper is pinned as a direct
+    // `push` option below: Git treats duplicate `remote.<name>.receivepack`
+    // config values specially, so a `-c` assignment would not reliably
+    // override a repository value.
     let cursor = 3;
-    for (const setting of GRANTED_PUSH_SETTINGS) {
+    for (const setting of grantedPushSettings(grant)) {
       if (words[cursor] !== "-c" || words[cursor + 1] !== setting) return undefined;
       cursor += 2;
     }
     if (words[cursor] !== "push") return undefined;
-    // No push option at all: `-u` did nothing with a commit as the source, and
-    // an allowlist of one no-op is only surface. The refspec names the
+    // One direct option pins the receive-pack helper. Git treats duplicate
+    // `remote.<name>.receivepack` values specially, so this must be a push
+    // option rather than another `-c` assignment. The refspec names the
     // verified commit, so git pushes exactly that object; a commit made during
     // the publish turn stays local ("Everything up-to-date") instead of riding
     // the grant. `refs/heads/` is spelled out because a bare destination is
     // refused by git when the remote branch does not exist yet.
     const rest = words.slice(cursor + 1);
-    if (rest.length !== 2 || rest.some((word) => word.startsWith("-"))) return undefined;
-    const [remote, refspec] = rest as [string, string];
+    if (rest.length !== 3 || rest[0] !== "--receive-pack=git-receive-pack" || rest.slice(1).some((word) => word.startsWith("-"))) return undefined;
+    const [, remote, refspec] = rest as [string, string, string];
     if (remote !== grant.remoteName) return undefined;
     if (refspec !== `${grant.head}:refs/heads/${grant.branch}`) return undefined;
     return { decision: "allow", reason: `publish grant: push ${grant.head.slice(0, 12)} to ${grant.remoteName}/${grant.branch}`, granted: true };
   }
 
   if (name === "gh" && grant.authority === "pr") {
+    if (words[0] !== (grant.ghCommand ?? "gh")) return undefined;
     if (!grant.repository) return undefined;
     if (words[1] !== "pr" || words[2] !== "create") return undefined;
     const rest = words.slice(3);
@@ -456,6 +754,13 @@ function containsRemoteCliMutation(command: string): boolean {
   return /\b(?:gh|glab|hub)\b[\s\S]*(?:\b(?:pr|mr|pull-request)\s+(?:merge|create|close|delete|edit|comment)\b|\b(?:release)\s+(?:create|delete|edit|upload)\b|\bapi\b[\s\S]*(?:-X|--request|--method(?:=|\s+))(?:\s*=?)\s*(?:POST|PUT|PATCH|DELETE)\b)/iu.test(command);
 }
 
+/** Detect a Git mutation embedded in an interpreter/heredoc payload without
+ * treating an ordinary argument such as `git commit -m "merge"` as one. */
+function containsEmbeddedGitMutation(command: string): boolean {
+  return /(?:^|[;\n"'(\[])[ \t]*git[\t\n ]+(?:push|merge|send-pack|receive-pack|update-ref)(?=$|[\t\n ;"')\]])/iu.test(command)
+    || /["']git["'][\t ]*,[\t ]*["'](?:push|merge|send-pack|receive-pack|update-ref)["']/iu.test(command);
+}
+
 function containsRemoteHttpMutation(command: string): boolean {
   const hasHttpClient = /\b(?:curl|wget)\b/iu.test(command);
   const hasMutationFlag = /(?:-X\s*(?:POST|PUT|PATCH|DELETE)\b|--request(?:=|\s+)(?:POST|PUT|PATCH|DELETE)\b|--method(?:=|\s+)(?:POST|PUT|PATCH|DELETE)\b)/iu.test(command)
@@ -464,9 +769,12 @@ function containsRemoteHttpMutation(command: string): boolean {
   return hasHttpClient && hasMutationFlag && hasProtectedEndpoint;
 }
 
+const MAX_POLICY_COMMAND_BYTES = 64 * 1024;
+
 export function evaluateCommand(command: string, args: readonly string[] = [], grant?: RemoteGrant): PolicyResult {
   const normalized = command.trim();
   if (!normalized) return { decision: "deny", reason: "empty command" };
+  if (Buffer.byteLength(normalized, "utf8") > MAX_POLICY_COMMAND_BYTES) return { decision: "deny", reason: "command is too large to capability-check safely" };
   const lexical = lexShell(normalized);
   if (lexical.error) return { decision: "deny", reason: `command could not be safely parsed: ${lexical.error}` };
   const literalArgs = args.map((value) => ({ value, operator: false, dynamic: false }));
@@ -483,8 +791,9 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   const values = tokens.filter((token) => !token.operator).map((token) => token.value);
   const lower = values.map((value) => value.toLowerCase());
   const hasGit = values.some((value) => /(?:^|[\\/])git$/iu.test(value) || /^(?:git-(?:send|receive|upload)-pack)$/iu.test(value));
-  const hasGitTransport = lower.some((value) => /^(?:git-(?:send|receive|upload)-pack)$/u.test(value));
-  const hasRemoteOperation = lower.some((value) => remoteOperations.has(value));
+  const hasGitTransport = segmentsOf(tokens).some((segment) => gitTransportInvocation(segment));
+  const hasRemoteOperation = segmentsOf(tokens).some((segment) => gitRemoteOperation(segment))
+    || (lower.includes("for") && lower.includes("do") && hasGit && lower.some((value) => remoteOperations.has(value)));
   const hasGhRemote = containsRemoteCliMutation(canonical);
   const hasPackagePublication = lower.some((value) => value === "npm" || value === "pnpm" || value === "yarn") && lower.includes("publish");
   const hasGitAliasConfiguration = hasGit && lower.some((value) => /^alias\.[^=]*(?:=|$)/u.test(value));
@@ -510,15 +819,18 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   // Dynamic text in an ordinary local command (`for f in …; echo "$f"`) or in
   // another statement (`npm test; echo "exit $?"`) is Claude's own business.
   const segments = segmentsOf(tokens);
+  if (segments.some((segment) => privilegeEscalationInvocation(segment))) {
+    return { decision: "deny", reason: "Worker cannot use privilege-escalation wrappers" };
+  }
   if ((hasDynamicArgument && hasDynamicCommandName(tokens)) || segments.some((segment) => hasDynamicSensitiveArgument(segment))) {
     return { decision: "deny", reason: "a repository, package, network or shell command with a dynamic argument cannot be capability-checked; substitute the literal value for the shell variable so the command can be read, or use the Write/Edit tools when the intent is to change a file" };
   }
-  if (/\bgit\b[\s\S]*\b(?:push|merge(?!-)|send-pack|receive-pack|update-ref)\b/iu.test(canonical)
-    || /\bgit-(?:send|receive|upload)-pack\b/iu.test(canonical)
-    || containsRemoteCliMutation(canonical)) {
+  if (segments.some((segment) => gitRemoteOperation(segment) || gitTransportInvocation(segment))
+    || containsRemoteCliMutation(canonical)
+    || containsEmbeddedGitMutation(canonical)) {
     return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority", boundary: "remote" };
   }
-  if (hasGit && (hasRemoteOperation || hasGitTransport) || hasGhRemote) {
+  if (hasRemoteOperation || hasGitTransport || hasGhRemote || containsEmbeddedGitMutation(canonical)) {
     return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority", boundary: "remote" };
   }
   // Repointing a remote would make the grant's remote *name* meaningless and
@@ -545,7 +857,7 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   }
   const directRefWrite = tokens.some((token) => token.operator && (token.value === ">" || token.value === ">>"))
     || ["cp", "echo", "install", "mv", "printf", "sed", "tee"].includes(lower[0] ?? "");
-  if (/\.git[\\/](?:HEAD|packed-refs|refs[\\/]heads[\\/])/iu.test(canonical)
+  if (segments.some((segment) => /\.git[\\/](?:HEAD|packed-refs|refs[\\/]heads[\\/])/iu.test(segment.map((token) => token.value).join(" ")) && !onlyReads(segment))
     || (directRefWrite && hasProtectedBranch && /refs[\\/]heads[\\/]/iu.test(canonical))) {
     return { decision: "deny", reason: "Worker cannot write protected Git branch refs directly" };
   }
@@ -589,13 +901,34 @@ const GIT_GLOBAL_VALUE_OPTIONS = new Set(["-C", "-c", "--git-dir", "--work-tree"
  * and `-c` let `remote set-url` and `config remote.*` hide behind `--git-dir`.
  */
 function gitSubcommandIndex(words: readonly string[]): number {
-  const first = words[0]?.split(/[\\/]/u).at(-1)?.toLowerCase();
+  const commandIndex = commandExecutableIndex(words);
+  const first = words[commandIndex]?.split(/[\\/]/u).at(-1)?.toLowerCase();
   if (first !== "git") return -1;
-  let index = 1;
+  let index = commandIndex + 1;
   while (index < words.length && words[index]!.startsWith("-")) {
     index += GIT_GLOBAL_VALUE_OPTIONS.has(words[index]!) ? 2 : 1;
   }
   return index < words.length ? index : -1;
+}
+
+function gitRemoteOperation(segment: readonly ShellToken[]): boolean {
+  const words = segment.filter((token) => !token.operator).map((token) => token.value);
+  const index = gitSubcommandIndex(words);
+  return index >= 0 && remoteOperations.has(words[index]!.toLowerCase());
+}
+
+function gitTransportInvocation(segment: readonly ShellToken[]): boolean {
+  const words = segment.filter((token) => !token.operator).map((token) => token.value);
+  const executable = words[commandExecutableIndex(words)]?.split(/[\\/]/u).at(-1)?.toLowerCase();
+  return executable === "git-send-pack" || executable === "git-receive-pack" || executable === "git-upload-pack";
+}
+
+function containsDangerousCommand(tokens: readonly ShellToken[]): boolean {
+  return segmentsOf(tokens).some((segment) => {
+    const words = segment.filter((token) => !token.operator).map((token) => token.value);
+    const executable = words[commandExecutableIndex(words)]?.split(/[\\/]/u).at(-1)?.toLowerCase();
+    return executable !== undefined && DANGEROUS_COMMANDS.has(executable);
+  });
 }
 
 /** True when this one statement is `git [options] remote <mutating action>`. */
@@ -620,6 +953,84 @@ const REMOTE_TRANSPORT_CONFIG_KEY = /^(?:remote\.|url\.|push\.|credential\.|http
 /** `git config` flags and verbs that only read; a key next to one of them is a query, not a change. */
 const GIT_CONFIG_READ_FLAGS = new Set(["--get", "--get-all", "--get-regexp", "--get-urlmatch", "-l", "--list", "--show-origin", "--show-scope", "--name-only"]);
 const GIT_CONFIG_WRITE_FLAGS = new Set(["--add", "--replace-all", "--unset", "--unset-all", "--remove-section", "--rename-section", "--edit", "-e"]);
+const COMMAND_WRAPPERS = new Set(["command", "builtin", "exec", "nohup", "nice", "timeout", "time", "env", "sudo", "doas", "su"]);
+const DANGEROUS_COMMANDS = new Set(["shutdown", "reboot", "poweroff"]);
+
+/**
+ * Return the actual executable position after harmless command wrappers and
+ * environment assignments. Policy decisions must inspect the command argv,
+ * not every word in a joined shell string (`env FOO=x git push` is still a
+ * push, while `git commit -m \"merge\"` is not).
+ */
+function skipEnvWrapperArguments(words: readonly string[], start: number): number {
+  let index = start;
+  while (index < words.length) {
+    const word = words[index]!;
+    if (word === "--") return index + 1;
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/u.test(word)) { index += 1; continue; }
+    if (word === "-u" || word === "--unset" || word === "--chdir") { index += 2; continue; }
+    if (word.startsWith("--unset=") || word.startsWith("--chdir=")) { index += 1; continue; }
+    if (word.startsWith("-")) { index += 1; continue; }
+    break;
+  }
+  return index;
+}
+
+function privilegeEscalationInvocation(segment: readonly ShellToken[]): boolean {
+  const words = segment.filter((token) => !token.operator).map((token) => token.value);
+  let index = 0;
+  for (let depth = 0; depth < 8 && index < words.length; depth += 1) {
+    while (index < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[index]!)) index += 1;
+    if (index >= words.length) return false;
+    const executable = words[index]!.split(/[\\/]/u).at(-1)?.toLowerCase() ?? "";
+    if (executable === "sudo" || executable === "doas" || executable === "su") return true;
+    if (!COMMAND_WRAPPERS.has(executable)) return false;
+    index += 1;
+    if (executable === "env") {
+      index = skipEnvWrapperArguments(words, index);
+    } else if (executable === "nice") {
+      while (index < words.length && words[index]!.startsWith("-")) index += 1;
+      if (index < words.length && /^\d+$/u.test(words[index]!)) index += 1;
+    } else if (executable === "timeout" || executable === "time") {
+      while (index < words.length && words[index]!.startsWith("-")) index += 1;
+      if (executable === "timeout" && index < words.length && !words[index]!.startsWith("-")) index += 1;
+    } else if (executable === "sudo" || executable === "doas") {
+      while (index < words.length && words[index]!.startsWith("-")) {
+        const option = words[index]!;
+        index += 1;
+        if (["-u", "--user", "-g", "--group", "-C", "--chdir"].includes(option) && index < words.length) index += 1;
+      }
+    }
+  }
+  return false;
+}
+
+function commandExecutableIndex(words: readonly string[]): number {
+  let index = 0;
+  for (let depth = 0; depth < 8 && index < words.length; depth += 1) {
+    while (index < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[index]!)) index += 1;
+    if (index >= words.length) return index;
+    const executable = words[index]!.split(/[\\/]/u).at(-1)?.toLowerCase() ?? "";
+    if (!COMMAND_WRAPPERS.has(executable)) return index;
+    index += 1;
+    if (executable === "env") {
+      index = skipEnvWrapperArguments(words, index);
+    } else if (executable === "nice") {
+      while (index < words.length && words[index]!.startsWith("-")) index += 1;
+      if (index < words.length && /^\d+$/u.test(words[index]!)) index += 1;
+    } else if (executable === "timeout" || executable === "time") {
+      while (index < words.length && words[index]!.startsWith("-")) index += 1;
+      if (executable === "timeout" && index < words.length && !words[index]!.startsWith("-")) index += 1;
+    } else if (executable === "sudo" || executable === "doas") {
+      while (index < words.length && words[index]!.startsWith("-")) {
+        const option = words[index]!;
+        index += 1;
+        if (["-u", "--user", "-g", "--group", "-C", "--chdir"].includes(option) && index < words.length) index += 1;
+      }
+    }
+  }
+  return index;
+}
 
 /**
  * True when a word names `.git/config`, `.git/config.worktree` or something
@@ -819,6 +1230,9 @@ function evaluateTokens(rawTokens: readonly ShellToken[], depth: number, grant?:
   if (boundary) return boundary;
   if (containsRemoteHttpMutation(canonical)) {
     return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
+  }
+  if (containsDangerousCommand(tokens)) {
+    return { decision: "deny", reason: "command matches a prohibited destructive pattern" };
   }
   if (deniedPatterns.some((pattern) => pattern.test(canonical))) {
     if (/\b(?:curl|wget)\b[\s\S]*(?:github|gitlab|bitbucket|registry\.npmjs)\b/iu.test(canonical)) {

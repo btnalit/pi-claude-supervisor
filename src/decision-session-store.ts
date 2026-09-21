@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { chmod, lstat, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { TextDecoder } from "node:util";
 import { redactSensitive } from "./redaction.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import type { TaskSpec } from "./types.ts";
@@ -62,6 +64,13 @@ export type DecisionSessionRecordInput = Omit<DecisionSessionRecord, "version" |
 
 const LOCK_TIMEOUT_MS = 10_000;
 const STALE_LOCK_MS = 5_000;
+const MAX_SESSION_RECORD_BYTES = 1 * 1024 * 1024;
+
+interface LockIdentity {
+  device: number;
+  inode: number;
+  token: string;
+}
 
 /**
  * Small crash-tolerant registry for Decision Worker sessions.
@@ -302,7 +311,8 @@ export class DecisionSessionStore {
           assertNoCredentialPath(typeof value.decisionSessionFile === "string" ? resolve(value.decisionSessionFile) : "");
           const record = normalizeRecord(redactRecord(value), this.#directory, expectedTaskId);
           if (!options.activeOnly || record.state === "active") records.push(record);
-        } catch {
+        } catch (error) {
+          if (!isRecoverableRegistryCorruption(error)) throw error;
           // A torn, misnamed, or manually edited registry record is not recoverable.
         }
       }
@@ -351,22 +361,30 @@ export class DecisionSessionStore {
     await this.#ensureDirectory();
     const target = this.#recordPath(record.taskId);
     const temporary = `${target}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
-    await writeJson(temporary, normalized);
-    await rename(temporary, target);
-    await chmod(target, 0o600);
+    try {
+      await writeJson(temporary, normalized);
+      await rename(temporary, target);
+    } finally {
+      await rm(temporary, { force: true }).catch(() => {});
+    }
   }
 
   async #withLock<T>(operation: () => Promise<T>): Promise<T> {
     await this.#ensureDirectory();
     const lockPath = join(this.#directory, ".lock");
     const deadline = Date.now() + LOCK_TIMEOUT_MS;
+    const lockToken = randomUUID();
+    let lockIdentity: LockIdentity | undefined;
     while (true) {
       try {
         await mkdir(lockPath, { mode: 0o700 });
-        await writeFile(join(lockPath, "owner.json"), JSON.stringify({
-          pid: process.pid,
-          at: new Date().toISOString(),
-        }), { encoding: "utf8", mode: 0o600 });
+        const lockInfo = await lstat(lockPath);
+        if (!lockInfo.isDirectory() || lockInfo.isSymbolicLink()) throw new Error("Decision Worker session registry lock is not a real directory");
+        if (typeof process.getuid === "function" && lockInfo.uid !== process.getuid()) throw new Error("Decision Worker session registry lock is owned by another user");
+        await writeJsonFile(join(lockPath, "owner.json"), { pid: process.pid, at: new Date().toISOString(), token: lockToken });
+        const acquired = await lstat(lockPath);
+        if (!acquired.isDirectory() || acquired.isSymbolicLink()) throw new Error("Decision Worker session registry lock changed during acquisition");
+        lockIdentity = { device: acquired.dev, inode: acquired.ino, token: lockToken };
         break;
       } catch (error) {
         if (!(error instanceof Error) || !/EEXIST/u.test(error.message)) throw error;
@@ -378,7 +396,7 @@ export class DecisionSessionStore {
     try {
       return await operation();
     } finally {
-      await rm(lockPath, { recursive: true, force: true });
+      if (lockIdentity) await removeOwnedSessionLock(lockPath, lockIdentity);
     }
   }
 
@@ -386,6 +404,7 @@ export class DecisionSessionStore {
     await mkdir(this.#directory, { recursive: true, mode: 0o700 });
     const info = await lstat(this.#directory);
     if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Decision Worker session registry is not a real directory");
+    if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error("Decision Worker session registry is owned by another user");
     await chmod(this.#directory, 0o700);
   }
 
@@ -396,13 +415,35 @@ export class DecisionSessionStore {
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
-  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  await writeJsonFile(path, value);
+}
+
+async function writeJsonFile(path: string, value: unknown): Promise<void> {
+  if (typeof fsConstants.O_NOFOLLOW !== "number") throw new Error("secure Decision Worker session writing is unavailable");
+  const encoded = `${JSON.stringify(value, null, 2)}\n`;
+  if (Buffer.byteLength(encoded, "utf8") > MAX_SESSION_RECORD_BYTES) throw new Error("Decision Worker session record exceeds the safe size limit");
+  const handle = await open(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+  try {
+    await handle.writeFile(encoded, "utf8");
+    await handle.chmod(0o600);
+  } finally {
+    await handle.close().catch(() => {});
+  }
 }
 
 async function readRecordFile(path: string): Promise<string> {
-  const info = await lstat(path);
-  if (!info.isFile() || info.isSymbolicLink()) throw new Error("Decision Worker session registry record is not a regular file");
-  return readFile(path, "utf8");
+  if (typeof fsConstants.O_NOFOLLOW !== "number") throw new Error("secure Decision Worker session opening is unavailable");
+  const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error("Decision Worker session registry record is not a regular file");
+    if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error("Decision Worker session registry record is owned by another user");
+    if (info.nlink > 1) throw new Error("Decision Worker session registry record is a hard-link alias");
+    if (info.size > MAX_SESSION_RECORD_BYTES) throw new Error("Decision Worker session registry record exceeds the safe size limit");
+    return new TextDecoder("utf-8", { fatal: true }).decode(await handle.readFile());
+  } finally {
+    await handle.close().catch(() => {});
+  }
 }
 
 function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: string, expectedTaskId?: string): DecisionSessionRecord {
@@ -538,6 +579,18 @@ function validLimit(value: unknown, minimum: number): boolean {
   return value === undefined || (typeof value === "number" && Number.isSafeInteger(value) && value >= minimum);
 }
 
+async function removeOwnedSessionLock(lockPath: string, expected: LockIdentity): Promise<void> {
+  try {
+    const info = await lstat(lockPath);
+    if (!info.isDirectory() || info.isSymbolicLink() || info.dev !== expected.device || info.ino !== expected.inode) return;
+    const owner = JSON.parse(await readRecordFile(join(lockPath, "owner.json"))) as { token?: unknown };
+    if (owner.token !== expected.token) return;
+    if (!await reclaimSessionLock(lockPath, { device: info.dev, inode: info.ino }, expected.token)) throw new Error("Decision Worker session registry lock changed before release");
+  } catch (error) {
+    if (!(error instanceof Error) || !/ENOENT/u.test(error.message)) throw error;
+  }
+}
+
 async function removeStaleLock(lockPath: string): Promise<boolean> {
   try {
     const info = await lstat(lockPath);
@@ -554,8 +607,8 @@ async function removeStaleLock(lockPath: string): Promise<boolean> {
         throw error;
       }
     }
-    let owner: { pid?: unknown } = {};
-    try { owner = JSON.parse(await readFile(ownerPath, "utf8")) as { pid?: unknown }; }
+    let owner: { pid?: unknown; token?: unknown } = {};
+    try { owner = JSON.parse(await readRecordFile(ownerPath)) as { pid?: unknown; token?: unknown }; }
     catch { /* an old/incomplete lock is reclaimable after the grace period */ }
     if (typeof owner.pid === "number" && Number.isSafeInteger(owner.pid) && owner.pid > 0) {
       try {
@@ -565,10 +618,33 @@ async function removeStaleLock(lockPath: string): Promise<boolean> {
         if (error instanceof Error && /EPERM/u.test(error.message)) return false;
       }
     }
-    await rm(lockPath, { recursive: true, force: true });
-    return true;
+    return await reclaimSessionLock(lockPath, { device: info.dev, inode: info.ino }, typeof owner.token === "string" ? owner.token : undefined);
   } catch (error) {
     if (error instanceof Error && /ENOENT/u.test(error.message)) return true;
+    return false;
+  }
+}
+
+async function reclaimSessionLock(lockPath: string, expected: { device: number; inode: number }, token?: string): Promise<boolean> {
+  const quarantine = `${lockPath}.reap-${process.pid}-${randomUUID()}`;
+  try {
+    await rename(lockPath, quarantine);
+    const moved = await lstat(quarantine);
+    if (!moved.isDirectory() || moved.isSymbolicLink() || moved.dev !== expected.device || moved.ino !== expected.inode) {
+      await rename(quarantine, lockPath).catch(() => {});
+      return false;
+    }
+    if (token !== undefined) {
+      const owner = JSON.parse(await readRecordFile(join(quarantine, "owner.json"))) as { token?: unknown };
+      if (owner.token !== token) {
+        await rename(quarantine, lockPath).catch(() => {});
+        return false;
+      }
+    }
+    await rm(quarantine, { recursive: true, force: true });
+    return true;
+  } catch {
+    await rename(quarantine, lockPath).catch(() => {});
     return false;
   }
 }
@@ -592,6 +668,16 @@ async function processStartTime(pid: number): Promise<string | undefined> {
   } catch {
     return undefined;
   }
+}
+
+function isRecoverableRegistryCorruption(error: unknown): boolean {
+  if (error instanceof SyntaxError) return true;
+  if (!(error instanceof Error)) return false;
+  return error.message === "invalid task id"
+    || error.message === "Decision Worker session task id mismatch"
+    || error.message === "invalid Decision Worker session record"
+    || error.message.startsWith("task spec ")
+    || error.message.startsWith("acceptance[");
 }
 
 function delay(ms: number): Promise<void> {

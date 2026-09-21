@@ -1,6 +1,8 @@
-import { randomBytes } from "node:crypto";
-import { appendFile, chmod, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { randomBytes, randomUUID } from "node:crypto";
+import { chmod, lstat, mkdir, open, readdir, rename, rm } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { TextDecoder } from "node:util";
 import { redactSensitive } from "./redaction.ts";
 
 export interface SupervisorEvent {
@@ -18,6 +20,8 @@ const STALE_LOCK_MS = 5_000;
 const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
 const DEFAULT_KEEP_ROTATED = 5;
 const TAIL_WINDOW_BYTES = 256 * 1024;
+const MAX_EVENT_BYTES = 8 * 1024 * 1024;
+const MAX_EVENT_SCAN_BYTES = 128 * 1024 * 1024;
 const ROTATED_STAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[0-9a-f]{8}$/u;
 
 export class EventLog {
@@ -55,10 +59,13 @@ export class EventLog {
       seq: ++this.#seq,
       at: new Date().toISOString(),
     };
+    const serialized = JSON.stringify(entry);
+    if (Buffer.byteLength(serialized, "utf8") > Math.min(MAX_EVENT_BYTES, this.#maxBytes)) throw new Error("event exceeds the safe size limit");
     if (this.#path) {
       await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
-      await appendFile(this.#path, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
-      await chmod(this.#path, 0o600);
+      await assertPrivateDirectory(dirname(this.#path), "event log directory");
+      await chmod(dirname(this.#path), 0o700);
+      await appendSecure(this.#path, `${serialized}\n`);
     }
     return entry;
   }
@@ -67,11 +74,18 @@ export class EventLog {
     if (!this.#path) return operation();
     const lockPath = `${this.#path}.lock`;
     await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
+    await assertPrivateDirectory(dirname(this.#path), "event log directory");
+    await chmod(dirname(this.#path), 0o700);
     const deadline = Date.now() + LOCK_TIMEOUT_MS;
+    const lockToken = randomUUID();
+    let lockIdentity: { device: number; inode: number } | undefined;
     while (true) {
       try {
         await mkdir(lockPath);
-        await writeFile(`${lockPath}/owner.json`, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+        await assertPrivateDirectory(lockPath, "event log lock");
+        await writeExclusive(`${lockPath}/owner.json`, JSON.stringify({ pid: process.pid, token: lockToken, at: new Date().toISOString() }));
+        const lockInfo = await lstat(lockPath);
+        lockIdentity = { device: lockInfo.dev, inode: lockInfo.ino };
         break;
       } catch (error) {
         if (!(error instanceof Error) || !/EEXIST/u.test(error.message)) throw error;
@@ -83,21 +97,27 @@ export class EventLog {
     try {
       return await operation();
     } finally {
-      await rm(lockPath, { recursive: true, force: true });
+      if (lockIdentity) await releaseEventLock(lockPath, lockIdentity, lockToken);
     }
   }
 
   async #removeStaleLock(lockPath: string): Promise<boolean> {
+    let lockInfo;
     try {
-      const info = await stat(`${lockPath}/owner.json`);
-      if (Date.now() - info.mtimeMs < STALE_LOCK_MS) return false;
-      let owner: { pid?: unknown };
-      try {
-        owner = JSON.parse(await readFile(`${lockPath}/owner.json`, "utf8")) as { pid?: unknown };
-      } catch {
-        await rm(lockPath, { recursive: true, force: true });
-        return true;
-      }
+      lockInfo = await lstat(lockPath);
+      if (!lockInfo.isDirectory() || lockInfo.isSymbolicLink()) return false;
+    } catch (error) {
+      return error instanceof Error && /ENOENT/u.test(error.message);
+    }
+    const ownerPath = `${lockPath}/owner.json`;
+    let ownerMtime = lockInfo.mtimeMs;
+    let token: string | undefined;
+    try {
+      const ownerInfo = await lstat(ownerPath);
+      if (!ownerInfo.isFile() || ownerInfo.isSymbolicLink()) return false;
+      ownerMtime = ownerInfo.mtimeMs;
+      const owner = JSON.parse(await readSecure(ownerPath)) as { pid?: unknown; token?: unknown };
+      if (typeof owner.token === "string" && owner.token) token = owner.token;
       if (typeof owner.pid === "number") {
         try {
           process.kill(owner.pid, 0);
@@ -106,22 +126,13 @@ export class EventLog {
           if (error instanceof Error && /EPERM/u.test(error.message)) return false;
         }
       }
-      await rm(lockPath, { recursive: true, force: true });
-      return true;
     } catch (error) {
-      if (error instanceof Error && /ENOENT/u.test(error.message)) {
-        try {
-          const lockInfo = await stat(lockPath);
-          if (Date.now() - lockInfo.mtimeMs >= STALE_LOCK_MS) {
-            await rm(lockPath, { recursive: true, force: true });
-            return true;
-          }
-        } catch {
-          return true;
-        }
-      }
-      return false;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code && code !== "ENOENT") return false;
+      if (!code && !(error instanceof SyntaxError)) return false;
     }
+    if (Date.now() - ownerMtime < STALE_LOCK_MS) return false;
+    return reclaimEventLock(lockPath, { device: lockInfo.dev, inode: lockInfo.ino }, token);
   }
 
   async #initialize(): Promise<void> {
@@ -137,7 +148,10 @@ export class EventLog {
   async #fullScan(): Promise<void> {
     if (!this.#path) return;
     try {
-      const contents = await readFile(this.#path, "utf8");
+      const info = await lstat(this.#path);
+      if (!info.isFile() || info.isSymbolicLink()) throw new Error("event log is not a regular file");
+      if (info.size > Math.min(this.#maxBytes, MAX_EVENT_SCAN_BYTES)) throw new Error("event log exceeds the safe scan size limit");
+      const contents = await readSecure(this.#path);
       const lines = contents.split("\n");
       let firstCorruptLine = -1;
       for (let index = 0; index < lines.length; index += 1) {
@@ -153,8 +167,7 @@ export class EventLog {
         // A partial write is only safe to recover by removing it and anything
         // after it; otherwise future appends would remain unreplayable JSONL.
         const repaired = `${lines.slice(0, firstCorruptLine).join("\n").replace(/\n+$/u, "")}\n`;
-        await writeFile(this.#path, repaired, { mode: 0o600 });
-        await chmod(this.#path, 0o600);
+        await writeExistingSecure(this.#path, repaired);
         lines.length = firstCorruptLine;
       }
       for (const line of lines) {
@@ -176,7 +189,9 @@ export class EventLog {
     if (!this.#path) return;
     let size: number;
     try {
-      size = (await stat(this.#path)).size;
+      const info = await lstat(this.#path);
+      if (!info.isFile() || info.isSymbolicLink()) throw new Error("event log is not a regular file");
+      size = info.size;
     } catch (error) {
       if (!(error instanceof Error) || !/ENOENT/u.test(error.message)) throw error;
       // File is missing (e.g. right after rotation): keep #seq as-is.
@@ -187,11 +202,11 @@ export class EventLog {
     while (true) {
       const start = size - window;
       let text: string;
-      const handle = await open(this.#path, "r");
+      const handle = await openRegular(this.#path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
       try {
         const buffer = Buffer.alloc(window);
         const { bytesRead } = await handle.read(buffer, 0, window, start);
-        text = buffer.subarray(0, bytesRead).toString("utf8");
+        text = new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, bytesRead));
       } finally {
         await handle.close();
       }
@@ -230,7 +245,9 @@ export class EventLog {
     if (!this.#path) return;
     let size: number;
     try {
-      size = (await stat(this.#path)).size;
+      const info = await lstat(this.#path);
+      if (!info.isFile() || info.isSymbolicLink()) throw new Error("event log is not a regular file");
+      size = info.size;
     } catch (error) {
       if (!(error instanceof Error) || !/ENOENT/u.test(error.message)) throw error;
       return;
@@ -261,11 +278,11 @@ export class EventLog {
       if (!ROTATED_STAMP_PATTERN.test(name.slice(base.length + 1))) continue;
       let entryStat;
       try {
-        entryStat = await stat(join(dir, name));
+        entryStat = await lstat(join(dir, name));
       } catch {
         continue;
       }
-      if (!entryStat.isFile()) continue;
+      if (!entryStat.isFile() || entryStat.isSymbolicLink()) continue;
       rotated.push(name);
     }
     rotated.sort();
@@ -274,6 +291,92 @@ export class EventLog {
       await rm(join(dir, name), { force: true });
     }
   }
+}
+
+async function releaseEventLock(path: string, identity: { device: number; inode: number }, token: string): Promise<void> {
+  try {
+    const current = await lstat(path);
+    if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== identity.device || current.ino !== identity.inode) return;
+    const owner = JSON.parse(await readSecure(join(path, "owner.json"))) as { token?: unknown };
+    if (owner.token !== token) return;
+    await reclaimEventLock(path, identity, token);
+  } catch {
+    // Leave uncertain lock state for the stale-lock path; never remove an
+    // entry whose inode or owner token cannot be verified.
+  }
+}
+
+async function reclaimEventLock(path: string, identity: { device: number; inode: number }, token?: string): Promise<boolean> {
+  const quarantine = `${path}.reap-${process.pid}-${randomUUID()}`;
+  try {
+    await rename(path, quarantine);
+    const moved = await lstat(quarantine);
+    if (!moved.isDirectory() || moved.isSymbolicLink() || moved.dev !== identity.device || moved.ino !== identity.inode) {
+      await rename(quarantine, path).catch(() => {});
+      return false;
+    }
+    if (token !== undefined) {
+      const owner = JSON.parse(await readSecure(join(quarantine, "owner.json"))) as { token?: unknown };
+      if (owner.token !== token) {
+        await rename(quarantine, path).catch(() => {});
+        return false;
+      }
+    }
+    await rm(quarantine, { recursive: true, force: true });
+    return true;
+  } catch {
+    await rename(quarantine, path).catch(() => {});
+    return false;
+  }
+}
+
+async function assertPrivateDirectory(path: string, label: string): Promise<void> {
+  const info = await lstat(path);
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`${label} is not a real directory: ${path}`);
+  if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error(`${label} is owned by another user: ${path}`);
+}
+
+async function openRegular(path: string, flags: number, mode?: number) {
+  if (typeof fsConstants.O_NOFOLLOW !== "number") throw new Error("secure event-log opening is unavailable");
+  const handle = await open(path, flags | fsConstants.O_NOFOLLOW, mode);
+  const info = await handle.stat();
+  if (!info.isFile() || info.isSymbolicLink()) {
+    await handle.close().catch(() => {});
+    throw new Error(`event log entry is not a regular file: ${path}`);
+  }
+  if (typeof process.getuid === "function" && info.uid !== process.getuid()) {
+    await handle.close().catch(() => {});
+    throw new Error(`event log entry is owned by another user: ${path}`);
+  }
+  if (info.nlink > 1) {
+    await handle.close().catch(() => {});
+    throw new Error(`event log entry is a hard-link alias: ${path}`);
+  }
+  return handle;
+}
+
+async function readSecure(path: string): Promise<string> {
+  const handle = await openRegular(path, fsConstants.O_RDONLY);
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(await handle.readFile()); }
+  finally { await handle.close().catch(() => {}); }
+}
+
+async function writeExclusive(path: string, contents: string, mode = 0o600): Promise<void> {
+  const handle = await openRegular(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, mode);
+  try { await handle.writeFile(contents, "utf8"); await handle.chmod(mode); }
+  finally { await handle.close().catch(() => {}); }
+}
+
+async function appendSecure(path: string, contents: string): Promise<void> {
+  const handle = await openRegular(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND, 0o600);
+  try { await handle.writeFile(contents, "utf8"); await handle.chmod(0o600); }
+  finally { await handle.close().catch(() => {}); }
+}
+
+async function writeExistingSecure(path: string, contents: string): Promise<void> {
+  const handle = await openRegular(path, fsConstants.O_WRONLY | fsConstants.O_TRUNC);
+  try { await handle.writeFile(contents, "utf8"); await handle.chmod(0o600); }
+  finally { await handle.close().catch(() => {}); }
 }
 
 function delay(ms: number): Promise<void> {

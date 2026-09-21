@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { extractJsonObjects } from "./json-extract.ts";
+import { balancedObjectEnd, extractJsonObjects } from "./json-extract.ts";
 import { normalizeReviewReport, parseReview, usageFromSessionStats } from "./reviewer.ts";
 
 test("Reviewer parser accepts bounded structured findings", () => {
@@ -65,6 +65,21 @@ test("extractJsonObjects finds every balanced JSON object in surrounding text", 
   assert.equal(objects.length, 2);
   assert.deepEqual(objects[0], { a: 1 });
   assert.deepEqual(objects[1], { b: 2 });
+});
+
+test("balanced JSON ignores escaped quotes, backslashes and braces inside strings", () => {
+  const first = JSON.stringify({ message: 'brace } and { quote " and slash \\', nested: { ok: true } });
+  const text = `${first} trailing ${JSON.stringify({ ok: true })}`;
+  assert.equal(balancedObjectEnd(text, 0), first.length - 1);
+  assert.deepEqual(extractJsonObjects(text), [{ message: 'brace } and { quote " and slash \\', nested: { ok: true } }, { ok: true }]);
+  assert.equal(balancedObjectEnd('{"message":"unterminated\\\\', 0), -1);
+});
+
+test("malformed outer JSON cannot promote a nested verdict or duplicate key", () => {
+  const malformed = '{"verdict":"human","summary":"no","findings":[],"nested":{"verdict":"pass","summary":"ok","findings":[]},}';
+  assert.deepEqual(extractJsonObjects(malformed), []);
+  assert.deepEqual(extractJsonObjects('{"verdict":"pass","verdict":"human","summary":"x","findings":[]}'), []);
+  assert.equal(parseReview(malformed, 0).verdict, "human");
 });
 
 test("usageFromSessionStats maps aggregate session token counters onto ReviewReport.usage", () => {

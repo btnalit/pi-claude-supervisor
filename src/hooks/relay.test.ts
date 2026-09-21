@@ -160,6 +160,29 @@ test("Stop reply with block:true is translated into a top-level decision", async
   });
 });
 
+test("StopFailure is relayed as a non-blocking event without stdout", async () => {
+  await withServer(async (server, hookDir) => {
+    await withTempCwd(async (cwd) => {
+      let resolveObserved!: () => void;
+      const observed = new Promise<void>((resolve) => { resolveObserved = resolve; });
+      const unsubscribe = await server.subscribe(cwd, async (request: HookRelayRequest) => {
+        assert.equal(request.event.hook_event_name, "StopFailure");
+        resolveObserved();
+        return { block: true, blockReason: "ignored for StopFailure" };
+      });
+      try {
+        const event = baseEvent({ hook_event_name: "StopFailure", cwd, error: "stop failed" });
+        const result = await runRelay(event, hookDir);
+        assert.equal(result.code, 0);
+        assert.equal(result.stdout, "");
+        await Promise.race([observed, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("StopFailure was not delivered")), 2_000))]);
+      } finally {
+        await unsubscribe();
+      }
+    });
+  });
+});
+
 test("a non-blocking Notification event returns instantly with empty stdout", async () => {
   await withServer(async (server, hookDir) => {
     await withTempCwd(async (cwd) => {
