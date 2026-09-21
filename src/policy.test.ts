@@ -599,9 +599,11 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
   // round-trip through the parser, or a change to either side produces an
   // instruction the policy refuses and the only symptom is a blocked publish.
   assert.equal(evaluatePermission("Bash", { command: publishCommand(push) }, process.cwd(), { remote: push }).granted, true);
-  const sshPush = { ...push, sshCommand: "/usr/bin/ssh -F /dev/null" };
+  const sshPush = { ...push, pushUrls: ["git@github.com:acme/console.git"], sshCommand: "/usr/bin/ssh -F /dev/null" };
   assert.equal(evaluatePermission("Bash", { command: publishCommand(sshPush) }, process.cwd(), { remote: sshPush }).granted, true);
-  const spacedSsh = { ...push, sshCommand: "'/tmp/trusted ssh/ssh' -F /dev/null" };
+  const unpinnedSsh = { ...sshPush, sshCommand: undefined };
+  assert.equal(evaluatePermission("Bash", { command: publishCommand(unpinnedSsh) }, process.cwd(), { remote: unpinnedSsh }).granted, undefined, "SSH publication without a trusted -F /dev/null command is refused");
+  const spacedSsh = { ...sshPush, sshCommand: "'/tmp/trusted ssh/ssh' -F /dev/null" };
   assert.equal(evaluatePermission("Bash", { command: publishCommand(spacedSsh) }, process.cwd(), { remote: spacedSsh }).granted, true, "the SSH helper path is quoted inside core.sshCommand");
   assert.equal(evaluatePermission("Bash", { command: `${pullRequestCommand(pr)} --title t --body b` }, process.cwd(), { remote: pr }).granted, true);
   const spaced = { ...push, cwd: "/tmp/it's a dir" };

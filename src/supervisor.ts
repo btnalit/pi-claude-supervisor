@@ -42,6 +42,7 @@ function requiresPinnedSsh(url: string): boolean {
   // Exclude a Windows drive spelling, which is a local path rather than an
   // SSH destination. The URL verifier admits only the same safe remote shapes.
   if (/^ssh:\/\//iu.test(url)) return true;
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(url)) return false;
   const scp = url.match(/^(?:[^/\s@]+@)?([A-Za-z0-9._-]+):/u);
   return Boolean(scp && !(scp[1]!.length === 1 && /^[A-Za-z]:[\\/]/u.test(url)));
 }

@@ -601,6 +601,13 @@ export function sameDirectory(first: string, second: string, whenMissing: "false
  * statement, and refuses rather than guess. Returns undefined when the command
  * is not a permitted publish, leaving the ordinary denials to answer.
  */
+function requiresPinnedSsh(url: string): boolean {
+  if (/^ssh:\/\//iu.test(url)) return true;
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(url)) return false;
+  const match = url.match(/^(?:[^/\\s@]+@)?([A-Za-z0-9._-]+):/u);
+  return Boolean(match && !(match[1]!.length === 1 && /^[A-Za-z]:[\\/]/u.test(url)));
+}
+
 function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGrant): PolicyResult | undefined {
   // A single statement only: `git push origin x && rm -rf /` must never pass.
   if (tokens.some((token) => token.operator)) return undefined;
@@ -620,6 +627,7 @@ function permittedRemoteCommand(tokens: readonly ShellToken[], grant: RemoteGran
   if (isProtectedBranch(grant.branch)) return undefined;
   if (!isCommitId(grant.head)) return undefined;
   if (!Array.isArray(grant.pushUrls) || grant.pushUrls.length === 0 || grant.pushUrls.some((url) => !isSafeGrantedPushUrl(url))) return undefined;
+  if (grant.pushUrls.some(requiresPinnedSsh) && !grant.sshCommand) return undefined;
   if (!isPlainRemoteName(grant.remoteName)) return undefined;
   const optionName = (word: string): string => word.split("=")[0] ?? word;
 
