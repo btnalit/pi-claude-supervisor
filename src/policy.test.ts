@@ -603,6 +603,8 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
   assert.equal(evaluatePermission("Bash", { command: publishCommand(sshPush) }, process.cwd(), { remote: sshPush }).granted, true);
   const unpinnedSsh = { ...sshPush, sshCommand: undefined };
   assert.equal(evaluatePermission("Bash", { command: publishCommand(unpinnedSsh) }, process.cwd(), { remote: unpinnedSsh }).granted, undefined, "SSH publication without a trusted -F /dev/null command is refused");
+  const usernameWithS = { ...unpinnedSsh, pushUrls: ["suser@github.com:acme/console.git"] };
+  assert.equal(evaluatePermission("Bash", { command: publishCommand(usernameWithS) }, process.cwd(), { remote: usernameWithS }).granted, undefined, "an SCP username containing s still requires an SSH pin");
   const spacedSsh = { ...sshPush, sshCommand: "'/tmp/trusted ssh/ssh' -F /dev/null" };
   assert.equal(evaluatePermission("Bash", { command: publishCommand(spacedSsh) }, process.cwd(), { remote: spacedSsh }).granted, true, "the SSH helper path is quoted inside core.sshCommand");
   assert.equal(evaluatePermission("Bash", { command: `${pullRequestCommand(pr)} --title t --body b` }, process.cwd(), { remote: pr }).granted, true);

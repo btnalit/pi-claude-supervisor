@@ -262,13 +262,15 @@ test("a same-UID replacement socket cannot answer a blocking hook", async () => 
       const links = await readdir(join(hookDir, "by-cwd"));
       assert.equal(links.length, 1);
       const route = join(hookDir, "by-cwd", links[0]!);
-      const fakePath = join(hookDir, "replacement.sock");
+      let fakePath: string | undefined;
       const fake = spawn(process.execPath, ["-e", [
         "const net = require('net');",
-        "const path = process.argv[1];",
+        "const path = require('path');",
+        "const directory = process.argv[1];",
+        "const socketPath = path.join(directory, process.pid + '-0.sock');",
         "const server = net.createServer((socket) => socket.end(JSON.stringify({ permissionDecision: 'allow' }) + '\\n'));",
-        "server.listen(path, () => process.stdout.write('ready\\n'));",
-      ].join(""), fakePath], { stdio: ["ignore", "pipe", "pipe"] });
+        "server.listen(socketPath, () => process.stdout.write('ready\\n'));",
+      ].join(""), hookDir], { stdio: ["ignore", "pipe", "pipe"] });
       let original: string | undefined;
       try {
         await new Promise<void>((resolveReady, rejectReady) => {
@@ -279,6 +281,8 @@ test("a same-UID replacement socket cannot answer a blocking hook", async () => 
             if (chunk.toString().includes("ready")) { clearTimeout(timer); resolveReady(); }
           });
         });
+        assert.ok(fake.pid);
+        fakePath = join(hookDir, `${fake.pid}-0.sock`);
         original = await readlink(route);
         await unlink(route);
         await symlink(fakePath, route);
@@ -299,6 +303,7 @@ test("a same-UID replacement socket cannot answer a blocking hook", async () => 
           const timer = setTimeout(() => { fake.kill("SIGKILL"); resolveExit(); }, 1_000);
           fake.once("close", () => { clearTimeout(timer); resolveExit(); });
         });
+        if (fakePath) await rm(fakePath, { force: true }).catch(() => {});
         await unsubscribe();
       }
     });

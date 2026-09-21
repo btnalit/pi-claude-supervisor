@@ -604,7 +604,7 @@ export function sameDirectory(first: string, second: string, whenMissing: "false
 function requiresPinnedSsh(url: string): boolean {
   if (/^ssh:\/\//iu.test(url)) return true;
   if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(url)) return false;
-  const match = url.match(/^(?:[^/\\s@]+@)?([A-Za-z0-9._-]+):/u);
+  const match = url.match(/^(?:[^/\s@]+@)?([A-Za-z0-9._-]+):/u);
   return Boolean(match && !(match[1]!.length === 1 && /^[A-Za-z]:[\\/]/u.test(url)));
 }
 

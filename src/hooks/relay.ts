@@ -141,6 +141,8 @@ export const HOOK_RELAY_SCRIPT = `
   var net = require("net");
   var socket = net.createConnection(connectPath);
   var finished = false;
+  var endpointChecked = false;
+  var endpointTrusted = false;
   var timer;
 
   function finish() {
@@ -222,6 +224,8 @@ export const HOOK_RELAY_SCRIPT = `
 
   function afterVerifiedConnect(send) {
     verifyServerEndpoint(function (trusted) {
+      endpointChecked = true;
+      endpointTrusted = trusted;
       if (!trusted) { finish(); return; }
       send();
     });
@@ -242,7 +246,10 @@ export const HOOK_RELAY_SCRIPT = `
   var buffer = Buffer.alloc(0);
   socket.on("connect", function () { afterVerifiedConnect(function () { socket.write(payload); }); });
   socket.on("data", function (chunk) {
-    if (finished) return;
+    // The server sends no bytes before receiving the request. Ignore any
+    // early reply while native endpoint authentication is pending; otherwise
+    // a replacement socket could race the credential check and print allow.
+    if (finished || !endpointChecked || !endpointTrusted) return;
     var bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     buffer = Buffer.concat([buffer, bytes]);
     if (buffer.length > 1024 * 1024) { finish(); return; }
