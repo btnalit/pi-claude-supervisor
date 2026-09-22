@@ -113,6 +113,7 @@ interface TmuxRecord {
   guardianStartTime?: string;
   guardianExit?: string;
   guardianStopping?: boolean;
+  bridgeExit?: string;
   bridgeGeneration?: string;
   serverPid?: number;
   serverStartTime?: string;
@@ -546,7 +547,9 @@ if (result.error) {
   process.stderr.write("tmux interactive launcher spawn failed: " + result.error.message + "\\n");
   process.exit(127);
 }
-process.exit(result.status === null ? (result.signal ? 128 : 1) : result.status);
+const childCode = result.status === null ? (result.signal ? 128 : 1) : result.status;
+process.stderr.write("tmux interactive launcher child exited: code=" + String(childCode) + " signal=" + String(result.signal || "none") + "\\n");
+process.exit(childCode);
 `;
 
 const GUARDIAN_READY_MARKER = "PI_CLAUDE_SUPERVISOR_GUARDIAN_READY";
@@ -1468,12 +1471,44 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   async #startupFailureDetails(record: TmuxRecord): Promise<string> {
     const details: string[] = [];
     try {
-      const pane = await this.#paneStatus(record);
+      await this.#collectOutput(record);
+    } catch {
+      details.push("pane log=unavailable");
+    }
+    let pane: TmuxPaneStatus | undefined;
+    try {
+      pane = await this.#paneStatus(record);
       details.push(`pane pid=${pane.pid ?? "none"} dead=${pane.dead ? "yes" : "no"} exit=${pane.exitCode ?? "none"}`);
     } catch (error) {
-      details.push(`pane status unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      details.push(`pane status unavailable: ${startupFailureReason(error instanceof Error ? error.message : String(error))}`);
+    }
+    // tmux can expose a stale dead-pane status while respawn-pane is replacing
+    // the occupant. A bounded second read distinguishes that race from an
+    // actual launcher exit without changing the startup decision.
+    await delay(25);
+    try {
+      const retry = await this.#paneStatus(record);
+      if (!pane || retry.dead !== pane.dead || retry.pid !== pane.pid || retry.exitCode !== pane.exitCode) {
+        details.push(`pane recheck pid=${retry.pid ?? "none"} dead=${retry.dead ? "yes" : "no"} exit=${retry.exitCode ?? "none"}`);
+      }
+    } catch {
+      details.push("pane recheck=unavailable");
     }
     if (record.guardianExit) details.push(`guardian ${record.guardianExit}`);
+    if (record.bridgeExit) details.push(`bridge ${record.bridgeExit}`);
+    const marker = startupFailureMarker(record.output);
+    if (marker) details.push(marker);
+    if (record.cgroupPath) {
+      try {
+        const events = await readFile(join(record.cgroupPath, "cgroup.events"), "utf8");
+        const populated = /^populated ([01])$/mu.exec(events)?.[1] ?? "unknown";
+        const procs = (await readFile(join(record.cgroupPath, "cgroup.procs"), "utf8")).trim();
+        const processCount = procs ? procs.split(/\s+/u).length : 0;
+        details.push(`cgroup populated=${populated} processes=${processCount}`);
+      } catch {
+        details.push("cgroup state=unavailable");
+      }
+    }
     return details.join("; ");
   }
 
@@ -2167,7 +2202,13 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         this.#emit(record, { type: "turn_completed", handle: record.handle, result: event, sequence: record.turnSequence });
       }
     }
-    if (event.type === "bridge_exit") record.activeRequests = 0;
+    if (event.type === "bridge_exit") {
+      const code = typeof event.code === "number" && Number.isSafeInteger(event.code) ? String(event.code) : "none";
+      const signal = typeof event.signal === "string" && /^[A-Za-z0-9_-]{1,32}$/u.test(event.signal) ? event.signal : "none";
+      const reason = typeof event.error === "string" ? startupFailureReason(event.error) : undefined;
+      record.bridgeExit = `code=${code} signal=${signal}${reason ? ` reason=${reason}` : ""}`;
+      record.activeRequests = 0;
+    }
   }
 
   async #withOutputLock<T>(record: TmuxRecord, operation: () => Promise<T>): Promise<T> {
@@ -2714,6 +2755,30 @@ function assertNoCredentialArguments(command: string, args: string[]): void {
 
 function redactSensitiveText(value: string): string {
   return String(redactSensitive(value));
+}
+
+function startupFailureReason(value: string): string {
+  const normalized = String(value);
+  if (/\b(?:EACCES|EPERM)\b|permission denied/iu.test(normalized)) return "permission-denied";
+  if (/\b(?:ENOENT|ENOTDIR)\b|no such file|not found/iu.test(normalized)) return "not-found";
+  if (/\b(?:EAGAIN|EMFILE|ENFILE)\b|resource temporarily unavailable/iu.test(normalized)) return "resource-unavailable";
+  if (/\b(?:ENODEV|EBUSY)\b|no such device|device or resource busy/iu.test(normalized)) return "device-state";
+  if (/\bSIG(?:TERM|KILL|HUP|INT|ABRT|SEGV)\b/iu.test(normalized)) return "signalled";
+  return "reported";
+}
+
+function startupFailureMarker(chunks: WorkerOutputChunk[]): string | undefined {
+  for (const chunk of chunks.slice(-16)) {
+    for (const line of stripAnsi(chunk.text).split(/\r?\n/u)) {
+      const normalized = line.trim();
+      if (/^tmux pane bootstrap failed:/u.test(normalized)) return `pane-bootstrap=${startupFailureReason(normalized)}`;
+      if (/^tmux interactive launcher failed:/u.test(normalized)) return `interactive-cgroup=${startupFailureReason(normalized)}`;
+      if (/^tmux interactive launcher spawn failed:/u.test(normalized)) return `interactive-spawn=${startupFailureReason(normalized)}`;
+      const child = /^tmux interactive launcher child exited: code=([-0-9]+) signal=([A-Za-z0-9_-]+)$/u.exec(normalized);
+      if (child) return `interactive-child=code-${child[1]}-${child[2]}`;
+    }
+  }
+  return undefined;
 }
 
 function supervisorChunkLinePrefix(generation: string, chunkId: string, index: number, total: number): string {
