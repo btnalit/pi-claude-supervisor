@@ -112,6 +112,7 @@ interface TmuxRecord {
   guardianPid?: number;
   guardianStartTime?: string;
   guardianExit?: string;
+  guardianStopping?: boolean;
   bridgeGeneration?: string;
   serverPid?: number;
   serverStartTime?: string;
@@ -1461,7 +1462,19 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       await delay(Math.min(this.#pollIntervalMs, Math.max(1, deadline - Date.now())));
     }
     this.#assertNotAborted(record);
-    throw new Error(`tmux Claude session did not reach an input prompt before startup timeout; attach with ${attachCommand(record)}`);
+    throw new Error(`tmux Claude session did not reach an input prompt before startup timeout; attach with ${attachCommand(record)}; ${await this.#startupFailureDetails(record)}`);
+  }
+
+  async #startupFailureDetails(record: TmuxRecord): Promise<string> {
+    const details: string[] = [];
+    try {
+      const pane = await this.#paneStatus(record);
+      details.push(`pane pid=${pane.pid ?? "none"} dead=${pane.dead ? "yes" : "no"} exit=${pane.exitCode ?? "none"}`);
+    } catch (error) {
+      details.push(`pane status unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (record.guardianExit) details.push(`guardian ${record.guardianExit}`);
+    return details.join("; ");
   }
 
   /**
@@ -1501,7 +1514,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       await delay(Math.min(this.#pollIntervalMs, Math.max(1, deadline - Date.now())));
     }
     this.#assertNotAborted(record);
-    throw new Error(`tmux Claude interactive session did not reach an input prompt before startup timeout; attach with ${attachCommand(record)}`);
+    throw new Error(`tmux Claude interactive session did not reach an input prompt before startup timeout; attach with ${attachCommand(record)}; ${await this.#startupFailureDetails(record)}`);
   }
 
   async #waitForPaneExit(record: TmuxRecord, timeoutMs: number): Promise<void> {
@@ -1826,7 +1839,9 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     record.guardianStartTime = identity.startTime;
     child.once("exit", (code, signal) => {
       record.guardianExit = `code ${code ?? "null"}, signal ${signal ?? "none"}${guardianStderr.trim() ? `: ${guardianStderr.trim()}` : ""}`;
-      if (!record.cleanupComplete && !record.stopping && !record.paneDead) {
+      const expectedStop = record.guardianStopping;
+      record.guardianStopping = false;
+      if (!expectedStop && !record.cleanupComplete && !record.stopping && !record.paneDead) {
         record.cleanupError ??= new Error(`tmux parent-death guardian exited unexpectedly (${record.guardianExit})`);
       }
     });
@@ -1842,6 +1857,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     if (!identity || !record.guardianStartTime || identity.startTime !== record.guardianStartTime) {
       throw new Error(`refusing to terminate an unverified tmux guardian process: ${pid}`);
     }
+    record.guardianStopping = true;
     try { process.kill(pid, "SIGTERM"); }
     catch (error) { if (!(error instanceof Error) || !/ESRCH/u.test(error.message)) throw error; }
     for (let attempt = 0; attempt < 20 && isPidAlive(pid); attempt += 1) await delay(25);
@@ -1852,7 +1868,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       catch (error) { if (!(error instanceof Error) || !/ESRCH/u.test(error.message)) throw error; }
     }
     for (let attempt = 0; attempt < 20 && isPidAlive(pid); attempt += 1) await delay(25);
-    if (isPidAlive(pid) && !(await isZombie(pid))) throw new Error(`tmux parent-death guardian did not exit: ${pid}`);
+    if (isPidAlive(pid) && !(await isZombie(pid))) {
+      record.guardianStopping = false;
+      throw new Error(`tmux parent-death guardian did not exit: ${pid}`);
+    }
   }
 
   async #cleanup(record: TmuxRecord, _force: boolean): Promise<void> {
