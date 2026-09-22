@@ -111,6 +111,7 @@ interface TmuxRecord {
   paneDead?: boolean;
   guardianPid?: number;
   guardianStartTime?: string;
+  guardianExit?: string;
   bridgeGeneration?: string;
   serverPid?: number;
   serverStartTime?: string;
@@ -1772,13 +1773,18 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       [GUARDIAN_KEYS.parentPid]: encode(String(process.pid)),
       [GUARDIAN_KEYS.parentStart]: encode(parent.startTime),
     };
-    const child = spawn(nodeScriptCommand(), ["-e", TMUX_GUARDIAN_SCRIPT], { detached: true, stdio: ["ignore", "pipe", "ignore"], env });
+    const child = spawn(nodeScriptCommand(), ["-e", TMUX_GUARDIAN_SCRIPT], { detached: true, stdio: ["ignore", "pipe", "pipe"], env });
+    let guardianStderr = "";
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      guardianStderr = boundTextHead(guardianStderr + String(chunk), 4 * 1024);
+    });
     await new Promise<void>((resolve, reject) => {
       child.once("spawn", () => resolve());
       child.once("error", reject);
     });
     if (!child.pid) throw new Error("tmux parent-death guardian did not expose a pid");
     record.guardianPid = child.pid;
+    let guardianExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
     const ready = await new Promise<boolean>((resolve) => {
       let buffer = "";
       let settled = false;
@@ -1787,6 +1793,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         settled = true;
         clearTimeout(timer);
         child.stdout?.off("data", onData);
+        child.off("error", onError);
         child.off("exit", onExit);
         resolve(value);
       };
@@ -1794,14 +1801,21 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         buffer += String(chunk);
         if (buffer.includes(GUARDIAN_READY_MARKER)) finish(true);
       };
-      const onExit = () => finish(false);
+      const onError = () => finish(false);
+      const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+        guardianExit = { code, signal };
+        finish(false);
+      };
       const timer = setTimeout(() => finish(false), 2_000);
       child.stdout?.on("data", onData);
+      child.once("error", onError);
       child.once("exit", onExit);
     });
     if (!ready) {
       try { process.kill(child.pid, "SIGKILL"); } catch {}
-      throw new Error("tmux parent-death guardian did not become ready");
+      const exit = guardianExit ? ` (code ${guardianExit.code ?? "null"}, signal ${guardianExit.signal ?? "none"})` : " (no exit status)";
+      const stderr = guardianStderr.trim();
+      throw new Error(`tmux parent-death guardian did not become ready${exit}${stderr ? `: ${stderr}` : ""}`);
     }
     child.stdout?.destroy();
     const identity = await processIdentity(child.pid);
@@ -1810,8 +1824,11 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       throw new Error("tmux parent-death guardian identity is unavailable");
     }
     record.guardianStartTime = identity.startTime;
-    child.once("exit", () => {
-      if (!record.cleanupComplete && !record.stopping && !record.paneDead) record.cleanupError ??= new Error("tmux parent-death guardian exited unexpectedly");
+    child.once("exit", (code, signal) => {
+      record.guardianExit = `code ${code ?? "null"}, signal ${signal ?? "none"}${guardianStderr.trim() ? `: ${guardianStderr.trim()}` : ""}`;
+      if (!record.cleanupComplete && !record.stopping && !record.paneDead) {
+        record.cleanupError ??= new Error(`tmux parent-death guardian exited unexpectedly (${record.guardianExit})`);
+      }
     });
     child.unref();
   }

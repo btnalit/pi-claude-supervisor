@@ -94,6 +94,9 @@ jobs:
         run: bash scripts/ci/install-trusted-node.sh
       - run: npm ci --ignore-scripts
       - run: bash scripts/ci/run-in-cgroup.sh npm run check
+      - name: Diagnose automatic-test containment
+        if: failure()
+        run: bash scripts/ci/diagnose-cgroup.sh
       - run: npm run test:pi
       - run: npm run test:install
       - run: npm audit --audit-level=high
@@ -150,6 +153,9 @@ jobs:
           printf 'PATH=%s/bin:%s\n' "$NPM_PREFIX" "$PATH" >> "$GITHUB_ENV"
       - run: npm ci --ignore-scripts
       - run: bash scripts/ci/run-in-cgroup.sh npm run check
+      - name: Diagnose automatic-test containment
+        if: failure()
+        run: bash scripts/ci/diagnose-cgroup.sh
       - run: npm run test:install
       - run: npm run build
       - name: Remove delegated cgroup
