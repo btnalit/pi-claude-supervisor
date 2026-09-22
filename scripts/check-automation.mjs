@@ -10,6 +10,7 @@ const cgroupRun = read("scripts/ci/run-in-cgroup.sh");
 const cgroupCleanup = read("scripts/ci/cleanup-cgroup.sh");
 const trustedNode = read("scripts/ci/install-trusted-node.sh");
 const cleanupTrustedNode = read("scripts/ci/cleanup-trusted-node.sh");
+const cleanupNpmPrefix = read("scripts/ci/cleanup-npm-prefix.sh");
 const publishPackage = read("scripts/publish-package.mjs");
 const releaseAssets = read("scripts/release-assets.mjs");
 const codeowners = read(".github/CODEOWNERS");
@@ -47,6 +48,8 @@ assert.match(trustedNode, /PATH=%s:%s/u, "CI Node trust setup must export the ve
 assert.match(cleanupTrustedNode, /PI_CLAUDE_SUPERVISOR_CI_SLOT/u, "CI Node cleanup must isolate matrix slots");
 assert.match(cleanupTrustedNode, /sudo -n \/usr\/bin\/rm -f --/u, "CI Node cleanup must remove only the validated runtime file");
 assert.match(cleanupTrustedNode, /sudo -n \/usr\/bin\/rmdir --/u, "CI Node cleanup must remove only the validated runtime directory");
+assert.match(cleanupNpmPrefix, /RUNNER_TEMP/u, "CI npm cleanup must remain runner-local");
+assert.match(cleanupNpmPrefix, /readlink -e/u, "CI npm cleanup must canonicalize its target");
 assert.match(publishPackage, /NPM_AUTH_MODE must be exactly oidc or token/u, "publication must validate the selected npm authentication mode");
 assert.match(publishPackage, /NPM_AUTH_MODE=token requires NODE_AUTH_TOKEN/u, "token publication must require its credential");
 assert.match(publishPackage, /NPM_AUTH_MODE=oidc requires the GitHub OIDC request token/u, "OIDC publication must require its credential");
@@ -99,8 +102,9 @@ for (const jobName of ["checks", "checks_npm_latest"]) {
   assert.ok(steps.some((step) => step.run?.includes("run-in-cgroup.sh npm run check")), `${jobName} must run the suite in the delegated cgroup`);
   assert.ok(steps.some((step) => step.run === "bash scripts/ci/cleanup-cgroup.sh"), `${jobName} must clean the delegated cgroup`);
   assert.ok(steps.some((step) => step.run === "bash scripts/ci/cleanup-trusted-node.sh" && step.if === "always()"), `${jobName} must clean the verified Node helper`);
+  if (jobName === "checks_npm_latest") assert.ok(steps.some((step) => step.run === "bash scripts/ci/cleanup-npm-prefix.sh" && step.if === "always()"), `${jobName} must clean its npm prefix`);
 }
-assert.ok(ci.jobs.checks_npm_latest.steps.some((step) => step.run?.includes("npm install --global --ignore-scripts \"npm@$NPM_VERSION\"")), "npm major selection must actually run, not use an unsupported action input");
+assert.ok(ci.jobs.checks_npm_latest.steps.some((step) => step.run?.includes("npm install --global --ignore-scripts --prefix \"$NPM_PREFIX\" \"npm@$NPM_VERSION\"")), "npm major selection must actually run, not use an unsupported action input");
 assert.ok(!ci.on.pull_request.paths && !ci.on.pull_request["paths-ignore"], "Required checks cannot be skipped by path filters");
 const release = parse(read(".github/workflows/release.yml"));
 assert.equal(release.jobs.publish.environment, "npm");

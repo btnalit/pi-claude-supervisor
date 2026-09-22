@@ -143,8 +143,11 @@ jobs:
         env:
           NPM_VERSION: ${{ matrix.npm }}
         run: |
-          npm install --global --ignore-scripts "npm@$NPM_VERSION"
-          node --input-type=module -e 'import {execFileSync} from "node:child_process"; if (execFileSync("npm", ["--version"], {encoding:"utf8"}).trim().split(".")[0] !== process.env.NPM_VERSION) throw new Error("npm major mismatch");'
+          NPM_PREFIX="$RUNNER_TEMP/pi-claude-supervisor-npm-$NPM_VERSION"
+          npm install --global --ignore-scripts --prefix "$NPM_PREFIX" "npm@$NPM_VERSION"
+          PATH="$NPM_PREFIX/bin:$PATH" node --input-type=module -e 'import {execFileSync} from "node:child_process"; if (execFileSync("npm", ["--version"], {encoding:"utf8"}).trim().split(".")[0] !== process.env.NPM_VERSION) throw new Error("npm major mismatch");'
+          printf 'PI_CLAUDE_SUPERVISOR_NPM_PREFIX=%s\n' "$NPM_PREFIX" >> "$GITHUB_ENV"
+          printf 'PATH=%s/bin:%s\n' "$NPM_PREFIX" "$PATH" >> "$GITHUB_ENV"
       - run: npm ci --ignore-scripts
       - run: bash scripts/ci/run-in-cgroup.sh npm run check
       - run: npm run test:install
@@ -155,6 +158,9 @@ jobs:
       - name: Remove verified Node helper
         if: always()
         run: bash scripts/ci/cleanup-trusted-node.sh
+      - name: Remove selected npm prefix
+        if: always()
+        run: bash scripts/ci/cleanup-npm-prefix.sh
 
   integration:
     name: Pi installation and integration
