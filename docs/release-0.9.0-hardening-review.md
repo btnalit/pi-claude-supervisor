@@ -60,6 +60,8 @@ Latest candidate evidence was collected on Node `v26.8.2` / npm `11.19.1`:
 - `npm run check:automation` — passed.
 - `npm run build` — passed; release manifest, SHA-256 and npm integrity metadata generated.
 - `npm audit --audit-level=high` — passed; 0 vulnerabilities.
+- `npm run test:pi` — passed.
+- `npm run test:install` — passed with the native npm installation smoke test.
 - `bash -n scripts/ci/*.sh scripts/check-workflows.sh` and `git diff --check` — passed.
 - Invalid `NPM_AUTH_MODE` execution — failed closed before publication.
 - Real cgroup containment and verification cleanup tests — passed in the writable local cgroup.
