@@ -47,6 +47,7 @@ interface TmuxRecord {
   expectedIdentity?: WorkerStartInput["tmuxExpectedIdentity"];
   logPath: string;
   runtimeDir: string;
+  tmuxConfigPath?: string;
   owned: boolean;
   pipeAttached: boolean;
   outputOffset: number;
@@ -158,6 +159,10 @@ const BRIDGE_KEYS = {
   args: "PI_CLAUDE_SUPERVISOR_TMUX_ARGS",
   cwd: "PI_CLAUDE_SUPERVISOR_TMUX_CWD",
   cgroup: "PI_CLAUDE_SUPERVISOR_TMUX_CGROUP",
+  xdgRuntime: "PI_CLAUDE_SUPERVISOR_TMUX_XDG_RUNTIME_DIR",
+  dbusSession: "PI_CLAUDE_SUPERVISOR_TMUX_DBUS_SESSION_BUS_ADDRESS",
+  invocationId: "PI_CLAUDE_SUPERVISOR_TMUX_INVOCATION_ID",
+  systemdExecPid: "PI_CLAUDE_SUPERVISOR_TMUX_SYSTEMD_EXEC_PID",
 } as const;
 const BRIDGE_EVENT_START = "\u001bPPI_CLAUDE_SUPERVISOR_EVENT;";
 const BRIDGE_INPUT_START = "\u001bPPI_CLAUDE_SUPERVISOR_INPUT;";
@@ -172,12 +177,16 @@ const BRIDGE_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
  * worker process.
  */
 const TMUX_PANE_BOOTSTRAP_SCRIPT = `
-// The Supervisor moves the private tmux server into the Worker cgroup before
-// this bootstrap is replaced with the bridge or interactive launcher. Keeping
-// this placeholder side-effect free avoids a same-UID cgroup migration race
-// in hosted runners whose delegated cgroup source is not writable by panes.
+// The tmux server is started inside the Worker cgroup by the trusted wrapper,
+// so this placeholder inherits containment before it is ever created. Keep it
+// alive until pipe-pane attaches and respawn-pane replaces it; the parent check
+// also prevents it from surviving a server failure during startup.
+const parentPid = process.ppid;
 process.stdin.resume();
-setInterval(() => {}, 10_000).unref();
+const parentCheck = setInterval(() => {
+  if (process.ppid !== parentPid) process.exit(0);
+}, 100);
+parentCheck.unref();
 `;
 
 const TMUX_BRIDGE_SCRIPT = `
@@ -227,6 +236,10 @@ const decodeLine = (value) => Buffer.from(value, "base64").toString("utf8");
 const clearSupervisorInput = () => control("\\x1b[1A\\r\\x1b[2K\\x1b[1B\\r");
 const childEnv = { ...process.env };
 for (const key of bridgeKeys) delete childEnv[key];
+for (const [key, name] of [["${BRIDGE_KEYS.xdgRuntime}", "XDG_RUNTIME_DIR"], ["${BRIDGE_KEYS.dbusSession}", "DBUS_SESSION_BUS_ADDRESS"], ["${BRIDGE_KEYS.invocationId}", "INVOCATION_ID"], ["${BRIDGE_KEYS.systemdExecPid}", "SYSTEMD_EXEC_PID"]]) {
+  const value = decode(key);
+  if (value) childEnv[name] = value;
+}
 const isBashRule = (value) => (Array.isArray(value) ? value : [value]).some((item) => typeof item === "string" && item.split(/[\\s,]+/u).some((rule) => /^Bash(?:$|\\()/iu.test(rule)));
 const unsafeMode = (value) => typeof value === "string" && ["auto", "bypasspermissions", "dontask"].includes(value.replace(/[-_]/gu, "").toLowerCase());
 const settingsBash = (value) => {
@@ -526,6 +539,10 @@ const keys = ${JSON.stringify(Object.values(INTERACTIVE_KEYS))};
 // before this launcher is respawned, so Claude inherits the containment.
 const childEnv = { ...process.env };
 for (const key of keys) delete childEnv[key];
+for (const [key, name] of [["${BRIDGE_KEYS.xdgRuntime}", "XDG_RUNTIME_DIR"], ["${BRIDGE_KEYS.dbusSession}", "DBUS_SESSION_BUS_ADDRESS"], ["${BRIDGE_KEYS.invocationId}", "INVOCATION_ID"], ["${BRIDGE_KEYS.systemdExecPid}", "SYSTEMD_EXEC_PID"]]) {
+  const value = decode(key);
+  if (value) childEnv[name] = value;
+}
 const result = spawnSync(command, [...args, "--settings", settings], { cwd, env: childEnv, stdio: "inherit" });
 if (result.error) {
   process.stderr.write("tmux interactive launcher spawn failed: " + result.error.message + "\\n");
@@ -682,6 +699,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     const target = sessionName;
     const runtimeDir = join(this.#stateDir, "tmux", id);
     const logPath = join(runtimeDir, `worker-${id}.log`);
+    const tmuxConfigPath = owned && (structured || interactive) ? join(runtimeDir, "tmux.conf") : undefined;
     const handle: WorkerHandle = {
       id,
       startedAt: new Date().toISOString(),
@@ -700,6 +718,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       expectedIdentity: input.tmuxExpectedIdentity,
       logPath,
       runtimeDir,
+      tmuxConfigPath,
       owned,
       pipeAttached: false,
       outputOffset: 0,
@@ -758,6 +777,12 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       if (await realpath(runtimeDir) !== runtimeDir) throw new Error(`tmux runtime directory contains a symlink: ${runtimeDir}`);
       await chmod(runtimeDir, 0o700);
       await writeFile(logPath, "", { mode: 0o600, flag: "wx" });
+      if (tmuxConfigPath) {
+        await writeFile(tmuxConfigPath, "set-option -g remain-on-exit on\n", { mode: 0o600, flag: "wx" });
+        const configInfo = await lstat(tmuxConfigPath);
+        if (!configInfo.isFile() || configInfo.isSymbolicLink() || configInfo.nlink > 1) throw new Error("tmux configuration is not a unique regular file");
+        if (typeof process.getuid === "function" && configInfo.uid !== process.getuid()) throw new Error("tmux configuration is owned by another user");
+      }
       if ((structured || interactive) && owned) {
         handle.cgroupPath = await this.#plannedCgroupPath(id);
         if (input.retainCgroupUntilLeaseRelease) handle.retainCgroupUntilLeaseRelease = true;
@@ -807,14 +832,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         record.sessionCreated = true;
         if (interactive) record.hookUnsubscribe = await input.hookSource!.subscribe(input.cwd, (request) => this.#handleHookRequest(record, request), { capability: record.hookCapability });
         await this.#rememberServerIdentity(record);
-        if (record.cgroupPath) {
-          await this.#moveServerIntoCgroup(record);
-          // The bootstrap pane was created before the server could be moved.
-          // Attach it too so a Supervisor crash cannot leave that placeholder
-          // outside the guardian's Worker-cgroup kill boundary.
-          const bootstrap = await this.#paneStatus(record);
-          if (!bootstrap.dead && bootstrap.pid) await this.#moveProcessIntoCgroup(record.cgroupPath, bootstrap.pid, undefined, "tmux bootstrap");
-        }
+        if (record.cgroupPath) await this.#moveServerIntoCgroup(record);
         // Persist the server identity while pendingStartup is still present;
         // a crash before the final pre-spawn callback can then use normal
         // identity-bound tmux takeover checks.
@@ -832,6 +850,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         await this.#run(record, ["respawn-pane", "-k", "-c", input.cwd, "-t", target, "--", ...launch], undefined, bridgeEnv);
         await this.#pinTarget(record);
         const ownedPane = await this.#paneStatus(record);
+        if (!ownedPane.dead && ownedPane.pid && record.cgroupPath) await this.#assertPaneCgroup(record, ownedPane.pid);
         record.paneDead = ownedPane.dead;
         if (!ownedPane.dead) {
           // respawn-pane may still be replacing the old shell when the first
@@ -861,6 +880,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         await this.#rememberPaneIdentity(record, readyPane.pid);
         record.panePid = readyPane.pid;
         record.handle.pid = readyPane.pid;
+        if (record.cgroupPath && record.panePid !== undefined) await this.#assertPaneCgroup(record, record.panePid);
       }
       if (sendInitialInput) {
         await this.#send(record, input.task, `${id}:initial`);
@@ -1720,6 +1740,12 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     }
   }
 
+  async #assertPaneCgroup(record: TmuxRecord, pid: number): Promise<void> {
+    if (!record.cgroupPath) return;
+    const actual = await processCgroupPath(pid);
+    if (actual !== resolve(record.cgroupPath)) throw new Error(`tmux pane escaped its Worker cgroup: ${actual ?? "unavailable"}`);
+  }
+
   async #moveServerIntoCgroup(record: TmuxRecord): Promise<void> {
     const cgroupPath = record.cgroupPath;
     const serverPid = record.serverPid;
@@ -2034,11 +2060,17 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   async #run(record: TmuxRecord, args: string[], input?: string, env = workerEnvironment(process.env), ignoreAbort = false): Promise<{ stdout: string; stderr: string }> {
     if (record.abortRequested && !ignoreAbort) throw new Error("tmux worker startup was aborted");
     const tmuxArgs = record.socketPath
-      ? [...((record.structured || record.interactive) ? ["-f", "/dev/null"] : []), "-S", record.socketPath, ...args]
+      ? [...((record.structured || record.interactive) ? ["-f", record.tmuxConfigPath ?? "/dev/null"] : []), "-S", record.socketPath, ...args]
       : args;
     const trustedTmux = this.#trustedTmuxBinary;
     if (!trustedTmux) throw new Error("tmux command cannot run before trusted executable preflight");
-    const result = await runCommand(trustedTmux, tmuxArgs, input, env, this.#commandTimeoutMs);
+    const commandEnvironment = record.structured || record.interactive ? tmuxClientEnvironment(env) : env;
+    const createContainedServer = Boolean(record.cgroupPath && record.owned && !record.sessionCreated && args[0] === "new-session");
+    const command = createContainedServer ? nodeScriptCommand() : trustedTmux;
+    const commandArgs = createContainedServer
+      ? ["-e", tmuxServerBootstrapScript(trustedTmux, tmuxArgs, record.cgroupPath!)]
+      : tmuxArgs;
+    const result = await runCommand(command, commandArgs, input, commandEnvironment, this.#commandTimeoutMs);
     if (record.abortRequested && !ignoreAbort) throw new Error("tmux worker startup was aborted");
     return result;
   }
@@ -2478,6 +2510,46 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   }
 }
 
+function tmuxServerBootstrapScript(tmuxPath: string, tmuxArgs: readonly string[], cgroupPath: string): string {
+  return `
+const { spawnSync } = require("node:child_process");
+const { readFileSync, writeFileSync } = require("node:fs");
+const { resolve } = require("node:path");
+const cgroupPath = ${JSON.stringify(resolve(cgroupPath))};
+const tmuxPath = ${JSON.stringify(tmuxPath)};
+const tmuxArgs = ${JSON.stringify(tmuxArgs)};
+try {
+  writeFileSync(cgroupPath + "/cgroup.procs", String(process.pid) + "\\n");
+  const line = readFileSync("/proc/" + process.pid + "/cgroup", "utf8").split(/\\r?\\n/u).find((value) => value.startsWith("0::"));
+  const actual = line && line.slice(3).startsWith("/") ? resolve("/sys/fs/cgroup", "." + line.slice(3)) : undefined;
+  if (actual !== cgroupPath) throw new Error("self cgroup attachment was not confirmed");
+} catch (error) {
+  process.stderr.write("tmux server cgroup attachment failed: " + (error instanceof Error ? error.message : String(error)) + "\\n");
+  process.exit(125);
+}
+const result = spawnSync(tmuxPath, tmuxArgs, { env: process.env, stdio: "inherit" });
+if (result.error) {
+  process.stderr.write("tmux server bootstrap failed: " + result.error.message + "\\n");
+  process.exit(127);
+}
+process.exit(result.status === null ? (result.signal ? 128 : 1) : result.status);
+`;
+}
+
+function tmuxClientEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const result = { ...env };
+  // Ubuntu/Debian tmux builds may use the user systemd bus to place every
+  // pane in a transient tmux-spawn scope. That scope is outside the
+  // Supervisor-owned Worker cgroup and cannot be moved by the worker UID.
+  // The bridge/interactive launcher restores these values only for Claude,
+  // after tmux has created the pane without the systemd cgroup integration.
+  delete result.XDG_RUNTIME_DIR;
+  delete result.DBUS_SESSION_BUS_ADDRESS;
+  delete result.INVOCATION_ID;
+  delete result.SYSTEMD_EXEC_PID;
+  return result;
+}
+
 function bridgeEnvironment(env: NodeJS.ProcessEnv, cwd: string, command: string, args: readonly string[], cgroupPath?: string, hookSettingsPath?: string, hookCapability?: string): NodeJS.ProcessEnv {
   const encode = (value: string) => Buffer.from(value, "utf8").toString("base64");
   const result: NodeJS.ProcessEnv = {
@@ -2486,6 +2558,10 @@ function bridgeEnvironment(env: NodeJS.ProcessEnv, cwd: string, command: string,
     [BRIDGE_KEYS.args]: encode(JSON.stringify(args)),
     [BRIDGE_KEYS.cwd]: encode(cwd),
     [BRIDGE_KEYS.cgroup]: encode(cgroupPath ?? ""),
+    [BRIDGE_KEYS.xdgRuntime]: encode(env.XDG_RUNTIME_DIR ?? ""),
+    [BRIDGE_KEYS.dbusSession]: encode(env.DBUS_SESSION_BUS_ADDRESS ?? ""),
+    [BRIDGE_KEYS.invocationId]: encode(env.INVOCATION_ID ?? ""),
+    [BRIDGE_KEYS.systemdExecPid]: encode(env.SYSTEMD_EXEC_PID ?? ""),
   };
   if (hookSettingsPath !== undefined) result[INTERACTIVE_KEYS.settings] = encode(hookSettingsPath);
   if (hookCapability !== undefined) result[HOOK_CAPABILITY_KEY] = hookCapability;

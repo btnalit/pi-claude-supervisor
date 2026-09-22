@@ -353,6 +353,12 @@ process.stdin.on("data", data => {
         else events.push({ type: event.type });
       },
     });
+    assert.equal(await cgroupPathOf(handle.pid!), handle.cgroupPath);
+    assert.ok(handle.tmuxServerPid);
+    const tmuxServerEnvironment = (await readFile(`/proc/${handle.tmuxServerPid}/environ`, "utf8")).split("\0");
+    for (const key of ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "INVOCATION_ID", "SYSTEMD_EXEC_PID"]) {
+      assert.equal(tmuxServerEnvironment.some((entry) => entry.startsWith(`${key}=`)), false);
+    }
     await waitFor(() => events.some((event) => event.type === "turn_completed"));
     assert.equal(events.filter((event) => event.type === "turn_completed").length, 1);
     assert.equal(events.find((event) => event.type === "turn_completed")?.result?.uuid, "hello");
@@ -361,6 +367,9 @@ process.stdin.on("data", data => {
     for (const [key, value] of Object.entries(inheritedCapability)) {
       if (key === "GIT_CONFIG_PARAMETERS") assert.equal(capturedEnvironment[key], undefined);
       else assert.equal(capturedEnvironment[key], value);
+    }
+    for (const key of ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "INVOCATION_ID", "SYSTEMD_EXEC_PID"]) {
+      assert.equal(capturedEnvironment[key], previousEnvironment[key]);
     }
     const output = (await adapter.readOutput(handle)).map((chunk) => chunk.text).join("");
     assert.match(output, /ACK:hello/u);
@@ -678,6 +687,7 @@ process.stdin.on("data", data => {
       catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
     }
     assert.ok(nestedPid && nestedPid > 0);
+    assert.equal(await cgroupPathOf(nestedPid), handle.cgroupPath);
   } finally {
     if (handle) await adapter.stop(handle, "nested Claude test cleanup").catch(() => {});
     if (nestedPid) {
@@ -1493,6 +1503,12 @@ function createFakeHookSource(): HookEventSource & { dispatch: (cwd: string, req
       return handler(request.capability === undefined ? { ...request, capability: TEST_HOOK_CAPABILITY } : request);
     },
   };
+}
+
+async function cgroupPathOf(pid: number): Promise<string> {
+  const line = (await readFile(`/proc/${pid}/cgroup`, "utf8")).split(/\r?\n/u).find((value) => value.startsWith("0::"));
+  assert.ok(line, `unified cgroup was not available for pid ${pid}`);
+  return `/sys/fs/cgroup${line.slice(3)}`;
 }
 
 async function waitForFileContent(path: string): Promise<string> {
