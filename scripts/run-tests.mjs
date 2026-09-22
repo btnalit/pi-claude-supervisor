@@ -1,6 +1,11 @@
 import { spawn } from "node:child_process";
 
-const child = spawn(process.execPath, ["--test", "src/**/*.test.ts", "scripts/*.test.mjs"], {
+// Automatic tmux/cgroup tests use real PTYs and delegated process trees. Keep
+// CI's full, zero-skip suite deterministic on hosted runners; local developers
+// retain Node's normal file-level parallelism unless they opt into the same
+// safety gate.
+const testConcurrency = process.env.PI_CLAUDE_SUPERVISOR_FAIL_ON_TEST_SKIP === "1" ? ["--test-concurrency=1"] : [];
+const child = spawn(process.execPath, ["--test", ...testConcurrency, "src/**/*.test.ts", "scripts/*.test.mjs"], {
   cwd: process.cwd(),
   env: process.env,
   stdio: ["inherit", "pipe", "pipe"],
