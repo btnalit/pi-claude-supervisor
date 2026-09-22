@@ -5,7 +5,7 @@
 - Comparison baseline: `36e144a8d71f03e0367fbae5925044956b8f1e62` (PR #60 release baseline).
 - Reviewed candidate branch: `security-hardening-r0-r8`.
 - Committed review head before the hosted tmux follow-up delta: `ed9f682` (`fix: attach tmux server to worker cgroup`).
-- Current local review head: `618944c` (`fix: contain tmux server before pane startup`).
+- Current local review head: `bff6422` (`fix: guard tmux bootstrap parent death`).
 - No release tag is used as the baseline; the exact commit above is the authority.
 
 The candidate includes the R0–R8 hardening delta plus the follow-up review fixes. This
@@ -51,7 +51,8 @@ Four fresh review lanes were requested against the baseline-to-head scope:
 - Automatic owned tmux starts its private server through a trusted Node wrapper that self-attaches
   before executing tmux. Distro tmux systemd-cgroup variables are removed only from the tmux
   client/server environment; the bridge and interactive launcher restore them for Claude. Startup
-  verifies the pane and nested Claude process remain in the Worker cgroup.
+  verifies the pane and nested Claude process remain in the Worker cgroup; the startup wrapper and
+placeholder also monitor parent death during the handoff window.
 
 ## Local validation
 
@@ -82,7 +83,7 @@ Hosted runs `35691121119`, `35695320060`, and `35697564853` passed policy, packa
 integration jobs but failed all Node/npm matrix jobs during automatic tmux startup. The latest
 diagnostics classified the failure as `tmux bootstrap could not join its Worker cgroup: EACCES`
 after the tmux server itself had been moved. This was not characterized as a matrix collision.
-Commit `618944c` changes startup to self-attach the server before pane creation, disables distro
+Commit `bff6422` changes startup to self-attach the server before pane creation, disables distro
 tmux's transient systemd pane scopes for the tmux process only, and fails closed if pane or
 nested-child cgroup membership is not confirmed. A fresh hosted run is still required.
 
