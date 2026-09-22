@@ -4,7 +4,8 @@
 
 - Comparison baseline: `36e144a8d71f03e0367fbae5925044956b8f1e62` (PR #60 release baseline).
 - Reviewed candidate branch: `security-hardening-r0-r8`.
-- Committed review head before this candidate delta: `40d77541b4509436c4d71c3de8f28359edd7ab35`.
+- Committed review head before the hosted tmux follow-up delta: `ed9f682` (`fix: attach tmux server to worker cgroup`).
+- Current local review head: `618944c` (`fix: contain tmux server before pane startup`).
 - No release tag is used as the baseline; the exact commit above is the authority.
 
 The candidate includes the R0–R8 hardening delta plus the follow-up review fixes. This
@@ -47,6 +48,10 @@ Four fresh review lanes were requested against the baseline-to-head scope:
   package metadata and Release Please configuration. The live GitHub ruleset must require those
   code-owner reviews and the `CI / Quality gate` status; repository files cannot prove that
   external setting by themselves.
+- Automatic owned tmux starts its private server through a trusted Node wrapper that self-attaches
+  before executing tmux. Distro tmux systemd-cgroup variables are removed only from the tmux
+  client/server environment; the bridge and interactive launcher restore them for Claude. Startup
+  verifies the pane and nested Claude process remain in the Worker cgroup.
 
 ## Local validation
 
@@ -69,14 +74,22 @@ Latest candidate evidence was collected on Node `v26.8.2` / npm `11.19.1`:
 The full `npm run check` matrix was also run; one tmux timing assertion failed once under
 load, the bounded wait was made more tolerant, and the subsequent complete `npm test` run
 passed with no skips. Hosted Node 22.19/24, npm 10/12, passwordless `sudo -n`, and GitHub
-Actions evidence remain required because they cannot be substituted by this Node 26/local run.
+Actions evidence remain required because they cannot be substituted by local runs. After the tmux containment follow-up, Node 26 again passed all 406 tests with zero skips; Node 22 with both tmux 3.4 and the distro systemd-integrated tmux passed the focused structured, nested-child, and interactive containment tests.
 
-## Release blockers and residual risk
+## Hosted failure and release blockers
+
+Hosted runs `35691121119`, `35695320060`, and `35697564853` passed policy, package, and Pi
+integration jobs but failed all Node/npm matrix jobs during automatic tmux startup. The latest
+diagnostics classified the failure as `tmux bootstrap could not join its Worker cgroup: EACCES`
+after the tmux server itself had been moved. This was not characterized as a matrix collision.
+Commit `618944c` changes startup to self-attach the server before pane creation, disables distro
+tmux's transient systemd pane scopes for the tmux process only, and fails closed if pane or
+nested-child cgroup membership is not confirmed. A fresh hosted run is still required.
 
 Do not merge or release until all of the following are independently evidenced:
 
-1. Hosted CI passes the exact candidate commit on Node 22.19 and 24, npm 10 and 12, including
-   the trusted-Node installation/cleanup and delegated cgroup jobs.
+1. Hosted CI passes the exact current candidate commit on Node 22.19 and 24, npm 10 and 12,
+   including the trusted-Node installation/cleanup and delegated cgroup jobs, with zero skips.
 2. The live `main` ruleset requires the pinned `CI / Quality gate`, code-owner approval for
    `.github/CODEOWNERS` paths, latest-push approval, stale-review dismissal, and no bypass.
    Local checks cannot verify this; use an authenticated GitHub API audit.
