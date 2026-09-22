@@ -172,13 +172,10 @@ const BRIDGE_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
  * worker process.
  */
 const TMUX_PANE_BOOTSTRAP_SCRIPT = `
-const { writeFileSync } = require("node:fs");
-const key = ${JSON.stringify(BRIDGE_KEYS.cgroup)};
-const cgroup = Buffer.from(process.env[key] || "", "base64").toString("utf8");
-if (cgroup) {
-  try { writeFileSync(cgroup + "/cgroup.procs", String(process.pid) + "\\n"); }
-  catch (error) { process.stderr.write("tmux pane bootstrap failed: " + (error instanceof Error ? error.message : String(error)) + "\\n"); process.exit(125); }
-}
+// The Supervisor moves the private tmux server into the Worker cgroup before
+// this bootstrap is replaced with the bridge or interactive launcher. Keeping
+// this placeholder side-effect free avoids a same-UID cgroup migration race
+// in hosted runners whose delegated cgroup source is not writable by panes.
 process.stdin.resume();
 setInterval(() => {}, 10_000).unref();
 `;
@@ -187,7 +184,7 @@ const TMUX_BRIDGE_SCRIPT = `
 const { randomBytes } = require("node:crypto");
 const { TextDecoder } = require("node:util");
 const { spawn } = require("node:child_process");
-const { readFileSync, writeFileSync } = require("node:fs");
+const { readFileSync } = require("node:fs");
 const { dirname, join, resolve } = require("node:path");
 const { homedir } = require("node:os");
 const readline = require("node:readline");
@@ -196,7 +193,6 @@ const command = decode("${BRIDGE_KEYS.command}");
 const args = JSON.parse(decode("${BRIDGE_KEYS.args}"));
 const cwd = decode("${BRIDGE_KEYS.cwd}");
 const bridgeKeys = ${JSON.stringify(Object.values(BRIDGE_KEYS))};
-const cgroup = decode("${BRIDGE_KEYS.cgroup}");
 const eventStart = String.fromCharCode(27) + "PPI_CLAUDE_SUPERVISOR_EVENT;";
 const inputStart = String.fromCharCode(27) + "PPI_CLAUDE_SUPERVISOR_INPUT;";
 const eventEnd = String.fromCharCode(27) + "\\\\";
@@ -212,13 +208,8 @@ const writeEvent = (value) => {
   const payload = Buffer.from(JSON.stringify(value), "utf8").toString("base64");
   control(eventStart + payload + eventEnd);
 };
-if (cgroup) {
-  try { writeFileSync(cgroup + "/cgroup.procs", String(process.pid) + "\\n"); }
-  catch (error) {
-    writeEvent({ type: "bridge_exit", code: 125, error: error instanceof Error ? error.message : String(error) });
-    process.exit(125);
-  }
-}
+// The private tmux server is attached to the Worker cgroup by the Supervisor
+// before this bridge is respawned, so the bridge and Claude child inherit it.
 // Each bridge process gets a private in-memory generation. A response that was
 // queued for an older bridge can therefore never be forwarded by a respawned
 // bridge, even if it reaches the replacement pane after the PID check.
@@ -525,21 +516,14 @@ const INTERACTIVE_KEYS = {
  */
 const TMUX_INTERACTIVE_LAUNCHER_SCRIPT = `
 const { spawnSync } = require("node:child_process");
-const { writeFileSync } = require("node:fs");
 const decode = (key) => Buffer.from(process.env[key] || "", "base64").toString("utf8");
 const command = decode(${JSON.stringify(INTERACTIVE_KEYS.command)});
 const args = JSON.parse(decode(${JSON.stringify(INTERACTIVE_KEYS.args)}));
 const cwd = decode(${JSON.stringify(INTERACTIVE_KEYS.cwd)});
-const cgroup = decode(${JSON.stringify(INTERACTIVE_KEYS.cgroup)});
 const settings = decode(${JSON.stringify(INTERACTIVE_KEYS.settings)});
 const keys = ${JSON.stringify(Object.values(INTERACTIVE_KEYS))};
-if (cgroup) {
-  try { writeFileSync(cgroup + "/cgroup.procs", String(process.pid) + "\\n"); }
-  catch (error) {
-    process.stderr.write("tmux interactive launcher failed: " + (error instanceof Error ? error.message : String(error)) + "\\n");
-    process.exit(125);
-  }
-}
+// The private tmux server is attached to the Worker cgroup by the Supervisor
+// before this launcher is respawned, so Claude inherits the containment.
 const childEnv = { ...process.env };
 for (const key of keys) delete childEnv[key];
 const result = spawnSync(command, [...args, "--settings", settings], { cwd, env: childEnv, stdio: "inherit" });
@@ -823,6 +807,14 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         record.sessionCreated = true;
         if (interactive) record.hookUnsubscribe = await input.hookSource!.subscribe(input.cwd, (request) => this.#handleHookRequest(record, request), { capability: record.hookCapability });
         await this.#rememberServerIdentity(record);
+        if (record.cgroupPath) {
+          await this.#moveServerIntoCgroup(record);
+          // The bootstrap pane was created before the server could be moved.
+          // Attach it too so a Supervisor crash cannot leave that placeholder
+          // outside the guardian's Worker-cgroup kill boundary.
+          const bootstrap = await this.#paneStatus(record);
+          if (!bootstrap.dead && bootstrap.pid) await this.#moveProcessIntoCgroup(record.cgroupPath, bootstrap.pid, undefined, "tmux bootstrap");
+        }
         // Persist the server identity while pendingStartup is still present;
         // a crash before the final pre-spawn callback can then use normal
         // identity-bound tmux takeover checks.
@@ -1726,6 +1718,27 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       if (error instanceof Error && /tmux pane identity changed/u.test(error.message)) throw error;
       throw new Error(`tmux pane identity unavailable for pid ${pid}`);
     }
+  }
+
+  async #moveServerIntoCgroup(record: TmuxRecord): Promise<void> {
+    const cgroupPath = record.cgroupPath;
+    const serverPid = record.serverPid;
+    if (!cgroupPath || !serverPid || !record.serverStartTime) throw new Error("tmux cgroup attachment is missing the pinned server identity");
+    await this.#moveProcessIntoCgroup(cgroupPath, serverPid, record.serverStartTime, "tmux server");
+  }
+
+  async #moveProcessIntoCgroup(cgroupPath: string, pid: number, expectedStartTime: string | undefined, label: string): Promise<void> {
+    const before = await processIdentity(pid);
+    if (!before || (expectedStartTime !== undefined && before.startTime !== expectedStartTime)) throw new Error(`${label} identity changed before cgroup attachment`);
+    try {
+      await writeFile(join(cgroupPath, "cgroup.procs"), `${pid}\n`);
+    } catch (error) {
+      throw new Error(`${label} could not join its Worker cgroup: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+    }
+    const after = await processIdentity(pid);
+    if (!after || after.startTime !== before.startTime) throw new Error(`${label} identity changed during cgroup attachment`);
+    const actual = await processCgroupPath(pid);
+    if (actual !== resolve(cgroupPath)) throw new Error(`${label} cgroup attachment was not confirmed`);
   }
 
   async #plannedCgroupPath(id: string): Promise<string> {
@@ -2957,6 +2970,16 @@ async function processIdentity(pid: number): Promise<ProcessIdentity | undefined
     const pgid = Number(fields[2]);
     const command = (await readFile(`/proc/${pid}/comm`, "utf8")).trim();
     return startTime && Number.isSafeInteger(pgid) && command ? { startTime, pgid, command } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function processCgroupPath(pid: number): Promise<string | undefined> {
+  try {
+    const line = (await readFile(`/proc/${pid}/cgroup`, "utf8")).split(/\r?\n/u).find((value) => value.startsWith("0::"));
+    const relative = line?.slice(3);
+    return relative?.startsWith("/") ? resolve("/sys/fs/cgroup", `.${relative}`) : undefined;
   } catch {
     return undefined;
   }
