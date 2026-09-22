@@ -5,14 +5,15 @@ readonly trusted_base=/usr/local/lib/pi-claude-supervisor-ci
 readonly job=${GITHUB_JOB:-}
 readonly run_id=${GITHUB_RUN_ID:-}
 readonly run_attempt=${GITHUB_RUN_ATTEMPT:-}
-if [[ -z "${PI_CLAUDE_SUPERVISOR_NODE:-}" && -z "$job$run_id$run_attempt" ]]; then
+readonly slot=${PI_CLAUDE_SUPERVISOR_CI_SLOT:-}
+if [[ -z "${PI_CLAUDE_SUPERVISOR_NODE:-}" && -z "$job$run_id$run_attempt$slot" ]]; then
   # The cleanup step can also run outside GitHub Actions; with no identity and
   # no exported helper there is no path that can be safely derived.
   exit 0
 fi
-[[ "$job" =~ ^[A-Za-z0-9_.-]+$ && "$run_id" =~ ^[0-9]+$ && "$run_attempt" =~ ^[0-9]+$ ]] \
-  || { printf 'GitHub job identity is missing or malformed\n' >&2; exit 1; }
-readonly expected_node="$trusted_base/${job}-${run_id}-${run_attempt}/node"
+[[ "$job" =~ ^[A-Za-z0-9_.-]+$ && "$run_id" =~ ^[0-9]+$ && "$run_attempt" =~ ^[0-9]+$ && "$slot" =~ ^[A-Za-z0-9_.-]+$ ]] \
+  || { printf 'GitHub job identity or matrix slot is missing or malformed\n' >&2; exit 1; }
+readonly expected_node="$trusted_base/${job}-${slot}-${run_id}-${run_attempt}/node"
 trusted_node=${PI_CLAUDE_SUPERVISOR_NODE:-$expected_node}
 [[ "$trusted_node" == "$expected_node" ]] \
   || { printf 'refusing to clean an unexpected Node path: %s\n' "$trusted_node" >&2; exit 1; }

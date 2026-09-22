@@ -42,6 +42,9 @@ assert.match(trustedNode, /sudo -n \/usr\/bin\/install/u, "CI Node trust setup m
 assert.match(trustedNode, /sha256sum/u, "CI Node trust setup must verify copied runtime identity");
 assert.match(trustedNode, /GITHUB_ENV/u, "CI Node trust setup must export the verified runtime");
 assert.match(trustedNode, /GITHUB_RUN_ID/u, "CI Node trust setup must use a per-run runtime path");
+assert.match(trustedNode, /PI_CLAUDE_SUPERVISOR_CI_SLOT/u, "CI Node trust setup must isolate matrix slots");
+assert.match(trustedNode, /PATH=%s:%s/u, "CI Node trust setup must export the verified runtime for shebangs");
+assert.match(cleanupTrustedNode, /PI_CLAUDE_SUPERVISOR_CI_SLOT/u, "CI Node cleanup must isolate matrix slots");
 assert.match(cleanupTrustedNode, /sudo -n \/usr\/bin\/rm -f --/u, "CI Node cleanup must remove only the validated runtime file");
 assert.match(cleanupTrustedNode, /sudo -n \/usr\/bin\/rmdir --/u, "CI Node cleanup must remove only the validated runtime directory");
 assert.match(publishPackage, /NPM_AUTH_MODE must be exactly oidc or token/u, "publication must validate the selected npm authentication mode");
@@ -85,6 +88,7 @@ for (const command of ["npm run check", "npm run test:install", "npm run build"]
   assert.ok(ci.jobs.checks_npm_latest.steps.some((step) => step.run === command || step.run?.includes(`run-in-cgroup.sh ${command}`)), `Explicit npm lanes must run ${command}`);
 }
 for (const jobName of ["checks", "checks_npm_latest"]) {
+  assert.match(ci.jobs[jobName].env?.PI_CLAUDE_SUPERVISOR_CI_SLOT ?? "", /\$\{\{ matrix\.(node|npm) \}\}/u, `${jobName} must provide a validated matrix slot to the Node helper`);
   const steps = ci.jobs[jobName].steps;
   const trustedNodeIndex = steps.findIndex((step) => step.run === "bash scripts/ci/install-trusted-node.sh");
   assert.ok(trustedNodeIndex >= 0, `${jobName} must install the verified Node helper before tests`);

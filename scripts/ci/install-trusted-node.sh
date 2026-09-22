@@ -9,9 +9,10 @@ readonly trusted_base=/usr/local/lib/pi-claude-supervisor-ci
 readonly job=${GITHUB_JOB:-}
 readonly run_id=${GITHUB_RUN_ID:-}
 readonly run_attempt=${GITHUB_RUN_ATTEMPT:-}
-[[ "$job" =~ ^[A-Za-z0-9_.-]+$ && "$run_id" =~ ^[0-9]+$ && "$run_attempt" =~ ^[0-9]+$ ]] \
-  || { printf 'GitHub job identity is missing or malformed\n' >&2; exit 1; }
-readonly trusted_dir="$trusted_base/${job}-${run_id}-${run_attempt}"
+readonly slot=${PI_CLAUDE_SUPERVISOR_CI_SLOT:-}
+[[ "$job" =~ ^[A-Za-z0-9_.-]+$ && "$run_id" =~ ^[0-9]+$ && "$run_attempt" =~ ^[0-9]+$ && "$slot" =~ ^[A-Za-z0-9_.-]+$ ]] \
+  || { printf 'GitHub job identity or matrix slot is missing or malformed\n' >&2; exit 1; }
+readonly trusted_dir="$trusted_base/${job}-${slot}-${run_id}-${run_attempt}"
 readonly trusted_node="$trusted_dir/node"
 
 assert_private_root_directory() {
@@ -59,8 +60,13 @@ read -r source_uid source_mode source_links source_type <<< "$source_stat"
 runner_uid=$(id -u)
 [[ ("$source_uid" == "$runner_uid" || "$source_uid" == 0) && "$source_links" == 1 && "$source_type" == 'regular file' && "$source_mode" =~ ^[0-7]+$ ]] \
   || { printf 'setup-node runtime has unsafe identity: %s\n' "$source_stat" >&2; exit 1; }
-(( (8#$source_mode & 18) == 0 )) \
-  || { printf 'setup-node runtime is group/world writable: %s\n' "$node_source" >&2; exit 1; }
+# GitHub's hosted-runner toolcache can be writable by the runner user or its
+# group/world (notably Node 24). It is still accepted only at the canonical
+# setup-node path and with a unique regular file owned by the runner/root. The
+# untrusted staging file is never exposed to the workload: sudo copies it into
+# the root-owned, non-writable destination below, whose hash and identity are
+# checked after the copy. A source mutation during the copy is detected by the
+# source/destination hash comparison.
 
 source_hash=$(/usr/bin/sha256sum -- "$node_source" | /usr/bin/awk '{print $1}')
 [[ "$source_hash" =~ ^[[:xdigit:]]{64}$ ]] \
@@ -88,5 +94,9 @@ read -r trusted_uid trusted_mode trusted_links trusted_type <<< "$trusted_stat"
 # directory also makes npm's /usr/bin/env node shebang use this verified copy,
 # so process.execPath is trusted in runtime tests too.
 printf 'PI_CLAUDE_SUPERVISOR_NODE=%s\n' "$trusted_node" >> "${GITHUB_ENV:?GITHUB_ENV is required}"
+# GITHUB_PATH normally prepends this directory, while the explicit GITHUB_ENV
+# assignment also makes `/usr/bin/env node` shebangs use the verified runtime in
+# tmux-launched child processes and nested cgroup workloads.
 printf '%s\n' "$trusted_dir" >> "${GITHUB_PATH:?GITHUB_PATH is required}"
+printf 'PATH=%s:%s\n' "$trusted_dir" "${PATH:-}" >> "${GITHUB_ENV:?GITHUB_ENV is required}"
 printf 'Installed verified Node helper: %s (sha256 %s)\n' "$trusted_node" "$trusted_hash"

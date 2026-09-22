@@ -58,6 +58,8 @@ jobs:
     name: Node ${{ matrix.node }} checks
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      PI_CLAUDE_SUPERVISOR_CI_SLOT: node-${{ matrix.node }}
     strategy:
       fail-fast: false
       matrix:
@@ -106,6 +108,8 @@ jobs:
     name: Node 24 / npm ${{ matrix.npm }} checks
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      PI_CLAUDE_SUPERVISOR_CI_SLOT: npm-${{ matrix.npm }}
     strategy:
       fail-fast: false
       matrix:
