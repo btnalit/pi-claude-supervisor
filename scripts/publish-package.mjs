@@ -5,7 +5,16 @@ import { resolve } from "node:path";
 
 const tag = process.env.RELEASE_TAG;
 const sha = process.env.RELEASE_SHA;
+const authMode = process.env.NPM_AUTH_MODE;
 assert.match(tag ?? "", /^v\d+\.\d+\.\d+$/u, "RELEASE_TAG must be a stable vX.Y.Z tag");
+assert.match(authMode ?? "", /^(?:oidc|token)$/u, "NPM_AUTH_MODE must be exactly oidc or token");
+if (authMode === "token") {
+  assert.ok(process.env.NODE_AUTH_TOKEN?.trim(), "NPM_AUTH_MODE=token requires NODE_AUTH_TOKEN");
+} else {
+  assert.equal(process.env.NODE_AUTH_TOKEN ?? "", "", "NPM_AUTH_MODE=oidc must not provide NODE_AUTH_TOKEN");
+  assert.ok(process.env.ACTIONS_ID_TOKEN_REQUEST_URL, "NPM_AUTH_MODE=oidc requires the GitHub OIDC request URL");
+  assert.ok(process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN, "NPM_AUTH_MODE=oidc requires the GitHub OIDC request token");
+}
 assert.match(sha ?? "", /^[a-f0-9]{40}$/u, "RELEASE_SHA must be a commit SHA");
 const manifest = JSON.parse(await readFile("dist/release-manifest.json", "utf8"));
 assert.equal(`v${manifest.version}`, tag, "archive version does not match release tag");

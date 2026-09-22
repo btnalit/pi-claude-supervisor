@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants as fsConstants, readFileSync } from "node:fs";
-import { access, mkdir, writeFile } from "node:fs/promises";
+import { access, mkdir, rmdir, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { TextDecoder } from "node:util";
 import { cleanupCgroup, processGroupHasLiveMember } from "./worker/process-adapter.ts";
@@ -19,7 +19,9 @@ try { writeFileSync(cgroup + "/cgroup.procs", String(process.pid) + "\n"); } cat
   process.stderr.write("verification cgroup attachment failed: " + String(error) + "\n");
   process.exit(125);
 }
-const child = spawn(command, args, { cwd: process.cwd(), env: process.env, stdio: ["ignore", "inherit", "inherit"] });
+const childEnvironment = { ...process.env };
+delete childEnvironment.${COMMAND_CGROUP_ENV};
+const child = spawn(command, args, { cwd: process.cwd(), env: childEnvironment, stdio: ["ignore", "inherit", "inherit"] });
 for (const signal of ["SIGTERM", "SIGINT", "SIGQUIT"]) process.on(signal, () => { try { child.kill(signal); } catch {} });
 child.once("error", (error) => { process.stderr.write(String(error) + "\n"); process.exit(127); });
 child.once("exit", (code, signal) => {
@@ -66,16 +68,52 @@ export interface BoundedCommandResult {
  */
 export async function runBoundedCommand(command: string, args: readonly string[], options: BoundedCommandOptions): Promise<BoundedCommandResult> {
   let cgroupPath: string | undefined;
+  let cancelled = options.signal?.aborted === true;
+  let setupAbortRequested = cancelled;
+  let cleanupForAbort: ((reason: string) => Promise<void>) | undefined;
+  const onAbort = () => {
+    cancelled = true;
+    setupAbortRequested = true;
+    if (cleanupForAbort) void cleanupForAbort("verification cancelled");
+  };
+  const removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
+  if (options.signal) options.signal.addEventListener("abort", onAbort, { once: true });
+  if (setupAbortRequested) {
+    removeAbortListener();
+    return {
+      stdout: "",
+      stderr: "verification cancelled",
+      exitCode: 1,
+      timedOut: false,
+      cancelled: true,
+      outputTruncated: false,
+    };
+  }
   try {
     cgroupPath = options.cgroupParentPath ? await createCommandCgroup(options.cgroupParentPath) : undefined;
   } catch (error) {
+    removeAbortListener();
     return {
       stdout: "",
       stderr: `verification cgroup could not be created: ${error instanceof Error ? error.message : String(error)}`,
       exitCode: 1,
       timedOut: false,
-      cancelled: options.signal?.aborted === true,
+      cancelled,
       cleanupError: error instanceof Error ? error : new Error(String(error)),
+      outputTruncated: false,
+    };
+  }
+  if (setupAbortRequested || options.signal?.aborted === true) {
+    cancelled = true;
+    const cleanupError = await removeCommandCgroup(cgroupPath);
+    removeAbortListener();
+    return {
+      stdout: "",
+      stderr: "verification cancelled",
+      exitCode: 1,
+      timedOut: false,
+      cancelled: true,
+      ...(cleanupError ? { cleanupError } : {}),
       outputTruncated: false,
     };
   }
@@ -95,14 +133,16 @@ export async function runBoundedCommand(command: string, args: readonly string[]
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch (error) {
-    await removeCommandCgroup(cgroupPath).catch(() => {});
+    const cleanupError = await removeCommandCgroup(cgroupPath);
+    removeAbortListener();
     return {
       stdout: "",
       stderr: `verification command could not start: ${error instanceof Error ? error.message : String(error)}`,
       exitCode: 1,
       timedOut: false,
-      cancelled: options.signal?.aborted === true,
+      cancelled,
       spawnError: error instanceof Error ? error : new Error(String(error)),
+      ...(cleanupError ? { cleanupError } : {}),
       outputTruncated: false,
     };
   }
@@ -132,7 +172,7 @@ export async function runBoundedCommand(command: string, args: readonly string[]
     } catch (error) {
       decodeError ??= error instanceof Error ? error : new Error(String(error));
       append(stream, "[invalid UTF-8 output]\n");
-      void ensureCleanup("invalid UTF-8 output");
+      void cleanupForAbort?.("invalid UTF-8 output");
     }
   };
   child.stdout?.on("data", (chunk) => appendBytes("stdout", chunk));
@@ -160,12 +200,11 @@ export async function runBoundedCommand(command: string, args: readonly string[]
     exitCode = code;
     exitSignal = signal ?? undefined;
     resolveExit();
-    void ensureCleanup("leader exit");
+    void cleanupForAbort?.("leader exit");
   });
   child.once("close", () => resolveClose());
 
   let timedOut = false;
-  let cancelled = options.signal?.aborted === true;
   let cleanupStarted = false;
   let cleanupPromise: Promise<void> | undefined;
   const ensureCleanup = (reason: string): Promise<void> => {
@@ -176,11 +215,11 @@ export async function runBoundedCommand(command: string, args: readonly string[]
     });
     return cleanupPromise;
   };
-  const onAbort = () => {
+  cleanupForAbort = ensureCleanup;
+  if (setupAbortRequested || Boolean(options.signal?.aborted)) {
     cancelled = true;
     void ensureCleanup("verification cancelled");
-  };
-  if (options.signal) options.signal.addEventListener("abort", onAbort, { once: true });
+  }
   const timer = setTimeout(() => {
     timedOut = true;
     void ensureCleanup("verification timeout");
@@ -200,7 +239,7 @@ export async function runBoundedCommand(command: string, args: readonly string[]
   }
   await Promise.race([closed, delay(1_000)]);
   flushDecoders();
-  if (options.signal) options.signal.removeEventListener("abort", onAbort);
+  removeAbortListener();
   if (spawnError && !stderr.includes(spawnError.message)) stderr += `\n${spawnError.message}`;
   return { stdout, stderr, exitCode, signal: exitSignal, timedOut, cancelled, ...(spawnError ? { spawnError } : {}), ...(cleanupError ? { cleanupError } : {}), ...(decodeError ? { decodeError } : {}), outputTruncated };
 }
@@ -209,10 +248,24 @@ async function createCommandCgroup(parent: string): Promise<string> {
   if (process.platform !== "linux") throw new Error("verification cgroups are only available on Linux");
   const path = `${parent}/pi-claude-supervisor-verification-${process.pid}-${randomUUID()}`;
   await mkdir(path);
-  await access(`${path}/cgroup.procs`, fsConstants.R_OK | fsConstants.W_OK);
-  await access(`${path}/cgroup.events`, fsConstants.R_OK);
-  await access(`${path}/cgroup.kill`, fsConstants.W_OK);
-  return path;
+  try {
+    await access(`${path}/cgroup.procs`, fsConstants.R_OK | fsConstants.W_OK);
+    await access(`${path}/cgroup.events`, fsConstants.R_OK);
+    await access(`${path}/cgroup.kill`, fsConstants.W_OK);
+    return path;
+  } catch (error) {
+    // The directory was created by this invocation, but the caller has not
+    // received its path yet. Remove it directly first: a failed control-file
+    // preflight may be exactly the case where cgroup.kill is unavailable.
+    try {
+      await rmdir(path);
+    } catch (cleanupError) {
+      if (!(cleanupError instanceof Error && /ENOENT/u.test(cleanupError.message))) {
+        await removeCommandCgroup(path);
+      }
+    }
+    throw error;
+  }
 }
 
 async function cleanupCommandBoundary(child: ChildProcess, cgroupPath: string | undefined, identity: ProcessGroupIdentity | undefined, _reason: string, exited: Promise<void>, timeoutMs: number): Promise<void> {
@@ -253,9 +306,14 @@ async function cleanupCommandBoundary(child: ChildProcess, cgroupPath: string | 
   }
 }
 
-async function removeCommandCgroup(path: string | undefined): Promise<void> {
-  if (!path) return;
-  await cleanupCgroup(path, 500).catch(() => {});
+async function removeCommandCgroup(path: string | undefined): Promise<Error | undefined> {
+  if (!path) return undefined;
+  try {
+    await cleanupCgroup(path, 500);
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
 }
 
 function readProcessGroupIdentitySync(pid: number): ProcessGroupIdentity | undefined {

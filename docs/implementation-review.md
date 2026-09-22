@@ -9,7 +9,7 @@ Claude-sandbox assumptions were deliberately superseded by the full-capability
 unattended operating model.
 
 Automatic mode still validates a non-bare Git worktree, an existing full baseline
-commit, a non-protected branch, the Claude JSONL/tmux transport and the bare
+commit, a named branch, the Claude JSONL/tmux transport and the bare
 `claude`/`claude.exe` command name. Startup resolves and pins an operator-owned,
 non-writable executable path (or an explicit `PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE`
 path), and the final pre-spawn check compares the current repository HEAD with the

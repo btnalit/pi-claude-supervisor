@@ -8,7 +8,26 @@ const cgroupCommon = read("scripts/ci/cgroup-common.sh");
 const cgroupPrepare = read("scripts/ci/prepare-cgroup.sh");
 const cgroupRun = read("scripts/ci/run-in-cgroup.sh");
 const cgroupCleanup = read("scripts/ci/cleanup-cgroup.sh");
-for (const [name, script] of Object.entries({ cgroupCommon, cgroupPrepare, cgroupRun, cgroupCleanup })) {
+const trustedNode = read("scripts/ci/install-trusted-node.sh");
+const cleanupTrustedNode = read("scripts/ci/cleanup-trusted-node.sh");
+const publishPackage = read("scripts/publish-package.mjs");
+const releaseAssets = read("scripts/release-assets.mjs");
+const codeowners = read(".github/CODEOWNERS");
+for (const path of [
+  "/.github/workflows/",
+  "/.github/CODEOWNERS",
+  "/package.json",
+  "/package-lock.json",
+  "/scripts/ci/",
+  "/scripts/check-automation.mjs",
+  "/scripts/check-workflows.sh",
+  "/scripts/run-tests.mjs",
+  "/scripts/publish-package.mjs",
+  "/scripts/release-assets.mjs",
+  "/release-please-config.json",
+  "/.release-please-manifest.json",
+]) assert.ok(codeowners.split(/\r?\n/u).some((line) => line.trim() === `${path} @btnalit`), `CODEOWNERS must protect ${path}`);
+for (const [name, script] of Object.entries({ cgroupCommon, cgroupPrepare, cgroupRun, cgroupCleanup, cleanupTrustedNode })) {
   assert.doesNotMatch(script, /sudo\s+(?:sh|bash|env|setpriv)\b/u, `${name} must not run arbitrary commands as root`);
   assert.doesNotMatch(script, /rm\s+-rf/u, `${name} must not recursively remove cgroup paths`);
 }
@@ -19,6 +38,16 @@ assert.match(cgroupCommon, /tee --/u, "CI cgroup fallback must write through a b
 assert.match(cgroupCommon, /readlink -e/u, "CI cgroup paths must be canonicalized");
 assert.match(cgroupRun, /exec --/u, "CI workload arguments must be passed without a shell");
 assert.match(cgroupCommon, /rmdir --/u, "CI cgroup cleanup must be non-recursive");
+assert.match(trustedNode, /sudo -n \/usr\/bin\/install/u, "CI Node trust setup must use bounded noninteractive install");
+assert.match(trustedNode, /sha256sum/u, "CI Node trust setup must verify copied runtime identity");
+assert.match(trustedNode, /GITHUB_ENV/u, "CI Node trust setup must export the verified runtime");
+assert.match(trustedNode, /GITHUB_RUN_ID/u, "CI Node trust setup must use a per-run runtime path");
+assert.match(cleanupTrustedNode, /sudo -n \/usr\/bin\/rm -f --/u, "CI Node cleanup must remove only the validated runtime file");
+assert.match(cleanupTrustedNode, /sudo -n \/usr\/bin\/rmdir --/u, "CI Node cleanup must remove only the validated runtime directory");
+assert.match(publishPackage, /NPM_AUTH_MODE must be exactly oidc or token/u, "publication must validate the selected npm authentication mode");
+assert.match(publishPackage, /NPM_AUTH_MODE=token requires NODE_AUTH_TOKEN/u, "token publication must require its credential");
+assert.match(publishPackage, /NPM_AUTH_MODE=oidc requires the GitHub OIDC request token/u, "OIDC publication must require its credential");
+assert.doesNotMatch(releaseAssets, /--clobber/u, "release assets must not be overwritten in place");
 const pkg = JSON.parse(read("package.json"));
 assert.equal(pkg.scripts.test, "node scripts/run-tests.mjs", "The test runner must enforce the CI skip gate");
 assert.equal(JSON.parse(read(".release-please-manifest.json"))["."], pkg.version, "Release manifest/version drift");
@@ -56,16 +85,23 @@ for (const command of ["npm run check", "npm run test:install", "npm run build"]
   assert.ok(ci.jobs.checks_npm_latest.steps.some((step) => step.run === command || step.run?.includes(`run-in-cgroup.sh ${command}`)), `Explicit npm lanes must run ${command}`);
 }
 for (const jobName of ["checks", "checks_npm_latest"]) {
-  assert.equal(ci.jobs[jobName].env.PI_CLAUDE_SUPERVISOR_NODE, "/usr/bin/node", `${jobName} must use the trusted system Node for Supervisor helpers`);
   const steps = ci.jobs[jobName].steps;
+  const trustedNodeIndex = steps.findIndex((step) => step.run === "bash scripts/ci/install-trusted-node.sh");
+  assert.ok(trustedNodeIndex >= 0, `${jobName} must install the verified Node helper before tests`);
+  assert.ok(steps.some((step) => step.run === "/usr/bin/sudo -n /usr/bin/apt-get update && /usr/bin/sudo -n /usr/bin/apt-get install --no-install-recommends -y tmux"), `${jobName} must use bounded noninteractive sudo for tmux`);
+  const firstNpmIndex = steps.findIndex((step) => step.run?.startsWith("npm "));
+  assert.ok(firstNpmIndex < 0 || trustedNodeIndex < firstNpmIndex, `${jobName} must install the verified Node helper before npm`);
   assert.ok(steps.some((step) => step.run === "bash scripts/ci/prepare-cgroup.sh"), `${jobName} must prepare a delegated cgroup`);
   assert.ok(steps.some((step) => step.run?.includes("run-in-cgroup.sh npm run check")), `${jobName} must run the suite in the delegated cgroup`);
   assert.ok(steps.some((step) => step.run === "bash scripts/ci/cleanup-cgroup.sh"), `${jobName} must clean the delegated cgroup`);
+  assert.ok(steps.some((step) => step.run === "bash scripts/ci/cleanup-trusted-node.sh" && step.if === "always()"), `${jobName} must clean the verified Node helper`);
 }
 assert.ok(ci.jobs.checks_npm_latest.steps.some((step) => step.run?.includes("npm install --global --ignore-scripts \"npm@$NPM_VERSION\"")), "npm major selection must actually run, not use an unsupported action input");
 assert.ok(!ci.on.pull_request.paths && !ci.on.pull_request["paths-ignore"], "Required checks cannot be skipped by path filters");
 const release = parse(read(".github/workflows/release.yml"));
 assert.equal(release.jobs.publish.environment, "npm");
+assert.equal(release.jobs.publish.env.NPM_AUTH_MODE, "${{ vars.NPM_AUTH_MODE }}");
+assert.equal(release.jobs.publish.env.NODE_AUTH_TOKEN, "${{ vars.NPM_AUTH_MODE == 'token' && secrets.NPM_TOKEN || '' }}");
 assert.deepEqual(release.jobs.publish.needs, ["plan", "verify"]);
 assert.equal(release.jobs.verify.uses, "./.github/workflows/ci.yml");
 assert.ok(release.jobs.plan.steps.some((step) => step.with?.script?.includes("createWorkflowDispatch")), "Bot PRs need explicit CI dispatch when using GITHUB_TOKEN");

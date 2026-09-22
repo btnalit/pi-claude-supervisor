@@ -249,7 +249,9 @@ async function automaticClaudeSettings(cwd: string, args: readonly string[], env
 }
 
 async function readClaudeSettingsFile(path: string): Promise<string> {
+  await assertSecureSettingsParent(path);
   const resolved = await realpath(path);
+  if (resolved !== path) await assertSecureSettingsParent(resolved);
   let handle: FileHandle | undefined;
   try {
     handle = await open(resolved, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
@@ -262,6 +264,22 @@ async function readClaudeSettingsFile(path: string): Promise<string> {
     return new TextDecoder("utf-8", { fatal: true }).decode(await handle.readFile());
   } finally {
     await handle?.close().catch(() => {});
+  }
+}
+
+async function assertSecureSettingsParent(path: string): Promise<void> {
+  if (process.platform === "win32") return;
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  let directory = dirname(path);
+  while (true) {
+    const info = await stat(directory);
+    const stickySharedDirectory = (info.mode & 0o1000) !== 0 && (info.mode & 0o002) !== 0 && info.uid === 0;
+    if (((info.mode & 0o022) !== 0 && !stickySharedDirectory) || (uid !== undefined && info.uid !== uid && info.uid !== 0)) {
+      throw new Error("a directory containing Claude settings is writable by or owned by an untrusted user");
+    }
+    const parent = dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
   }
 }
 

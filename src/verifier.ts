@@ -377,9 +377,17 @@ export async function repositoryGitDirectoryIsLocal(cwd: string, signal?: AbortS
 /** Determine whether cwd is a non-bare Git worktree without invoking a shell. */
 export async function repositoryWorkTree(cwd: string, signal?: AbortSignal): Promise<boolean | undefined> {
   try {
-    const result = await runSupervisorGit(cwd, ["rev-parse", "--is-inside-work-tree"], { signal, maxBuffer: 1024 });
-    const value = result.stdout.trim();
-    return value === "true" ? true : value === "false" ? false : undefined;
+    const [inside, topLevel] = await Promise.all([
+      runSupervisorGit(cwd, ["rev-parse", "--is-inside-work-tree"], { signal, maxBuffer: 1024 }),
+      runSupervisorGit(cwd, ["rev-parse", "--show-toplevel"], { signal, maxBuffer: 4096 }),
+    ]);
+    const value = inside.stdout.trim();
+    if (value === "false") return false;
+    if (value !== "true") return undefined;
+    // A repository-local core.worktree can make Git report a different work
+    // tree while the process is launched in `cwd`. Never let Supervisor
+    // inspect or authorize a neighboring directory under that spelling.
+    return await realpath(topLevel.stdout.trim()) === await realpath(cwd);
   } catch {
     return undefined;
   }

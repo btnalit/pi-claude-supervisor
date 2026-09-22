@@ -807,6 +807,7 @@ test("claude-jsonl mode frames initial and subsequent messages", async () => {
 test("embedded process-adapter scripts are syntactically valid JavaScript", () => {
   for (const script of Object.values(PROCESS_EMBEDDED_SCRIPTS)) {
     assert.doesNotThrow(() => new Function(script));
+    assert.doesNotMatch(script, /rmSync\([^)]*recursive\s*:/u, "cgroup cleanup must not use recursive filesystem removal");
   }
 });
 

@@ -27,8 +27,10 @@ The system must still provide a kill switch, bounded execution, cleanup verifica
 complete audit trail. These are reliability and containment mechanisms, not requests for a human
 to approve every development action. Automatic mode also records and revalidates a full existing
 repository baseline, captures the startup HEAD and requires that exact HEAD again at
-final pre-spawn, requires a non-protected branch and a pinned operator-owned direct Claude
-JSONL Worker or Supervisor-owned tmux bridge, and by default requires a local commit before a candidate is deliverable.
+final pre-spawn, requires a pinned operator-owned direct Claude JSONL Worker or
+Supervisor-owned tmux bridge, and by default requires a local commit before a candidate is
+deliverable. A task may start or finish on any named branch, including a protected branch;
+protected branch names never receive implicit publish authority.
 
 ## 2. Hard authority boundary
 
@@ -41,8 +43,10 @@ Automatic local work has no implicit authority for remote push or merging into `
 protected integration branch. It refuses known direct Bash forms of those operations, protected
 Git metadata writes and package publication; only a verified candidate's explicit `RemoteGrant`
 may admit its exact push (and, for `pr`, its pinned pull-request creation).
-Starting candidate work directly on a protected integration branch remains refused; automatic
-repositories use a non-protected local branch.
+Starting candidate work directly on a protected integration branch is allowed for local
+verification, but the current implementation refuses publication while the candidate remains
+on that protected branch. Automatic repositories do not infer remote or main-branch authority
+from the current branch name.
 
 Automatic Claude workers intentionally inherit credentials, helpers, network configuration and
 custom Claude configuration. Agents, background tasks, plugins, MCP servers and nested Claude
@@ -111,7 +115,7 @@ Automatic mode implements the local loop: policy decisions allow ordinary local 
 `AskUserQuestion` is converted to a denied interactive permission, the Decision Worker can
 continue/redirect/answer/repair, acceptance and independent Review run without a human callback,
 and unresolved situations become `blocked` candidates. The default task autonomy is unattended, requires a local commit, and permits two bounded
-Decision Worker request retries. Automatic startup rejects non-Git/detached/bare/protected
+Decision Worker request retries. Automatic startup rejects non-Git/detached/bare
 repository states, malformed baselines, startup-HEAD races, the unstructured
 process-pipe transport, Bash-preauthorizing Claude arguments/settings and non-Claude or untrusted
 executable identities before Worker startup. The resolved

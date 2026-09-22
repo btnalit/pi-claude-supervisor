@@ -1,14 +1,21 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { runSupervisorGit, supervisorGitEnvironment } from "./git-runner.ts";
-import { remoteBranchHead, remoteUrl, repositoryClean, repositoryGitDirectoryIsLocal, repositorySlug, sameDestination } from "./verifier.ts";
+import { runSupervisorGit, supervisorGitArgs, supervisorGitEnvironment } from "./git-runner.ts";
+import { remoteBranchHead, remoteUrl, repositoryClean, repositoryGitDirectoryIsLocal, repositorySlug, repositoryWorkTree, sameDestination } from "./verifier.ts";
 
 const execFileAsync = promisify(execFile);
+
+test("Supervisor Git pins command-executing local configuration", () => {
+  const args = supervisorGitArgs(["status"]);
+  assert.ok(args.includes("core.askPass="));
+  assert.ok(args.includes("core.alternateRefsCommand="));
+  assert.ok(args.includes("core.hooksPath=/dev/null"));
+});
 
 test("Supervisor Git isolates mutable global and system configuration", () => {
   const keys = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_SSH_COMMAND"] as const;
@@ -137,6 +144,12 @@ test("a clean tree and a local .git directory are what the grant requires", asyn
     await execFileAsync("git", ["init", "-q", "-b", "main", cwd]);
     await execFileAsync("git", ["-C", cwd, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "one"]);
     assert.equal(await repositoryClean(cwd), true);
+    assert.equal(await repositoryWorkTree(cwd), true);
+    const outside = join(base, "outside");
+    await mkdir(outside);
+    await execFileAsync("git", ["-C", cwd, "config", "core.worktree", outside]);
+    assert.equal(await repositoryWorkTree(cwd), false, "a repository-local worktree redirect is not the task cwd");
+    await execFileAsync("git", ["-C", cwd, "config", "--unset", "core.worktree"]);
     await writeFile(join(cwd, "untracked.txt"), "x\n");
     assert.equal(await repositoryClean(cwd), false, "an untracked file is not clean");
     assert.equal(await repositoryClean(join(base, "not-a-repo")), undefined, "git could not say");

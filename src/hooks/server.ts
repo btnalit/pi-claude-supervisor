@@ -119,15 +119,29 @@ export class HookServer implements HookEventSource {
       // unhandled "error" event would crash the whole Supervisor process.
       console.error(`pi-claude-supervisor hook server error: ${error instanceof Error ? error.message : String(error)}`);
     });
-    await new Promise<void>((resolveListen, reject) => {
-      const onError = (error: Error) => reject(error);
-      server.once("error", onError);
-      server.listen(socketPath, () => {
-        server.removeListener("error", onError);
-        resolveListen();
+    let listening = false;
+    try {
+      await new Promise<void>((resolveListen, reject) => {
+        const onError = (error: Error) => reject(error);
+        server.once("error", onError);
+        server.listen(socketPath, () => {
+          listening = true;
+          server.removeListener("error", onError);
+          resolveListen();
+        });
       });
-    });
-    await chmod(socketPath, 0o600);
+      await chmod(socketPath, 0o600);
+    } catch (error) {
+      // `chmod` runs after bind but before the server becomes this instance's
+      // owned resource. Tear down a socket we actually bound; never unlink a
+      // path after an unsuccessful bind, because another same-UID server may
+      // own it.
+      if (listening || server.listening) {
+        await new Promise<void>((resolveClose) => server.close(() => resolveClose())).catch(() => {});
+        await rm(socketPath, { force: true }).catch(() => {});
+      }
+      throw error;
+    }
     this.#server = server;
     this.#socketPath = socketPath;
   }
@@ -345,10 +359,22 @@ async function processStartTime(pid: number): Promise<string> {
 }
 
 async function assertPrivateDirectory(path: string, label: string): Promise<void> {
-  const info = await lstat(path);
-  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`${label} is not a real directory: ${path}`);
-  if (typeof process.getuid === "function" && info.uid !== process.getuid()) throw new Error(`${label} is owned by another user: ${path}`);
-  if (await realpath(path) !== resolve(path)) throw new Error(`${label} contains a symlink: ${path}`);
+  const resolved = resolve(path);
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  let current = resolved;
+  while (true) {
+    const info = await lstat(current);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`${label} is not a real directory: ${path}`);
+    const stickySharedDirectory = (info.mode & 0o1000) !== 0 && (info.mode & 0o002) !== 0 && info.uid === 0;
+    if ((uid !== undefined && info.uid !== uid && info.uid !== 0)
+      || ((info.mode & 0o022) !== 0 && !stickySharedDirectory)) {
+      throw new Error(`${label} has an unsafe writable ancestor: ${current}`);
+    }
+    const parent = resolve(current, "..");
+    if (parent === current) break;
+    current = parent;
+  }
+  if (await realpath(path) !== resolved) throw new Error(`${label} contains a symlink: ${path}`);
 }
 
 async function assertPrivatePermissions(path: string, label: string): Promise<void> {

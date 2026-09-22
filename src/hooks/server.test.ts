@@ -207,13 +207,23 @@ test("subscribe creates a by-cwd symlink and unsubscribe removes it", async () =
 test("concurrent takeover and unsubscribe preserve the successor cwd route", async () => {
   await withServer(async (server) => {
     await withTempCwd(async (cwd) => {
-      const [unsubscribeOld, unsubscribeNew] = await Promise.all([
-        server.subscribe(cwd, async () => ({ permissionDecision: "deny" })),
-        server.subscribe(cwd, async () => ({ permissionDecision: "allow" })),
-      ]);
+      const unsubscribeOld = await server.subscribe(cwd, async () => ({ permissionDecision: "deny" }));
+      // Release both operations together. Whichever subscription-lock order
+      // wins, the old cleanup must either run before the takeover or observe
+      // that the successor owns the route; it must never unlink the successor.
+      let release!: () => void;
+      const start = new Promise<void>((resolve) => { release = resolve; });
+      const takeover = (async () => {
+        await start;
+        return server.subscribe(cwd, async () => ({ permissionDecision: "allow" }));
+      })();
+      const removeOld = (async () => {
+        await start;
+        return unsubscribeOld();
+      })();
+      release();
+      const [unsubscribeNew] = await Promise.all([takeover, removeOld]);
       const event = JSON.stringify(request(cwd));
-      assert.equal(JSON.parse((await send(server.socketPath!, event)).reply).permissionDecision, "allow");
-      await unsubscribeOld();
       assert.equal(JSON.parse((await send(server.socketPath!, event)).reply).permissionDecision, "allow");
       await unsubscribeNew();
       await assert.rejects(() => lstat(byCwdPath(server.directory, cwd)), /ENOENT/);

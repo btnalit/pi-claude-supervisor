@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -194,6 +194,26 @@ test("automatic permission checks use the effective HOME settings root", async (
     await assert.rejects(
       () => assertAutomaticClaudePermissionConfiguration(cwd, [], { HOME: home }),
       /Bash permission events/u,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("automatic settings reject a file under a writable ancestor", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-settings-parent-"));
+  const shared = join(root, "shared");
+  const cwd = join(root, "repo");
+  try {
+    await mkdir(shared);
+    await mkdir(cwd);
+    await writeFile(join(shared, "settings.json"), JSON.stringify({ permissions: { allow: ["Edit"] } }));
+    await chmod(shared, 0o777);
+    await assert.rejects(
+      () => assertAutomaticClaudePermissionConfiguration(cwd, ["--settings", join(shared, "settings.json")], { CLAUDE_CONFIG_DIR: join(root, "empty-config") }),
+      (error: unknown) => error instanceof Error
+        && error.cause instanceof Error
+        && /directory containing Claude settings/u.test(error.cause.message),
     );
   } finally {
     await rm(root, { recursive: true, force: true });

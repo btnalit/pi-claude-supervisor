@@ -836,7 +836,7 @@ const BOOTSTRAP_KEYS = {
  */
 const GUARDED_BOOTSTRAP_SCRIPT = `
 const { spawn } = require("node:child_process");
-const { readFileSync, rmSync, rmdirSync, writeFileSync } = require("node:fs");
+const { readdirSync, readFileSync, rmdirSync, writeFileSync } = require("node:fs");
 const { dirname } = require("node:path");
 const keys = ${JSON.stringify(Object.values(BOOTSTRAP_KEYS))};
 const decode = (key) => Buffer.from(process.env[key] || "", "base64").toString("utf8");
@@ -860,10 +860,20 @@ const moveOutOfCgroup = () => {
   if (!parentCgroup) return;
   try { writeFileSync(parentCgroup + "/cgroup.procs", String(process.pid) + "\\n"); } catch {}
 };
+const removeEmptyChildCgroups = (path) => {
+  let entries;
+  try { entries = readdirSync(path, { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    const child = path + "/" + entry.name;
+    removeEmptyChildCgroups(child);
+    try { rmdirSync(child); } catch {}
+  }
+};
 const removeCgroup = () => {
   if (!cgroup) return;
   try { rmdirSync(cgroup); return; } catch {}
-  try { rmSync(cgroup, { recursive: true, force: true }); } catch {}
+  removeEmptyChildCgroups(cgroup);
   try { rmdirSync(cgroup); } catch {}
 };
 const killGroup = (signal) => {

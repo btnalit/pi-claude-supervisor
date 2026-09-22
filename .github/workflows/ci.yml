@@ -58,12 +58,6 @@ jobs:
     name: Node ${{ matrix.node }} checks
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    # actions/setup-node's toolcache is runner-owned and therefore not a
-    # trusted executable for Supervisor-created Node helper processes. Use the
-    # immutable system runtime for those helpers while the matrix Node still
-    # runs the test commands themselves.
-    env:
-      PI_CLAUDE_SUPERVISOR_NODE: /usr/bin/node
     strategy:
       fail-fast: false
       matrix:
@@ -87,13 +81,15 @@ jobs:
           chmod 700 .ci-bin/claude
           echo "$GITHUB_WORKSPACE/.ci-bin" >> "$GITHUB_PATH"
       - name: Install tmux transport test dependency
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y tmux
+        run: /usr/bin/sudo -n /usr/bin/apt-get update && /usr/bin/sudo -n /usr/bin/apt-get install --no-install-recommends -y tmux
       - name: Prepare delegated cgroup for automatic tests
         run: bash scripts/ci/prepare-cgroup.sh
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+      - name: Install verified Node helper
+        run: bash scripts/ci/install-trusted-node.sh
       - run: npm ci --ignore-scripts
       - run: bash scripts/ci/run-in-cgroup.sh npm run check
       - run: npm run test:pi
@@ -102,13 +98,14 @@ jobs:
       - name: Remove delegated cgroup
         if: always()
         run: bash scripts/ci/cleanup-cgroup.sh
+      - name: Remove verified Node helper
+        if: always()
+        run: bash scripts/ci/cleanup-trusted-node.sh
 
   checks_npm_latest:
     name: Node 24 / npm ${{ matrix.npm }} checks
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    env:
-      PI_CLAUDE_SUPERVISOR_NODE: /usr/bin/node
     strategy:
       fail-fast: false
       matrix:
@@ -129,13 +126,15 @@ jobs:
           chmod 700 .ci-bin/claude
           echo "$GITHUB_WORKSPACE/.ci-bin" >> "$GITHUB_PATH"
       - name: Install tmux transport test dependency
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y tmux
+        run: /usr/bin/sudo -n /usr/bin/apt-get update && /usr/bin/sudo -n /usr/bin/apt-get install --no-install-recommends -y tmux
       - name: Prepare delegated cgroup for automatic tests
         run: bash scripts/ci/prepare-cgroup.sh
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
         with:
           node-version: '24'
           cache: npm
+      - name: Install verified Node helper
+        run: bash scripts/ci/install-trusted-node.sh
       - name: Select and verify npm major
         env:
           NPM_VERSION: ${{ matrix.npm }}
@@ -149,6 +148,9 @@ jobs:
       - name: Remove delegated cgroup
         if: always()
         run: bash scripts/ci/cleanup-cgroup.sh
+      - name: Remove verified Node helper
+        if: always()
+        run: bash scripts/ci/cleanup-trusted-node.sh
 
   integration:
     name: Pi installation and integration

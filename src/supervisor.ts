@@ -182,7 +182,7 @@ export interface SupervisorStartOptions {
   expectedClaudeExecutable?: string;
   /** Automatic-mode Claude CLI knobs (--model, --autocompact, --max-budget-usd, --mcp-config). */
   workerArgOptions?: AutomaticClaudeArgOptions;
-  /** Non-protected local branch before automatic work begins. */
+  /** Named local branch before automatic work begins; protected names remain non-publishable by default. */
   baseBranch?: string;
   /** The granted remote's URLs when the task first started; recovery reuses the recorded baseline. */
   remoteBaseline?: RemoteDestination;

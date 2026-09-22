@@ -27,14 +27,22 @@ any job fails, is cancelled, or is skipped:
 - npm audit at high severity;
 - deterministic package artifact build with SHA-256 and npm integrity metadata.
 
-Configure branch protection for `main` with:
+Configure a non-bypassable ruleset for `main` with:
 
 - pull request required;
 - `CI / Quality gate` required and up to date;
 - conversation resolution required;
-- force pushes and branch deletion disabled.
+- force pushes and branch deletion disabled;
+- code-owner review required for the patterns in `.github/CODEOWNERS`;
+- stale approvals dismissed and approval of the latest push required;
+- administrators prevented from bypassing the ruleset where the repository policy permits.
 
-The workflow does not auto-merge arbitrary pull requests.
+The workflow file and its executable gate scripts are therefore not a trust anchor by
+themselves: a pull request may edit them, but cannot merge those edits without the
+trusted code-owner review and the required base ruleset. Verify the live ruleset with the
+GitHub API before treating a hosted green check as release evidence; local `npm run check`
+can only validate that `.github/CODEOWNERS` names the protected paths. The workflow does not
+auto-merge arbitrary pull requests.
 
 ## Local release checks
 

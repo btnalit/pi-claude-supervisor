@@ -103,6 +103,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ needs.plan.outputs.tag }}
       RELEASE_SHA: ${{ needs.plan.outputs.sha }}
+      NPM_AUTH_MODE: ${{ vars.NPM_AUTH_MODE }}
       NODE_AUTH_TOKEN: ${{ vars.NPM_AUTH_MODE == 'token' && secrets.NPM_TOKEN || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4

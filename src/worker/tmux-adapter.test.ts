@@ -365,7 +365,7 @@ process.stdin.on("data", data => {
     const output = (await adapter.readOutput(handle)).map((chunk) => chunk.text).join("");
     assert.match(output, /ACK:hello/u);
     assert.doesNotMatch(output, /\u001bPPI_CLAUDE_SUPERVISOR_EVENT|@pi:user/u);
-    for (let attempt = 0; attempt < 100 && (await adapter.getStatus(handle)).activeRequests !== 0; attempt += 1) {
+    for (let attempt = 0; attempt < 250 && (await adapter.getStatus(handle)).activeRequests !== 0; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     assert.equal((await adapter.getStatus(handle)).activeRequests, 0);

@@ -1,0 +1,15 @@
+# The CI/release gate and the scripts it executes must receive a trusted
+# code-owner review. Branch protection must require code-owner approval for
+# these patterns and dismiss stale approvals after every push.
+/.github/workflows/ @btnalit
+/.github/CODEOWNERS @btnalit
+/package.json @btnalit
+/package-lock.json @btnalit
+/scripts/ci/ @btnalit
+/scripts/check-automation.mjs @btnalit
+/scripts/check-workflows.sh @btnalit
+/scripts/run-tests.mjs @btnalit
+/scripts/publish-package.mjs @btnalit
+/scripts/release-assets.mjs @btnalit
+/release-please-config.json @btnalit
+/.release-please-manifest.json @btnalit
