@@ -2512,12 +2512,13 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
 
 function tmuxServerBootstrapScript(tmuxPath: string, tmuxArgs: readonly string[], cgroupPath: string): string {
   return `
-const { spawnSync } = require("node:child_process");
+const { spawn } = require("node:child_process");
 const { readFileSync, writeFileSync } = require("node:fs");
 const { resolve } = require("node:path");
 const cgroupPath = ${JSON.stringify(resolve(cgroupPath))};
 const tmuxPath = ${JSON.stringify(tmuxPath)};
 const tmuxArgs = ${JSON.stringify(tmuxArgs)};
+const parentPid = process.ppid;
 try {
   writeFileSync(cgroupPath + "/cgroup.procs", String(process.pid) + "\\n");
   const line = readFileSync("/proc/" + process.pid + "/cgroup", "utf8").split(/\\r?\\n/u).find((value) => value.startsWith("0::"));
@@ -2527,12 +2528,30 @@ try {
   process.stderr.write("tmux server cgroup attachment failed: " + (error instanceof Error ? error.message : String(error)) + "\\n");
   process.exit(125);
 }
-const result = spawnSync(tmuxPath, tmuxArgs, { env: process.env, stdio: "inherit" });
-if (result.error) {
-  process.stderr.write("tmux server bootstrap failed: " + result.error.message + "\\n");
+const child = spawn(tmuxPath, tmuxArgs, { env: process.env, stdio: "inherit" });
+let stopping = false;
+const stopForParentDeath = () => {
+  if (stopping) return;
+  stopping = true;
+  try { child.kill("SIGTERM"); } catch {}
+  setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 500).unref();
+};
+const parentCheck = setInterval(() => {
+  if (process.ppid !== parentPid) {
+    clearInterval(parentCheck);
+    stopForParentDeath();
+  }
+}, 50);
+child.once("error", (error) => {
+  clearInterval(parentCheck);
+  process.stderr.write("tmux server bootstrap failed: " + error.message + "\\n");
   process.exit(127);
-}
-process.exit(result.status === null ? (result.signal ? 128 : 1) : result.status);
+});
+child.once("exit", (code, signal) => {
+  clearInterval(parentCheck);
+  if (stopping) process.exit(143);
+  process.exit(code === null ? (signal ? 128 : 1) : code);
+});
 `;
 }
 
