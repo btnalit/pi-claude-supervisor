@@ -598,8 +598,10 @@ evidence still parks.
 
 A `revise` result produces an audited repair round and sends a bounded corrective
 instruction to a still-live `repairableSession` Worker. Checks and review then run again.
-The repair budget defaults to three rounds; repeated findings and P0/P1 findings
-stop automation and park a non-publishable candidate. A Worker that has already exited cannot be silently recreated
+The repair budget defaults to three rounds. P0/P1 findings block a `pass` but are repair
+inputs like any other concrete finding (a `pass` carrying one is treated as `revise`); a
+`human` verdict, repeated findings or an exhausted budget stop automation and park a
+non-publishable candidate. A Worker that has already exited cannot be silently recreated
 for repair; it remains failed/recoverable rather than replaying the original task. If a repair
 or candidate branch cannot continue, a single idempotent terminalizer records
 `verification_failed`, closes the Decision Worker and reports cleanup evidence; it never performs

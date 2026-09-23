@@ -23,16 +23,16 @@ import {
 } from "./config.ts";
 
 test("autonomy environment defaults are unattended and bounded", () => {
-  assert.deepEqual(autonomyDefaults({}), { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
+  assert.deepEqual(autonomyDefaults({}), { unattended: true, requireLocalCommit: true, maxDecisionRetries: 4, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
   assert.deepEqual(autonomyDefaults({
     PI_CLAUDE_SUPERVISOR_UNATTENDED: "0",
     PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT: "false",
-    PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES: "4",
-  }), { unattended: false, requireLocalCommit: false, maxDecisionRetries: 4, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
+    PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES: "1",
+  }), { unattended: false, requireLocalCommit: false, maxDecisionRetries: 1, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
   assert.deepEqual(autonomyDefaults({
     PI_CLAUDE_SUPERVISOR_UNATTENDED: "not-a-boolean",
     PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES: "99",
-  }), { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
+  }), { unattended: true, requireLocalCommit: true, maxDecisionRetries: 4, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
 });
 
 test("reviewTimeoutMs defaults and rejects out-of-range overrides", () => {

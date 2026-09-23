@@ -106,7 +106,7 @@ stop or park safely and retain evidence; it must not silently grant remote or ma
 Automatic mode implements the local loop: policy decisions allow ordinary local development,
 `AskUserQuestion` is converted to a denied interactive permission, the Decision Worker can
 continue/redirect/answer/repair, acceptance and independent Review run without a human callback,
-and unresolved situations become `blocked` candidates. The default task autonomy is unattended, requires a local commit, and permits two bounded
+and unresolved situations become `blocked` candidates. The default task autonomy is unattended, requires a local commit, and permits four bounded
 Decision Worker request retries. Automatic startup rejects non-Git/detached/bare/protected
 repository states, malformed baselines, startup-HEAD races, the unstructured
 process-pipe transport, Bash-preauthorizing Claude arguments/settings and non-Claude or untrusted

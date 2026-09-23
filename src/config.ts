@@ -62,7 +62,7 @@ export function autonomyDefaults(env: NodeJS.ProcessEnv = process.env): Autonomy
   return {
     unattended: readBoolean(env.PI_CLAUDE_SUPERVISOR_UNATTENDED, true),
     requireLocalCommit: readBoolean(env.PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT, true),
-    maxDecisionRetries: readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES, 2, 0, 10),
+    maxDecisionRetries: readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES, DEFAULT_MAX_DECISION_RETRIES, 0, 10),
     permissionAuthority: readPermissionAuthority(env.PI_CLAUDE_SUPERVISOR_PERMISSION_AUTHORITY),
     remoteAuthority: readRemoteAuthority(env.PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY),
     remoteName: readRemoteName(env.PI_CLAUDE_SUPERVISOR_REMOTE_NAME),
@@ -120,6 +120,8 @@ export function evidenceMaxUntrackedFiles(env: NodeJS.ProcessEnv = process.env):
   return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES, 512, 16, 10_000);
 }
 
+/** Retries of a failed Decision Worker request before the task is parked. */
+export const DEFAULT_MAX_DECISION_RETRIES = 4;
 export const DEFAULT_DEADLINE_MS = 4 * 60 * 60_000;
 export const DEFAULT_DEADLINE_GRACE_MS = 30 * 60_000;
 export const DEFAULT_DEADLINE_WARNING_MS = 15 * 60_000;

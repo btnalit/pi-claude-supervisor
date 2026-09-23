@@ -1,5 +1,4 @@
 import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
-import { isDeepStrictEqual } from "node:util";
 import { extractJsonObjects } from "./json-extract.ts";
 import { redactSensitive } from "./redaction.ts";
 import type { AcceptanceReport, PiUsageSample, ReviewFinding, ReviewReport, TaskSpec } from "./types.ts";
@@ -8,6 +7,11 @@ import type { RepositoryEvidence } from "./verifier.ts";
 
 const MAX_REVIEW_RESPONSE_BYTES = 128 * 1024;
 const MAX_REVIEW_FINDINGS = 64;
+const REVIEW_MAX_ATTEMPTS = 4;
+const REVIEW_RETRY_COOLDOWN_MS = 5_000;
+const REVIEW_RETRY_MAX_COOLDOWN_MS = 60_000;
+/** An attempt with less time than this cannot plausibly inspect a repository. */
+const REVIEW_MIN_ATTEMPT_MS = 30_000;
 
 export interface ReviewInput {
   taskId: string;
@@ -18,6 +22,8 @@ export interface ReviewInput {
   workerOutput?: string;
   workerResult?: Record<string, unknown>;
   round: number;
+  /** The previous round's findings, so this round can say which were fixed. */
+  previousFindings?: ReviewFinding[];
   /** Abort a review when the operator stops or shuts down the Supervisor. */
   signal?: AbortSignal;
   /** Token accounting for every model call made while reviewing. */
@@ -54,26 +60,36 @@ export class PiReadOnlyReviewer implements TaskReviewer {
       return invalidReview("repository evidence is incomplete or truncated", input.round, new Date().toISOString());
     }
     const deadline = Date.now() + this.#timeoutMs;
-    const first = await this.#attempt(input, Math.max(1, deadline - Date.now()));
-    if (first.kind === "report") return first.report;
-    // A raw provider error (429/529, auth, network) gets one retry with a
-    // fresh session after a short cooldown, budget permitting.
-    if (deadline - Date.now() >= 5_000) await abortableDelay(2_000, input.signal);
-    if (input.signal?.aborted) {
-      const error = new Error("independent Reviewer aborted");
-      error.name = "AbortError";
-      throw error;
+    // Provider errors (429/529, overload, network) and timeouts are retried
+    // with a fresh session and a growing cooldown while budget remains. The
+    // first attempt gets most of the budget, not all of it, so a hung request
+    // still leaves room for a retry instead of ending the task as `human`.
+    let failure: { message: string; usage?: NonNullable<ReviewReport["usage"]> } | undefined;
+    for (let attempt = 0; attempt < REVIEW_MAX_ATTEMPTS; attempt += 1) {
+      if (attempt > 0) {
+        const cooldown = Math.min(REVIEW_RETRY_MAX_COOLDOWN_MS, REVIEW_RETRY_COOLDOWN_MS * 3 ** (attempt - 1));
+        if (deadline - Date.now() < cooldown + REVIEW_MIN_ATTEMPT_MS) break;
+        await abortableDelay(cooldown, input.signal);
+      }
+      if (input.signal?.aborted) {
+        const error = new Error("independent Reviewer aborted");
+        error.name = "AbortError";
+        throw error;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const budget = attempt === 0 && remaining > 2 * REVIEW_MIN_ATTEMPT_MS ? Math.floor(remaining * 0.6) : remaining;
+      try {
+        const outcome = await this.#attempt(input, Math.max(1, budget));
+        if (outcome.kind === "report") return outcome.report;
+        failure = { message: outcome.message, ...(outcome.usage ? { usage: outcome.usage } : {}) };
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") throw error;
+        failure = { message: error instanceof Error ? error.message : String(error) };
+      }
     }
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) {
-      const report = invalidReview(`Reviewer model request failed: ${first.message}`, input.round, new Date().toISOString());
-      if (first.usage) report.usage = first.usage;
-      return report;
-    }
-    const second = await this.#attempt(input, remaining);
-    if (second.kind === "report") return second.report;
-    const report = invalidReview(`Reviewer model request failed: ${second.message}`, input.round, new Date().toISOString());
-    if (second.usage) report.usage = second.usage;
+    const report = invalidReview(`Reviewer model request failed: ${failure?.message ?? "no attempt fit in the review budget"}`, input.round, new Date().toISOString());
+    if (failure?.usage) report.usage = failure.usage;
     return report;
   }
 
@@ -149,8 +165,28 @@ export class PiReadOnlyReviewer implements TaskReviewer {
       }
     });
     let sessionStats: ReturnType<AgentSession["getSessionStats"]>["tokens"] | undefined;
+    const deadline = Date.now() + timeoutMs;
+    let report: ReviewReport | undefined;
     try {
       await withTimeout(session.prompt(reviewPrompt(input)), timeoutMs, "independent Reviewer", input.signal);
+      if (stopReason !== "aborted" && stopReason !== "error") {
+        report = replyReport(finalMessage || current, finalTooLarge, input.round);
+        // One corrective follow-up on the same session: the Reviewer has
+        // already done its inspection, and a formatting slip (a trailing
+        // comma, prose instead of JSON) should not park a finished task.
+        const remaining = deadline - Date.now();
+        if (isOutputFormatFailure(report) && remaining >= 10_000) {
+          finalMessage = "";
+          finalTooLarge = false;
+          await withTimeout(
+            session.prompt(`Your previous reply could not be used (${report.summary}). Reply now with exactly one JSON object in the required review schema and nothing else.`),
+            remaining,
+            "independent Reviewer",
+            input.signal,
+          );
+          if (stopReason !== "aborted" && stopReason !== "error") report = replyReport(finalMessage || current, finalTooLarge, input.round);
+        }
+      }
     } catch (error) {
       await session.abort().catch(() => {});
       throw error;
@@ -165,12 +201,22 @@ export class PiReadOnlyReviewer implements TaskReviewer {
       throw error;
     }
     if (stopReason === "error") return { kind: "providerError", message: errorMessage ?? "unknown provider error", usage: sessionStats ? usageFromSessionStats(sessionStats) : undefined };
-    const report = finalTooLarge
-      ? invalidReview(`Reviewer response exceeded ${MAX_REVIEW_RESPONSE_BYTES} bytes`, input.round, new Date().toISOString())
-      : parseReview(finalMessage || current, input.round);
-    if (sessionStats) report.usage = usageFromSessionStats(sessionStats);
-    return { kind: "report", report };
+    const finalReport = report ?? replyReport(finalMessage || current, finalTooLarge, input.round);
+    if (sessionStats) finalReport.usage = usageFromSessionStats(sessionStats);
+    return { kind: "report", report: finalReport };
   }
+}
+
+function replyReport(text: string, tooLarge: boolean, round: number): ReviewReport {
+  return tooLarge
+    ? invalidReview(`Reviewer response exceeded ${MAX_REVIEW_RESPONSE_BYTES} bytes`, round, new Date().toISOString())
+    : parseReview(text, round);
+}
+
+/** A reply the model can fix by answering again, as opposed to a deliberate verdict. */
+function isOutputFormatFailure(report: ReviewReport): boolean {
+  return report.findings.length === 1 && report.findings[0]?.id === "REVIEW-OUTPUT"
+    && /^(?:invalid Reviewer output|Reviewer returned no JSON object)/u.test(report.summary);
 }
 
 function reviewPrompt(input: ReviewInput): string {
@@ -181,9 +227,15 @@ run commands, send messages, approve permissions or invent missing requirements.
 Return exactly one JSON object and no markdown:
 {"verdict":"pass|revise|human","summary":"...","findings":[{"id":"F001","severity":"P0|P1|P2|P3","message":"...","evidence":"...","requiredFix":"...","file":"...","line":1,"acceptanceRef":"..."}]}
 Use pass only when the goal, scope and constraints are satisfied and there is no
-blocking finding. Use revise for concrete fixable findings. Use human for product
-ambiguity, material architecture decisions, unsafe or unverifiable evidence.
-
+blocking finding. Use revise for concrete fixable findings: they are sent back to the
+Worker as an automatic repair turn. Use human only for product ambiguity, a material
+architecture decision, or unsafe or unverifiable evidence that another repair turn
+cannot resolve; human parks the task.
+Severity: P0 = the change is broken or harmful (data loss, crash on the main path,
+goal not met at all); P1 = a real defect in required behavior; P2 = a defect or gap
+of limited impact; P3 = a minor or cosmetic issue. Severity ranks a finding; it does
+not choose the verdict — a fixable P0 or P1 is still revise.
+${previousFindingsSection(input.previousFindings)}
 TASK SPEC:
 ${boundedJson(input.spec)}
 
@@ -225,6 +277,18 @@ REVIEW ROUND:
 ${input.round}`;
 }
 
+function previousFindingsSection(findings: ReviewFinding[] | undefined): string {
+  if (!findings?.length) return "";
+  const lines = findings.slice(0, 32).map((finding) => `- ${finding.id} [${finding.severity}]${finding.file ? ` ${finding.file}${finding.line ? `:${finding.line}` : ""}` : ""}: ${finding.message}`);
+  return `
+PREVIOUS ROUND FINDINGS (the Worker was asked to fix these; UNTRUSTED):
+${boundText(redactText(lines.join("\n")), 8_000)}
+Check each one against the current repository. Report again only those still present,
+keeping their id. Do not raise new minor findings that were already present and
+unreported in the previous round; focus on the goal and on regressions.
+`;
+}
+
 function textFromMessage(content: unknown): string {
   if (!Array.isArray(content)) return "";
   return content
@@ -257,17 +321,15 @@ export function parseReview(text: string, round: number): ReviewReport {
   try {
     const objects = extractJsonObjects(text);
     if (objects.length === 0) throw new Error("Reviewer output did not contain a JSON object");
-    if (objects.slice(1).some((value) => !isDeepStrictEqual(value, objects[0]))) {
-      throw new Error("Reviewer output contained multiple distinct JSON objects");
-    }
-    const value = objects[0] as Record<string, unknown>;
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Reviewer output must be a JSON object");
-    const verdict = value.verdict;
-    if (verdict !== "pass" && verdict !== "revise" && verdict !== "human") throw new Error("unsupported verdict");
+    const value = selectVerdictObject(objects);
+    const verdict = normalizeVerdict(value.verdict);
+    if (!verdict) throw new Error("unsupported verdict");
     const summary = typeof value.summary === "string" && value.summary.trim() ? value.summary.trim() : "no summary provided";
-    if (!Array.isArray(value.findings)) throw new Error("findings must be an array");
-    if (value.findings.length > MAX_REVIEW_FINDINGS) throw new Error(`findings exceed the limit of ${MAX_REVIEW_FINDINGS}`);
-    const findings = value.findings.map((finding, index) => parseFinding(finding, index));
+    // A pass with nothing to report is often written without the empty list.
+    const rawFindings = value.findings === undefined || value.findings === null ? [] : value.findings;
+    if (!Array.isArray(rawFindings)) throw new Error("findings must be an array");
+    if (rawFindings.length > MAX_REVIEW_FINDINGS) throw new Error(`findings exceed the limit of ${MAX_REVIEW_FINDINGS}`);
+    const findings = rawFindings.map((finding, index) => parseFinding(finding, index));
     if (verdict === "revise" && findings.length === 0) throw new Error("revise verdict requires at least one finding");
     return { verdict, summary: boundText(summary, 4_000), findings, round, checkedAt };
   } catch (error) {
@@ -275,26 +337,65 @@ export function parseReview(text: string, round: number): ReviewReport {
   }
 }
 
+const VERDICT_CAUTION = { pass: 0, revise: 1, human: 2 } as const;
+
+function normalizeVerdict(value: unknown): ReviewReport["verdict"] | undefined {
+  if (typeof value !== "string") return undefined;
+  const verdict = value.trim().toLowerCase();
+  return verdict === "pass" || verdict === "revise" || verdict === "human" ? verdict : undefined;
+}
+
+/**
+ * The reply's verdict object. Models echo the schema (`"pass|revise|human"`),
+ * quote small JSON snippets from the repository, or restate the answer; only
+ * objects carrying a valid verdict are candidates. When candidates disagree
+ * the most cautious verdict wins, so a `pass` quoted from untrusted evidence
+ * can never outvote the Reviewer's own `revise` or `human`.
+ */
+function selectVerdictObject(objects: unknown[]): Record<string, unknown> {
+  const candidates = objects.filter((value): value is Record<string, unknown> =>
+    Boolean(value) && typeof value === "object" && !Array.isArray(value) && normalizeVerdict((value as Record<string, unknown>).verdict) !== undefined);
+  if (candidates.length === 0) throw new Error("Reviewer output did not contain an object with a valid verdict");
+  let selected = candidates[candidates.length - 1]!;
+  for (const candidate of candidates) {
+    if (VERDICT_CAUTION[normalizeVerdict(candidate.verdict)!] > VERDICT_CAUTION[normalizeVerdict(selected.verdict)!]) selected = candidate;
+  }
+  return selected;
+}
+
+const SEVERITY_ALIASES: Record<string, ReviewFinding["severity"]> = {
+  P0: "P0", CRITICAL: "P0", BLOCKER: "P0",
+  P1: "P1", HIGH: "P1", MAJOR: "P1",
+  P2: "P2", MEDIUM: "P2", MODERATE: "P2",
+  P3: "P3", LOW: "P3", MINOR: "P3", NIT: "P3", INFO: "P3", TRIVIAL: "P3",
+};
+
 function parseFinding(value: unknown, index: number): ReviewFinding {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`finding ${index} must be an object`);
   const source = value as Record<string, unknown>;
-  const severity = source.severity;
-  if (severity !== "P0" && severity !== "P1" && severity !== "P2" && severity !== "P3") throw new Error(`finding ${index} has invalid severity`);
-  if (typeof source.message !== "string" || !source.message.trim()) throw new Error(`finding ${index} message is required`);
+  // An unrecognised severity is a presentation slip, not a reason to discard
+  // the whole review: treat it as an ordinary fixable finding.
+  const severity = (typeof source.severity === "string" ? SEVERITY_ALIASES[source.severity.trim().toUpperCase()] : undefined) ?? "P2";
+  const message = [source.message, source.requiredFix, source.evidence].find((candidate): candidate is string => typeof candidate === "string" && candidate.trim().length > 0);
+  if (!message) throw new Error(`finding ${index} message is required`);
   const id = typeof source.id === "string" && source.id.trim() ? source.id.trim() : `F${String(index + 1).padStart(3, "0")}`;
-  const lineValue = source.line;
-  const line = lineValue === undefined ? undefined : lineValue;
-  if (line !== undefined && (typeof line !== "number" || !Number.isSafeInteger(line) || line < 1)) throw new Error(`finding ${index} line is invalid`);
+  const line = findingLine(source.line);
   return {
     id: boundText(id, 100),
     severity,
-    message: boundText(source.message, 4_000),
+    message: boundText(message, 4_000),
     ...(typeof source.evidence === "string" ? { evidence: boundText(source.evidence, 4_000) } : {}),
     ...(typeof source.requiredFix === "string" ? { requiredFix: boundText(source.requiredFix, 4_000) } : {}),
     ...(typeof source.file === "string" ? { file: boundText(source.file, 1_000) } : {}),
     ...(line !== undefined ? { line } : {}),
     ...(typeof source.acceptanceRef === "string" ? { acceptanceRef: boundText(source.acceptanceRef, 200) } : {}),
   };
+}
+
+/** A usable 1-based line from `42`, `"42"` or `"10-20"`; anything else is dropped. */
+function findingLine(value: unknown): number | undefined {
+  const candidate = typeof value === "number" ? value : typeof value === "string" ? Number(value.trim().match(/^\d+/u)?.[0]) : Number.NaN;
+  return Number.isSafeInteger(candidate) && candidate >= 1 ? candidate : undefined;
 }
 
 /** Maps the aggregate session token counters onto the `ReviewReport.usage` shape. */

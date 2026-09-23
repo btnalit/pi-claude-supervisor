@@ -35,17 +35,38 @@ test("Reviewer parser tolerates fences, prose and an identical repeated object",
   }
 });
 
-test("conflicting Reviewer JSON objects remain blocking", () => {
-  const report = parseReview(
-    `${JSON.stringify({ verdict: "pass", summary: "ok", findings: [] })}\n${JSON.stringify({ verdict: "human", summary: "uncertain", findings: [] })}`,
-    2,
-  );
-  assert.equal(report.verdict, "human");
-  assert.match(report.summary, /multiple distinct JSON objects/u);
+test("conflicting Reviewer verdict objects resolve to the most cautious verdict", () => {
+  const pass = JSON.stringify({ verdict: "pass", summary: "ok", findings: [] });
+  const human = JSON.stringify({ verdict: "human", summary: "uncertain", findings: [] });
+  // Whichever order they come in, a quoted or restated `pass` never outvotes
+  // the Reviewer's own `human`.
+  for (const output of [`${pass}\n${human}`, `${human}\n${pass}`]) {
+    const report = parseReview(output, 2);
+    assert.equal(report.verdict, "human");
+    assert.equal(report.summary, "uncertain");
+  }
+});
+
+test("Reviewer parser accepts the schema variations models actually produce", () => {
+  const schemaEcho = '{"verdict":"pass|revise|human","summary":"...","findings":[]}';
+  const cases: Array<[string, string, number]> = [
+    [JSON.stringify({ verdict: "pass", summary: "ok" }), "pass", 0],
+    [JSON.stringify({ verdict: "PASS", summary: "ok", findings: null }), "pass", 0],
+    [`The schema is ${schemaEcho}. My answer:\n${JSON.stringify({ verdict: "pass", summary: "ok", findings: [] })}`, "pass", 0],
+    [`I checked {"a": 1} in config.json.\n${JSON.stringify({ verdict: "revise", summary: "fix", findings: [{ severity: "p2", message: "m", line: "42" }] })}`, "revise", 1],
+    [JSON.stringify({ verdict: "revise", summary: "fix", findings: [{ severity: "medium", message: "m", line: null }, { severity: "odd", requiredFix: "do x", line: "10-20" }] }), "revise", 2],
+  ];
+  for (const [output, verdict, count] of cases) {
+    const report = parseReview(output, 1);
+    assert.equal(report.verdict, verdict, output);
+    assert.equal(report.findings.length, count, output);
+  }
+  const detailed = parseReview(JSON.stringify({ verdict: "revise", summary: "fix", findings: [{ severity: "medium", message: "m", line: "42" }, { severity: "odd", requiredFix: "do x", line: "10-20" }, { severity: "high", message: "h", line: null }] }), 1);
+  assert.deepEqual(detailed.findings.map((finding) => [finding.severity, finding.message, finding.line]), [["P2", "m", 42], ["P2", "do x", 10], ["P1", "h", undefined]]);
 });
 
 test("invalid Reviewer output escalates to human", () => {
-  for (const output of ["not JSON", "{} trailing", JSON.stringify({ verdict: "pass", summary: "missing findings" }), JSON.stringify({ verdict: "revise", summary: "missing findings", findings: [] })]) {
+  for (const output of ["not JSON", "{} trailing", JSON.stringify({ verdict: "maybe", summary: "unsupported" }), JSON.stringify({ verdict: "revise", summary: "missing findings", findings: [] })]) {
     const report = parseReview(output, 2);
     assert.equal(report.verdict, "human");
     assert.equal(report.findings[0]?.severity, "P1");

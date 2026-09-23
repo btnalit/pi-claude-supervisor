@@ -1129,9 +1129,11 @@ export class Supervisor {
         return;
       }
       if (action.action === "retry") {
-        if (!action.message?.trim()) { await this.#parkCandidate(`Retry requires a concrete corrective instruction: ${action.reason}`, event); return; }
+        // The prompt invites a bare retry after a Worker API error; resume the
+        // turn rather than parking a task over a single transient failure.
+        const message = action.message?.trim() ? action.message : RETRY_RESUME_MESSAGE;
         if (await this.#decisionIsStale(event)) return;
-        await this.#sendInternal(action.message);
+        await this.#sendInternal(message);
       }
     });
   }
@@ -1757,6 +1759,9 @@ export class Supervisor {
       this.#reportProgress("review", "collecting repository evidence and running independent Reviewer", true);
       let review: ReviewReport;
       let reviewUsageReceived = false;
+      // Until this round finishes, #lastVerification still holds the round
+      // whose findings the Worker was just asked to repair.
+      const previousFindings = this.#repairRound > 0 ? this.#lastVerification?.review?.findings : undefined;
       try {
         const evidence = repositoryEvidence ?? redactRepositoryEvidence(await collectRepositoryEvidence(this.#task.cwd, { signal: verificationAbortController.signal, baseRef: this.#task.baseCommit }));
         judgedEvidence = evidence;
@@ -1769,6 +1774,7 @@ export class Supervisor {
           workerOutput: String(redactSensitive(this.#workerOutput)),
           workerResult: this.#lastWorkerResult ? redactSensitive(this.#lastWorkerResult) as Record<string, unknown> : undefined,
           round: this.#repairRound,
+          ...(previousFindings?.length ? { previousFindings } : {}),
           signal: verificationAbortController.signal,
           onUsage: (sample) => { reviewUsageReceived = true; this.#recordPiUsage(sample); },
         } satisfies ReviewInput), this.#reviewTimeoutMs + 30_000, "independent Reviewer", verificationAbortController.signal);
@@ -1781,8 +1787,12 @@ export class Supervisor {
         if (error instanceof Error && error.name === "TimeoutError") verificationAbortController.abort(error.message);
         review = { verdict: "human" as const, summary: `independent Reviewer failed: ${safeMessage(error)}`, findings: [], round: this.#repairRound, checkedAt: new Date().toISOString() };
       }
+      // A P0/P1 finding blocks a pass, but it is a repair input like any other
+      // concrete finding: the bounded repair loop is where serious, fixable
+      // defects get fixed. Only a `human` verdict (or an exhausted/repeating
+      // repair loop) parks the candidate.
       const hasBlockingFinding = review.findings.some((finding) => finding.severity === "P0" || finding.severity === "P1");
-      if (hasBlockingFinding) review = { ...review, verdict: "human" as const, summary: `${review.summary}; blocking findings require human review` };
+      if (hasBlockingFinding && review.verdict === "pass") review = { ...review, verdict: "revise" as const, summary: `${review.summary}; blocking findings must be repaired before the candidate can pass` };
       if (review.verdict === "revise") {
         const signature = findingSignature(review);
         if (signature === this.#lastFindingSignature) {
@@ -2486,7 +2496,16 @@ export class Supervisor {
   /** The per-event context refresh sent to the Decision Worker before every notification or replay. */
   #decisionContextPatch(): Partial<DecisionContext> {
     const deadline = this.#deadlineContext();
-    return { state: this.#machine.state, turn: this.#turn, repairRound: this.#repairRound, ...(deadline ? { deadline } : {}) };
+    const verification = this.#lastVerification;
+    // The Worker's own repair prompt carries these; without them the Decision
+    // Worker judges a repair turn only by Claude's claim that it is done.
+    const lastVerification = verification ? {
+      ok: verification.ok,
+      failedChecks: verification.checks.filter((check) => check.check.required && !check.ok).map((check) => check.check.id).slice(0, 16),
+      ...(verification.review ? { reviewVerdict: verification.review.verdict } : {}),
+      findings: (verification.review?.findings ?? []).slice(0, 8).map((finding) => `${finding.id} [${finding.severity}] ${finding.message}`.slice(0, 200)),
+    } : undefined;
+    return { state: this.#machine.state, turn: this.#turn, repairRound: this.#repairRound, ...(deadline ? { deadline } : {}), ...(lastVerification ? { lastVerification } : {}) };
   }
 
   /**
@@ -2905,15 +2924,30 @@ function cancelledAcceptanceReport(reason: string): AcceptanceReport {
   };
 }
 
+function tailText(value: string, maxChars: number): string {
+  return value.length <= maxChars ? value : `[…${value.length - maxChars} earlier characters omitted]\n${value.slice(-maxChars)}`;
+}
+
+const RETRY_RESUME_MESSAGE = "Your previous turn stopped before finishing. Resume the task where you left off.";
+
 function repairInstruction(result: AcceptanceReport, reason: string, round: number): string {
+  // Each check keeps the *end* of its output: that is where test runners
+  // print the failure summary, while the head is usually progress noise.
   const failedChecks = result.checks
     .filter((check) => check.check.required && !check.ok)
-    .map((check) => `${check.check.id}: ${check.output}`)
+    .map((check) => `${check.check.id}: ${tailText(check.output, 4_000)}`)
     .join("\n");
+  // Findings carry their location and evidence: they are what points the
+  // Worker at the fix. They go first so the 16 KB bound never cuts them.
   const findings = result.review?.findings
-    .map((finding) => `${finding.id} [${finding.severity}] ${finding.message}${finding.requiredFix ? `; required fix: ${finding.requiredFix}` : ""}`)
+    .map((finding) => {
+      const location = finding.file ? ` ${finding.file}${finding.line ? `:${finding.line}` : ""}` : "";
+      const fix = finding.requiredFix ? `; required fix: ${finding.requiredFix}` : "";
+      const evidence = finding.evidence ? `; evidence: ${tailText(finding.evidence, 1_000)}` : "";
+      return `${finding.id} [${finding.severity}]${location}: ${finding.message}${fix}${evidence}`;
+    })
     .join("\n") ?? "";
-  const evidence = [failedChecks ? `Failed acceptance checks:\n${failedChecks}` : "", findings ? `Reviewer findings:\n${findings}` : ""].filter(Boolean).join("\n\n");
+  const evidence = [findings ? `Reviewer findings:\n${findings}` : "", failedChecks ? `Failed acceptance checks:\n${failedChecks}` : ""].filter(Boolean).join("\n\n");
   const commitRequirement = reason.includes("local commit") || reason.includes("uncommitted")
     ? "Before reporting completion, inspect the final diff, run the relevant checks, and create a local git commit on the task branch. Do not push, merge, publish, or modify main/integration."
     : "";

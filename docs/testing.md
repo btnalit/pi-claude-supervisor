@@ -1,6 +1,6 @@
 # Testing
 
-> Autonomy target: local editing, testing, repair and local commits run without a human being online. Invalid output, unavailable evidence, duplicate findings, P0/P1 findings and exhausted budgets become parked/non-publishable candidates rather than synchronous human gates. Remote push and main/integration merge remain independent-boundary tests. See [autonomy-target.md](autonomy-target.md).
+> Autonomy target: local editing, testing, repair and local commits run without a human being online. Invalid output (after one corrective re-prompt), unavailable evidence, duplicate findings, a `human` Reviewer verdict and exhausted budgets become parked/non-publishable candidates rather than synchronous human gates. Remote push and main/integration merge remain independent-boundary tests. See [autonomy-target.md](autonomy-target.md).
 
 ## Local checks
 
@@ -146,7 +146,7 @@ Pi Decision Worker. Setting `PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux` selects the
 Supervisor-owned live bridge, which carries the same structured records through
 private framing on the PTY rather than an independent JSONL sidecar. Task autonomy
 defaults to unattended local work, a required
-local commit on the task branch (any branch, anchored to the baseline commit) and two bounded Decision Worker retries. Configure
+local commit on the task branch (any branch, anchored to the baseline commit) and four bounded Decision Worker retries. Configure
 `PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT=0` or task `autonomy.requireLocalCommit`
 only to disable the local-commit deliverability check; automatic mode still requires a Git
 baseline (any branch, including `main`; the candidate must descend from it). The tmux bridge
@@ -240,7 +240,7 @@ Deterministic tests must cover:
 - multiple required/optional checks with bounded output, timeout and exit-code evidence;
 - independent read-only Reviewer pass/revise/human results;
 - invalid Reviewer JSON and Reviewer API failure becoming a parked/non-publishable candidate without requiring a live callback;
-- repair rounds, repeated finding detection, P0/P1 parking and repair-budget exhaustion;
+- repair rounds (P0/P1 findings are repaired, never passed), repeated finding detection and repair-budget exhaustion;
 - non-persistent JSONL verification failure without duplicate terminal transitions;
 - repairable-but-not-persistent JSONL multi-turn repair;
 - stop and Pi shutdown from `verifying`, including Decision Worker closure and cwd lease release;

@@ -285,7 +285,7 @@ commit,通知能说清已验证的 commit 是否在工作树变动之前就已�
   "autonomy": {
     "unattended": true,
     "requireLocalCommit": true,
-    "maxDecisionRetries": 2,
+    "maxDecisionRetries": 4,
     "permissionAuthority": "hybrid",
     "maxWorkerCostUsd": 20
   }
@@ -321,7 +321,7 @@ commit,通知能说清已验证的 commit 是否在工作树变动之前就已�
 | `HUMAN_WEBHOOK_SECRET` | 未设置 | HMAC 签名密钥;以 `x-pi-supervisor-signature` header 发送 |
 | `UNATTENDED` | `true` | 任务无需同步人工回调即可运行 |
 | `REQUIRE_LOCAL_COMMIT` | `true` | 完成前要求在候选所在分支上有本地 commit |
-| `MAX_DECISION_RETRIES` | `2`(0–10) | Decision Worker 调用超时或失败(429/529、网络、鉴权)时的重试次数 |
+| `MAX_DECISION_RETRIES` | `4`(0–10) | Decision Worker 调用超时或失败(429/529、网络、鉴权)时的重试次数;两次尝试之间依次等待 15s、45s、60s |
 | `PERMISSION_AUTHORITY` | `hybrid` | `policy` \| `hybrid` \| `decision-worker` |
 | `REMOTE_AUTHORITY` | `none` | `none` \| `push` \| `pr`;验收通过后开启发布阶段。`--remote` 可按任务覆盖 |
 | `REMOTE_NAME` | `origin` | 发布授权唯一允许的 remote 名 |

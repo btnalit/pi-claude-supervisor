@@ -374,7 +374,7 @@ confirmed publish says so in its candidate notice instead of reporting a bare
   "autonomy": {
     "unattended": true,
     "requireLocalCommit": true,
-    "maxDecisionRetries": 2,
+    "maxDecisionRetries": 4,
     "permissionAuthority": "hybrid",
     "maxWorkerCostUsd": 20
   }
@@ -411,7 +411,7 @@ Environment variables (or `~/.config/pi-claude-supervisor/env`), all prefixed
 | `HUMAN_WEBHOOK_SECRET` | unset | HMAC signing secret; sent as the `x-pi-supervisor-signature` header |
 | `UNATTENDED` | `true` | Task runs without a synchronous human callback |
 | `REQUIRE_LOCAL_COMMIT` | `true` | Require a local commit on the candidate's branch before completion |
-| `MAX_DECISION_RETRIES` | `2` (0–10) | Retries of a Decision Worker call that times out or fails (429/529, network, auth) |
+| `MAX_DECISION_RETRIES` | `4` (0–10) | Retries of a Decision Worker call that times out or fails (429/529, network, auth); waits 15s, 45s, then 60s between attempts |
 | `PERMISSION_AUTHORITY` | `hybrid` | `policy` \| `hybrid` \| `decision-worker` |
 | `REMOTE_AUTHORITY` | `none` | `none` \| `push` \| `pr`; grants the publish phase after verification passes. `--remote` overrides it per task |
 | `REMOTE_NAME` | `origin` | The single remote a publish grant may name |

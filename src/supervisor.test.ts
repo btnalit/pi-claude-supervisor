@@ -1160,7 +1160,7 @@ test("repair-round exhaustion parks the candidate after the final automatic repa
   assert.ok(events.events.some((event) => event.type === "candidate_parked"));
 });
 
-test("P0 and P1 Reviewer findings never enter automatic repair", async () => {
+test("P0 and P1 Reviewer findings enter automatic repair, and a pass carrying one does not pass", async () => {
   const handle: WorkerHandle = { id: "blocking-finding-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
   let running = true;
   let sends = 0;
@@ -1177,7 +1177,9 @@ test("P0 and P1 Reviewer findings never enter automatic repair", async () => {
     resumeSession: async () => handle,
   };
   const supervisor = new Supervisor(adapter, undefined, {
-    reviewer: { review: async () => ({ verdict: "revise", summary: "unsafe", findings: [{ id: "F001", severity: "P1", message: "unsafe behavior", requiredFix: "human decision" }], round: 0, checkedAt: new Date().toISOString() }) },
+    // The Reviewer contradicts itself: `pass` with a P1 finding. The finding
+    // must still be repaired rather than waved through or parked.
+    reviewer: { review: async () => ({ verdict: "pass", summary: "looks fine", findings: [{ id: "F001", severity: "P1", message: "crash on empty input", requiredFix: "guard the empty case" }], round: 0, checkedAt: new Date().toISOString() }) },
   });
   await supervisor.start({
     task: "blocking finding fixture",
@@ -1191,11 +1193,12 @@ test("P0 and P1 Reviewer findings never enter automatic repair", async () => {
   });
   await supervisor.poll();
   const result = await supervisor.verify();
-  assert.equal(result.review?.verdict, "human");
+  assert.equal(result.ok, false);
+  assert.equal(result.review?.verdict, "revise");
   assert.equal(supervisor.humanRequired, false);
-  assert.equal(supervisor.candidateParked, true);
-  assert.equal(supervisor.state, "blocked");
-  assert.equal(sends, 0);
+  assert.equal(supervisor.candidateParked, false);
+  assert.equal(supervisor.state, "running");
+  assert.equal(sends, 1);
 });
 
 test("Reviewer API failure parks a candidate without human review", async () => {
@@ -3807,5 +3810,34 @@ test("a task granted remote authority never reports ready without saying the pub
     assert.match(String(candidates.at(-1)?.reason), /not published: .*protected branch/u);
   } finally {
     await repo.cleanup();
+  }
+});
+
+test("a retry decision without a message resumes the Worker instead of parking the task", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-bare-retry-"));
+  try {
+    await initializeGitRepository(cwd, "worker/bare-retry");
+    const fixture = closeOutFixture(cwd);
+    const supervisor = new Supervisor(fixture.adapter, undefined, { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "survive a transient Worker API error",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const turn: WorkerEvent = { type: "turn_completed", handle: fixture.handle, result: { subtype: "error", is_error: true, result: "API Error: 529 overloaded" }, sequence: 1 };
+    fixture.state.listener?.(turn);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "retry", reason: "transient API error" }, turn);
+    assert.equal(supervisor.candidateParked, false);
+    assert.equal(supervisor.state, "running");
+    assert.equal(fixture.state.sent.length, 1);
+    assert.match(fixture.state.sent[0]!, /Resume the task/u);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
   }
 });

@@ -312,6 +312,46 @@ test("a reply with no JSON gets exactly one bounded re-prompt before an action i
   await worker.close();
 });
 
+test("noop on a completed turn gets one corrective re-prompt before it is accepted", async () => {
+  const { session, prompts } = createFakeSession([
+    { stopReason: "stop", text: "ack" },
+    { stopReason: "stop", text: JSON.stringify({ action: "noop", reason: "nothing to do" }) },
+    { stopReason: "stop", text: JSON.stringify({ action: "verify", reason: "done" }) },
+  ]);
+  const actions: DecisionAction[] = [];
+  const worker = new PiDecisionWorker(baseOptions({
+    onAction: (action) => { actions.push(action); },
+    sessionFactory: async () => ({ session }),
+  }));
+  await worker.start();
+  const promptsAfterStart = prompts.length;
+  worker.notify(turnCompletedEvent());
+  while (actions.length === 0) await flush();
+  assert.equal(actions[0]?.action, "verify");
+  assert.equal(prompts.length - promptsAfterStart, 2);
+  assert.match(prompts.at(-1)!, /noop is not a valid action/u);
+  await worker.close();
+});
+
+test("the current context carries the last verification summary", async () => {
+  const { session, prompts } = createFakeSession([
+    { stopReason: "stop", text: "ack" },
+    { stopReason: "stop", text: JSON.stringify({ action: "verify", reason: "x" }) },
+  ]);
+  const worker = new PiDecisionWorker(baseOptions({
+    onAction: () => {},
+    sessionFactory: async () => ({ session }),
+  }));
+  await worker.start();
+  const promptsAfterStart = prompts.length;
+  worker.updateContext({ lastVerification: { ok: false, failedChecks: ["unit"], reviewVerdict: "revise", findings: ["F001 [P1] crash on empty input"] } });
+  worker.notify(turnCompletedEvent());
+  while (prompts.length === promptsAfterStart) await flush();
+  assert.match(prompts[promptsAfterStart]!, /"failedChecks": \[\s*"unit"/u);
+  assert.match(prompts[promptsAfterStart]!, /crash on empty input/u);
+  await worker.close();
+});
+
 test("event prompts are compact even when the underlying event payload is large", async () => {
   const largeContent = "x".repeat(100 * 1024);
   const { session, prompts } = createFakeSession([
