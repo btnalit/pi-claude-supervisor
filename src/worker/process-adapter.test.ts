@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, chmod, constants, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, constants, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { claudeJsonlArgs, cleanupCgroup, PROCESS_EMBEDDED_SCRIPTS, preflightCgroupContainment, ProcessWorkerAdapter, processGroupHasLiveMember } from "./process-adapter.ts";
+import { claudeJsonlArgs, cleanupCgroup, currentCgroupPath, PROCESS_EMBEDDED_SCRIPTS, preflightCgroupContainment, ProcessWorkerAdapter, processGroupHasLiveMember } from "./process-adapter.ts";
 
 const requiredCgroupTestAvailable = process.platform === "linux" && await canCreateCgroup();
 
@@ -190,6 +190,19 @@ test("automatic natural exit retains an empty cgroup until lease finalization", 
 
 test("cgroup preflight probes attachment and returns within its bounded cleanup", { skip: !requiredCgroupTestAvailable, timeout: 5_000 }, async () => {
   await preflightCgroupContainment();
+});
+
+test("cgroup preflight against a non-cgroup directory fails without leaving a probe behind", { skip: process.platform !== "linux" }, async () => {
+  // A hybrid host's /sys/fs/cgroup is a tmpfs: mkdir succeeds there but no
+  // control files appear. The probe must fail and remove its directory
+  // rather than create a regular `cgroup.kill` that blocks the rmdir.
+  const parent = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-not-cgroup-"));
+  try {
+    await assert.rejects(() => preflightCgroupContainment(parent), /required cgroup preflight failed/u);
+    assert.deepEqual(await readdir(parent), []);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
 });
 
 test("process adapter reports spawn failures instead of leaving a running record", async () => {
@@ -493,10 +506,9 @@ test("stop cleans descendants after the worker leader exits", async () => {
   await new Promise((resolve) => setTimeout(resolve, 25));
   await adapter.stop(handle, "test orphan cleanup");
   for (let attempt = 0; attempt < 20; attempt++) {
-    try { process.kill(childPid, 0); } catch (error) {
-      if (error instanceof Error && /ESRCH/u.test(error.message)) return;
-      throw error;
-    }
+    // A killed orphan can linger as a zombie when the container's PID 1 does
+    // not reap; that is dead for cleanup purposes.
+    if (!(await processIsLive(childPid))) return;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   assert.fail(`descendant process ${childPid} survived group cleanup`);
@@ -804,10 +816,7 @@ test("processGroupHasLiveMember detects live and reaped process groups", { skip:
 
 async function canCreateCgroup(): Promise<boolean> {
   try {
-    const contents = await readFile("/proc/self/cgroup", "utf8");
-    const match = contents.match(/^0::([^\n]*)$/mu);
-    if (!match) return false;
-    await access(`/sys/fs/cgroup${match[1]}`, constants.W_OK);
+    await access(await currentCgroupPath(), constants.W_OK);
     return true;
   } catch {
     return false;

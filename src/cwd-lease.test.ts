@@ -8,6 +8,9 @@ import test from "node:test";
 import { CwdLeaseStore, pathsOverlap, removeEmptyChildCgroups, workerIdentity } from "./cwd-lease.ts";
 import { currentCgroupPath } from "./worker/process-adapter.ts";
 
+// A hybrid or v1-only host has no delegated v2 hierarchy for these tests.
+const cgroupV2Parent = process.platform === "linux" ? await currentCgroupPath().catch(() => undefined) : undefined;
+
  test("cwd lease stale-lock reclamation is token and inode bound", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-lock-"));
   const leaseDir = join(root, "leases");
@@ -105,7 +108,7 @@ test("cwd lease takeover requires an explicit dead-owner and dead-worker proof",
 });
 
 test("automatic process takeover replaces a lease and then removes its cgroup", async (t) => {
-  if (process.platform !== "linux") {
+  if (!cgroupV2Parent) {
     t.skip("Linux cgroup v2 is required");
     return;
   }
@@ -115,7 +118,7 @@ test("automatic process takeover replaces a lease and then removes its cgroup", 
   let cgroupPath: string | undefined;
   try {
     await mkdir(cwd);
-    const parent = await currentCgroupPath();
+    const parent = cgroupV2Parent!;
     const workerId = randomUUID();
     cgroupPath = join(parent, `pi-claude-supervisor-${workerId}`);
     try {
@@ -173,7 +176,7 @@ test("a durable pre-spawn lease can be replaced before cgroup creation", async (
 });
 
 test("automatic provisional lease identity supports takeover before Worker PID registration", async (t) => {
-  if (process.platform !== "linux") {
+  if (!cgroupV2Parent) {
     t.skip("Linux cgroup v2 is required");
     return;
   }
@@ -183,7 +186,7 @@ test("automatic provisional lease identity supports takeover before Worker PID r
   let cgroupPath: string | undefined;
   try {
     await mkdir(cwd);
-    const parent = await currentCgroupPath();
+    const parent = cgroupV2Parent!;
     const workerId = randomUUID();
     cgroupPath = join(parent, `pi-claude-supervisor-${workerId}`);
     try { await mkdir(cgroupPath); }
@@ -210,15 +213,15 @@ test("automatic provisional lease identity supports takeover before Worker PID r
 });
 
 test("startup takeover reconciles a cgroup created after its provisional plan", async (t) => {
-  if (process.platform !== "linux") {
-    t.skip("Linux cgroup identity is required");
+  if (!cgroupV2Parent) {
+    t.skip("Linux cgroup v2 is required");
     return;
   }
   const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-startup-resource-"));
   const leaseDir = join(root, "leases");
   const cwd = join(root, "repo");
   const workerId = randomUUID();
-  const cgroupPath = `${await currentCgroupPath()}/pi-claude-supervisor-${workerId}`;
+  const cgroupPath = `${cgroupV2Parent!}/pi-claude-supervisor-${workerId}`;
   await mkdir(cwd);
   const store = new CwdLeaseStore(leaseDir);
   const old = await store.acquire(cwd, "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "jsonl", { startup: true });
@@ -256,15 +259,15 @@ test("startup takeover reconciles a cgroup created after its provisional plan", 
 });
 
 test("automatic tmux startup takeover reconciles a planned cgroup before server identity", async (t) => {
-  if (process.platform !== "linux") {
-    t.skip("Linux cgroup identity is required");
+  if (!cgroupV2Parent) {
+    t.skip("Linux cgroup v2 is required");
     return;
   }
   const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-tmux-startup-resource-"));
   const leaseDir = join(root, "leases");
   const cwd = join(root, "repo");
   const workerId = randomUUID();
-  const cgroupPath = `${await currentCgroupPath()}/pi-claude-supervisor-tmux-${workerId}`;
+  const cgroupPath = `${cgroupV2Parent!}/pi-claude-supervisor-tmux-${workerId}`;
   const sessionName = `pi-supervisor-${workerId}`;
   const tmuxSocket = `/tmp/pi-cs-${workerId}.sock`;
   await mkdir(cwd);
@@ -351,7 +354,7 @@ test("tmux handoff refuses an unreconciled pending cleanup transaction", async (
 });
 
 test("releasing an automatic lease removes its retained empty cgroup", async (t) => {
-  if (process.platform !== "linux") {
+  if (!cgroupV2Parent) {
     t.skip("Linux cgroup v2 is required");
     return;
   }
@@ -361,7 +364,7 @@ test("releasing an automatic lease removes its retained empty cgroup", async (t)
   let cgroupPath: string | undefined;
   try {
     await mkdir(cwd);
-    const parent = await currentCgroupPath();
+    const parent = cgroupV2Parent!;
     const workerId = randomUUID();
     cgroupPath = join(parent, `pi-claude-supervisor-${workerId}`);
     try { await mkdir(cgroupPath); }
@@ -379,7 +382,7 @@ test("releasing an automatic lease removes its retained empty cgroup", async (t)
 });
 
 test("replacement-phase pending cleanup retains the replacement lease", async (t) => {
-  if (process.platform !== "linux") {
+  if (!cgroupV2Parent) {
     t.skip("Linux cgroup v2 is required");
     return;
   }
@@ -389,7 +392,7 @@ test("replacement-phase pending cleanup retains the replacement lease", async (t
   let cgroupPath: string | undefined;
   try {
     await mkdir(cwd);
-    const parent = await currentCgroupPath();
+    const parent = cgroupV2Parent!;
     const workerId = randomUUID();
     cgroupPath = join(parent, `pi-claude-supervisor-${workerId}`);
     try { await mkdir(cgroupPath); }
@@ -422,7 +425,7 @@ test("replacement-phase pending cleanup retains the replacement lease", async (t
 });
 
 test("pending takeover cleanup is reconciled before lease discovery", async (t) => {
-  if (process.platform !== "linux") {
+  if (!cgroupV2Parent) {
     t.skip("Linux cgroup v2 is required");
     return;
   }
@@ -432,7 +435,7 @@ test("pending takeover cleanup is reconciled before lease discovery", async (t) 
   let cgroupPath: string | undefined;
   try {
     await mkdir(cwd);
-    const parent = await currentCgroupPath();
+    const parent = cgroupV2Parent!;
     const workerId = randomUUID();
     cgroupPath = join(parent, `pi-claude-supervisor-${workerId}`);
     try {
@@ -465,8 +468,8 @@ test("pending takeover cleanup is reconciled before lease discovery", async (t) 
 });
 
 test("automatic tmux takeover reclaims a guardian-cleaned lease", async (t) => {
-  if (process.platform !== "linux" || spawnSync("tmux", ["-V"], { stdio: "ignore" }).status !== 0) {
-    t.skip("Linux tmux is required");
+  if (!cgroupV2Parent || spawnSync("tmux", ["-V"], { stdio: "ignore" }).status !== 0) {
+    t.skip("Linux cgroup v2 and tmux are required");
     return;
   }
   const root = await mkdtemp(join(tmpdir(), "p-"));
@@ -475,7 +478,7 @@ test("automatic tmux takeover reclaims a guardian-cleaned lease", async (t) => {
   let cgroupPath: string | undefined;
   try {
     await mkdir(cwd);
-    const parent = await currentCgroupPath();
+    const parent = cgroupV2Parent!;
     const workerId = randomUUID();
     cgroupPath = join(parent, `pi-claude-supervisor-tmux-${workerId}`);
     try {

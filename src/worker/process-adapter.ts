@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants as fsConstants, readFileSync } from "node:fs";
-import { access, mkdir, readFile, readdir, rmdir, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rmdir, stat, statfs, writeFile } from "node:fs/promises";
 import { delimiter, isAbsolute, join } from "node:path";
 import type {
   WorkerAdapter,
@@ -983,10 +983,24 @@ async function assertExecutable(command: string, pathValue: string | undefined):
   throw new Error(`worker executable preflight failed (ENOENT): ${command}`);
 }
 
+/** statfs(2) f_type of a cgroup v2 mount (CGROUP2_SUPER_MAGIC). */
+const CGROUP2_SUPER_MAGIC = 0x63677270;
+
 export async function currentCgroupPath(): Promise<string> {
   const contents = await readFile("/proc/self/cgroup", "utf8");
   const match = contents.match(/^0::([^\n]*)$/mu);
   if (!match) throw new Error("cgroup v2 is not active");
+  // A hybrid (v1 + v2) host also lists a `0::` line, but its unified
+  // hierarchy is not mounted at /sys/fs/cgroup — that is a tmpfs holding the
+  // v1 controllers. Creating a "cgroup" there only makes an ordinary directory
+  // with no controls, so require the real cgroup2 filesystem first.
+  let type: number;
+  try {
+    type = (await statfs("/sys/fs/cgroup")).type;
+  } catch (error) {
+    throw new Error(`cgroup v2 is not mounted at /sys/fs/cgroup: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  }
+  if (type !== CGROUP2_SUPER_MAGIC) throw new Error("cgroup v2 is not mounted at /sys/fs/cgroup (a cgroup v1 or hybrid host)");
   // /proc/self/cgroup uses the same escaped component spelling as the cgroup
   // filesystem (for example, a literal `\\x2d` in a systemd scope name).
   return `/sys/fs/cgroup${match[1]}`;
@@ -1043,7 +1057,10 @@ export async function preflightCgroupContainment(parentPath?: string): Promise<v
     throw new Error(`required cgroup preflight failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
   } finally {
     if (probePath) {
-      try { await writeFile(`${probePath}/cgroup.kill`, "1" + String.fromCharCode(10)); } catch {}
+      // O_WRONLY without O_CREAT: kill through an existing control file only.
+      // The default `w` flag would create a regular file in a directory that
+      // turned out not to be a cgroup, and that file then blocks its rmdir.
+      try { await writeFile(`${probePath}/cgroup.kill`, "1" + String.fromCharCode(10), { flag: fsConstants.O_WRONLY }); } catch {}
     }
     const child = probeChild;
     if (child && child.exitCode === null) {
