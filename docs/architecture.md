@@ -591,11 +591,14 @@ When automatic supervision is enabled, a successful check set is passed to a
 fresh read-only Reviewer session. The Reviewer receives the task specification, repository status/diff evidence,
 check results and bounded Worker completion evidence, but not the Decision Worker
 conversation or control channel. It can inspect only `read`, `grep`, `find` and `ls`, and must return
-`pass`, `revise` or `human` with bounded structured findings. Invalid Reviewer
+`pass`, `revise` or `human` with bounded structured findings. Its answer must
+carry a random `reviewId` that appears only in its own prompt, so a verdict
+object quoted from the repository can never be taken for the answer; an answer
+without it, or two different ones, earns one corrective re-prompt. Invalid Reviewer
 output, incomplete evidence or a Reviewer API failure must prevent a candidate
 from crossing the remote/main boundary; the local system may retry, repair or
-park it without requiring a human to be online. The Reviewer retries a provider
-error once within a total review budget
+park it without requiring a human to be online. The Reviewer retries provider
+errors with a fresh session within a total review budget
 (`PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS`, default 10 minutes). Truncated
 (oversize) evidence requests a bounded repair before parking, while incomplete
 evidence still parks.

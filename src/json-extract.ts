@@ -4,12 +4,7 @@
  * objects: prose is harmless, but ambiguity must remain non-publishable.
  */
 export function extractJsonObjects(text: string): unknown[] {
-  return extractJsonObjectSpans(text).map((span) => span.value);
-}
-
-/** The same objects, with the character range each was parsed from (`end` inclusive). */
-export function extractJsonObjectSpans(text: string): Array<{ value: unknown; start: number; end: number }> {
-  const objects: Array<{ value: unknown; start: number; end: number }> = [];
+  const objects: unknown[] = [];
   let offset = 0;
   while (offset < text.length) {
     const start = text.indexOf("{", offset);
@@ -22,7 +17,7 @@ export function extractJsonObjectSpans(text: string): Array<{ value: unknown; st
     const candidate = text.slice(start, end + 1);
     try {
       const value = JSON.parse(candidate) as unknown;
-      if (value && typeof value === "object" && !Array.isArray(value)) objects.push({ value, start, end });
+      if (value && typeof value === "object" && !Array.isArray(value)) objects.push(value);
       offset = end + 1;
     } catch {
       offset = start + 1;
