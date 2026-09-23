@@ -250,7 +250,7 @@ export class PiDecisionWorker implements DecisionWorkerLike {
       // idle forever; the Supervisor parks it. Ask once for a concrete action.
       if (!repromptAttempted && action.action === "noop" && (event.type === "turn_completed" || event.type === "permission_request")) {
         repromptAttempted = true;
-        prompt = `noop is not a valid action for a ${event.type} event: the Worker is waiting on you and nothing will happen. Choose a concrete action (for example continue, verify, wait, or a permission decision) and return exactly one JSON object now.`;
+        prompt = `noop is not a valid action for a ${event.type} event: the Worker is waiting on you and nothing will happen. Choose a concrete action (for example continue, redirect or verify for a completed turn, or allow_permission/deny_permission for a permission request) and return exactly one JSON object now.`;
         continue;
       }
       // An action handler may stop or close the session. Do not replay an
@@ -279,7 +279,7 @@ export class PiDecisionWorker implements DecisionWorkerLike {
       ), this.#timeoutMs, "Decision Worker compaction");
       this.#instructionsStale = true;
     } catch {
-      await this.#session?.abortCompaction?.();
+      try { this.#session?.abortCompaction?.(); } catch { /* best effort */ }
       // A compaction failure must not fail the decision that already succeeded.
     }
   }

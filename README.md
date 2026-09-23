@@ -393,8 +393,9 @@ check (120s timeout) and the env autonomy defaults below.
 Environment variables (or `~/.config/pi-claude-supervisor/env`), all prefixed
 `PI_CLAUDE_SUPERVISOR_`; see `.env.example` for a template. The env file takes
 `KEY=value` lines, optionally prefixed with `export ` and followed by a
-` # comment`. A value that is out of range or unparsable keeps the default and is
-reported once as a `pi-claude-supervisor: ignoring …` warning.
+` # comment`. A numeric, duration or boolean value that is out of range or
+unparsable keeps the default and is reported once as a
+`pi-claude-supervisor: ignoring …` warning.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -432,7 +433,7 @@ reported once as a `pi-claude-supervisor: ignoring …` warning.
 | `DECISION_SESSION_RETENTION_DAYS` | `30` | Prunes closed Decision Worker session records older than this; `0` keeps forever |
 | `EVIDENCE_MAX_BYTES` | `1048576` (1 MiB) | Maximum repository evidence bytes collected per task |
 | `EVIDENCE_MAX_UNTRACKED_FILES` | `512` | Maximum untracked files collected as evidence per task |
-| `REVIEW_TIMEOUT_MS` | `10m` (30s–1h) | Total independent Reviewer budget per round, including retries of provider errors and timeouts |
+| `REVIEW_TIMEOUT_MS` | `10m` (30s–1h) | Total independent Reviewer budget per round; a provider error is retried with a fresh session while budget remains |
 | `DEADLINE_MS` | `4h` | Wall-clock budget per task, measured from its start — time Pi was down counts too, so `recover --extend` grants a fresh budget (`8h`, `90m`, `2h30m` or ms; 5m–7d); `0` (or `0m`) disables it; `--deadline` overrides it per task |
 | `DEADLINE_GRACE_MS` | `30m` | Close-out window after the deadline for automatic tasks: an idle Worker is verified instead of stopped; `0` restores the immediate stop |
 | `DEADLINE_WARNING_MS` | `15m` | How long before the deadline the Decision Worker is warned and re-asked; `0` disables the warning |

@@ -1,4 +1,5 @@
 import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
+import { isDeepStrictEqual } from "node:util";
 import { extractJsonObjects } from "./json-extract.ts";
 import { redactSensitive } from "./redaction.ts";
 import type { AcceptanceReport, PiUsageSample, ReviewFinding, ReviewReport, TaskSpec } from "./types.ts";
@@ -43,16 +44,24 @@ export interface PiReadOnlyReviewerOptions {
   timeoutMs?: number;
   /** Pi model for Reviewer sessions; undefined keeps Pi's configured default. */
   model?: PiModel;
+  /** Test seam: creates the Reviewer's Pi session. */
+  sessionFactory?: typeof createAgentSession;
+  /** First retry cooldown; later cooldowns triple. */
+  retryCooldownMs?: number;
 }
 
 export class PiReadOnlyReviewer implements TaskReviewer {
   readonly #timeoutMs: number;
   readonly #model: PiModel | undefined;
+  readonly #sessionFactory: typeof createAgentSession;
+  readonly #retryCooldownMs: number;
 
   constructor(options: PiReadOnlyReviewerOptions = {}) {
-    // #timeoutMs is a TOTAL deadline across both attempts, not a per-attempt budget.
+    // #timeoutMs is a TOTAL deadline across every attempt, not a per-attempt budget.
     this.#timeoutMs = options.timeoutMs ?? 600_000;
     this.#model = options.model;
+    this.#sessionFactory = options.sessionFactory ?? createAgentSession;
+    this.#retryCooldownMs = options.retryCooldownMs ?? REVIEW_RETRY_COOLDOWN_MS;
   }
 
   async review(input: ReviewInput): Promise<ReviewReport> {
@@ -61,14 +70,14 @@ export class PiReadOnlyReviewer implements TaskReviewer {
     }
     const deadline = Date.now() + this.#timeoutMs;
     // Provider errors (429/529, overload, network) and timeouts are retried
-    // with a fresh session and a growing cooldown while budget remains. The
-    // first attempt gets most of the budget, not all of it, so a hung request
-    // still leaves room for a retry instead of ending the task as `human`.
+    // with a fresh session and a growing cooldown while budget remains. Every
+    // attempt may use all of the remaining budget: a legitimately slow review
+    // must not be cut short to reserve room for a retry it did not need.
     let failure: { message: string; usage?: NonNullable<ReviewReport["usage"]> } | undefined;
     for (let attempt = 0; attempt < REVIEW_MAX_ATTEMPTS; attempt += 1) {
       if (attempt > 0) {
-        const cooldown = Math.min(REVIEW_RETRY_MAX_COOLDOWN_MS, REVIEW_RETRY_COOLDOWN_MS * 3 ** (attempt - 1));
-        if (deadline - Date.now() < cooldown + REVIEW_MIN_ATTEMPT_MS) break;
+        const cooldown = Math.min(REVIEW_RETRY_MAX_COOLDOWN_MS, this.#retryCooldownMs * 3 ** (attempt - 1));
+        if (deadline - Date.now() < cooldown + Math.min(REVIEW_MIN_ATTEMPT_MS, this.#timeoutMs / 4)) break;
         await abortableDelay(cooldown, input.signal);
       }
       if (input.signal?.aborted) {
@@ -78,9 +87,8 @@ export class PiReadOnlyReviewer implements TaskReviewer {
       }
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
-      const budget = attempt === 0 && remaining > 2 * REVIEW_MIN_ATTEMPT_MS ? Math.floor(remaining * 0.6) : remaining;
       try {
-        const outcome = await this.#attempt(input, Math.max(1, budget));
+        const outcome = await this.#attempt(input, Math.max(1, remaining));
         if (outcome.kind === "report") return outcome.report;
         failure = { message: outcome.message, ...(outcome.usage ? { usage: outcome.usage } : {}) };
       } catch (error) {
@@ -104,7 +112,7 @@ export class PiReadOnlyReviewer implements TaskReviewer {
       noContextFiles: true,
       systemPrompt: "You are an independent read-only code reviewer. Never modify files, execute shell commands, send Worker input, or grant permissions.",
     });
-    const { session } = await createAgentSession({
+    const { session } = await this.#sessionFactory({
       cwd: input.cwd,
       resourceLoader,
       sessionManager: SessionManager.inMemory(input.cwd),
@@ -321,7 +329,7 @@ export function parseReview(text: string, round: number): ReviewReport {
   try {
     const objects = extractJsonObjects(text);
     if (objects.length === 0) throw new Error("Reviewer output did not contain a JSON object");
-    const value = selectVerdictObject(objects);
+    const value = selectVerdictObject(text, objects);
     const verdict = normalizeVerdict(value.verdict);
     if (!verdict) throw new Error("unsupported verdict");
     const summary = typeof value.summary === "string" && value.summary.trim() ? value.summary.trim() : "no summary provided";
@@ -337,8 +345,6 @@ export function parseReview(text: string, round: number): ReviewReport {
   }
 }
 
-const VERDICT_CAUTION = { pass: 0, revise: 1, human: 2 } as const;
-
 function normalizeVerdict(value: unknown): ReviewReport["verdict"] | undefined {
   if (typeof value !== "string") return undefined;
   const verdict = value.trim().toLowerCase();
@@ -346,21 +352,25 @@ function normalizeVerdict(value: unknown): ReviewReport["verdict"] | undefined {
 }
 
 /**
- * The reply's verdict object. Models echo the schema (`"pass|revise|human"`),
- * quote small JSON snippets from the repository, or restate the answer; only
- * objects carrying a valid verdict are candidates. When candidates disagree
- * the most cautious verdict wins, so a `pass` quoted from untrusted evidence
- * can never outvote the Reviewer's own `revise` or `human`.
+ * The reply's single verdict object. Anything ambiguous is a format failure
+ * (which earns one corrective re-prompt), never a guess: two different
+ * objects carrying a `verdict` — a restated answer that dropped the findings,
+ * the schema echoed back, or a `{"verdict":"pass"}` quoted from a repository
+ * file the Worker controls — and a `"verdict":` that did not parse (the
+ * Reviewer's own object broken by a trailing comma, leaving only a quoted one)
+ * are all refused. Objects without a `verdict` key (quoted snippets, a
+ * finding extracted from a broken reply) are ignored.
  */
-function selectVerdictObject(objects: unknown[]): Record<string, unknown> {
-  const candidates = objects.filter((value): value is Record<string, unknown> =>
-    Boolean(value) && typeof value === "object" && !Array.isArray(value) && normalizeVerdict((value as Record<string, unknown>).verdict) !== undefined);
-  if (candidates.length === 0) throw new Error("Reviewer output did not contain an object with a valid verdict");
-  let selected = candidates[candidates.length - 1]!;
-  for (const candidate of candidates) {
-    if (VERDICT_CAUTION[normalizeVerdict(candidate.verdict)!] > VERDICT_CAUTION[normalizeVerdict(selected.verdict)!]) selected = candidate;
+function selectVerdictObject(text: string, objects: unknown[]): Record<string, unknown> {
+  const withVerdict = objects.filter((value): value is Record<string, unknown> =>
+    Boolean(value) && typeof value === "object" && !Array.isArray(value) && Object.hasOwn(value as object, "verdict"));
+  if (withVerdict.length === 0) throw new Error("Reviewer output did not contain an object with a verdict");
+  const written = text.match(/"verdict"\s*:/gu)?.length ?? 0;
+  if (written > withVerdict.length) throw new Error("Reviewer output contained a verdict object that is not valid JSON");
+  if (withVerdict.slice(1).some((value) => !isDeepStrictEqual(value, withVerdict[0]))) {
+    throw new Error("Reviewer output contained multiple distinct verdict objects");
   }
-  return selected;
+  return withVerdict[0]!;
 }
 
 const SEVERITY_ALIASES: Record<string, ReviewFinding["severity"]> = {

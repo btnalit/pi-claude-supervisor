@@ -229,7 +229,9 @@ function rejectSetting(name: string | undefined, value: string, reason: string, 
 export function envFileValue(raw: string): string {
   const quoted = raw.match(/^(?:"([^"]*)"|'([^']*)')(?:\s+#.*)?$/u);
   if (quoted) return quoted[1] ?? quoted[2] ?? "";
-  return raw.replace(/(?:^|\s+)#.*$/u, "").trim();
+  // A comment needs whitespace before its `#`, as in a shell: `KEY=#abc`
+  // is the value `#abc` (a webhook secret may well start with one).
+  return raw.replace(/\s+#.*$/u, "").trim();
 }
 
 function readBoolean(value: string | undefined, fallback: boolean, name?: string): boolean {

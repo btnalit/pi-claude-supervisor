@@ -64,7 +64,7 @@ test("env-file values accept quotes and trailing comments", () => {
   assert.equal(envFileValue('"auto" # enable'), "auto");
   assert.equal(envFileValue("'a # b'"), "a # b");
   assert.equal(envFileValue("https://example.invalid/hook?key=x#frag"), "https://example.invalid/hook?key=x#frag");
-  assert.equal(envFileValue("# only a comment"), "");
+  assert.equal(envFileValue("#starts-with-a-hash"), "#starts-with-a-hash");
 });
 
 test("the env file accepts shell-style export lines and comments", async () => {
