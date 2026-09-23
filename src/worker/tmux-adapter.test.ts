@@ -1624,3 +1624,68 @@ test("writeRoots carry the scratchpad and the project memory directory", () => {
   assert.deepEqual(writeRootsOf({ handle, transcriptPath: relocated, claudeConfigDir: "/home/u/.claude-work" }), ["/home/u/.claude-work/projects/-mnt-work-Repo/memory"]);
   assert.deepEqual(writeRootsOf({ handle, transcriptPath: relocated }, configDir), [], "without it, another configuration directory is not this Claude's");
 });
+
+test("the bridge reassembles a framed long message and drops a failed send's leftover part", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  // Drives the embedded bridge script directly in a private tmux server with
+  // a fake Claude, so the framing protocol is exercised without cgroups.
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "pi-claude-supervisor-bridge-frame-")));
+  const socket = join(dir, "tmux.sock");
+  const received = join(dir, "received.jsonl");
+  const paneLog = join(dir, "pane.log");
+  const fakeClaude = join(dir, "fake-claude.mjs");
+  await writeFile(fakeClaude, `import { appendFileSync } from "node:fs";
+import readline from "node:readline";
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  appendFileSync(${JSON.stringify(received)}, line + "\\n");
+  process.stdout.write(JSON.stringify({ type: "result", subtype: "success" }) + "\\n");
+});
+`);
+  await writeFile(paneLog, "");
+  const encode = (value: string) => Buffer.from(value, "utf8").toString("base64");
+  const env = {
+    ...process.env,
+    PI_CLAUDE_SUPERVISOR_TMUX_COMMAND: encode(process.execPath),
+    PI_CLAUDE_SUPERVISOR_TMUX_ARGS: encode(JSON.stringify([fakeClaude])),
+    PI_CLAUDE_SUPERVISOR_TMUX_CWD: encode(dir),
+    PI_CLAUDE_SUPERVISOR_TMUX_CGROUP: encode(""),
+  };
+  const tmux = (...args: string[]) => spawnSync("tmux", ["-f", "/dev/null", "-S", socket, ...args], { env, encoding: "utf8" });
+  try {
+    assert.equal(tmux("new-session", "-d", "-s", "bridge", "-x", "160", "-y", "40", "-c", dir, "--", "sh", "-c", "sleep 0.3; exec \"$0\" -e \"$1\"", process.execPath, TMUX_EMBEDDED_SCRIPTS.bridge).status, 0);
+    assert.equal(tmux("pipe-pane", "-o", "-t", "bridge", `cat >> ${paneLog}`).status, 0);
+    let generation = "";
+    for (let attempt = 0; attempt < 50 && !generation; attempt += 1) {
+      const frame = (await readFile(paneLog, "utf8")).match(/PI_CLAUDE_SUPERVISOR_EVENT;([A-Za-z0-9+/=]+)/u);
+      if (frame) generation = (JSON.parse(Buffer.from(frame[1]!, "base64").toString("utf8")) as { generation?: string }).generation ?? "";
+      else await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(generation, "the bridge announced its generation");
+    const sendLine = async (line: string) => {
+      assert.equal(spawnSync("tmux", ["-f", "/dev/null", "-S", socket, "load-buffer", "-b", "frame", "-"], { input: line, env }).status, 0);
+      assert.equal(tmux("paste-buffer", "-p", "-d", "-b", "frame", "-t", "bridge").status, 0);
+      assert.equal(tmux("send-keys", "-t", "bridge", "Enter").status, 0);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    };
+    const sendFramed = async (message: string) => {
+      const base64 = encode(message);
+      let parts = 0;
+      for (let offset = 0; offset + 2_000 < base64.length; offset += 2_000) await sendLine(`@pi:control ${generation} @pi:part ${parts++} ${base64.slice(offset, offset + 2_000)}`);
+      await sendLine(`@pi:control ${generation} @pi:user ${parts} ${base64.slice(Math.floor(Math.max(0, base64.length - 1) / 2_000) * 2_000)}`);
+    };
+    // A send that failed after its first part left this behind.
+    await sendLine(`@pi:control ${generation} @pi:part 0 ${encode("LEFTOVER".repeat(300)).slice(0, 2_000)}`);
+    await sendFramed("short follow-up");
+    const long = `repair:${"界".repeat(3_000)}`;
+    await sendFramed(long);
+    let lines: string[] = [];
+    for (let attempt = 0; attempt < 50 && lines.length < 2; attempt += 1) {
+      lines = (await readFile(received, "utf8").catch(() => "")).split("\n").filter(Boolean);
+      if (lines.length < 2) await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const contents = lines.map((line) => (JSON.parse(line) as { message: { content: string } }).message.content);
+    assert.deepEqual(contents, ["short follow-up", long]);
+  } finally {
+    tmux("kill-server");
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -372,22 +372,43 @@ child.once("exit", (code, signal) => {
   process.exit(code ?? 1);
 });
 // The PTY's canonical line limit (4095 bytes) truncates a long control line,
-// so the Supervisor splits a payload's base64 across @pi:part lines and this
-// reassembles it before the final @pi:user/@pi:json line.
+// so the Supervisor splits a payload's base64 across numbered
+// "@pi:part <index> <chunk>" lines and names the part count on the final
+// "@pi:user|json <count> <chunk>" line. Part 0 discards whatever a failed
+// earlier send left behind, and a count that does not match drops the frame
+// rather than delivering a spliced message.
 let pendingPayload = "";
+let pendingParts = 0;
 const forwardSupervisorCommand = (commandLine) => {
-  if (commandLine.startsWith("@pi:part ")) {
-    pendingPayload += commandLine.slice("@pi:part ".length);
+  const part = commandLine.match(/^@pi:part (\\d+) ([A-Za-z0-9+/=]*)$/u);
+  if (part) {
+    if (part[1] === "0") { pendingPayload = ""; pendingParts = 0; }
+    if (Number(part[1]) !== pendingParts) { pendingPayload = ""; pendingParts = -1; return; }
+    pendingPayload += part[2];
+    pendingParts += 1;
     return;
   }
-  const payload = (prefix) => { const value = pendingPayload + commandLine.slice(prefix.length); pendingPayload = ""; return value; };
+  const payload = (prefix) => {
+    const framed = commandLine.slice(prefix.length).match(/^(\\d+) ([A-Za-z0-9+/=]*)$/u);
+    const count = framed ? Number(framed[1]) : -1;
+    // 0 parts: a single-line frame; anything pending is a failed send's leftover.
+    const value = framed && (count === 0 || count === pendingParts) ? (count === 0 ? "" : pendingPayload) + framed[2] : undefined;
+    pendingPayload = "";
+    pendingParts = 0;
+    if (value === undefined) output("\\n[incomplete Supervisor input discarded]\\n");
+    return value;
+  };
   if (commandLine.startsWith("@pi:user ")) {
+    const value = payload("@pi:user ");
+    if (value === undefined) return;
     inputActive = true;
-    child.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: decodeLine(payload("@pi:user ")) } }) + "\\n");
+    child.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: decodeLine(value) } }) + "\\n");
     return;
   }
   if (commandLine.startsWith("@pi:json ")) {
-    const message = decodeLine(payload("@pi:json "));
+    const value = payload("@pi:json ");
+    if (value === undefined) return;
+    const message = decodeLine(value);
     child.stdin.write(message.endsWith("\\n") ? message : message + "\\n");
     return;
   }
@@ -406,6 +427,7 @@ input.on("line", (line) => {
     clearSupervisorInput();
     if (generation !== bridgeGeneration) {
       pendingPayload = "";
+      pendingParts = 0;
       output("\\n[stale Supervisor input rejected]\\n");
       return;
     }
@@ -1113,7 +1135,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       record.turnObservedOutput = false;
       record.inputAt = Date.now();
       if (record.interactive) {
-        record.pendingSentMessages.push(message);
+        // What the pane receives (and UserPromptSubmit echoes) is the
+        // sanitised text; matching the raw message would count the
+        // Supervisor's own turn as human input and pause automation.
+        record.pendingSentMessages.push(safeTmuxMessage(message));
         while (record.pendingSentMessages.length > 50) record.pendingSentMessages.shift();
       }
       try {
@@ -1122,7 +1147,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         record.lastInputAt = new Date().toISOString();
       } catch (error) {
         if (record.interactive) {
-          const index = record.pendingSentMessages.lastIndexOf(message);
+          const index = record.pendingSentMessages.lastIndexOf(safeTmuxMessage(message));
           if (index >= 0) record.pendingSentMessages.splice(index, 1);
         }
         record.activeRequests = 0;
@@ -1176,11 +1201,13 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
    * is far past 4 KB; a single line was silently truncated by the terminal.
    */
   async #sendFramed(record: TmuxRecord, command: "@pi:user" | "@pi:json", base64: string): Promise<void> {
+    let parts = 0;
     for (let offset = 0; offset + BRIDGE_FRAME_CHUNK_CHARS < base64.length; offset += BRIDGE_FRAME_CHUNK_CHARS) {
-      await this.#sendLine(record, this.#bridgeControl(record, `@pi:part ${base64.slice(offset, offset + BRIDGE_FRAME_CHUNK_CHARS)}`));
+      await this.#sendLine(record, this.#bridgeControl(record, `@pi:part ${parts} ${base64.slice(offset, offset + BRIDGE_FRAME_CHUNK_CHARS)}`));
+      parts += 1;
     }
     const lastOffset = base64.length === 0 ? 0 : Math.floor((base64.length - 1) / BRIDGE_FRAME_CHUNK_CHARS) * BRIDGE_FRAME_CHUNK_CHARS;
-    await this.#sendLine(record, this.#bridgeControl(record, `${command} ${base64.slice(lastOffset)}`));
+    await this.#sendLine(record, this.#bridgeControl(record, `${command} ${parts} ${base64.slice(lastOffset)}`));
   }
 
   #bridgeControl(record: TmuxRecord, commandLine: string): string {
@@ -2394,9 +2421,10 @@ function redactSensitiveText(value: string): string {
 function safeTmuxMessage(value: string): string {
   const withoutEscapes = value
     // OSC … BEL/ST, then CSI sequences, then any other two-byte ESC sequence.
-    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?/gu, "")
+    .replace(/\u001b\][^\u0007\u001b\r\n]*(?:\u0007|\u001b\\)?/gu, "")
     .replace(/(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/gu, "")
-    .replace(/\u001b[@-_]?/gu, "");
+    // Charset designation (ESC ( B from tput sgr0) and other ESC + final byte.
+    .replace(/\u001b[ -/]*[0-~]?/gu, "");
   const normalized = withoutEscapes.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
   let safe = "";
   for (const character of normalized) {
@@ -2409,7 +2437,7 @@ function safeTmuxMessage(value: string): string {
 function stripInternalBridgeEcho(value: string): string {
   return value
     .replaceAll("\u001b[1A\r\u001b[2K\u001b[1B\r", "")
-    .replace(/(?:^|\r?\n)[^\r\n]*@pi:(?:user|json|part) [A-Za-z0-9+/=]+\r?(?=\n|$)/gu, "\n")
+    .replace(/(?:^|\r?\n)[^\r\n]*@pi:(?:user|json|part) (?:\d+ )?[A-Za-z0-9+/=]*\r?(?=\n|$)/gu, "\n")
     .replace(/(?:^|\r?\n)[^\r\n]*@pi:stop\r?(?=\n|$)/gu, "\n");
 }
 

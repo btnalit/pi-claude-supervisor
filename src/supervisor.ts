@@ -219,6 +219,8 @@ export class Supervisor {
   #lastTurnCompleted?: WorkerEvent;
   /** Key of the completed turn whose decision is still in flight; the deadline must not verify underneath it. */
   #pendingDecisionKey?: string;
+  /** When the pending decision was requested; bounds how long an idle timeout defers to it. */
+  #pendingDecisionSince = 0;
   /**
    * Publish phase. Authority exists only between "acceptance and Reviewer
    * passed" and "the publish turn completed", and only for `#verifiedHead` on
@@ -1187,7 +1189,10 @@ export class Supervisor {
     // nothing must be marked as pending on its account.
     if (replay && !this.#decision.replay) return;
     this.#decision.updateContext(this.#decisionContextPatch());
-    if (event.type === "turn_completed") this.#pendingDecisionKey = workerEventKey(event);
+    if (event.type === "turn_completed") {
+      this.#pendingDecisionKey = workerEventKey(event);
+      this.#pendingDecisionSince = Date.now();
+    }
     if (replay) this.#decision.replay!(event);
     else this.#decision.notify(event);
   }
@@ -2489,10 +2494,15 @@ export class Supervisor {
     // turn and is waiting (typically on background work that never came
     // back). Judge the work instead of killing it and discarding the chance
     // of a candidate; a Worker silent in the middle of a turn is still stopped.
+    // A Worker that never completed a turn under this Supervisor (recovered,
+    // or adopted) still reads `running`; classify it first, as the close-out does.
+    if (reason === "worker produced no output before timeout" && this.#automation && this.#machine.state === "running" && !status.activeRequests) await this.#pollInternal();
     if (reason === "worker produced no output before timeout" && this.#automation && this.#machine.state === "waiting" && !status.activeRequests) {
       // A decision about this idle Worker is still being made (it may be
-      // backing off a provider outage); let it land rather than race it.
-      if (this.#pendingDecisionKey) return;
+      // backing off a provider outage); let it land rather than race it —
+      // but not forever: one that has not landed within another timeout
+      // period never will.
+      if (this.#pendingDecisionKey && now - this.#pendingDecisionSince < this.#noOutputTimeoutMs) return;
       this.#clearWaitTimer();
       await this.#appendEvent({ type: "worker_idle_timeout", taskId, workerId, data: { reason, action: "verify", noOutputTimeoutMs: this.#noOutputTimeoutMs } }).catch(() => {});
       await this.#startVerification(this.#handle, this.#lastTurnCompleted, "no-output timeout");
@@ -2892,11 +2902,13 @@ function removeFlagWithValue(args: readonly string[], flag: string): string[] {
 /**
  * The deadline (in ms since the task started) that grants `extendMs` more
  * from now: measured from the later of the current deadline and the present,
- * so extending an expired task by 30 minutes means 30 minutes from now, and
- * extending by 0 opens its close-out immediately.
+ * so extending an expired task by 30 minutes means 30 minutes from now.
+ * Extending by 0 means "close out now" for any task, expired or not: the
+ * deadline lands on the present so the close-out opens at once.
  */
 export function extendedDeadlineMs(currentDeadlineMs: number, elapsedMs: number, extendMs: number): number {
-  return Math.max(currentDeadlineMs, elapsedMs) + Math.max(0, extendMs);
+  if (extendMs <= 0) return elapsedMs;
+  return Math.max(currentDeadlineMs, elapsedMs) + extendMs;
 }
 
 function canRepairInPlace(adapter: WorkerAdapter): boolean {

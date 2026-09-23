@@ -199,7 +199,7 @@ export class CwdLeaseStore {
           }
           const ownerGone = !existing.pendingCleanup && !await processIdentityLive(existing.ownerPid, existing.ownerStartTime);
           throw new Error(ownerGone
-            ? `working-directory lease is held by task ${existing.taskId}: ${redactText(existing.cwd)}; its Pi (pid ${existing.ownerPid}) is gone but its Worker boundary may still be live — run /supervise recover --takeover ${existing.taskId} to prove it is empty, or use another worktree`
+            ? `working-directory lease is held by task ${existing.taskId}: ${redactText(existing.cwd)}; its Pi (pid ${existing.ownerPid}) is gone but its Worker (a cgroup or tmux session) may still be running. For an automatic task run /supervise recover --takeover ${existing.taskId}; for a manual one, stop or re-adopt its Worker, then delete ${redactText(this.#path(existing.leaseId))}; or use another worktree`
             : `working-directory lease is held by task ${existing.taskId}: ${redactText(existing.cwd)}`);
         }
         if (takeoverLease && takeoverProof) {

@@ -908,15 +908,24 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
               // not remember the task. A failure here leaves the recovered
               // Worker idle under takeover, exactly as a plain recover would.
               if (automaticRecovery && extendMs !== undefined) {
+                const turnBefore = session.turn;
                 try {
                   await session.resumeAutomation();
                   if (extendMs > 0) await session.send(recoveryContinuation(record.spec?.goal ?? record.task));
                   message = extendMs > 0
-                    ? `Worker recovered: task=${record.taskId} worker=${handle.id}; automation resumed with a continuation of the original task; ${formatDurationMs(extendMs)} of budget from now`
+                    ? `Worker recovered: task=${record.taskId} worker=${handle.id}; automation resumed with a continuation of the original task; ${formatDurationMs(Math.max(0, recoveryDeadlineMs - elapsedMs))} of budget from now`
                     : `Worker recovered: task=${record.taskId} worker=${handle.id}; automation resumed; the close-out verifies and reviews the repository as it stands`;
                 } catch (error) {
-                  await session.takeover().catch(() => {});
-                  message = `${message} (automatic resume failed: ${redactText(error instanceof Error ? error.message : String(error))})`;
+                  const detail = redactText(error instanceof Error ? error.message : String(error));
+                  if (session.turn > turnBefore) {
+                    // The continuation reached the Worker (only its audit
+                    // record failed): it is working under automation now,
+                    // and taking it over would leave that turn undecided.
+                    message = `Worker recovered: task=${record.taskId} worker=${handle.id}; automation resumed with a continuation of the original task (warning: ${detail})`;
+                  } else {
+                    await session.takeover().catch(() => {});
+                    message = `${message} (automatic resume failed: ${detail})`;
+                  }
                 }
               }
             } catch (error) {

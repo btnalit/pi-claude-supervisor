@@ -132,7 +132,7 @@ test("an abandoned lease is reclaimed only when nothing of its task can still be
     // A Worker whose leader is still alive keeps its lease, and the refusal
     // says what to do about it.
     await plant("33333333-3333-4333-8333-333333333333", { transport: "process-pipe", pid: process.pid, ownership: "owned" });
-    await assert.rejects(() => store.acquire(cwd, "44444444-4444-4444-8444-444444444444", "process-pipe"), /its Pi \(pid 999999990\) is gone .*recover --takeover 33333333/u);
+    await assert.rejects(() => store.acquire(cwd, "44444444-4444-4444-8444-444444444444", "process-pipe"), /its Pi \(pid 999999990\) is gone .*recover --takeover 33333333.*for a manual one, stop or re-adopt its Worker, then delete /u);
     for (const lease of await store.list()) await rm(join(leaseDir, `${lease.leaseId}.json`), { force: true });
     // A tmux session is meant to outlive its Pi: never reclaimed here.
     await plant("55555555-5555-4555-8555-555555555555", { transport: "tmux", pid: 999999991, ownership: "owned", sessionName: "s", tmuxSocket: "/tmp/nonexistent-pi-cs.sock" });

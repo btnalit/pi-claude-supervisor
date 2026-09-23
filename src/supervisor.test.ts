@@ -3157,7 +3157,8 @@ test("extendedDeadlineMs grants the extension from now for an expired task and f
   assert.equal(extendedDeadlineMs(4 * hour, 5 * hour, 0), 5 * hour);
   // Not yet expired: the extension is added to the remaining budget.
   assert.equal(extendedDeadlineMs(4 * hour, 1 * hour, 30 * 60_000), 4 * hour + 30 * 60_000);
-  assert.equal(extendedDeadlineMs(4 * hour, 1 * hour, -5), 4 * hour);
+  // `--extend 0` closes out now even before the deadline.
+  assert.equal(extendedDeadlineMs(4 * hour, 1 * hour, 0), 1 * hour);
 });
 
 /**
@@ -4003,6 +4004,65 @@ test("a Worker under human takeover is not stopped for silence", async () => {
     assert.ok(["running", "waiting"].includes(supervisor.state));
     assert.ok(!events.events.some((event) => event.type === "worker_watchdog_timeout"));
     await supervisor.stop("test cleanup").catch(() => {});
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a recovered Worker that never completed a turn is verified when it stays idle, not killed", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recovered-idle-"));
+  try {
+    await initializeGitRepository(cwd, "worker/recovered-idle");
+    const fixture = closeOutFixture(cwd);
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "recovered and handed back to automation",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      deadlineMs: 0,
+      noOutputTimeoutMs: 1_000,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    // As `recover` leaves it: under takeover, then resumed, with no turn yet.
+    await supervisor.takeover();
+    await supervisor.resumeAutomation();
+    assert.equal(supervisor.state, "running");
+    await waitFor(() => supervisor.state === "completed");
+    const types = events.events.map((event) => event.type);
+    assert.ok(types.includes("worker_idle_timeout"));
+    assert.ok(!types.includes("worker_watchdog_timeout"));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("an idle timeout defers to a pending decision only for one more timeout period", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-stuck-decision-"));
+  try {
+    await initializeGitRepository(cwd, "worker/stuck-decision");
+    const fixture = closeOutFixture(cwd);
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "a decision that never lands",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      deadlineMs: 0,
+      noOutputTimeoutMs: 1_000,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    // The turn is handed to the Decision Worker, which never answers.
+    fixture.state.listener?.(fixture.turn(1));
+    await supervisor.poll();
+    const started = Date.now();
+    await waitFor(() => supervisor.state === "completed");
+    assert.ok(Date.now() - started >= 900, "the pending decision was given its timeout period first");
+    assert.ok(events.events.some((event) => event.type === "worker_idle_timeout"));
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
