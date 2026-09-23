@@ -2499,7 +2499,13 @@ export class Supervisor {
     if (reason === "worker produced no output before timeout" && this.#automation && this.#machine.state === "running" && !status.activeRequests) {
       await this.#pollInternal();
       // The Worker exited in between: the poll has already classified it.
-      if (!["running", "waiting"].includes(this.#machine.state)) return;
+      // As at the top of this function, a classified exit is verified here
+      // too, in case its `exited` event (which normally drives it) was lost.
+      const polled: string = this.#machine.state;
+      if (polled !== "running" && polled !== "waiting") {
+        if (polled === "verifying" && !this.#verificationAbortController) await this.#verifyInternal();
+        return;
+      }
     }
     if (reason === "worker produced no output before timeout" && this.#automation && this.#machine.state === "waiting" && !status.activeRequests) {
       // A decision about this idle Worker is still being made (it may be

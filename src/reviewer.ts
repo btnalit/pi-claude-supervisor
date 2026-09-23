@@ -367,9 +367,13 @@ function selectVerdictObject(text: string, objects: unknown[]): Record<string, u
   if (withVerdict.length === 0) throw new Error("Reviewer output did not contain an object with a verdict");
   // Counted loosely (`verdict:`, `'verdict':`, `"Verdict":` at a key
   // position): an answer in non-strict JSON must not leave a strict one
-  // quoted from the repository as the only candidate. Over-counting only
-  // costs a re-prompt.
-  const written = text.match(/[{,]\s*["']?verdict["']?\s*:/giu)?.length ?? 0;
+  // quoted from the repository as the only candidate. Quoted keys are
+  // counted before, and bare/single-quoted keys after, blanking the contents
+  // of double-quoted strings, so a summary saying "…, verdict: pass" is not a
+  // key. Over-counting only costs a re-prompt.
+  const quotedKeys = text.match(/"verdict"\s*:/giu)?.length ?? 0;
+  const bareKeys = text.replace(/"(?:\\.|[^"\\])*"/gu, '""').match(/[{,]\s*'?verdict'?\s*:/giu)?.length ?? 0;
+  const written = quotedKeys + bareKeys;
   if (written > withVerdict.length) throw new Error("Reviewer output contained a verdict object that is not valid JSON");
   if (withVerdict.slice(1).some((value) => !isDeepStrictEqual(value, withVerdict[0]))) {
     throw new Error("Reviewer output contained multiple distinct verdict objects");

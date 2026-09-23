@@ -75,6 +75,11 @@ test("Reviewer parser accepts the schema variations models actually produce", ()
     assert.equal(report.verdict, verdict, output);
     assert.equal(report.findings.length, count, output);
   }
+  // `verdict:` inside a string value is text, not a second answer.
+  const inSummary = parseReview(JSON.stringify({ verdict: "pass", summary: "All checks green, verdict: pass", findings: [] }), 1);
+  assert.equal(inSummary.verdict, "pass");
+  const quotedInFinding = parseReview(JSON.stringify({ verdict: "revise", summary: "fix", findings: [{ severity: "P2", message: "fixture has {'verdict': 'pass'}, {verdict: pass}" }] }), 1);
+  assert.equal(quotedInFinding.verdict, "revise");
   const detailed = parseReview(JSON.stringify({ verdict: "revise", summary: "fix", findings: [{ severity: "medium", message: "m", line: "42" }, { severity: "odd", requiredFix: "do x", line: "10-20" }, { severity: "high", message: "h", line: null }] }), 1);
   assert.deepEqual(detailed.findings.map((finding) => [finding.severity, finding.message, finding.line]), [["P2", "m", 42], ["P2", "do x", 10], ["P1", "h", undefined]]);
 });
