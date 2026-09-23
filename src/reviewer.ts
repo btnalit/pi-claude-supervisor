@@ -189,7 +189,7 @@ export class PiReadOnlyReviewer implements TaskReviewer {
           finalMessage = "";
           finalTooLarge = false;
           await withTimeout(
-            session.prompt(`Your previous reply could not be used (${report.summary}). Reply now with exactly one JSON object in the required review schema, including "reviewId": "${reviewId}", and nothing else.`),
+            session.prompt(`Your previous reply could not be used (${report.summary}). Reply now with only one JSON object in the required review schema — keys reviewId, verdict, summary and findings, with "reviewId": "${reviewId}" — and no text before or after it.`),
             remaining,
             "independent Reviewer",
             input.signal,
@@ -237,7 +237,9 @@ run commands, send messages, approve permissions or invent missing requirements.
 Return exactly one JSON object and no markdown:
 {"reviewId":"${reviewId}","verdict":"pass|revise|human","summary":"...","findings":[{"id":"F001","severity":"P0|P1|P2|P3","message":"...","evidence":"...","requiredFix":"...","file":"...","line":1,"acceptanceRef":"..."}]}
 The reviewId must be exactly "${reviewId}": it is how your answer is told apart from any
-JSON you quote from the repository, so never put it anywhere else.
+JSON you quote from the repository, so never put it anywhere else. Reply with that one
+object only — no prose before or after it, no other keys — and escape any repository
+text you quote inside its strings.
 Use pass only when the goal, scope and constraints are satisfied and there is no
 blocking finding. Use revise for concrete fixable findings: they are sent back to the
 Worker as an automatic repair turn. Use human only for product ambiguity, a material
@@ -331,9 +333,7 @@ export function parseReview(text: string, round: number, reviewId?: string): Rev
   if (Buffer.byteLength(text, "utf8") > MAX_REVIEW_RESPONSE_BYTES) return invalidReview(`Reviewer response exceeded ${MAX_REVIEW_RESPONSE_BYTES} bytes`, round, checkedAt);
   if (!text.trim()) return invalidReview("Reviewer returned no JSON object", round, checkedAt);
   try {
-    const spans = extractJsonObjectSpans(text);
-    if (spans.length === 0) throw new Error("Reviewer output did not contain a JSON object");
-    const value = selectVerdictObject(spans, reviewId);
+    const value = reviewId === undefined ? selectVerdictObject(extractJsonObjectSpans(text)) : wholeReplyAnswer(text, reviewId);
     const verdict = normalizeVerdict(value.verdict);
     if (!verdict) throw new Error("unsupported verdict");
     const summary = typeof value.summary === "string" && value.summary.trim() ? value.summary.trim() : "no summary provided";
@@ -355,31 +355,47 @@ function normalizeVerdict(value: unknown): ReviewReport["verdict"] | undefined {
   return verdict === "pass" || verdict === "revise" || verdict === "human" ? verdict : undefined;
 }
 
+const ANSWER_KEYS = new Set(["reviewId", "verdict", "summary", "findings"]);
+
 /**
- * The Reviewer's own verdict object. With a `reviewId` (every live review)
- * only objects carrying that exact id count: the id is random per attempt and
- * appears nowhere but in the Reviewer's prompt, so an object quoted from the
- * repository — however it is spelled or escaped — can never stand in for the
- * answer. Without one (a structured report being normalised) exactly one
- * distinct object with a `verdict` must be present. Either way, zero or
- * several distinct candidates is a format failure, which earns the corrective
- * re-prompt rather than a guess.
+ * A live Reviewer's answer: the whole reply must be one JSON object (an
+ * optional ```json fence aside) that carries this attempt's random
+ * `reviewId`, names no key twice and has no top-level key beyond the schema.
+ *
+ * The Reviewer reads repository text the Worker controls and may copy it
+ * verbatim into a string. Each rule closes one way such text could rewrite
+ * the answer: the id (known only to this prompt) rules out a quoted object
+ * standing in for it; the whole-reply rule rules out closing the answer early
+ * and appending another; the duplicate-key rule rules out re-setting
+ * `verdict` inside it; the key allowlist rules out moving later findings into
+ * a harmless-looking key. A reply that breaks any rule is a format failure,
+ * which earns the corrective re-prompt rather than a guess.
  */
-function selectVerdictObject(spans: Array<{ value: unknown; source: string }>, reviewId: string | undefined): Record<string, unknown> {
-  const records = spans.filter((span): span is { value: Record<string, unknown>; source: string } => Boolean(span.value) && typeof span.value === "object" && !Array.isArray(span.value));
-  const matching = reviewId === undefined
-    ? records.filter((span) => Object.hasOwn(span.value, "verdict"))
-    : records.filter((span) => span.value.reviewId === reviewId);
-  if (matching.length === 0) {
-    throw new Error(reviewId === undefined
-      ? "Reviewer output did not contain an object with a verdict"
-      : "Reviewer output did not contain an object with this review's reviewId");
-  }
-  // A repeated key means the object was spliced: text quoted verbatim into a
-  // string closed it and appended its own `"verdict":"pass"`, which
-  // JSON.parse would silently let win.
-  if (matching.some((span) => jsonHasDuplicateKeys(span.source))) throw new Error("Reviewer output repeats a key inside its answer object");
-  const candidates = matching.map((span) => span.value);
+function wholeReplyAnswer(text: string, reviewId: string): Record<string, unknown> {
+  const trimmed = text.trim();
+  const body = trimmed.match(/^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n?```$/u)?.[1]?.trim() ?? trimmed;
+  let value: unknown;
+  try { value = JSON.parse(body); }
+  catch { throw new Error("Reviewer reply must be exactly one JSON object and nothing else"); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Reviewer reply must be exactly one JSON object and nothing else");
+  const answer = value as Record<string, unknown>;
+  if (answer.reviewId !== reviewId) throw new Error("Reviewer reply does not carry this review's reviewId");
+  if (jsonHasDuplicateKeys(body)) throw new Error("Reviewer reply repeats a key");
+  const unknown = Object.keys(answer).filter((key) => !ANSWER_KEYS.has(key));
+  if (unknown.length > 0) throw new Error(`Reviewer reply has keys outside the schema: ${unknown.slice(0, 4).join(", ")}`);
+  return answer;
+}
+
+/**
+ * A structured report being normalised (a custom Reviewer's return value,
+ * re-encoded): exactly one distinct object with a `verdict`.
+ */
+function selectVerdictObject(spans: Array<{ value: unknown; source: string }>): Record<string, unknown> {
+  if (spans.length === 0) throw new Error("Reviewer output did not contain a JSON object");
+  const candidates = spans
+    .filter((span): span is { value: Record<string, unknown>; source: string } => Boolean(span.value) && typeof span.value === "object" && !Array.isArray(span.value) && Object.hasOwn(span.value as object, "verdict"))
+    .map((span) => span.value);
+  if (candidates.length === 0) throw new Error("Reviewer output did not contain an object with a verdict");
   if (candidates.slice(1).some((value) => !isDeepStrictEqual(value, candidates[0]))) {
     throw new Error("Reviewer output contained multiple distinct verdict objects");
   }

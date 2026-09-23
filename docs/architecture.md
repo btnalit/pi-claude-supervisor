@@ -591,10 +591,12 @@ When automatic supervision is enabled, a successful check set is passed to a
 fresh read-only Reviewer session. The Reviewer receives the task specification, repository status/diff evidence,
 check results and bounded Worker completion evidence, but not the Decision Worker
 conversation or control channel. It can inspect only `read`, `grep`, `find` and `ls`, and must return
-`pass`, `revise` or `human` with bounded structured findings. Its answer must
-carry a random `reviewId` that appears only in its own prompt, so a verdict
-object quoted from the repository can never be taken for the answer; an answer
-without it, or two different ones, earns one corrective re-prompt. Invalid Reviewer
+`pass`, `revise` or `human` with bounded structured findings. Its whole reply
+must be that one JSON object (an optional ```json fence aside), carrying a
+random `reviewId` that appears only in its own prompt, with no key repeated and
+no top-level key beyond the schema — so repository text it quotes or copies can
+neither stand in for the answer nor rewrite it. A reply that breaks any of
+these earns one corrective re-prompt. Invalid Reviewer
 output, incomplete evidence or a Reviewer API failure must prevent a candidate
 from crossing the remote/main boundary; the local system may retry, repair or
 park it without requiring a human to be online. The Reviewer retries provider
