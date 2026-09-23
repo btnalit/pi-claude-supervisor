@@ -3841,3 +3841,169 @@ test("a retry decision without a message resumes the Worker instead of parking t
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+test("the no-output timer restarts when the Supervisor sends a turn", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-send-baseline-"));
+  try {
+    await initializeGitRepository(cwd, "worker/send-baseline");
+    const fixture = closeOutFixture(cwd);
+    // The Worker last spoke long ago (as after a long acceptance/Review run).
+    fixture.handle.startedAt = new Date(Date.now() - 60_000).toISOString();
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "a repair turn after a long verification",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      deadlineMs: 0,
+      noOutputTimeoutMs: 2_500,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const turn = fixture.turn(1);
+    fixture.state.listener?.(turn);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "continue", message: "keep going", reason: "more to do" }, turn);
+    fixture.state.activeRequests = 1;
+    assert.equal(fixture.state.sent.length, 1);
+    // Old baseline: 60s of silence → stopped on the first tick. New baseline:
+    // the clock starts at the send.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    assert.equal(supervisor.state, "running");
+    assert.ok(!events.events.some((event) => event.type === "worker_watchdog_timeout"));
+    // A Worker that then stays silent mid-turn is still stopped.
+    await waitFor(() => events.events.some((event) => event.type === "worker_watchdog_timeout"));
+    await supervisor.stop("test cleanup").catch(() => {});
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("an idle Worker that outlasts the no-output timeout is verified, not killed", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-idle-timeout-"));
+  try {
+    await initializeGitRepository(cwd, "worker/idle-timeout");
+    const fixture = closeOutFixture(cwd);
+    const events = new FlakyEventLog("never-fail");
+    const candidates: string[] = [];
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidates.push(notice.status); },
+    });
+    await supervisor.start({
+      task: "a Worker waiting on background work that never returns",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      deadlineMs: 0,
+      noOutputTimeoutMs: 1_000,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const turn = fixture.turn(1);
+    fixture.state.listener?.(turn);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "wait", reason: "background agents are running" }, turn);
+    await waitFor(() => supervisor.state === "completed");
+    const types = events.events.map((event) => event.type);
+    assert.ok(types.includes("worker_idle_timeout"));
+    assert.ok(!types.includes("worker_watchdog_timeout"));
+    assert.ok(types.includes("verification_passed"));
+    assert.deepEqual(candidates, ["ready"]);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a spent turn budget verifies the work instead of parking it as a Decision Worker failure", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-turn-budget-"));
+  try {
+    await initializeGitRepository(cwd, "worker/turn-budget");
+    const fixture = closeOutFixture(cwd);
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "use up the turn budget",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      maxTurns: 1,
+      initialTurn: 1,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const turn = fixture.turn(2);
+    fixture.state.listener?.(turn);
+    await supervisor.poll();
+    await fixture.state.onAction?.({ action: "continue", message: "one more thing", reason: "not finished" }, turn);
+    assert.equal(fixture.state.sent.length, 0);
+    assert.equal(supervisor.state, "completed");
+    assert.equal(supervisor.candidateParked, false);
+    const override = events.events.find((event) => event.type === "decision_overridden");
+    assert.match(String(override?.data?.reason), /turn budget of 1 is exhausted/u);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a verify decision that lands after the Worker resumed on its own is dropped", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-stale-verify-"));
+  try {
+    await initializeGitRepository(cwd, "worker/stale-verify");
+    const fixture = closeOutFixture(cwd);
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "background work re-invokes the Worker",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const turn = fixture.turn(1);
+    fixture.state.listener?.(turn);
+    await supervisor.poll();
+    fixture.state.activeRequests = 1;
+    await fixture.state.onAction?.({ action: "verify", reason: "looks done" }, turn);
+    assert.equal(supervisor.state, "waiting");
+    assert.equal(fixture.state.stopReasons.length, 0);
+    assert.ok(events.events.some((event) => event.type === "decision_ignored"));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a Worker under human takeover is not stopped for silence", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-takeover-silence-"));
+  try {
+    await initializeGitRepository(cwd, "worker/takeover-silence");
+    const fixture = closeOutFixture(cwd);
+    fixture.handle.startedAt = new Date(Date.now() - 60_000).toISOString();
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "a recovered task waiting for its operator",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      deadlineMs: 0,
+      noOutputTimeoutMs: 1_000,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    await supervisor.takeover();
+    fixture.state.activeRequests = 1;
+    await new Promise((resolve) => setTimeout(resolve, 1_600));
+    assert.ok(["running", "waiting"].includes(supervisor.state));
+    assert.ok(!events.events.some((event) => event.type === "worker_watchdog_timeout"));
+    await supervisor.stop("test cleanup").catch(() => {});
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});

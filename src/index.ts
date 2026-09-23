@@ -73,6 +73,11 @@ async function userHooksInstalled(settingsPath: string): Promise<boolean> {
  * sessions may run concurrently, but active sessions must use different
  * working directories so workers cannot silently overwrite one another.
  */
+/** The first message a recovered Worker gets: it is a fresh process that never saw the task. */
+function recoveryContinuation(goal: string): string {
+  return `The Supervisor restarted this task after an interruption; you are a fresh session and earlier work may already be in the repository. First inspect git status, git log and the uncommitted diff to see what was done. Then continue the original task to completion, run the relevant checks and commit locally. Original task:\n${goal}`;
+}
+
 export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   loadSupervisorEnvironment();
   const automation = process.env.PI_CLAUDE_SUPERVISOR_MODE === "auto" || process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION === "1";
@@ -885,6 +890,25 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 throw new Error("Pi session shut down during recovery");
               }
               message = `Worker recovered idle: task=${record.taskId} worker=${handle.id}; original task was not replayed; send an explicit continuation, then use resume-auto`;
+              // `--extend` is an explicit request to carry on unattended: hand
+              // the task back to automation instead of leaving it under
+              // takeover. `--extend 0` needs no message — the close-out
+              // verifies the idle Worker on the next watchdog tick; a real
+              // extension sends a continuation, since the fresh Worker does
+              // not remember the task. A failure here leaves the recovered
+              // Worker idle under takeover, exactly as a plain recover would.
+              if (automaticRecovery && extendMs !== undefined) {
+                try {
+                  await session.resumeAutomation();
+                  if (extendMs > 0) await session.send(recoveryContinuation(record.spec?.goal ?? record.task));
+                  message = extendMs > 0
+                    ? `Worker recovered: task=${record.taskId} worker=${handle.id}; automation resumed with a continuation of the original task; ${formatDurationMs(extendMs)} of budget from now`
+                    : `Worker recovered: task=${record.taskId} worker=${handle.id}; automation resumed; the close-out verifies and reviews the repository as it stands`;
+                } catch (error) {
+                  await session.takeover().catch(() => {});
+                  message = `${message} (automatic resume failed: ${redactText(error instanceof Error ? error.message : String(error))})`;
+                }
+              }
             } catch (error) {
               const handle = session.handle ?? startedHandle;
               let cleanupConfirmed = !handle;

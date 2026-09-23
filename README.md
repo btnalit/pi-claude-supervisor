@@ -247,8 +247,11 @@ Supervisor being able to see it, or when you don't need to attach.
   is a release: Claude keeps running, unsupervised. The close-out belongs to
   automatic tasks; a manual task is stopped at the deadline as before, and
   `DEADLINE_GRACE_MS=0` restores that for automatic ones too. A 20-minute
-  no-output watchdog (`NO_OUTPUT_TIMEOUT_MS`) still stops a silent Worker at
-  any time.
+  no-output watchdog (`NO_OUTPUT_TIMEOUT_MS`, counted from the Worker's last
+  output or the Supervisor's last message to it) stops a Worker that falls
+  silent mid-turn; an automatic Worker that is merely idle that long (waiting on
+  background work that never came back) is verified instead
+  (`worker_idle_timeout`), and a Worker under human takeover is never timed out.
 - Acceptance checks, evidence collection, and the Reviewer share an abort
   signal, so a stop or shutdown does not wait for a full command or model
   timeout.
@@ -452,7 +455,11 @@ A task that stopped at its wall-clock deadline is listed with `deadline=expired
 <task-id>` grants that much budget from now (the recovered Supervisor persists
 the new deadline), and `--extend 0` opens the close-out at once, so the fresh
 Worker's first watchdog tick verifies and reviews the repository as it stands
-and any repair round tells it how long it has. A record nobody will recover is
+and any repair round tells it how long it has. With `--extend` the recovered
+task goes straight back to automation: a real extension sends the fresh Worker a
+continuation of the original task (telling it to inspect the earlier work first),
+and `--extend 0` needs none. A plain `recover` still leaves the Worker idle under
+takeover — send it a continuation, then `resume-auto`. A record nobody will recover is
 dropped with `/supervise discard <task-id>` (its session file is kept until
 retention pruning).
 

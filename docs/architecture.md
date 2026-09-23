@@ -399,8 +399,11 @@ For Claude JSONL, the adapter tracks `activeRequests`, `lastInputAt` and
 `lastOutputAt`. A `result` record closes an active request; malformed output does
 not. JSONL sends are rejected while a request is active, and a valid terminal
 result moves the session to `waiting`; only then may the next turn be sent. A paused
-Worker does not consume its no-output budget; resume establishes a fresh no-output
-baseline while the cumulative wall-clock deadline remains active.
+Worker does not consume its no-output budget; resume, and every message the
+Supervisor sends, establishes a fresh no-output baseline while the cumulative
+wall-clock deadline remains active. An idle automatic Worker that reaches the
+no-output timeout is verified (`worker_idle_timeout`) rather than stopped, and a
+Worker under human takeover is exempt.
 
 The wall-clock deadline is a budget, not a kill switch. The watchdog drives it
 through three phases, each recorded once per task: `worker_deadline_approaching`

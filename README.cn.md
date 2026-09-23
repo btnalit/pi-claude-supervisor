@@ -202,8 +202,11 @@ stream-json` 的方式运行 Claude,完全没有终端界面;一旦设置
   时间。只有收尾窗口也耗尽,Worker 才会被硬停(`worker_watchdog_timeout`);对
   接管的交互式会话来说这个硬停只是 release:Claude 继续运行,但不再受监督。
   收尾窗口只属于自动模式任务;手动任务仍在到期时停止,`DEADLINE_GRACE_MS=0`
-  让自动任务也恢复这一行为。20 分钟无输出 watchdog(`NO_OUTPUT_TIMEOUT_MS`)
-  随时会停止沉默的 Worker。
+  让自动任务也恢复这一行为。20 分钟无输出 watchdog(`NO_OUTPUT_TIMEOUT_MS`,
+  从 Worker 最后一次输出或 Supervisor 最后一次发给它的消息起算)会停止在一轮
+  中途沉默的 Worker;自动模式下只是空闲了这么久的 Worker(在等永远没回来的
+  后台工作)则改为直接验收(`worker_idle_timeout`),人工接管中的 Worker 不会
+  因沉默超时。
 - 验收命令、证据收集和 Reviewer 共用一个 abort signal,因此 stop 或 shutdown
   不必等待完整的命令或模型超时。
 - 每个任务只持有一个 cwd 租约;并发任务需要各自独立的 worktree。
@@ -358,7 +361,10 @@ Worker,它不会静默恢复或重复执行任务。只有在租约证明旧 Wor
 会拒绝它;`recover --takeover --extend <duration> <task-id>` 从现在起再给这么
 多预算(恢复后的 Supervisor 会把新时限持久化),`--extend 0` 则立即进入收尾:
 新 Worker 的第一个 watchdog tick 就会对仓库现状做验收和 review,修复轮会告诉
-它还剩多少时间。确定不再恢复的记录用 `/supervise discard <task-id>` 丢弃
+它还剩多少时间。带 `--extend` 时,恢复的任务会直接交回自动化:非零的延长会
+给新 Worker 发送原任务的续做指令(先让它查看已有的工作),`--extend 0` 则无需
+指令。不带 `--extend` 的普通 `recover` 仍让 Worker 在人工接管下空闲——先发送
+续做指令,再执行 `resume-auto`。确定不再恢复的记录用 `/supervise discard <task-id>` 丢弃
 (会话文件保留到保留期清理为止)。
 
 每个任务在 `CWD_LEASE_DIR` 下持有一个 cwd 租约;并发任务需要各自独立的

@@ -182,6 +182,106 @@ test("index recovers an idle Decision Worker without replaying the original task
   }
 });
 
+test("recover --extend hands the task back to automation with a continuation of the original task", { skip: !requiredCgroupTestAvailable || (!trustedCheckout && untrustedCheckoutSkipReason), concurrency: false }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-index-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-state-"));
+  const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-recover-leases-"));
+  const fakeBin = await mkdtemp(join(process.cwd(), ".pi-claude-supervisor-recover-bin-"));
+  const taskId = "23232323-2323-4232-8232-232323232323";
+  const fakeClaude = join(fakeBin, "claude");
+  await copyFile(process.execPath, fakeClaude);
+  await chmod(fakeClaude, 0o700);
+  assert.equal(spawnSync("git", ["init", "-q"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["config", "user.email", "test@example.invalid"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["config", "user.name", "Test"], { cwd, stdio: "ignore" }).status, 0);
+  await writeFile(join(cwd, "base.txt"), "base\n");
+  assert.equal(spawnSync("git", ["add", "base.txt"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["commit", "-qm", "base"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["switch", "-c", "worker/recovery"], { cwd, stdio: "ignore" }).status, 0);
+  const baseCommit = spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).stdout.trim();
+  const marker = join(stateDir, "received-input.jsonl");
+  const decisionStore = new DecisionSessionStore(join(stateDir, "decision-sessions"));
+  const decisionSessionDirectory = decisionStore.sessionDirectory(taskId);
+  await mkdir(decisionSessionDirectory, { recursive: true });
+  const decisionSessionFile = join(decisionSessionDirectory, "session.jsonl");
+  await writeFile(decisionSessionFile, `${JSON.stringify({ type: "session", version: 3, id: randomUUID(), timestamp: new Date().toISOString(), cwd })}\n`);
+  const fakeWorker = "const fs=require('node:fs'); process.stdin.on('data', data => fs.appendFileSync(process.argv[1], data)); setInterval(() => {}, 10000);";
+  await decisionStore.save({
+    taskId,
+    task: "finish the widget",
+    cwd,
+    command: "claude",
+    args: ["-e", fakeWorker, marker],
+    resolvedExecutable: fakeClaude,
+    decisionSessionFile,
+    maxTurns: 2,
+    deadlineMs: 60_000,
+    noOutputTimeoutMs: 60_000,
+    startedAt: new Date().toISOString(),
+    baseCommit,
+    baseBranch: "worker/recovery",
+    turn: 0,
+    state: "active",
+  });
+  const keys = ["PI_CLAUDE_SUPERVISOR_STATE_DIR", "PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR", "PI_CLAUDE_SUPERVISOR_TRANSPORT", "PI_CLAUDE_SUPERVISOR_CGROUP_MODE", "PI_CLAUDE_SUPERVISOR_MODE", "PI_CLAUDE_SUPERVISOR_AUTOMATION", "PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE"] as const;
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]])) as Record<typeof keys[number], string | undefined>;
+  const previousPath = process.env.PATH;
+  for (const key of keys) delete process.env[key];
+  process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
+  process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
+  process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "jsonl";
+  process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "required";
+  process.env.PI_CLAUDE_SUPERVISOR_MODE = "auto";
+  process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "1";
+  process.env.PATH = `${fakeBin}${delimiter}${previousPath ?? ""}`;
+  delete process.env.PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE;
+  const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
+  const messages: string[] = [];
+  const context: TestContext = { cwd, hasUI: true, ui: { confirm: async () => false, notify: (message) => messages.push(message) } };
+  let shutdownHandler: (() => Promise<void>) | undefined;
+  try {
+    const fakePi = {
+      registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) { registrations.commands.push({ name, definition }); },
+      on(name: string, handler: () => Promise<void>) { registrations.events.push({ name, handler }); },
+    };
+    extension(fakePi as never);
+    const command = registrations.commands.find(({ name }) => name === "supervise")?.definition;
+    shutdownHandler = registrations.events.find(({ name }) => name === "session_shutdown")?.handler;
+    assert.ok(command);
+    assert.ok(shutdownHandler);
+
+    await command.handler(`recover --extend 30m ${taskId}`, context);
+    assert.match(messages.at(-1) ?? "", new RegExp(`Worker recovered: task=${taskId} worker=[^;]+; automation resumed with a continuation of the original task; 30m of budget from now`, "u"));
+    // The fresh Worker is told what the task was and to look at earlier work
+    // first, without anyone having to send it by hand.
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      try {
+        const received = await readFile(marker, "utf8");
+        assert.match(received, /restarted this task after an interruption/u);
+        assert.match(received, /finish the widget/u);
+        break;
+      } catch (error) {
+        if (attempt === 39) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+    await command.handler(`stop ${taskId}`, context);
+    assert.equal((await decisionStore.load(taskId))?.state, "closed");
+  } finally {
+    if (shutdownHandler) await shutdownHandler().catch(() => {});
+    for (const key of keys) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await rm(fakeBin, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(leaseDir, { recursive: true, force: true });
+  }
+});
+
 test("adopted tmux detach retains a live lease and reaps it after the session dies", { skip: spawnSync("tmux", ["-V"], { stdio: "ignore" }).status !== 0, concurrency: false }, async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-adopted-index-"));
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-adopted-state-"));
