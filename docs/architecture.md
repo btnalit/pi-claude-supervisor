@@ -143,7 +143,8 @@ start); credentials are not copied into a file, and credential-shaped command
 arguments are still rejected.
 `load-buffer`, bracketed `paste-buffer` and `send-keys Enter` provide the input
 boundary without interpolating a task into a shell command. C0/C1 terminal
-control bytes are rejected; CRLF is normalized to a newline. Automatic agents,
+control bytes are neutralized (escape sequences removed, a lone CR becomes a newline,
+other C0/C1 bytes become spaces); CRLF is normalized to a newline. Automatic agents,
 background tasks, plugins, MCP servers and nested Claude processes stay in the
 same cgroup and are cleaned with the Worker; they are intentionally not rejected
 or polled as a nested-process policy failure. The lexical Bash/file-tool policy

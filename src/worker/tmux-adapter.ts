@@ -36,6 +36,8 @@ export interface TmuxWorkerAdapterOptions {
   terminationGraceMs?: number;
   /** Linux cgroup mode for automatic tmux bridge descendants. */
   cgroupMode?: "off" | "auto" | "required";
+  /** How long an interactive permission hook waits for the Supervisor; defaults to just under the hook timeout. */
+  permissionDecisionTimeoutMs?: number;
 }
 
 interface TmuxRecord {
@@ -369,14 +371,23 @@ child.once("exit", (code, signal) => {
   output("\\n[Claude exited " + String(code === null ? signal : code) + "]\\n");
   process.exit(code ?? 1);
 });
+// The PTY's canonical line limit (4095 bytes) truncates a long control line,
+// so the Supervisor splits a payload's base64 across @pi:part lines and this
+// reassembles it before the final @pi:user/@pi:json line.
+let pendingPayload = "";
 const forwardSupervisorCommand = (commandLine) => {
+  if (commandLine.startsWith("@pi:part ")) {
+    pendingPayload += commandLine.slice("@pi:part ".length);
+    return;
+  }
+  const payload = (prefix) => { const value = pendingPayload + commandLine.slice(prefix.length); pendingPayload = ""; return value; };
   if (commandLine.startsWith("@pi:user ")) {
     inputActive = true;
-    child.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: decodeLine(commandLine.slice("@pi:user ".length)) } }) + "\\n");
+    child.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: decodeLine(payload("@pi:user ")) } }) + "\\n");
     return;
   }
   if (commandLine.startsWith("@pi:json ")) {
-    const message = decodeLine(commandLine.slice("@pi:json ".length));
+    const message = decodeLine(payload("@pi:json "));
     child.stdin.write(message.endsWith("\\n") ? message : message + "\\n");
     return;
   }
@@ -394,6 +405,7 @@ input.on("line", (line) => {
     const commandLine = separator >= 0 ? line.slice(separator + 1) : "";
     clearSupervisorInput();
     if (generation !== bridgeGeneration) {
+      pendingPayload = "";
       output("\\n[stale Supervisor input rejected]\\n");
       return;
     }
@@ -407,6 +419,9 @@ input.on("line", (line) => {
 input.on("close", () => { try { child.kill("SIGTERM"); } catch {} });
 prompt();
 `;
+
+/** Base64 characters per bridge control line; with its prefix, well under the PTY's 4095-byte line limit. */
+const BRIDGE_FRAME_CHUNK_CHARS = 2_000;
 
 const GUARDIAN_KEYS = {
   tmux: "PI_CLAUDE_SUPERVISOR_TMUX_BINARY",
@@ -529,6 +544,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   readonly #pollIntervalMs: number;
   readonly #terminationGraceMs: number;
   readonly #cgroupMode: "off" | "auto" | "required";
+  readonly #permissionDecisionTimeoutMs: number;
   readonly #maxOutputBytes = 8 * 1024 * 1024;
   readonly #maxLogBytes = 16 * 1024 * 1024;
   readonly #commandTimeoutMs = 10_000;
@@ -540,6 +556,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     this.#pollIntervalMs = boundedDelay(options.pollIntervalMs ?? 500);
     this.#terminationGraceMs = boundedDelay(options.terminationGraceMs ?? 2_000);
     this.#cgroupMode = options.cgroupMode ?? "auto";
+    this.#permissionDecisionTimeoutMs = boundedDelay(options.permissionDecisionTimeoutMs ?? Math.max(0, (HOOK_TIMEOUT_SECONDS - 10) * 1_000));
   }
 
   async preflight(input: Pick<WorkerStartInput, "cwd" | "command" | "args" | "env" | "approval" | "automatic" | "interactive">): Promise<void> {
@@ -1120,7 +1137,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   async #sendRaw(record: TmuxRecord, message: string): Promise<void> {
     if (record.structured) {
       const encoded = Buffer.from(safeTmuxMessage(message), "utf8").toString("base64");
-      await this.#sendLine(record, this.#bridgeControl(record, `@pi:user ${encoded}`));
+      await this.#sendFramed(record, "@pi:user", encoded);
       return;
     }
     const safeMessage = safeTmuxMessage(message);
@@ -1145,11 +1162,25 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       // monitor interval. Revalidate the exact pane process after acquiring
       // the input gate, not merely at the last status poll.
       await this.#assertControlPaneIdentity(record);
-      const command = rawCommand ?? `@pi:json ${Buffer.from(`${JSON.stringify(value)}\n`, "utf8").toString("base64")}`;
-      await this.#sendLine(record, this.#bridgeControl(record, command));
+      if (rawCommand) await this.#sendLine(record, this.#bridgeControl(record, rawCommand));
+      else await this.#sendFramed(record, "@pi:json", Buffer.from(`${JSON.stringify(value)}\n`, "utf8").toString("base64"));
     } finally {
       release();
     }
+  }
+
+  /**
+   * Send one base64 payload as bridge control lines no longer than the PTY's
+   * canonical line limit: every part but the last as `@pi:part`, then the
+   * final command. A repair prompt or a permission reply echoing a large Write
+   * is far past 4 KB; a single line was silently truncated by the terminal.
+   */
+  async #sendFramed(record: TmuxRecord, command: "@pi:user" | "@pi:json", base64: string): Promise<void> {
+    for (let offset = 0; offset + BRIDGE_FRAME_CHUNK_CHARS < base64.length; offset += BRIDGE_FRAME_CHUNK_CHARS) {
+      await this.#sendLine(record, this.#bridgeControl(record, `@pi:part ${base64.slice(offset, offset + BRIDGE_FRAME_CHUNK_CHARS)}`));
+    }
+    const lastOffset = base64.length === 0 ? 0 : Math.floor((base64.length - 1) / BRIDGE_FRAME_CHUNK_CHARS) * BRIDGE_FRAME_CHUNK_CHARS;
+    await this.#sendLine(record, this.#bridgeControl(record, `${command} ${base64.slice(lastOffset)}`));
   }
 
   #bridgeControl(record: TmuxRecord, commandLine: string): string {
@@ -2105,11 +2136,20 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       },
     });
     return new Promise<HookRelayReply>((resolve) => {
-      const timeoutMs = Math.max(0, (HOOK_TIMEOUT_SECONDS - 10) * 1_000);
+      const timeoutMs = this.#permissionDecisionTimeoutMs;
       const timer = setTimeout(() => {
         record.pendingPermissionRequests.delete(requestId);
+        // A decision that arrives after this is answered already: accept it
+        // as a no-op instead of failing the Supervisor's action handler.
+        record.permissionResponses.add(requestId);
         this.#logOutput(record, `[supervisor] permission request ${requestId} timed out waiting for a Supervisor decision\n`);
-        resolve({});
+        // PreToolUse: no opinion, so Claude's own flow continues into its
+        // PermissionRequest hook. PermissionRequest: an empty reply would open
+        // Claude's interactive dialog and wait for a human who is not there;
+        // deny instead, so Claude can simply try the call again.
+        resolve(phase === "prompt"
+          ? { permissionDecision: "deny", permissionDecisionReason: "the Supervisor's permission decision timed out; retry the same tool call" }
+          : {});
       }, timeoutMs);
       timer.unref?.();
       record.pendingPermissionRequests.set(requestId, {
@@ -2295,12 +2335,15 @@ function isReadyScreen(screen: string): boolean {
 }
 
 function hasBridgePromptInput(screen: string): boolean {
-  const lines = stripAnsi(screen).replaceAll("\u00a0", " ").split(/\r?\n/u).map((line) => line.trim());
-  // Supervisor input is echoed by the PTY after the bridge prompt. A long
-  // base64 frame can wrap, and the bridge's one-line erase then leaves the
-  // first `> @pi:user ...` line visible after the result. It is stale control
-  // input, not a human turn; counting it would leave activeRequests stuck at 1.
-  return lines.some((line) => /^>\s+.+$/u.test(line) && !/^>\s+@pi:(?:user|json)\s+/u.test(line));
+  const lines = stripAnsi(screen).replaceAll("\u00a0", " ").split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
+  // Only the line the cursor sits on can be a human typing at the bridge
+  // prompt: earlier lines are scrollback, where Claude's own Markdown
+  // blockquotes (`> Note …`) also start with `>`. Supervisor input is echoed
+  // by the PTY (`> @pi:control <generation> @pi:user …`, possibly wrapped);
+  // it is stale control input, not a human turn, and counting it would leave
+  // activeRequests stuck at 1 after every result.
+  const last = lines.at(-1) ?? "";
+  return /^>\s+.+$/u.test(last) && !/^>\s+@pi:/u.test(last);
 }
 
 function hasPromptInput(screen: string): boolean {
@@ -2339,21 +2382,34 @@ function redactSensitiveText(value: string): string {
   return String(redactSensitive(value));
 }
 
+/**
+ * Make text safe to paste into a terminal. Supervisor messages routinely
+ * embed command output (a failed check's colours, a progress bar's `\r`), so
+ * control bytes are neutralised rather than refused — refusing blocked the
+ * task at its first repair turn. Escape sequences are removed, a lone CR
+ * becomes a newline, and any other C0/C1 control byte becomes a space; tab
+ * and newline pass through. Nothing that reaches the pane can drive the
+ * terminal.
+ */
 function safeTmuxMessage(value: string): string {
-  const normalized = value.replaceAll(String.fromCharCode(13, 10), "\n");
+  const withoutEscapes = value
+    // OSC … BEL/ST, then CSI sequences, then any other two-byte ESC sequence.
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?/gu, "")
+    .replace(/(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/gu, "")
+    .replace(/\u001b[@-_]?/gu, "");
+  const normalized = withoutEscapes.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+  let safe = "";
   for (const character of normalized) {
     const code = character.codePointAt(0) ?? 0;
-    if (code <= 8 || code === 11 || code === 12 || (code >= 13 && code <= 31) || code === 127 || (code >= 128 && code <= 159)) {
-      throw new Error("tmux input contains terminal control bytes; refusing to send it");
-    }
+    safe += code === 9 || code === 10 || (code > 31 && code !== 127 && (code < 128 || code > 159)) ? character : " ";
   }
-  return normalized;
+  return safe;
 }
 
 function stripInternalBridgeEcho(value: string): string {
   return value
     .replaceAll("\u001b[1A\r\u001b[2K\u001b[1B\r", "")
-    .replace(/(?:^|\r?\n)[^\r\n]*@pi:(?:user|json) [A-Za-z0-9+/=]+\r?(?=\n|$)/gu, "\n")
+    .replace(/(?:^|\r?\n)[^\r\n]*@pi:(?:user|json|part) [A-Za-z0-9+/=]+\r?(?=\n|$)/gu, "\n")
     .replace(/(?:^|\r?\n)[^\r\n]*@pi:stop\r?(?=\n|$)/gu, "\n");
 }
 

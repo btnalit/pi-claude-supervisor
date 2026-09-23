@@ -514,6 +514,25 @@ test("stop cleans descendants after the worker leader exits", async () => {
   assert.fail(`descendant process ${childPid} survived group cleanup`);
 });
 
+test("a multi-byte character split across two pipe reads is decoded intact", async () => {
+  const adapter = new ProcessWorkerAdapter();
+  // "中" is e4 b8 ad: write its first two bytes, pause so they arrive as their
+  // own read, then the last byte.
+  const handle = await adapter.start({
+    task: "",
+    cwd: process.cwd(),
+    command: process.execPath,
+    args: ["-e", "process.stdout.write(Buffer.from([0xe4, 0xb8])); setTimeout(() => { process.stdout.write(Buffer.from([0xad, 0x0a])); setTimeout(() => process.exit(0), 50); }, 150);", "--"],
+  });
+  let text = "";
+  for (let attempt = 0; attempt < 60 && !text.includes("\n"); attempt += 1) {
+    text += (await adapter.readOutput(handle)).filter((chunk) => chunk.stream === "stdout").map((chunk) => chunk.text).join("");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(text, "中\n");
+  await adapter.stop(handle, "test cleanup").catch(() => {});
+});
+
 test("claude-jsonl result sequence distinguishes repeated session ids", async () => {
   const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
   const events: import("../types.ts").WorkerEvent[] = [];
@@ -536,6 +555,32 @@ test("claude-jsonl result sequence distinguishes repeated session ids", async ()
   const completed = events.filter((event): event is Extract<import("../types.ts").WorkerEvent, { type: "turn_completed" }> => event.type === "turn_completed");
   assert.deepEqual(completed.map((event) => event.sequence), [1, 2]);
   await adapter.stop(handle, "test complete");
+});
+
+test("claude-jsonl delivers a permission request for a large Write by default", async () => {
+  const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
+  const events: import("../types.ts").WorkerEvent[] = [];
+  // A 1 MB file body in one can_use_tool request: dropping it would leave
+  // Claude waiting forever for the control_response.
+  const script = "process.stdin.once('data', () => { process.stdout.write(JSON.stringify({type:'control_request', request_id:'req-large', request:{subtype:'can_use_tool', tool_use_id:'tool-large', tool_name:'Write', input:{file_path:'/tmp/big.txt', content:'x'.repeat(1024*1024)}}}) + '\\n'); }); setInterval(() => {}, 1000)";
+  const handle = await adapter.start({
+    task: "write a large file",
+    cwd: process.cwd(),
+    command: process.execPath,
+    eventListener: (event) => { events.push(event); },
+    args: ["-e", script, "--"],
+  });
+  try {
+    for (let attempt = 0; attempt < 100 && !events.some((event) => event.type === "permission_request"); attempt += 1) {
+      await adapter.readOutput(handle);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const request = events.find((event): event is Extract<import("../types.ts").WorkerEvent, { type: "permission_request" }> => event.type === "permission_request");
+    assert.equal(request?.request.requestId, "req-large");
+    assert.equal(((request?.request.input as { content?: string }).content ?? "").length, 1024 * 1024);
+  } finally {
+    await adapter.stop(handle, "large permission request test complete");
+  }
 });
 
 test("claude-jsonl discards split continuations after an overlong protocol record", async () => {

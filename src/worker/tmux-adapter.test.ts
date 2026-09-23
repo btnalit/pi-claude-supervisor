@@ -74,9 +74,13 @@ test("tmux adapter owns a private PTY, completes turns, and preserves output", {
     assert.match(firstOutput, /first line/u);
     assert.match(firstOutput, /second line/u);
 
-    await assert.rejects(() => adapter.send(handle, "unsafe\u001b[31m", "unsafe-input"), /control bytes/u);
-    await adapter.send(handle, "follow-up", "test-follow-up");
+    // Coloured check output inside a repair message is neutralised, not refused.
+    await adapter.send(handle, "coloured\u001b[31mred\u001b[0m\u0007", "coloured-input");
     await waitFor(() => events.filter((event) => event.type === "turn_completed").length === 2);
+    const colouredOutput = (await adapter.readOutput(handle)).map((chunk) => chunk.text).join("");
+    assert.match(colouredOutput, /DONE:colouredred/u);
+    await adapter.send(handle, "follow-up", "test-follow-up");
+    await waitFor(() => events.filter((event) => event.type === "turn_completed").length === 3);
     const secondOutput = (await adapter.readOutput(handle)).map((chunk) => chunk.text).join("");
     assert.match(secondOutput, /DONE:.*follow-up/u);
 
@@ -366,6 +370,15 @@ process.stdin.on("data", data => {
     assert.equal(spawnSync("tmux", ["-S", handle.tmuxSocket!, "send-keys", "-t", handle.tmuxPaneId!, "Enter"], { stdio: "ignore" }).status, 0);
     await waitFor(() => events.filter((event) => event.type === "turn_completed").length === 2);
     assert.match((await adapter.readOutput(handle)).map((chunk) => chunk.text).join(""), /ACK:human-next/u);
+    // A repair-sized message is past the PTY's 4095-byte line limit; it must
+    // arrive whole, and the echoed control lines must not look like a new
+    // human turn once the result is in.
+    const long = `repair:${"L".repeat(6_000)}`;
+    await adapter.send(handle, long, "long-message");
+    await waitFor(() => events.filter((event) => event.type === "turn_completed").length === 3);
+    assert.equal(events.filter((event) => event.type === "turn_completed").at(-1)?.result?.uuid, long);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
     await adapter.stop(handle, "bridge test complete");
     const status = await adapter.getStatus(handle);
     assert.equal(status.cleanupError, undefined);
@@ -1298,6 +1311,27 @@ test("PermissionRequest maps to phase prompt with a derived requestId", { skip: 
   }
 });
 
+test("an unanswered PermissionRequest is denied for a retry, and a late answer is a no-op", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
+  const fixture = await startInteractiveOwnedFixture({ permissionDecisionTimeoutMs: 300 });
+  const { adapter, handle, hookSource, events, stateDir, fakePid } = fixture;
+  try {
+    const reply = await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: fakePid + 1,
+      ppid: fakePid,
+      event: { hook_event_name: "PermissionRequest", session_id: "session-1", cwd: stateDir, tool_name: "Bash", tool_input: { command: "npm test" } },
+    });
+    // An empty reply would open Claude's own dialog and wait for a human.
+    assert.equal(reply?.permissionDecision, "deny");
+    assert.match(String(reply?.permissionDecisionReason), /timed out; retry/u);
+    const request = events.find((event): event is Extract<WorkerEvent, { type: "permission_request" }> => event.type === "permission_request")!;
+    await adapter.respondPermission(handle, request.request.requestId, request.request.toolUseId, { behavior: "allow" });
+  } finally {
+    await adapter.stop(handle, "permission timeout test cleanup").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("requests that do not bind to the pane are ignored", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
   const fixture = await startInteractiveOwnedFixture();
   const { adapter, handle, events, stateDir, hookSource } = fixture;
@@ -1441,7 +1475,7 @@ async function waitForFileContent(path: string): Promise<string> {
 }
 
 /** Owned interactive fixture already past the trust dialog and bound via a SessionStart hook. */
-async function startInteractiveOwnedFixture(options: { retainCgroupUntilLeaseRelease?: boolean } = {}): Promise<{
+async function startInteractiveOwnedFixture(options: { retainCgroupUntilLeaseRelease?: boolean; permissionDecisionTimeoutMs?: number } = {}): Promise<{
   stateDir: string;
   adapter: TmuxWorkerAdapter;
   handle: Awaited<ReturnType<TmuxWorkerAdapter["start"]>>;
@@ -1464,7 +1498,7 @@ setInterval(() => {}, 10000);
   await chmod(fakeClaude, 0o700);
   const hookSource = createFakeHookSource();
   const events: WorkerEvent[] = [];
-  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 200, ...(options.permissionDecisionTimeoutMs !== undefined ? { permissionDecisionTimeoutMs: options.permissionDecisionTimeoutMs } : {}) });
   const startPromise = adapter.start({
     task: "interactive fixture task",
     cwd: stateDir,

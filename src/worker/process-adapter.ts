@@ -59,6 +59,8 @@ interface ProcessRecord {
   seenResultIds: Set<string>;
   seenPermissionRequestIds: Set<string>;
   protocolBuffer: string;
+  /** Byte length of protocolBuffer, kept incrementally so a long line is not re-measured per chunk. */
+  protocolBufferBytes: number;
   discardProtocolLine: boolean;
   exitCode?: number | null;
   signal?: NodeJS.Signals;
@@ -114,7 +116,11 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     this.#killGraceMs = boundedDelay(options.killGraceMs ?? 500);
     this.#maxOutputChunks = boundedPositiveInteger(options.maxOutputChunks ?? 10_000, "maxOutputChunks");
     this.#maxOutputBytes = boundedPositiveInteger(options.maxOutputBytes ?? 8 * 1024 * 1024, "maxOutputBytes");
-    this.#maxProtocolBufferBytes = boundedPositiveInteger(options.maxProtocolBufferBytes ?? 256 * 1024, "maxProtocolBufferBytes");
+    // One JSONL record, not the stream: a permission request for a Write of a
+    // large file, or a long final result, is a single line. A dropped
+    // control_request leaves Claude waiting forever for its answer and a
+    // dropped result never ends the turn, so the bound only guards memory.
+    this.#maxProtocolBufferBytes = boundedPositiveInteger(options.maxProtocolBufferBytes ?? 32 * 1024 * 1024, "maxProtocolBufferBytes");
     this.#inputWriteTimeoutMs = boundedDelay(options.inputWriteTimeoutMs ?? 10_000);
     this.#cgroupMode = options.cgroupMode ?? "auto";
     this.#cgroupParentPath = options.cgroupParentPath;
@@ -258,6 +264,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       seenResultIds: new Set(),
       seenPermissionRequestIds: new Set(),
       protocolBuffer: "",
+      protocolBufferBytes: 0,
       discardProtocolLine: false,
       exited,
       resolveExit,
@@ -300,6 +307,12 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       this.#emit(record, { type: "output", handle: record.handle, chunk: outputChunk });
       if (stream === "stdout" && this.#mode === "claude-jsonl") this.#observeJsonl(record, text);
     };
+    // A stream decoder keeps a multi-byte character that straddles two pipe
+    // reads intact; String(buffer) per chunk turned it into U+FFFD, and a
+    // permission `updatedInput` echoed back from that text then wrote the
+    // corruption into the Worker's files.
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
     child.stdout?.on("data", capture("stdout"));
     child.stderr?.on("data", capture("stderr"));
     child.stdin?.on("error", (error) => {
@@ -602,28 +615,33 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
         if (newline < 0) return;
         record.discardProtocolLine = false;
         record.protocolBuffer = "";
+        record.protocolBufferBytes = 0;
         offset = newline + 1;
         continue;
       }
       const newline = chunk.indexOf("\n", offset);
       if (newline < 0) {
         const tail = chunk.slice(offset);
-        if (Buffer.byteLength(record.protocolBuffer, "utf8") + Buffer.byteLength(tail, "utf8") > this.#maxProtocolBufferBytes) {
+        const tailBytes = Buffer.byteLength(tail, "utf8");
+        if (record.protocolBufferBytes + tailBytes > this.#maxProtocolBufferBytes) {
           record.protocolBuffer = "";
+          record.protocolBufferBytes = 0;
           record.discardProtocolLine = true;
           record.outputTruncated = true;
         } else {
           record.protocolBuffer += tail;
+          record.protocolBufferBytes += tailBytes;
         }
         return;
       }
       const linePart = chunk.slice(offset, newline);
-      if (Buffer.byteLength(record.protocolBuffer, "utf8") + Buffer.byteLength(linePart, "utf8") > this.#maxProtocolBufferBytes) {
+      if (record.protocolBufferBytes + Buffer.byteLength(linePart, "utf8") > this.#maxProtocolBufferBytes) {
         record.outputTruncated = true;
       } else {
         this.#processJsonlLine(record, `${record.protocolBuffer}${linePart}`.trim());
       }
       record.protocolBuffer = "";
+      record.protocolBufferBytes = 0;
       offset = newline + 1;
     }
   }
