@@ -99,12 +99,47 @@ test("cwd lease takeover requires an explicit dead-owner and dead-worker proof",
   noCgroupRecord.ownerPid = 999999996;
   noCgroupRecord.ownerStartTime = "1";
   await writeFile(noCgroupPath, `${JSON.stringify(noCgroupRecord)}\n`);
-  await assert.rejects(
-    () => store.acquire(cwd, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "process-pipe", { takeover: { taskId: noCgroup.record.taskId } }),
-    /working-directory lease is held/u,
-  );
-  await noCgroup.release();
+  // No cgroup was ever used, and the Worker's leader and process group are
+  // gone along with its Pi: the adapter's own no-cgroup cleanup evidence.
+  // The lease is abandoned, and any start may reclaim it.
+  const reclaimed = await store.acquire(cwd, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "process-pipe");
+  assert.deepEqual((await store.list()).map((lease) => lease.taskId), ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]);
+  await reclaimed.release();
+  await noCgroup.release().catch(() => {});
   await rm(root, { recursive: true, force: true });
+});
+
+test("an abandoned lease is reclaimed only when nothing of its task can still be running", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-lease-abandoned-"));
+  const leaseDir = join(root, "leases");
+  const cwd = join(root, "repo");
+  await mkdir(cwd);
+  const store = new CwdLeaseStore(leaseDir);
+  const plant = async (taskId: string, worker: Record<string, unknown> | undefined, extra: Record<string, unknown> = {}): Promise<void> => {
+    const lease = await store.acquire(cwd, taskId, "process-pipe");
+    const path = join(leaseDir, `${lease.record.leaseId}.json`);
+    const record = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+    record.ownerPid = 999999990;
+    record.ownerStartTime = "1";
+    if (worker) record.worker = worker; else delete record.worker;
+    await writeFile(path, `${JSON.stringify({ ...record, ...extra })}\n`);
+  };
+  try {
+    // A Pi that died before spawning anything.
+    await plant("11111111-1111-4111-8111-111111111111", undefined);
+    const afterEmpty = await store.acquire(cwd, "22222222-2222-4222-8222-222222222222", "process-pipe");
+    await afterEmpty.release();
+    // A Worker whose leader is still alive keeps its lease, and the refusal
+    // says what to do about it.
+    await plant("33333333-3333-4333-8333-333333333333", { transport: "process-pipe", pid: process.pid, ownership: "owned" });
+    await assert.rejects(() => store.acquire(cwd, "44444444-4444-4444-8444-444444444444", "process-pipe"), /its Pi \(pid 999999990\) is gone .*recover --takeover 33333333/u);
+    for (const lease of await store.list()) await rm(join(leaseDir, `${lease.leaseId}.json`), { force: true });
+    // A tmux session is meant to outlive its Pi: never reclaimed here.
+    await plant("55555555-5555-4555-8555-555555555555", { transport: "tmux", pid: 999999991, ownership: "owned", sessionName: "s", tmuxSocket: "/tmp/nonexistent-pi-cs.sock" });
+    await assert.rejects(() => store.acquire(cwd, "66666666-6666-4666-8666-666666666666", "process-pipe"), /working-directory lease is held/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("automatic process takeover replaces a lease and then removes its cgroup", async (t) => {

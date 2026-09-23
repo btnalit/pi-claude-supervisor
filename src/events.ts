@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { appendFile, chmod, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { currentLockOwner, lockOwnerAlive } from "./lock-owner.ts";
 import { redactSensitive } from "./redaction.ts";
 
 export interface SupervisorEvent {
@@ -71,7 +72,7 @@ export class EventLog {
     while (true) {
       try {
         await mkdir(lockPath);
-        await writeFile(`${lockPath}/owner.json`, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+        await writeFile(`${lockPath}/owner.json`, JSON.stringify(await currentLockOwner()));
         break;
       } catch (error) {
         if (!(error instanceof Error) || !/EEXIST/u.test(error.message)) throw error;
@@ -91,21 +92,14 @@ export class EventLog {
     try {
       const info = await stat(`${lockPath}/owner.json`);
       if (Date.now() - info.mtimeMs < STALE_LOCK_MS) return false;
-      let owner: { pid?: unknown };
+      let owner: unknown;
       try {
-        owner = JSON.parse(await readFile(`${lockPath}/owner.json`, "utf8")) as { pid?: unknown };
+        owner = JSON.parse(await readFile(`${lockPath}/owner.json`, "utf8"));
       } catch {
         await rm(lockPath, { recursive: true, force: true });
         return true;
       }
-      if (typeof owner.pid === "number") {
-        try {
-          process.kill(owner.pid, 0);
-          return false;
-        } catch (error) {
-          if (error instanceof Error && /EPERM/u.test(error.message)) return false;
-        }
-      }
+      if (await lockOwnerAlive(owner)) return false;
       await rm(lockPath, { recursive: true, force: true });
       return true;
     } catch (error) {

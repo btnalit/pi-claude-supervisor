@@ -190,6 +190,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     return new PiReadOnlyReviewer({ timeoutMs: reviewTimeoutMs(), model: await reviewerPiModelPromise });
   };
   const sessions = new Map<string, Supervisor>();
+  /** The last few tasks that finished and were released, newest last, for `status`/`sessions`. */
+  const finishedSessions = new Map<string, { finishedAt: number; detail: string }>();
   const cwdLeases = new Map<string, CwdLeaseHandle>();
   const cleanupRequiredTasks = new Set<string>();
   const reservedCwds = new Map<string, string>();
@@ -235,6 +237,14 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     }
   };
   const forgetSession = (taskId: string): void => {
+    // Keep what a finished task ended as: after an overnight run, `status`
+    // is exactly where the operator looks, and the live session is gone.
+    const finished = sessions.get(taskId);
+    if (finished) {
+      finishedSessions.delete(taskId);
+      finishedSessions.set(taskId, { finishedAt: Date.now(), detail: formatSessionDetail(taskId, finished, tmuxModeLabel()) });
+      while (finishedSessions.size > MAX_FINISHED_SESSIONS) finishedSessions.delete(finishedSessions.keys().next().value!);
+    }
     sessions.delete(taskId);
     reservedCwds.delete(taskId);
     cleanupRequiredTasks.delete(taskId);
@@ -984,15 +994,22 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         } else if (operation === "sessions") {
           const recoverable = await decisionStore.list({ activeOnly: true });
           message = formatSessions(sessions, recoverable, tmuxModeLabel());
+          if (finishedSessions.size > 0) message += `\nRecently finished:\n${formatFinishedSessions(finishedSessions)}`;
           const quarantined = await cwdLeaseStore.quarantined();
           if (quarantined.length > 0) {
             message += `\nQuarantined cwd lease records (${quarantined.length}) in ${leaseDir}/quarantine: ${redactText(quarantined.join(", "))}`;
           }
         } else if (operation === "status") {
-          const { session, sessionId } = resolveSession(sessions, activeTaskId, rest, true);
-          message = session
-            ? `task=${sessionId} state=${session.state} worker=${session.handle?.id ?? "none"}${tmuxModeLabel() ? ` mode=${tmuxModeLabel()}` : ""}${formatDeadline(session.deadline)} ${formatUsageDetail(session.usage)}`
-            : formatSessions(sessions, await decisionStore.list({ activeOnly: true }), tmuxModeLabel());
+          const finished = rest[0] && !sessions.has(rest[0]) ? finishedSessions.get(rest[0]) : undefined;
+          if (finished) {
+            message = `finished ${formatDurationMs(Date.now() - finished.finishedAt)} ago: ${finished.detail}`;
+          } else {
+            const { session, sessionId } = resolveSession(sessions, activeTaskId, rest, true);
+            message = session && sessionId
+              ? formatSessionDetail(sessionId, session, tmuxModeLabel())
+              : formatSessions(sessions, await decisionStore.list({ activeOnly: true }), tmuxModeLabel())
+                + (finishedSessions.size > 0 ? `\nRecently finished:\n${formatFinishedSessions(finishedSessions)}` : "");
+          }
         } else if (operation === "capabilities") {
           message = JSON.stringify(adapter.capabilities(), null, 2);
         } else if (operation === "install-hooks" || operation === "uninstall-hooks") {
@@ -1171,6 +1188,35 @@ function formatDeadline(deadline: Supervisor["deadline"]): string {
   if (!deadline) return "";
   if (!deadline.closeOut) return ` deadline=${formatDurationMs(deadline.remainingMs)} left`;
   return ` deadline=close-out (${formatDurationMs(deadline.closeOutRemainingMs ?? 0)} left)`;
+}
+
+const MAX_FINISHED_SESSIONS = 20;
+
+/**
+ * One task's state in a line: what it is doing, how far it got, and — the
+ * question an operator of an unattended run actually has — whether it is
+ * waiting on them.
+ */
+function formatSessionDetail(taskId: string, session: Supervisor, tmuxModeLabel?: string): string {
+  const task = session.task;
+  const parts = [`task=${taskId}`, `state=${session.state}`, `worker=${session.handle?.id ?? "none"}`];
+  if (tmuxModeLabel) parts.push(`mode=${tmuxModeLabel}`);
+  if (session.humanRequired) parts.push("automation=paused(resume-auto)");
+  if (session.candidateParked) parts.push("candidate=parked");
+  if (task) {
+    parts.push(`turn=${session.turn}/${task.maxTurns}`);
+    if (session.repairRound > 0) parts.push(`repair=${session.repairRound}`);
+    const startedAt = Date.parse(task.startedAt);
+    if (Number.isFinite(startedAt)) parts.push(`elapsed=${formatDurationMs(Math.max(0, Date.now() - startedAt))}`);
+  }
+  const verification = session.lastVerification;
+  if (verification) parts.push(`lastVerify=${verification.ok ? "pass" : "fail"}${verification.review ? `(review=${verification.review.verdict})` : ""}`);
+  const terminal = ["completed", "blocked", "stopped", "failed"].includes(session.state);
+  return `${parts.join(" ")}${terminal ? "" : formatDeadline(session.deadline)} ${formatUsageDetail(session.usage)}`;
+}
+
+function formatFinishedSessions(finished: Map<string, { finishedAt: number; detail: string }>): string {
+  return [...finished.values()].reverse().map((entry) => `  ${formatDurationMs(Date.now() - entry.finishedAt)} ago: ${entry.detail}`).join("\n");
 }
 
 function formatSessions(sessions: Map<string, Supervisor>, recoverable: DecisionSessionRecord[] = [], tmuxModeLabel?: string): string {

@@ -187,7 +187,20 @@ export class CwdLeaseStore {
               continue;
             }
           }
-          throw new Error(`working-directory lease is held by task ${existing.taskId}: ${redactText(existing.cwd)}`);
+          // A crash leaves the lease of a task that no longer exists
+          // anywhere. When its owner and its Worker are provably gone and
+          // it holds no cleanup boundary (cgroup, tmux server) that recovery
+          // still has to prove empty, it blocks nothing real: drop it rather
+          // than strand the directory behind a record no command can free.
+          if (await leaseAbandoned(existing)) {
+            await rm(this.#path(existing.leaseId), { force: true });
+            console.error(`pi-claude-supervisor released an abandoned cwd lease of task ${existing.taskId}: its Pi (pid ${existing.ownerPid}) and Worker are gone`);
+            continue;
+          }
+          const ownerGone = !existing.pendingCleanup && !await processIdentityLive(existing.ownerPid, existing.ownerStartTime);
+          throw new Error(ownerGone
+            ? `working-directory lease is held by task ${existing.taskId}: ${redactText(existing.cwd)}; its Pi (pid ${existing.ownerPid}) is gone but its Worker boundary may still be live — run /supervise recover --takeover ${existing.taskId} to prove it is empty, or use another worktree`
+            : `working-directory lease is held by task ${existing.taskId}: ${redactText(existing.cwd)}`);
         }
         if (takeoverLease && takeoverProof) {
           if (takeoverProof.startupOnly) {
@@ -654,6 +667,26 @@ async function cgroupHasProcesses(path: string): Promise<boolean> {
 /** True while the Pi process that acquired the lease is still alive (pid and start time both match). */
 export async function leaseOwnerLive(lease: CwdLeaseRecord): Promise<boolean> {
   return processIdentityLive(lease.ownerPid, lease.ownerStartTime);
+}
+
+/**
+ * A lease nobody can still be using: its owning Pi is gone (pid and start
+ * time), no takeover transaction is pending, and its Worker either never
+ * started or ran without a cgroup and is dead along with its whole process
+ * group — the same evidence the adapter's own cleanup relies on in that mode
+ * — with no tmux server left. A Worker that had a cgroup boundary is never
+ * reclaimed here: only an explicit, record-backed `recover --takeover` may
+ * prove that boundary empty.
+ */
+async function leaseAbandoned(lease: CwdLeaseRecord): Promise<boolean> {
+  if (lease.pendingCleanup || await processIdentityLive(lease.ownerPid, lease.ownerStartTime)) return false;
+  const worker = lease.worker;
+  if (!worker) return true;
+  // A tmux session is meant to outlive its Pi and be re-adopted or handed
+  // off by identity; that record is evidence, never garbage.
+  if (worker.transport === "tmux" || worker.ownership === "adopted" || worker.cgroupPath || worker.retainCgroupUntilLeaseRelease) return false;
+  if (worker.pid === undefined) return Boolean(lease.pendingStartup) && !worker.workerId;
+  return !await processExists(worker.pid) && !await processGroupExists(worker.pid);
 }
 
 async function canTakeoverLease(lease: CwdLeaseRecord): Promise<TakeoverProof | undefined> {

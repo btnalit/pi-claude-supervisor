@@ -301,7 +301,9 @@ commit,通知能说清已验证的 commit 是否在工作树变动之前就已�
 ## 配置参考
 
 环境变量(或 `~/.config/pi-claude-supervisor/env`),均以 `PI_CLAUDE_SUPERVISOR_`
-为前缀;完整模板见 `.env.example`。
+为前缀;完整模板见 `.env.example`。env 文件每行是 `KEY=value`,可以带 `export `
+前缀和行尾 ` # 注释`。超出范围或无法解析的值会沿用默认值,并以
+`pi-claude-supervisor: ignoring …` 警告报告一次。
 
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -339,8 +341,8 @@ commit,通知能说清已验证的 commit 是否在工作树变动之前就已�
 | `DECISION_SESSION_RETENTION_DAYS` | `30` | 启动时清理早于此天数的已关闭 Decision Worker session 记录;`0` 表示永久保留 |
 | `EVIDENCE_MAX_BYTES` | `1048576`(1 MiB) | 每个任务收集的最大仓库证据字节数 |
 | `EVIDENCE_MAX_UNTRACKED_FILES` | `512` | 每个任务作为证据收集的最大未跟踪文件数 |
-| `REVIEW_TIMEOUT_MS` | `600000`(10 分钟) | 每轮独立 Reviewer 的总预算,含一次针对 provider 错误的重试 |
-| `DEADLINE_MS` | `4h` | 每个任务的累计总时限(`8h`、`90m`、`2h30m` 或毫秒;5 分钟到 7 天);`0`(或 `0m`)关闭;`--deadline` 可按任务覆盖 |
+| `REVIEW_TIMEOUT_MS` | `10m`(30s–1h) | 每轮独立 Reviewer 的总预算,含对 provider 错误和超时的重试 |
+| `DEADLINE_MS` | `4h` | 每个任务从启动起算的墙钟总时限,Pi 停机期间也计入,因此恢复时用 `recover --extend` 重新给预算(`8h`、`90m`、`2h30m` 或毫秒;5 分钟到 7 天);`0`(或 `0m`)关闭;`--deadline` 可按任务覆盖 |
 | `DEADLINE_GRACE_MS` | `30m` | 自动任务到期后的收尾窗口:空闲的 Worker 会被验收而不是停止;`0` 恢复到期立即停止 |
 | `DEADLINE_WARNING_MS` | `15m` | 到期前多久提醒并重新询问 Decision Worker;`0` 关闭提醒 |
 | `NO_OUTPUT_TIMEOUT_MS` | `20m` | Worker 多久没有输出就停止;`0` 关闭该检查 |

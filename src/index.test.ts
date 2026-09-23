@@ -1089,3 +1089,60 @@ test("an expired recoverable record is listed as expired, refused by recover wit
     await rm(leaseDir, { recursive: true, force: true });
   }
 });
+
+test("a finished task stays visible in status and sessions after its session is released", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-index-finished-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-state-"));
+  const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-leases-"));
+  const keys = ["PI_CLAUDE_SUPERVISOR_WORKER", "PI_CLAUDE_SUPERVISOR_STATE_DIR", "PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR", "PI_CLAUDE_SUPERVISOR_TRANSPORT", "PI_CLAUDE_SUPERVISOR_CGROUP_MODE", "PI_CLAUDE_SUPERVISOR_MODE", "PI_CLAUDE_SUPERVISOR_AUTOMATION"] as const;
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  process.env.PI_CLAUDE_SUPERVISOR_WORKER = `${process.execPath} -e "setTimeout(() => process.exit(0), 200)"`;
+  process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
+  process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
+  process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "process-pipe";
+  process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "off";
+  process.env.PI_CLAUDE_SUPERVISOR_MODE = "manual";
+  process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "0";
+  const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
+  const messages: string[] = [];
+  const context: TestContext = { cwd, hasUI: true, ui: { confirm: async () => false, notify: (message) => messages.push(message) } };
+  let shutdownHandler: (() => Promise<void>) | undefined;
+  try {
+    extension({
+      registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) { registrations.commands.push({ name, definition }); },
+      on(name: string, handler: () => Promise<void>) { registrations.events.push({ name, handler }); },
+    } as never);
+    const command = registrations.commands.find(({ name }) => name === "supervise")?.definition;
+    shutdownHandler = registrations.events.find(({ name }) => name === "session_shutdown")?.handler;
+    assert.ok(command);
+    await command.handler("start a short task", context);
+    const taskId = (messages.at(-1) ?? "").match(/task=(\S+)/u)?.[1];
+    assert.ok(taskId);
+    await command.handler(`status ${taskId}`, context);
+    assert.match(messages.at(-1) ?? "", new RegExp(`^task=${taskId} state=\\S+ worker=\\S+ turn=0/100 elapsed=`, "u"));
+    // A non-repository cwd fails its acceptance check: a terminal, parked task.
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      await command.handler(`status ${taskId}`, context);
+      if (/state=verifying/u.test(messages.at(-1) ?? "")) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    await command.handler(`verify ${taskId}`, context);
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      await command.handler("sessions", context);
+      if (/Recently finished/u.test(messages.at(-1) ?? "")) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.match(messages.at(-1) ?? "", new RegExp(`Recently finished:\\n  \\S+ ago: task=${taskId} state=blocked .*candidate=parked .*lastVerify=fail`, "u"));
+    await command.handler(`status ${taskId}`, context);
+    assert.match(messages.at(-1) ?? "", new RegExp(`^finished \\S+ ago: task=${taskId} state=blocked`, "u"));
+  } finally {
+    if (shutdownHandler) await shutdownHandler().catch(() => {});
+    for (const key of keys) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+    await rm(cwd, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(leaseDir, { recursive: true, force: true });
+  }
+});

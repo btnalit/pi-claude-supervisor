@@ -316,6 +316,9 @@ export class Supervisor {
   get task() { return this.#task; }
   get handle() { return this.#handle; }
   get lastVerification() { return this.#lastVerification; }
+  /** Worker turns sent so far (the task's own opening turn is 0). */
+  get turn() { return this.#turn; }
+  get repairRound() { return this.#repairRound; }
   /** True only after an explicit takeover, never for ordinary uncertainty. */
   get humanRequired() { return this.#humanRequired; }
   get candidateParked() { return this.#candidateParked; }
