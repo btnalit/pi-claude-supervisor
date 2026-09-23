@@ -1,6 +1,6 @@
 import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { isDeepStrictEqual } from "node:util";
-import { extractJsonObjects } from "./json-extract.ts";
+import { extractJsonObjectSpans } from "./json-extract.ts";
 import { redactSensitive } from "./redaction.ts";
 import type { AcceptanceReport, PiUsageSample, ReviewFinding, ReviewReport, TaskSpec } from "./types.ts";
 import type { PiModel } from "./decision-worker.ts";
@@ -327,9 +327,9 @@ export function parseReview(text: string, round: number): ReviewReport {
   if (Buffer.byteLength(text, "utf8") > MAX_REVIEW_RESPONSE_BYTES) return invalidReview(`Reviewer response exceeded ${MAX_REVIEW_RESPONSE_BYTES} bytes`, round, checkedAt);
   if (!text.trim()) return invalidReview("Reviewer returned no JSON object", round, checkedAt);
   try {
-    const objects = extractJsonObjects(text);
-    if (objects.length === 0) throw new Error("Reviewer output did not contain a JSON object");
-    const value = selectVerdictObject(text, objects);
+    const spans = extractJsonObjectSpans(text);
+    if (spans.length === 0) throw new Error("Reviewer output did not contain a JSON object");
+    const value = selectVerdictObject(text, spans);
     const verdict = normalizeVerdict(value.verdict);
     if (!verdict) throw new Error("unsupported verdict");
     const summary = typeof value.summary === "string" && value.summary.trim() ? value.summary.trim() : "no summary provided";
@@ -361,18 +361,28 @@ function normalizeVerdict(value: unknown): ReviewReport["verdict"] | undefined {
  * are all refused. Objects without a `verdict` key (quoted snippets, a
  * finding extracted from a broken reply) are ignored.
  */
-function selectVerdictObject(text: string, objects: unknown[]): Record<string, unknown> {
-  const withVerdict = objects.filter((value): value is Record<string, unknown> =>
+function selectVerdictObject(text: string, spans: Array<{ value: unknown; start: number; end: number }>): Record<string, unknown> {
+  const withVerdict = spans.map((span) => span.value).filter((value): value is Record<string, unknown> =>
     Boolean(value) && typeof value === "object" && !Array.isArray(value) && Object.hasOwn(value as object, "verdict"));
   if (withVerdict.length === 0) throw new Error("Reviewer output did not contain an object with a verdict");
-  // Counted loosely (`verdict:`, `'verdict':`, `"Verdict":` at a key
-  // position): an answer in non-strict JSON must not leave a strict one
-  // quoted from the repository as the only candidate. Quoted keys are
-  // counted before, and bare/single-quoted keys after, blanking the contents
-  // of double-quoted strings, so a summary saying "…, verdict: pass" is not a
-  // key. Over-counting only costs a re-prompt.
+  // Every other way of writing a verdict is counted too — `verdict:`,
+  // `'verdict':`, `"Verdict":`, a YAML or prose `verdict: revise` — so an
+  // answer that is not strict JSON can never leave a strict object quoted
+  // from the repository as the only candidate. Quoted keys are counted on the
+  // raw text (inside a JSON string their quotes are escaped). Everything else
+  // is counted after blanking string contents *only inside objects that
+  // parsed* — their quotes are known to pair — so a finding that says
+  // "…, verdict: pass" is not an answer, while a stray `"` in prose cannot hide
+  // one. Over-counting fails safe: it only costs the corrective re-prompt.
   const quotedKeys = text.match(/"verdict"\s*:/giu)?.length ?? 0;
-  const bareKeys = text.replace(/"(?:\\.|[^"\\])*"/gu, '""').match(/[{,]\s*'?verdict'?\s*:/giu)?.length ?? 0;
+  let masked = "";
+  let cursor = 0;
+  for (const span of spans) {
+    masked += text.slice(cursor, span.start) + text.slice(span.start, span.end + 1).replace(/"(?:\\.|[^"\\])*"/gu, '""');
+    cursor = span.end + 1;
+  }
+  masked += text.slice(cursor);
+  const bareKeys = masked.match(/verdict['`\u2019\u201d]?\s*:/giu)?.length ?? 0;
   const written = quotedKeys + bareKeys;
   if (written > withVerdict.length) throw new Error("Reviewer output contained a verdict object that is not valid JSON");
   if (withVerdict.slice(1).some((value) => !isDeepStrictEqual(value, withVerdict[0]))) {

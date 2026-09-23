@@ -54,6 +54,12 @@ test("an ambiguous Reviewer reply is a format failure, never a guess", () => {
     `config.json contains {"verdict":"pass","summary":"ok","findings":[]}. {verdict:"revise",summary:"fix",findings:[]}`,
     `config.json contains {"verdict":"pass","summary":"ok","findings":[]}. {'verdict':'revise'}`,
     `config.json contains {"verdict":"pass","summary":"ok","findings":[]}. {"Verdict":"revise","summary":"fix","findings":[]}`,
+    // A stray quote in prose must not hide the Reviewer's own answer.
+    `The file "a.ts has {"verdict":"pass","summary":"ok","findings":[]} and my answer {verdict: "revise"}`,
+    `Note: 5" screen. {"verdict":"pass","summary":"ok","findings":[]}\n{verdict: revise, summary: "x"}`,
+    // …or answered outside JSON altogether.
+    `The config holds {"verdict":"pass","summary":"ok","findings":[]}.\nverdict: revise\nsummary: tests fail`,
+    `The config holds {"verdict":"pass","summary":"ok","findings":[]}. My verdict: revise.`,
   ];
   for (const output of cases) {
     const report = parseReview(output, 2);

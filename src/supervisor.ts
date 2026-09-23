@@ -2503,7 +2503,13 @@ export class Supervisor {
       // too, in case its `exited` event (which normally drives it) was lost.
       const polled: string = this.#machine.state;
       if (polled !== "running" && polled !== "waiting") {
-        if (polled === "verifying" && !this.#verificationAbortController) await this.#verifyInternal();
+        if (polled === "verifying" && !this.#verificationAbortController) {
+          try {
+            await this.#verifyInternal();
+          } catch (error) {
+            await this.#appendEvent({ type: "worker_event_error", taskId, workerId, data: { error: safeMessage(error), eventType: "watchdog_verify" } }).catch(() => {});
+          }
+        }
         return;
       }
     }
