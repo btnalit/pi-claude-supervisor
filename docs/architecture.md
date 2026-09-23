@@ -594,8 +594,9 @@ conversation or control channel. It can inspect only `read`, `grep`, `find` and 
 `pass`, `revise` or `human` with bounded structured findings. Its whole reply
 must be that one JSON object (an optional ```json fence aside), carrying a
 random `reviewId` that appears only in its own prompt, with no key repeated and
-no top-level key beyond the schema — so repository text it quotes or copies can
-neither stand in for the answer nor rewrite it. A reply that breaks any of
+nothing beyond the schema (a string `summary`, and `findings` as flat objects of
+the finding fields with scalar values) — so repository text it quotes or copies
+can neither stand in for the answer nor rewrite it. A reply that breaks any of
 these earns one corrective re-prompt. Invalid Reviewer
 output, incomplete evidence or a Reviewer API failure must prevent a candidate
 from crossing the remote/main boundary; the local system may retry, repair or

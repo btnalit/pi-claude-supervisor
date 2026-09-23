@@ -356,6 +356,7 @@ function normalizeVerdict(value: unknown): ReviewReport["verdict"] | undefined {
 }
 
 const ANSWER_KEYS = new Set(["reviewId", "verdict", "summary", "findings"]);
+const FINDING_KEYS = new Set(["id", "severity", "message", "evidence", "requiredFix", "file", "line", "acceptanceRef"]);
 
 /**
  * A live Reviewer's answer: the whole reply must be one JSON object (an
@@ -367,13 +368,17 @@ const ANSWER_KEYS = new Set(["reviewId", "verdict", "summary", "findings"]);
  * the answer: the id (known only to this prompt) rules out a quoted object
  * standing in for it; the whole-reply rule rules out closing the answer early
  * and appending another; the duplicate-key rule rules out re-setting
- * `verdict` inside it; the key allowlist rules out moving later findings into
- * a harmless-looking key. A reply that breaks any rule is a format failure,
- * which earns the corrective re-prompt rather than a guess.
+ * `verdict` inside it; and the full schema — `summary` a string, `findings`
+ * an array of flat objects with only the finding fields and scalar values —
+ * fixes the structure's depth, so text spliced into one string (or two)
+ * cannot open a container that swallows the Reviewer's own later keys or
+ * findings: those would land where the schema forbids them. A reply that
+ * breaks any rule is a format failure, which earns the corrective re-prompt
+ * rather than a guess.
  */
 function wholeReplyAnswer(text: string, reviewId: string): Record<string, unknown> {
   const trimmed = text.trim();
-  const body = trimmed.match(/^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n?```$/u)?.[1]?.trim() ?? trimmed;
+  const body = trimmed.match(/^```(?:jsonc?)?[ \t]*\r?\n([\s\S]*?)\r?\n?```$/iu)?.[1]?.trim() ?? trimmed;
   let value: unknown;
   try { value = JSON.parse(body); }
   catch { throw new Error("Reviewer reply must be exactly one JSON object and nothing else"); }
@@ -383,6 +388,18 @@ function wholeReplyAnswer(text: string, reviewId: string): Record<string, unknow
   if (jsonHasDuplicateKeys(body)) throw new Error("Reviewer reply repeats a key");
   const unknown = Object.keys(answer).filter((key) => !ANSWER_KEYS.has(key));
   if (unknown.length > 0) throw new Error(`Reviewer reply has keys outside the schema: ${unknown.slice(0, 4).join(", ")}`);
+  if (typeof answer.verdict !== "string") throw new Error("Reviewer reply verdict must be a string");
+  if (answer.summary !== undefined && typeof answer.summary !== "string") throw new Error("Reviewer reply summary must be a string");
+  if (answer.findings !== undefined && answer.findings !== null) {
+    if (!Array.isArray(answer.findings)) throw new Error("Reviewer reply findings must be an array");
+    for (const finding of answer.findings) {
+      if (!finding || typeof finding !== "object" || Array.isArray(finding)) throw new Error("Reviewer reply findings must be flat objects");
+      for (const [key, value] of Object.entries(finding as Record<string, unknown>)) {
+        if (!FINDING_KEYS.has(key)) throw new Error(`Reviewer reply finding has a key outside the schema: ${key.slice(0, 40)}`);
+        if (value !== null && typeof value === "object") throw new Error("Reviewer reply finding values must be strings or numbers");
+      }
+    }
+  }
   return answer;
 }
 
