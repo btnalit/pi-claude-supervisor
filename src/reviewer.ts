@@ -1,7 +1,7 @@
 import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { extractJsonObjects } from "./json-extract.ts";
+import { extractJsonObjectSpans, jsonHasDuplicateKeys } from "./json-extract.ts";
 import { redactSensitive } from "./redaction.ts";
 import type { AcceptanceReport, PiUsageSample, ReviewFinding, ReviewReport, TaskSpec } from "./types.ts";
 import type { PiModel } from "./decision-worker.ts";
@@ -331,9 +331,9 @@ export function parseReview(text: string, round: number, reviewId?: string): Rev
   if (Buffer.byteLength(text, "utf8") > MAX_REVIEW_RESPONSE_BYTES) return invalidReview(`Reviewer response exceeded ${MAX_REVIEW_RESPONSE_BYTES} bytes`, round, checkedAt);
   if (!text.trim()) return invalidReview("Reviewer returned no JSON object", round, checkedAt);
   try {
-    const objects = extractJsonObjects(text);
-    if (objects.length === 0) throw new Error("Reviewer output did not contain a JSON object");
-    const value = selectVerdictObject(objects, reviewId);
+    const spans = extractJsonObjectSpans(text);
+    if (spans.length === 0) throw new Error("Reviewer output did not contain a JSON object");
+    const value = selectVerdictObject(spans, reviewId);
     const verdict = normalizeVerdict(value.verdict);
     if (!verdict) throw new Error("unsupported verdict");
     const summary = typeof value.summary === "string" && value.summary.trim() ? value.summary.trim() : "no summary provided";
@@ -365,16 +365,21 @@ function normalizeVerdict(value: unknown): ReviewReport["verdict"] | undefined {
  * several distinct candidates is a format failure, which earns the corrective
  * re-prompt rather than a guess.
  */
-function selectVerdictObject(objects: unknown[], reviewId: string | undefined): Record<string, unknown> {
-  const records = objects.filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value));
-  const candidates = reviewId === undefined
-    ? records.filter((value) => Object.hasOwn(value, "verdict"))
-    : records.filter((value) => value.reviewId === reviewId);
-  if (candidates.length === 0) {
+function selectVerdictObject(spans: Array<{ value: unknown; source: string }>, reviewId: string | undefined): Record<string, unknown> {
+  const records = spans.filter((span): span is { value: Record<string, unknown>; source: string } => Boolean(span.value) && typeof span.value === "object" && !Array.isArray(span.value));
+  const matching = reviewId === undefined
+    ? records.filter((span) => Object.hasOwn(span.value, "verdict"))
+    : records.filter((span) => span.value.reviewId === reviewId);
+  if (matching.length === 0) {
     throw new Error(reviewId === undefined
       ? "Reviewer output did not contain an object with a verdict"
-      : `Reviewer output did not contain an object with "reviewId": "${reviewId}"`);
+      : "Reviewer output did not contain an object with this review's reviewId");
   }
+  // A repeated key means the object was spliced: text quoted verbatim into a
+  // string closed it and appended its own `"verdict":"pass"`, which
+  // JSON.parse would silently let win.
+  if (matching.some((span) => jsonHasDuplicateKeys(span.source))) throw new Error("Reviewer output repeats a key inside its answer object");
+  const candidates = matching.map((span) => span.value);
   if (candidates.slice(1).some((value) => !isDeepStrictEqual(value, candidates[0]))) {
     throw new Error("Reviewer output contained multiple distinct verdict objects");
   }
