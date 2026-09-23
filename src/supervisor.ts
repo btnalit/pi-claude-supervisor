@@ -2496,7 +2496,11 @@ export class Supervisor {
     // of a candidate; a Worker silent in the middle of a turn is still stopped.
     // A Worker that never completed a turn under this Supervisor (recovered,
     // or adopted) still reads `running`; classify it first, as the close-out does.
-    if (reason === "worker produced no output before timeout" && this.#automation && this.#machine.state === "running" && !status.activeRequests) await this.#pollInternal();
+    if (reason === "worker produced no output before timeout" && this.#automation && this.#machine.state === "running" && !status.activeRequests) {
+      await this.#pollInternal();
+      // The Worker exited in between: the poll has already classified it.
+      if (!["running", "waiting"].includes(this.#machine.state)) return;
+    }
     if (reason === "worker produced no output before timeout" && this.#automation && this.#machine.state === "waiting" && !status.activeRequests) {
       // A decision about this idle Worker is still being made (it may be
       // backing off a provider outage); let it land rather than race it —

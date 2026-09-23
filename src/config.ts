@@ -198,7 +198,7 @@ export function loadSupervisorEnvironment(): string | undefined {
       // Shell-style: an optional `export ` prefix, and a trailing `# comment`
       // after an unquoted value or a closing quote. Keeping the comment made
       // `MODE="auto" # enable` a value no reader accepts.
-      const match = line.match(/^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*(.*?)\s*$/u);
+      const match = line.match(/^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=(.*?)\s*$/u);
       if (!match || !allowed.has(match[1]) || process.env[match[1]] !== undefined) continue;
       process.env[match[1]] = envFileValue(match[2]);
     }
@@ -227,6 +227,10 @@ function rejectSetting(name: string | undefined, value: string, reason: string, 
 
 /** The value of one env-file assignment: quoted text verbatim, or an unquoted word before any ` #` comment. */
 export function envFileValue(raw: string): string {
+  // `KEY= # note` is an empty value with a comment, as in a shell; only a
+  // `#` right after the `=` (`KEY=#abc`) belongs to the value.
+  if (/^\s+#/u.test(raw)) return "";
+  raw = raw.trimStart();
   const quoted = raw.match(/^(?:"([^"]*)"|'([^']*)')(?:\s+#.*)?$/u);
   if (quoted) return quoted[1] ?? quoted[2] ?? "";
   // A comment needs whitespace before its `#`, as in a shell: `KEY=#abc`
