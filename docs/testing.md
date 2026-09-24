@@ -139,6 +139,10 @@ stores a key, and redacts what it prints. The scenarios cover:
 - `stuck`: a Worker that only claims success ends `blocked` within its repair
   budget.
 
+The scripted Worker writes the full implementation only after a Supervisor
+message that mentions the RangeError (or min > max). A Decision Worker answer
+that never names it leaves the work undone, and the scenario fails.
+
 Each prints a redacted summary: state, decisions, overrides, Reviewer verdicts
 and answer-format failures. The script exits non-zero when a scenario misses
 its expected outcome. Weak and rate-limited models are useful here, because

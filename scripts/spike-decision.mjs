@@ -42,7 +42,7 @@ const expected = {
   // The missing RangeError must have been asked for and then made: a
   // Reviewer that waves the incomplete first turn through fails this.
   review: (r) => r.state === "completed" && r.verified && r.fixRequested && r.workerFixed,
-  question: (r) => r.state === "completed" && r.verified && r.humanRequired.length === 0,
+  question: (r) => r.state === "completed" && r.verified && r.workerFixed && r.humanRequired.length === 0,
   stuck: (r) => r.state === "blocked" && !r.verified,
 };
 
