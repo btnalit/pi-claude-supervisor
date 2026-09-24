@@ -2579,7 +2579,7 @@ export class Supervisor {
       ok: verification.ok,
       failedChecks: verification.checks.filter((check) => check.check.required && !check.ok).map((check) => check.check.id).slice(0, 16),
       ...(verification.review ? { reviewVerdict: verification.review.verdict } : {}),
-      findings: (verification.review?.findings ?? []).slice(0, 8).map((finding) => `${finding.id} [${finding.severity}] ${finding.message}`.slice(0, 200)),
+      findings: bySeverity(verification.review?.findings ?? []).slice(0, 8).map((finding) => `${finding.id} [${finding.severity}] ${finding.message}`.slice(0, 200)),
     } : undefined;
     return { state: this.#machine.state, turn: this.#turn, repairRound: this.#repairRound, ...(deadline ? { deadline } : {}), ...(lastVerification ? { lastVerification } : {}) };
   }
@@ -3008,6 +3008,12 @@ function tailText(value: string, maxChars: number): string {
 
 const RETRY_RESUME_MESSAGE = "Your previous turn stopped before finishing. Resume the task where you left off.";
 
+/** Findings with the most severe first, keeping the Reviewer's order within a severity. */
+function bySeverity<T extends { severity: string }>(findings: readonly T[]): T[] {
+  const rank = (severity: string) => { const at = ["P0", "P1", "P2", "P3"].indexOf(severity); return at === -1 ? 4 : at; };
+  return [...findings].sort((a, b) => rank(a.severity) - rank(b.severity));
+}
+
 function repairInstruction(result: AcceptanceReport, reason: string, round: number): string {
   // Each check keeps the *end* of its output: that is where test runners
   // print the failure summary, while the head is usually progress noise.
@@ -3016,8 +3022,9 @@ function repairInstruction(result: AcceptanceReport, reason: string, round: numb
     .map((check) => `${check.check.id}: ${tailText(check.output, 4_000)}`)
     .join("\n");
   // Findings carry their location and evidence: they are what points the
-  // Worker at the fix. They go first so the 16 KB bound never cuts them.
-  const findings = result.review?.findings
+  // Worker at the fix. They go first so the 16 KB bound never cuts them, and
+  // the most severe lead, so long lesser findings cannot crowd out a P0.
+  const findings = bySeverity(result.review?.findings ?? [])
     .map((finding) => {
       const location = finding.file ? ` ${finding.file}${finding.line ? `:${finding.line}` : ""}` : "";
       const fix = finding.requiredFix ? `; required fix: ${finding.requiredFix}` : "";

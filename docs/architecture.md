@@ -595,14 +595,17 @@ conversation or control channel. It can inspect only `read`, `grep`, `find` and 
 must be that one JSON object (an optional ```json fence aside), carrying a
 random `reviewId` that appears only in its own prompt, with no key repeated and
 nothing beyond the schema (a string `summary`, and `findings` as flat objects of
-the finding fields with scalar values, each opening with `severity` then a
-non-empty `message` and closing with `evidence`, the only field the prompt
-allows repository quotes in). Repository text it quotes or copies therefore
-cannot stand in for the answer, change its verdict, or hide a finding, and a
-quote in `evidence` that closes a finding early can only add findings after it
-— never change the severity, message, fix or location the Reviewer already
-wrote. (A quote the Reviewer puts in `message` or `requiredFix` against the
-prompt can still reach the rest of that finding; any added P0/P1 still blocks.) A reply that breaks any of
+the finding fields with scalar values). Each finding opens with `severity`
+then a non-empty `message` (an `id` may lead) and closes with `evidence` if it
+has one — the only field the prompt allows repository quotes in. Repository
+text it quotes or copies therefore cannot stand in for the answer, change its
+verdict, or drop a finding it wrote, and a quote in `evidence` that closes a
+finding early can only add findings after it — never change the severity,
+message, fix or location the Reviewer already wrote. A quote the Reviewer puts
+in any other field against the prompt can still reach the rest of that
+finding. Added findings cannot unblock a candidate (any P0/P1 blocks, even
+under `pass`), and repair instructions list findings most severe first so
+added lesser ones cannot crowd out a blocking one. A reply that breaks any of
 these earns one corrective re-prompt. Invalid Reviewer
 output, incomplete evidence or a Reviewer API failure must prevent a candidate
 from crossing the remote/main boundary; the local system may retry, repair or

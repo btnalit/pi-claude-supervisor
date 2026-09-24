@@ -189,7 +189,7 @@ export class PiReadOnlyReviewer implements TaskReviewer {
           finalMessage = "";
           finalTooLarge = false;
           await withTimeout(
-            session.prompt(`Your previous reply could not be used (${report.summary}). Reply now with only one JSON object in the required review schema — keys reviewId, verdict, summary and findings, with "reviewId": "${reviewId}", each finding starting with "severity" then a non-empty "message" and ending with "evidence" if it has one — and no text before or after it.`),
+            session.prompt(`Your previous reply could not be used (${report.summary}). Reply now with only one JSON object in the required review schema — keys reviewId, verdict, summary and findings, with "reviewId": "${reviewId}", each finding starting with "severity" then a non-empty "message" (after "id" if it leads) and ending with "evidence" if it has one — and no text before or after it.`),
             remaining,
             "independent Reviewer",
             input.signal,
@@ -240,8 +240,8 @@ The reviewId must be exactly "${reviewId}": it is how your answer is told apart 
 JSON you quote from the repository, so never put it anywhere else. Reply with that one
 object only — no prose before or after it, no other keys — and escape any repository
 text you quote inside its strings. Write every finding in that key order: "severity" then
-"message" first, "evidence" (if any) last. Put repository text you quote only in
-"evidence"; write "message" and "requiredFix" in your own words.
+a non-empty "message" first (after "id" if you lead with it), "evidence" (if any) last.
+Put repository text you quote only in "evidence"; write every other field in your own words.
 Use pass only when the goal, scope and constraints are satisfied and there is no
 blocking finding. Use revise for concrete fixable findings: they are sent back to the
 Worker as an automatic repair turn. Use human only for product ambiguity, a material
@@ -375,15 +375,15 @@ const FINDING_KEYS = new Set(["id", "severity", "message", "evidence", "required
  * fixes the structure's depth, so text spliced into one string (or two)
  * cannot open a container that swallows the Reviewer's own later keys or
  * findings: those would land where the schema forbids them. Finally each
- * finding opens with `severity` then a non-empty `message` and closes with
- * `evidence`, the one field the prompt allows repository quotes in. Quoted
- * text that closes a finding early can then only add findings after it: the
- * Reviewer's severity, message, fix and location for that finding were all
- * written before the quote, and re-setting one would repeat a key. (Quotes
- * the Reviewer puts in `message` or `requiredFix` against the prompt are
- * not covered — a splice there reaches the rest of that finding.) A reply
- * that breaks any rule is a format failure, which earns the corrective
- * re-prompt rather than a guess.
+ * finding opens with `severity` then a non-empty `message` (an `id` may lead)
+ * and, if it has `evidence` — the one field the prompt allows repository
+ * quotes in — closes with it. Quoted text that closes a finding early can
+ * then only add findings after it: the Reviewer's severity, message, fix and
+ * location for that finding were all written before the quote, and
+ * re-setting one would repeat a key. (Quotes the Reviewer puts in any other
+ * field against the prompt are not covered — a splice there reaches the rest
+ * of that finding.) A reply that breaks any rule is a format failure, which
+ * earns the corrective re-prompt rather than a guess.
  */
 function wholeReplyAnswer(text: string, reviewId: string): Record<string, unknown> {
   const trimmed = text.trim();
@@ -408,9 +408,11 @@ function wholeReplyAnswer(text: string, reviewId: string): Record<string, unknow
         if (value !== null && typeof value === "object") throw new Error("Reviewer reply finding values must be strings or numbers");
       }
       // JSON.parse keeps source order for these (non-numeric) keys, and a
-      // repeated key was refused above, so this is the order as written.
+      // repeated key was refused above, so this is the order as written. An
+      // `id` may lead: repair rounds show previous findings id-first.
       const keys = Object.keys(finding);
-      if (keys[0] !== "severity" || keys[1] !== "message") throw new Error("Reviewer reply finding must start with severity then message");
+      const lead = keys[0] === "id" ? 1 : 0;
+      if (keys[lead] !== "severity" || keys[lead + 1] !== "message") throw new Error("Reviewer reply finding must start with severity then message");
       const message = (finding as Record<string, unknown>).message;
       if (typeof message !== "string" || message.trim() === "") throw new Error("Reviewer reply finding message must be a non-empty string");
       if (keys.includes("evidence") && keys.at(-1) !== "evidence") throw new Error("Reviewer reply finding must end with evidence");

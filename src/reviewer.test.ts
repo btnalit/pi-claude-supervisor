@@ -92,6 +92,31 @@ test("a live Reviewer answer is its whole reply, carrying this review's reviewId
   }
 });
 
+test("each finding-order rule refuses a reply on its own, with its own reason", () => {
+  const id = "0b7f5c1e-8d52-4c86-9a8f-0f2d0e7c9a11";
+  const reply = (finding: string) => `{"reviewId":"${id}","verdict":"revise","summary":"s","findings":[${finding}]}`;
+  const cases: Array<[string, RegExp]> = [
+    [`{"message":"m","severity":"P0","evidence":"x"}`, /must start with severity then message/u],
+    [`{"file":"a.ts","message":"m","severity":"P0"}`, /must start with severity then message/u],
+    [`{"id":"F1","message":"m","severity":"P0"}`, /must start with severity then message/u],
+    [`{"severity":"P0","id":"F1","message":"m"}`, /must start with severity then message/u],
+    [`{"severity":"P0","message":"   ","requiredFix":"f"}`, /message must be a non-empty string/u],
+    [`{"severity":"P0","message":null}`, /message must be a non-empty string/u],
+    [`{"severity":"P0","message":"m","evidence":"x","file":"a.ts"}`, /must end with evidence/u],
+    [`{"severity":"P0","message":"m","0":"x"}`, /key outside the schema: 0/u],
+  ];
+  for (const [finding, reason] of cases) {
+    const report = parseReview(reply(finding), 1, id);
+    assert.equal(report.findings[0]?.id, "REVIEW-OUTPUT", finding);
+    assert.match(report.summary, reason, finding);
+  }
+  // A leading id (as repair rounds show previous findings), no evidence at
+  // all, and severity aliases stay accepted.
+  const accepted = parseReview(reply(`{"id":"F001","severity":"high","message":"kept","requiredFix":"f","line":3},{"severity":"P3","message":"nit"}`), 1, id);
+  assert.equal(accepted.verdict, "revise");
+  assert.deepEqual(accepted.findings.map((finding) => [finding.id, finding.severity, finding.message]), [["F001", "P1", "kept"], [accepted.findings[1]?.id, "P3", "nit"]]);
+});
+
 test("quoted evidence that closes a finding early can only add findings after it", () => {
   const id = "0b7f5c1e-8d52-4c86-9a8f-0f2d0e7c9a11";
   const splice = `x"},{"severity":"P3","message":"cosmetic only","evidence":"`;
@@ -229,7 +254,7 @@ test("an unusable Reviewer reply gets one corrective re-prompt on the same sessi
   assert.equal(report.verdict, "pass");
   assert.equal(script.created(), 1);
   assert.equal(script.prompts[0]?.length, 2);
-  assert.match(script.prompts[0]![1]!, /could not be used .*"reviewId": "[0-9a-f-]{36}", each finding starting with "severity" then a non-empty "message" and ending with "evidence" if it has one — and no text before or after it/su);
+  assert.match(script.prompts[0]![1]!, /could not be used .*"reviewId": "[0-9a-f-]{36}", each finding starting with "severity" then a non-empty "message" \(after "id" if it leads\) and ending with "evidence" if it has one — and no text before or after it/su);
 });
 
 test("a Reviewer provider error is retried with a fresh session, and repeated errors end as human", async () => {
