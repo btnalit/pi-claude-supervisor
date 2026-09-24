@@ -2319,9 +2319,11 @@ export function writeRootsOf(record: { scratchpadDir?: string; transcriptPath?: 
  * task directory. Hooks route by Claude's project directory, so an event can
  * arrive from a shell that `cd`'d elsewhere (an adopted session, an explicit
  * CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=0, or EnterWorktree). Present
- * such a command as it actually runs, `cd <shell cwd> && <command>`, so the
- * policy and the Decision Worker judge the real target instead of treating
- * `echo x > hooks/pre-commit` from inside `.git` as a routine local write.
+ * such a command as it actually runs, `cd <shell cwd> && <command>`. The
+ * policy does not track `cd`, but a command with a `cd` segment is never
+ * routine, so the Decision Worker judges it with its real directory shown
+ * instead of `echo x > hooks/pre-commit` from inside `.git` being auto-allowed
+ * as a routine local write.
  * The raw event is left untouched; the reply carries only a decision.
  */
 export function effectiveToolInput(event: Pick<ClaudeHookEvent, "tool_name" | "tool_input" | "cwd">, taskCwd: string): unknown {

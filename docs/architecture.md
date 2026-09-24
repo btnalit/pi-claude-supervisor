@@ -217,8 +217,9 @@ A nested Claude launched in a different directory reports that directory as
 its project directory and is not routed to the parent's Supervisor (one
 launched in the task directory itself is, as it always was). A Bash request
 whose shell cwd differs from the task directory is presented to the policy as
-`cd <shell cwd> && <command>`, so relative paths are judged where they actually
-resolve. Automatic Workers also get
+`cd <shell cwd> && <command>`: the policy does not track `cd`, but such a
+command is never classed as routine, so under `hybrid` authority the Decision
+Worker judges it with its real directory shown. Automatic Workers also get
 `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1` (unless the caller set it), which
 returns Claude's Bash to the task directory after each command, so the
 policy's relative-path resolution against the task directory stays true. A
