@@ -474,7 +474,8 @@ npm run test:install
 
 详见 [architecture](docs/architecture.md)、[testing](docs/testing.md) 和
 [releasing](docs/releasing.md);`docs/autonomy-target.md` 记录了本项目所
-围绕的、已确认的无人值守开发目标。
+围绕的、已确认的无人值守开发目标;[optimization-roadmap](docs/optimization-roadmap.md)
+是 0.9.2 之后的优化路线图(提案)。
 
 ## License
 

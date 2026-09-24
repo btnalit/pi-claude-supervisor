@@ -588,7 +588,8 @@ from a path that is not group/world-writable.
 See [architecture](docs/architecture.md), [testing](docs/testing.md), and
 [releasing](docs/releasing.md) for more detail; `docs/autonomy-target.md`
 records the confirmed unattended-development target this project is built
-around.
+around, and [`docs/optimization-roadmap.md`](docs/optimization-roadmap.md) (in
+Chinese) proposes the post-0.9.2 optimization roadmap.
 
 ## License
 
