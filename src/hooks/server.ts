@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
 import { chmod, lstat, mkdir, readdir, readlink, realpath, rename, rm, symlink, unlink } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { CLAUDE_HOOK_EVENT_NAMES, type ClaudeHookEvent, type ClaudeHookEventName, type HookEventSource, type HookRelayReply, type HookRelayRequest } from "./types.ts";
 
@@ -33,7 +33,7 @@ export function hookSocketRuntimeDirectory(env: NodeJS.ProcessEnv = process.env)
 
 /**
  * One socket per Pi process, with a per-cwd symlink under `by-cwd/` so a
- * relay only needs the event's cwd to find its Supervisor. See
+ * relay only needs the task directory to find its Supervisor. See
  * src/hooks/types.ts for the full routing contract.
  */
 export class HookServer implements HookEventSource {
@@ -197,7 +197,7 @@ export class HookServer implements HookEventSource {
     try {
       const request = parseRequest(line);
       if (request) {
-        const handler = this.#handlers.get(hashCwd(await canonicalize(request.event.cwd)));
+        const handler = this.#handlers.get(hashCwd(await canonicalize(request.routeCwd ?? request.event.cwd)));
         if (handler) reply = (await handler(request)) ?? {};
       }
     } catch {
@@ -243,6 +243,7 @@ function parseRequest(line: string): HookRelayRequest | undefined {
   const request = value as Partial<HookRelayRequest>;
   if (request.version !== 1) return undefined;
   if (typeof request.pid !== "number" || typeof request.ppid !== "number") return undefined;
+  if (request.routeCwd !== undefined && (typeof request.routeCwd !== "string" || !isAbsolute(request.routeCwd))) return undefined;
   const event = request.event as Partial<ClaudeHookEvent> | undefined;
   if (!event || typeof event !== "object") return undefined;
   if (typeof event.cwd !== "string" || !event.cwd) return undefined;

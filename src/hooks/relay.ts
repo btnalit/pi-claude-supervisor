@@ -12,6 +12,14 @@ import { shellQuote } from "../policy.ts";
  * with empty stdout, so a relay bug never blocks Claude Code. The fast path
  * (no Supervisor listening for this cwd) never requires "net", matching the
  * expectation that it costs about a millisecond.
+ *
+ * Routing prefers `CLAUDE_PROJECT_DIR`, which Claude Code sets on every hook
+ * command to the directory the session was launched in, over the event's
+ * `cwd`, which follows a persisted Bash `cd` into a subdirectory. Routing by
+ * `cwd` alone silently drops every later event (Stop, PreToolUse,
+ * PermissionRequest) of a Worker that changed directory. A nested Claude
+ * sets its own project directory, so it is not routed to its parent's
+ * Supervisor by this.
  */
 export const HOOK_RELAY_SCRIPT = `
 (function () {
@@ -73,22 +81,26 @@ export const HOOK_RELAY_SCRIPT = `
   var hookDir = process.env.PI_CLAUDE_SUPERVISOR_HOOK_DIR
     || (/[\\/]relay\.js$/.test(scriptPath) ? path.dirname(scriptPath) : "")
     || path.join(os.homedir(), ".pi", "agent", "claude-supervisor", "hooks");
-  var canonicalCwd = event.cwd;
-  try {
-    canonicalCwd = fs.realpathSync(event.cwd);
-  } catch (e) { /* fall back to the raw cwd */ }
-  var hash = crypto.createHash("sha256").update(canonicalCwd).digest("hex");
-  var socketPath = path.join(hookDir, "by-cwd", hash);
-
-  // Fast path: no Supervisor owns this cwd. Check before requiring "net" so
-  // the common case (no hooks configured / no owning Supervisor) is cheap.
-  var socketInfo;
-  try {
-    socketInfo = fs.statSync(socketPath);
-  } catch (e) {
-    return;
+  function socketFor(dir) {
+    if (typeof dir !== "string" || !path.isAbsolute(dir)) return undefined;
+    var canonical = dir;
+    try {
+      canonical = fs.realpathSync(dir);
+    } catch (e) { /* fall back to the raw path */ }
+    var candidate = path.join(hookDir, "by-cwd", crypto.createHash("sha256").update(canonical).digest("hex"));
+    try {
+      return fs.statSync(candidate).isSocket() ? { socketPath: candidate, routeCwd: canonical } : undefined;
+    } catch (e) {
+      return undefined;
+    }
   }
-  if (!socketInfo.isSocket()) return;
+
+  // Fast path: no Supervisor owns the project directory or the cwd. Check
+  // before requiring "net" so the common case (no hooks configured / no
+  // owning Supervisor) is cheap.
+  var route = socketFor(process.env.CLAUDE_PROJECT_DIR) || socketFor(event.cwd);
+  if (!route) return;
+  var socketPath = route.socketPath;
 
   var BLOCKING_EVENTS = ${JSON.stringify([...BLOCKING_HOOK_EVENTS])};
   var blocking = BLOCKING_EVENTS.indexOf(event.hook_event_name) !== -1;
@@ -97,6 +109,7 @@ export const HOOK_RELAY_SCRIPT = `
     pid: process.pid,
     ppid: process.ppid,
     tmuxPane: process.env.TMUX_PANE,
+    routeCwd: route.routeCwd,
     event: event,
   }) + "\\n";
 

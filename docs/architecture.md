@@ -204,10 +204,20 @@ are mutually exclusive sub-modes of the automatic tmux transport.
 are configured to run a small embedded relay script
 (`src/hooks/relay.ts`'s `HOOK_RELAY_SCRIPT`, written to
 `<stateDir>/hooks/relay.js`). The relay reads the hook event JSON from stdin,
-hashes the event's `cwd` to find `<stateDir>/hooks/by-cwd/<sha256(cwd)>` — a
+hashes the task directory to find `<stateDir>/hooks/by-cwd/<sha256(cwd)>` — a
 symlink to a `HookServer`'s unix socket, created only while a Supervisor holds
-that cwd — and forwards the event over the socket, printing the reply as
-Claude's hook output. A cwd with no owning Supervisor is a fast no-op: the
+that cwd — and forwards the event over the socket together with the directory
+it routed by (`routeCwd`), printing the reply as Claude's hook output. The task
+directory is Claude's `CLAUDE_PROJECT_DIR` (set on every hook command to the
+session's launch directory) when a Supervisor owns it, else the event's `cwd`:
+a Bash `cd` into a subdirectory moves `cwd` but not the project directory, so
+routing by `cwd` alone would silently drop every later event of that Worker.
+A nested Claude reports its own project directory and is not routed to its
+parent's Supervisor. Automatic Workers also get
+`CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1` (unless the caller set it), which
+returns Claude's Bash to the task directory after each command, so the
+policy's relative-path resolution against the task directory stays true. A
+directory with no owning Supervisor is a fast no-op: the
 relay `stat`s the symlink path and returns before touching `net`. Non-blocking
 events (`SessionStart`, `SessionEnd`, `UserPromptSubmit`, `Notification`) are
 fire-and-forget; `PreToolUse`, `PermissionRequest` and `Stop` block Claude for

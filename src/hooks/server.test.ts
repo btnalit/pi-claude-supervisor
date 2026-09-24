@@ -113,6 +113,26 @@ test("routes a request to the handler subscribed for its canonical cwd and repli
   });
 });
 
+test("routes by the relay's routeCwd when present, so an event from a subdirectory reaches the task's handler", async () => {
+  await withServer(async (server) => {
+    await withTempCwd(async (cwd) => {
+      const subdir = join(cwd, "sub");
+      await mkdir(subdir);
+      const unsubscribe = await server.subscribe(cwd, async () => ({ permissionDecision: "allow" }));
+      try {
+        const routed = await send(server.socketPath!, JSON.stringify({ ...request(subdir), routeCwd: cwd }));
+        assert.deepEqual(JSON.parse(routed.reply), { permissionDecision: "allow" });
+        const unrouted = await send(server.socketPath!, JSON.stringify(request(subdir)));
+        assert.deepEqual(JSON.parse(unrouted.reply), {});
+        const relative = await send(server.socketPath!, JSON.stringify({ ...request(cwd), routeCwd: "relative/dir" }));
+        assert.deepEqual(JSON.parse(relative.reply), {});
+      } finally {
+        await unsubscribe();
+      }
+    });
+  });
+});
+
 test("every hook event the Supervisor installs reaches its handler through the server", async () => {
   await withServer(async (server) => {
     await withTempCwd(async (cwd) => {
