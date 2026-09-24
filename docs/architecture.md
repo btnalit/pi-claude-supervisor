@@ -162,7 +162,9 @@ placeholder), Enter is sent again, at most twice — never blindly, since Enter
 on a dialog would pick its default. A message still stuck after that is a
 non-retryable error (a resend would duplicate it); an empty box without the
 hook is accepted and logged, leaving a broken hook channel to the no-output
-watchdog. An `idle_prompt` notification is not counted as delivery. The Supervisor re-applies a Decision `continue`/`redirect`/`answer`/
+watchdog. An `idle_prompt` notification arriving while a send is still
+confirming neither counts as delivery nor closes the turn that is only
+starting. The Supervisor re-applies a Decision `continue`/`redirect`/`answer`/
 `retry` whose message was refused as retryable after 15 s, doubling to at most
 a minute, up to five times (`worker_input_deferred`); any fresh Worker event
 supersedes the retry, as do a later turn, an operator's own message or a

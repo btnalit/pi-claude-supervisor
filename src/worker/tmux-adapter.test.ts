@@ -1915,6 +1915,9 @@ test("an idle notification between paste and UserPromptSubmit does not count as 
     await sending;
     // The dropped Enter was resent: the idle notification did not short-circuit the check.
     assert.match(await output(), /sent Enter again/u);
+    // The idle notice did not close the turn that was only starting.
+    assert.equal(events.some((event) => event.type === "turn_completed"), false);
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 1);
     // The real submission still matches the pasted message rather than reading as a human prompt.
     await hook({ hook_event_name: "UserPromptSubmit", prompt: "wait for the real submit" });
     assert.equal(events.some((event) => event.type === "human_input"), false);

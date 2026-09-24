@@ -149,6 +149,8 @@ interface TmuxRecord {
   submitAcks: number;
   /** Counts prompts nobody here sent (human or Claude runtime), so a waiting send can tell the Worker moved on. */
   humanInputs: number;
+  /** A send is waiting for its UserPromptSubmit; an idle notice in that window is not a finished turn. */
+  confirmingDelivery?: boolean;
   pendingPermissionRequests: Map<string, { phase: "pre" | "prompt"; resolve: (reply: HookRelayReply) => void }>;
   /** Hook requests that did not bind to this pane's identity, for diagnostics. */
   ignoredHookRequests: number;
@@ -1258,6 +1260,15 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
    * the hook channel did not report it, which the no-output watchdog covers.
    */
   async #confirmDelivery(record: TmuxRecord, message: string, acksBefore: number): Promise<void> {
+    record.confirmingDelivery = true;
+    try {
+      await this.#confirmDeliveryAttempts(record, message, acksBefore);
+    } finally {
+      record.confirmingDelivery = false;
+    }
+  }
+
+  async #confirmDeliveryAttempts(record: TmuxRecord, message: string, acksBefore: number): Promise<void> {
     for (let enterResends = 0; ; enterResends += 1) {
       if (await this.#awaitSubmitAck(record, acksBefore)) return;
       const holdsMessage = inputHoldsMessage(await this.#capture(record), message);
@@ -2234,7 +2245,11 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         if (event.notification_type === "permission_prompt") {
           const hasPendingPrompt = [...record.pendingPermissionRequests.values()].some((pending) => pending.phase === "prompt");
           if (!hasPendingPrompt) this.#logOutput(record, "[supervisor] Claude is waiting at a permission prompt the hook did not intercept\n");
-        } else if (event.notification_type === "idle_prompt" && record.activeRequests > 0) {
+        } else if (event.notification_type === "idle_prompt" && record.activeRequests > 0 && !record.confirmingDelivery) {
+          // Skipped while a send is confirming its delivery: an idle notice in
+          // the gap between the paste and its UserPromptSubmit would close a
+          // turn that is only just starting, and the Supervisor would decide
+          // (even verify) on an empty result while Claude works.
           // Claude has been idle at its prompt for a minute with no Stop
           // delivered (interrupted turn, lost hook): close the turn so the
           // Supervisor is not left waiting for a completion that will not come.
