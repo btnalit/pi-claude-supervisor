@@ -265,7 +265,12 @@ copy-mode、Stop-hook block、后台任务、AskUserQuestion、限流模拟；�
 | D12 | cwd 租约（1288 行）：崩溃的 Pi 留下的租约在 tmux/cgroup 仍存活时需人工 `recover --takeover` | 无人值守下无法自动接续 | 自动回收可证明为孤儿的 owned tmux 服务器；接管事务机制简化为“锁 + 所有者 pid/启动时间 + Worker 存活检查” | 中 |
 
 **底线清单（必须保留或新增）**：
-- **新增：删除/移动底线**（**必须先于 D9、D5 上线**）。现状：Bash 中只拦截 `/`、`/*`、`-- /`；`rm -rf ~/other-project`、
+- ✅ **新增：删除/移动底线**（**必须先于 D9、D5 上线**）。**已实现**（`deleteFloorViolation`，接在 `evaluatePermission` 的 Bash 分支，任何授权模式与人工 approve 都无法越过）：
+  与下方原规则的差异——字面 glob 与绑定到字面值的变量按其路径判断而非一律拒绝（`rm -rf dist/*` 是日常清理），但隐藏项 glob（`.*`）
+  与无 name/path 过滤的 `find .`（会连带 `.git`）拒绝；字面 `cd`/`pushd` 会被跟踪而非一律拒绝，无法解析的 `cd` 之后的相对目标拒绝；
+  包含任务目录的祖先目录总是拒绝（即使任务位于 `/tmp` 之下）；整个写入根/临时根或其顶层 glob 拒绝；`git clean` 的 `-C`/`--work-tree`
+  按删除目标判断；`sudo`/`env`/`timeout`/`nohup` 等包装器、字面 `sh -c`/`eval` 与喂给 shell 的 heredoc 会被展开，动态脚本中含删除词即拒绝。
+  **残余风险**：解释器（`python -c`、Worker 自写脚本）执行的删除超出静态解析范围，本项不覆盖（cgroup 只限资源不限路径）；需要时由运维用容器/OS 沙箱收窄文件系统视图。原规则：现状：Bash 中只拦截 `/`、`/*`、`-- /`；`rm -rf ~/other-project`、
   `rm -rf ~`、`rm -rf /home`、`rm -rf /usr`、`find ~ -delete`、`rm -rf "$HOME"`、`rm -rf $(pwd)/../x`、`cd /tmp && rm -rf *`、
   `rm -rf .git` 均被放行（现有 `hybrid` 授权下这些不是常规命令，由 Decision LLM 把关；放宽为 `policy` 后只剩底线）。规则：
   对 `rm`/`mv`/`find -delete`/`git clean`/`shred` 等删除或移动类语句——

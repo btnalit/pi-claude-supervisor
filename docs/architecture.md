@@ -609,6 +609,29 @@ remote authority stays a plain stop. Optional alert
 delivery remains independent from event-log persistence, but notification is not
 the control boundary.
 
+Beneath every authority sits the delete floor (`deleteFloorViolation` in
+`src/policy.ts`, applied inside `evaluatePermission` to every Bash request, so no
+authority mode, human `/supervise approve` included, can lift it). A delete or
+move — `rm`, `rmdir`, `unlink`, `shred`, `mv`, `find -delete`/`-exec rm`, and
+`git clean` pointed elsewhere with `-C`/`--work-tree` — is read through wrappers
+(`sudo`, `env`, `timeout`, `nohup`, …), `sh -c`/`eval` with a literal script, and
+heredocs fed to a shell, while `cd`/`pushd` to a literal directory is followed.
+It is refused when a target is dynamic (`$VAR`, `$(…)`), follows a `cd` the
+reading cannot resolve, or comes from input (`xargs`, `parallel`); when it
+resolves (parent through realpath, last name as written, so `rm link` stays a
+link removal) outside the task directory, the extra write roots and the temp
+directory; when it is the task directory itself, a directory that contains the
+task, a whole write/temp root or a glob across its top; when it is a glob over
+hidden entries or an unfiltered `find` over the whole task tree (both would
+take `.git`); and when it is Git's own store. `git prune`, `git gc --prune*` and
+`git reflog expire/delete` are refused because with no remote authority the
+local commits are the only copy. Literal globs (`rm -rf dist/*`) and names bound
+to literal text inside the task stay allowed. An interpreter
+(`python -c "shutil.rmtree(...)"`, a script file the Worker wrote) is outside
+what a static reading can see. That residual risk is not covered here (the
+cgroup boundary limits resources, not paths); an operator who needs it closed
+runs the Worker in a container or OS sandbox with a read-only view of the rest.
+
 Permission requests are not all routed to the Decision Worker model. `autonomy.permissionAuthority`
 (`policy` | `hybrid`, default | `decision-worker`) chooses the authority: `policy` answers
 every request from the deterministic policy alone, `decision-worker` sends every

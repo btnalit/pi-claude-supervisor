@@ -19,7 +19,7 @@ the published TypeScript source directly and there is no second runtime bundle.
 
 ## Test layers
 
-- `policy.test.ts`: deterministic local allow and hard-boundary deny behavior; legacy approval cannot override denial.
+- `policy.test.ts`: deterministic local allow and hard-boundary deny behavior; legacy approval cannot override denial; the delete floor's allow/deny tables against a temp repo whose shared temp root is injected, so `..` is truly outside.
 - `state.test.ts`: legal and illegal lifecycle transitions.
 - `events.test.ts`: ordered JSONL persistence, sequence recovery and credential-shaped redaction.
 - `decision-session-store.test.ts`: atomic Decision Worker task mapping, permissions, restart discovery and corrupt-record isolation.

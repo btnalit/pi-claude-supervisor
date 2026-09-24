@@ -3,7 +3,7 @@ import { link, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { assertSafeWorkerCommand, evaluateCommand, evaluatePermission, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, sameDirectory, shellQuote } from "./policy.ts";
+import { assertSafeWorkerCommand, deleteFloorViolation, evaluateCommand, evaluatePermission, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, sameDirectory, shellQuote } from "./policy.ts";
 
 function bash(command: string) {
   return { command };
@@ -196,7 +196,7 @@ test("newlines separate statements and comments are ignored", () => {
   assert.equal(evaluateCommand("echo '#not a comment' # but this is\nls").decision, "allow");
 });
 
-test("the Bash tool path and direct command evaluation agree", () => {
+test("the Bash tool path is direct command evaluation plus the delete floor", () => {
   const matrix = [
     `git -C ${process.cwd()} push origin main`, "git pu{sh,} origin main", "$CMD --flag", "timeout 30 $CMD", "claude --permission-mode \"$MODE\"",
     "sh -c \"$x\"", "bash -lc 'git push origin main'", "npm publish", "gh pr create --title \"$title\"",
@@ -205,8 +205,12 @@ test("the Bash tool path and direct command evaluation agree", () => {
     "if [ -d .git ]; then git status; fi", "echo start\n$CMD", "c'l'a'u'de --print review",
   ];
   for (const command of matrix) {
-    assert.equal(evaluatePermission("Bash", { command }).decision, evaluateCommand(command).decision, command);
+    const expected = evaluateCommand(command).decision === "deny" || deleteFloorViolation(command, process.cwd()) ? "deny" : evaluateCommand(command).decision;
+    assert.equal(evaluatePermission("Bash", { command }).decision, expected, command);
   }
+  // The floor is what separates the two here: a glob across the whole temp root.
+  assert.equal(evaluateCommand("rm -rf /tmp/*").decision, "allow");
+  assert.equal(evaluatePermission("Bash", { command: "rm -rf /tmp/*" }).decision, "deny");
 });
 
 test("policy allows ordinary read-only commands and literal argv values", () => {
@@ -904,4 +908,146 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
   assert.equal(isRoutinePermission("Bash", { command: `${create} --title x --body y` }, process.cwd(), { remote: pr }), true);
   assert.equal(isRoutinePermission("Bash", { command: `git -C ${process.cwd()} ${hooks} push origin ${refspec}` }, process.cwd()), false);
   assert.equal(isRoutinePermission("Bash", { command: `git -C ${process.cwd()} ${hooks} push --force origin ${refspec}` }, process.cwd(), { remote: push }), false);
+});
+
+async function deleteFloorFixture() {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-delete-floor-"));
+  const repo = join(root, "repo");
+  const scratch = join(root, "scratch");
+  const shared = join(root, "shared-tmp");
+  const outside = join(root, "outside");
+  await Promise.all([
+    mkdir(join(repo, ".git", "objects"), { recursive: true }),
+    mkdir(join(repo, "src"), { recursive: true }),
+    mkdir(scratch, { recursive: true }),
+    mkdir(shared, { recursive: true }),
+    mkdir(outside, { recursive: true }),
+  ]);
+  await symlink(outside, join(repo, "outside-link"));
+  // The task directory is not under the shared temp root here, so `..` is truly outside.
+  const judge = (command: string) => deleteFloorViolation(command, repo, { writeRoots: [scratch], tempRoots: [shared] });
+  return { root, repo, scratch, shared, outside, judge };
+}
+
+test("the delete floor allows ordinary cleanup inside the task, its write roots and temp", async () => {
+  const { root, scratch, shared, judge } = await deleteFloorFixture();
+  try {
+    for (const command of [
+      "rm -rf node_modules dist",
+      "rm -rf ./dist/",
+      "rm -f src/*.js",
+      "rm -rf *",
+      "rm -rf build && npm run build",
+      "cd src && rm -rf generated",
+      "find . -name '*.pyc' -delete",
+      "find . -path './build/*' -exec rm -f {} +",
+      "find dist -type f -exec rm {} +",
+      "mv src/a.ts src/b.ts",
+      "mv -t src/old a.ts b.ts",
+      "rmdir src/empty",
+      "shred -u secrets.txt",
+      "rm outside-link",
+      `rm -rf ${scratch}/cache`,
+      `rm -rf ${shared}/pi-test-cache`,
+      "git clean -fdx",
+      "git -C . clean -fdx",
+      "git -C src clean -fd",
+      "git gc",
+      "git reflog show",
+      "D=dist; rm -rf $D",
+      "for d in dist build; do rm -rf $d; done",
+      "sudo rm -rf dist",
+      "bash -c 'rm -rf dist'",
+      "echo rm -rf ~",
+      "grep -r 'rm -rf' .",
+    ]) {
+      assert.equal(judge(command), undefined, command);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the delete floor refuses deletes and moves that could destroy what the task does not own", async () => {
+  const { root, scratch, shared, outside, judge } = await deleteFloorFixture();
+  try {
+    const cases: Array<[string, RegExp]> = [
+      ["rm -rf ~", /contains the task|outside the task/u],
+      ["rm -rf ~/other-project", /outside the task/u],
+      ['rm -rf "$HOME"', /only known at run time/u],
+      ["rm -rf /home", /contains the task|outside the task/u],
+      ["rm -rf /usr", /outside the task/u],
+      ["rm -rf /", /contains the task/u],
+      ["find ~ -delete", /contains the task|outside the task/u],
+      ["rm -rf $(pwd)/../x", /only known at run time/u],
+      ["rm -rf .", /task directory itself/u],
+      ["rm -rf ..", /contains the task/u],
+      ["rm -rf ../sibling", /outside the task/u],
+      [`rm -rf ${outside}`, /outside the task/u],
+      ["rm -rf outside-link/", /outside the task/u],
+      ["rm -rf outside-link/*", /outside the task/u],
+      ["rm -rf .git", /Git's own store/u],
+      ["rm -rf .git/objects", /Git's own store/u],
+      ["rm -rf src/../.git", /Git's own store/u],
+      ["mv .git /tmp/gitbak", /Git's own store/u],
+      ["rm -rf .*", /hidden entries/u],
+      ["rm -rf .[!.]*", /hidden entries/u],
+      ["find . -delete", /whole task tree/u],
+      ["find . -type f -exec rm {} +", /whole task tree/u],
+      [`cd ${shared} && rm -rf *`, /top of a shared directory/u],
+      [`rm -rf ${shared}`, /whole shared directory/u],
+      [`rm -rf ${scratch}`, /whole shared directory/u],
+      ["cd $DIR && rm -rf build", /cd the policy cannot follow/u],
+      ["mv dist ~/Desktop/", /outside the task/u],
+      ["mv --target-directory=/opt dist", /outside the task/u],
+      ["mv -t ~/elsewhere dist", /outside the task/u],
+      ["mv notes.md ~/.bashrc", /outside the task/u],
+      ["unlink /etc/hosts", /outside the task/u],
+      ["sudo rm -rf /var/lib/x", /outside the task/u],
+      ["env FOO=1 rm -rf ~/x", /outside the task/u],
+      ["timeout 5 rm -rf ../x", /outside the task/u],
+      ["nohup rm -rf /opt/x &", /outside the task/u],
+      ["true && rm -rf ../x", /outside the task/u],
+      ["ls | xargs rm", /taken from input/u],
+      ["find . -name x | xargs rm -rf", /taken from input/u],
+      ["sh -c 'rm -rf ~/x'", /outside the task/u],
+      ['bash -c "rm -rf $TARGET"', /built at run time/u],
+      ["eval rm -rf ../x", /outside the task/u],
+      ["cat <<'EOF' | sh\nrm -rf ../x\nEOF", /outside the task/u],
+      ["git gc --prune=now", /prune Git's own store/u],
+      ["git reflog expire --expire=now --all", /prune Git's own store/u],
+      ["git -C . prune", /prune Git's own store/u],
+      ["git -C ../other clean -fdx", /outside the task/u],
+      ["git --work-tree=/srv/app clean -fdx", /outside the task/u],
+    ];
+    for (const [command, reason] of cases) {
+      assert.match(judge(command) ?? "allowed", reason, command);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a task under the shared temp root still cannot delete its own parent", async () => {
+  const { root, repo } = await deleteFloorFixture();
+  try {
+    const judge = (command: string) => deleteFloorViolation(command, repo, { tempRoots: [root] });
+    assert.match(judge("rm -rf ..") ?? "allowed", /contains the task/u);
+    assert.equal(judge("rm -rf ../scratch"), undefined, "a sibling scratch directory under temp is fair game");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the Bash permission path applies the delete floor", async () => {
+  const { root, repo } = await deleteFloorFixture();
+  try {
+    assert.equal(evaluatePermission("Bash", bash("rm -rf dist && npm test"), repo).decision, "allow");
+    const denied = evaluatePermission("Bash", bash("rm -rf ~/other-project"), repo);
+    assert.equal(denied.decision, "deny");
+    assert.match(denied.reason, /outside the task/u);
+    assert.equal(evaluatePermission("Bash", bash("rm -rf .git"), repo).decision, "deny");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
