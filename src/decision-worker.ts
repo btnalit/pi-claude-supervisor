@@ -89,6 +89,12 @@ export interface DecisionWorkerOptions {
   compactionTokens?: number;
   /** Token accounting for every model call made by this session. */
   onUsage?: (usage: PiUsageSample) => void;
+  /** A decision request failed transiently and will be asked again after `delayMs`. */
+  onRetry?: (event: WorkerEvent, info: { attempt: number; delayMs: number; error: unknown }) => void;
+  /** True once a later event has made this one moot: it is then dropped, neither retried nor failed. */
+  isSuperseded?: (event: WorkerEvent) => boolean;
+  /** A moot event was dropped while its decision was failing (for the audit log). */
+  onSuperseded?: (event: WorkerEvent, error: unknown) => void;
 }
 
 export type PiModel = NonNullable<NonNullable<Parameters<typeof createAgentSession>[0]>["model"]>;
@@ -104,6 +110,58 @@ export const STALE_VERIFICATION_TURNS = 3;
 /** First retry wait; each later wait triples, capped at MAX_DECISION_RETRY_BACKOFF_MS. */
 const DEFAULT_DECISION_RETRY_BACKOFF_MS = 5_000;
 const MAX_DECISION_RETRY_BACKOFF_MS = 60_000;
+
+/**
+ * Errors no amount of waiting fixes: rejected, missing or expired
+ * credentials, an exhausted account, a model that does not exist. Matched on
+ * words, not bare status codes, which also turn up inside request ids, URLs
+ * and wrapped upstream errors.
+ */
+const CONFIGURATION_ERROR = /(?:account|organi[sz]ation)[^\n]{0,40}(?:terminated|disabled|suspended|deactivated)|authentication|unauthori[sz]ed|incorrect api key|token has expired|invalid[_ ]?x?-?api[_ -]?key|api[_ ]key[_ ](?:not[_ ]valid|expired|invalid)|no api key found|security token[^\n]{0,40}invalid|UnrecognizedClient|ExpiredToken|AccessDenied|permission[_ ]denied|permission_error|payment[_ ]required|credit[_ ]balance|insufficient[_ ]quota|billing_error|not_found_error|models?\b[^\n]{0,80}\b(?:not[_ ]found|does not exist|is invalid)|model identifier is invalid|unsupported[_ ]model|invalid[_ ]model/iu;
+
+/**
+ * Errors that pass by themselves: provider load and rate limits (including a
+ * quota that resets, whose Gemini message also mentions "billing"), 5xx,
+ * gateway and network failures. Based on pi-ai's own retryable list. Anything
+ * matching neither list, such as a prompt that is too long, a corrupted
+ * session or this worker's own request timeout, fails the same way every time
+ * and stays bounded by maxDecisionRetries.
+ */
+const TRANSIENT_ERROR = /overloaded|rate.?limit|too many requests|resource.?exhausted|retry in \d|quota exceeded for metric|exceeded your current quota|\b(?:429|500|502|503|504|524|529)\b|service.?unavailable|temporarily unavailable|server.?error|internal.?error|provider.?returned.?error|network.?error|connection.?(?:error|refused|lost|reset)|other side closed|fetch failed|getaddrinfo|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|upstream.?connect|reset before headers|socket hang up|socket connection was closed|gateway.?time.?out|websocket.?(?:closed|error)|ended without|stream ended before|http2 request did not get a response|you can retry your request|try your request again|please retry your request|try again in|timed? ?out|timeout|terminated|premature close|\b408\b/iu;
+
+/** The Decision Worker's own per-request timeout: the model ran the whole budget. */
+const OWN_TIMEOUT = /^Decision Worker [^\n]* timed out after \d+ms$/u;
+
+export type DecisionErrorClass = "configuration" | "transient" | "other";
+
+export function classifyDecisionError(error: unknown): DecisionErrorClass {
+  if (!(error instanceof Error)) return "other";
+  if (error.name === "DecisionWorkerConfigError") return "configuration";
+  if (OWN_TIMEOUT.test(error.message)) return "other";
+  // Judge the provider's own text, not this worker's "… model request failed:" wrapper.
+  const text = error.message.replace(/^[^\n:]*model request failed: /u, "");
+  if (CONFIGURATION_ERROR.test(text)) return "configuration";
+  // A provider's error turn (pi-ai reports it as a stop reason, not a throw).
+  if (error.name === "DecisionWorkerApiError" && TRANSIENT_ERROR.test(text)) return "transient";
+  // A thrown transport failure before any provider answered.
+  if (/fetch failed|getaddrinfo|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|socket hang up|network.?error/iu.test(text)) return "transient";
+  return "other";
+}
+
+export function isDecisionConfigurationError(error: unknown): boolean {
+  return classifyDecisionError(error) === "configuration";
+}
+
+function configurationError(error: Error): Error {
+  const wrapped = new Error(`Decision Worker configuration error (credentials, billing or model): ${error.message}`, { cause: error });
+  wrapped.name = "DecisionWorkerConfigError";
+  return wrapped;
+}
+
+/** Marks an error thrown while the Supervisor applied an action, as opposed to one from the model. */
+export function isDecisionActionError(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && (error as { decisionActionFailed?: unknown }).decisionActionFailed === true);
+}
 
 /**
  * A persistent Pi SDK session used only for supervision decisions.
@@ -122,6 +180,7 @@ export class PiDecisionWorker implements DecisionWorkerLike {
   readonly #timeoutMs: number;
   /** Ends a startup retry backoff early; set only while one is waiting. */
   #wakeStartupBackoff?: () => void;
+  #wakeRetryBackoff?: () => void;
   readonly #retryBackoffMs: number;
   readonly #compactionTokens: number;
   /** Set after a compaction; the next primary decision prompt re-sends the startup instructions once. */
@@ -187,7 +246,7 @@ export class PiDecisionWorker implements DecisionWorkerLike {
           if (this.#closed) throw closedDuringStartup();
           // Only a provider error is worth another attempt: a timeout already
           // spent the whole prompt budget and would only multiply it.
-          const retryable = error instanceof Error && error.name === "DecisionWorkerApiError";
+          const retryable = error instanceof Error && error.name === "DecisionWorkerApiError" && classifyDecisionError(error) !== "configuration";
           if (attempt >= maxRetries || !retryable) {
             try { await this.#options.onStartupFailure?.(error); } catch { /* preserve the original startup failure */ }
             throw error;
@@ -259,11 +318,34 @@ export class PiDecisionWorker implements DecisionWorkerLike {
       } catch (error) {
         if (this.#closed) return;
         if (error instanceof Error && error.name === "AbortError") throw error;
-        if (attempt >= maxRetries) throw error;
+        // A later event made this one moot: its failure decides nothing, and
+        // failing it would park a task whose current turn is still undecided.
+        if (this.#dropIfSuperseded(event, error)) return;
+        const kind = classifyDecisionError(error);
+        // Waiting does not fix credentials, billing or a missing model: park now, with that reason.
+        if (kind === "configuration") throw configurationError(error as Error);
+        // A transient provider or network outage on a completed turn is
+        // waited out rather than parking the task: nobody is there to resume
+        // it, and the Supervisor's idle watchdog verifies the Worker's
+        // finished work if no decision ever lands. Nothing like that backs up
+        // any other event: a permission request blocks the Worker mid-turn
+        // (on some transports nothing else answers it), and after an exit
+        // only this decision starts verification. Those, a turn a later event
+        // has made moot, and anything that fails the same way on every
+        // attempt stay bounded.
+        const waitOut = kind === "transient" && event.type === "turn_completed";
+        if (!waitOut && attempt >= maxRetries) throw error;
         attempt += 1;
         // 429/529 overloads last minutes, not seconds: 15s, 45s, then 60s.
-        await new Promise<void>((resolveWait) => setTimeout(resolveWait, Math.min(MAX_DECISION_RETRY_BACKOFF_MS, this.#retryBackoffMs * 3 ** attempt)));
+        const delayMs = Math.min(MAX_DECISION_RETRY_BACKOFF_MS, this.#retryBackoffMs * 3 ** Math.min(attempt, 10));
+        try { this.#options.onRetry?.(event, { attempt, delayMs, error }); } catch { /* observability only */ }
+        await new Promise<void>((resolveWait) => {
+          const timer = setTimeout(() => { this.#wakeRetryBackoff = undefined; resolveWait(); }, delayMs);
+          // close() wakes this wait, so a stop does not sit out the backoff.
+          this.#wakeRetryBackoff = () => { clearTimeout(timer); this.#wakeRetryBackoff = undefined; resolveWait(); };
+        });
         if (!this.#session || this.#closed) return;
+        if (this.#dropIfSuperseded(event, error)) return;
         continue;
       }
       if (this.#closed) return;
@@ -285,8 +367,14 @@ export class PiDecisionWorker implements DecisionWorkerLike {
         continue;
       }
       // An action handler may stop or close the session. Do not replay an
-      // already-decoded action if the handler itself fails.
-      await this.#options.onAction(action, event);
+      // already-decoded action if the handler itself fails, and do not let
+      // its failure read as a model failure.
+      try {
+        await this.#options.onAction(action, event);
+      } catch (error) {
+        if (error && typeof error === "object") (error as { decisionActionFailed?: boolean }).decisionActionFailed = true;
+        throw error;
+      }
       await this.#maybeCompact();
       return;
     }
@@ -327,11 +415,23 @@ export class PiDecisionWorker implements DecisionWorkerLike {
     return Boolean(this.#options.sessionFile && this.#sessionFile === this.#options.sessionFile);
   }
 
+  #dropIfSuperseded(event: WorkerEvent, error: unknown): boolean {
+    if (this.#options.isSuperseded?.(event) !== true) return false;
+    try { this.#options.onSuperseded?.(event, error); } catch { /* observability only */ }
+    return true;
+  }
+
+  /** Resolves once every queued decision has finished or given up (shutdown and tests). */
+  async settled(): Promise<void> {
+    await this.#tail.catch(() => {});
+  }
+
   async close(): Promise<void> {
     // Do not await #tail here: onAction may be closing the worker from inside
     // the same queued decision, which would otherwise deadlock shutdown.
     this.#closed = true;
     this.#wakeStartupBackoff?.();
+    this.#wakeRetryBackoff?.();
     const session = this.#session;
     this.#session = undefined;
     if (session) await session.abort().catch(() => {});

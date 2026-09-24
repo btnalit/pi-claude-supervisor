@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { EventLog, type SupervisorEvent } from "./events.ts";
 import { SupervisorStateMachine } from "./state.ts";
 import { evaluatePermission, isCommitId, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, type PermissionPolicyOptions, type PolicyResult, type RemoteGrant } from "./policy.ts";
-import { PiDecisionWorker, STALE_VERIFICATION_TURNS, type DecisionAction, type DecisionContext, type DecisionDeadlineContext, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
+import { PiDecisionWorker, STALE_VERIFICATION_TURNS, isDecisionActionError, isDecisionConfigurationError, type DecisionAction, type DecisionContext, type DecisionDeadlineContext, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
 import { DEFAULT_DEADLINE_GRACE_MS, DEFAULT_DEADLINE_MS, DEFAULT_DEADLINE_WARNING_MS, DEFAULT_NO_OUTPUT_TIMEOUT_MS, formatDurationMs } from "./config.ts";
 import { collectRepositoryEvidence, remoteBranchHead, remoteUrl, runReadOnly, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryIsAncestor, repositoryWorkTree, verifyAll, repositoryClean, repositoryGitDirectoryIsLocal, repositorySlug, sameDestination, type RemoteBranchLookup, type RemoteDestination, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
@@ -235,6 +235,10 @@ export class Supervisor {
   #lastTurnCompleted?: WorkerEvent;
   /** Key of the completed turn whose decision is still in flight; the deadline must not verify underneath it. */
   #pendingDecisionKey?: string;
+  /** The pending decision's request has failed at least once and is backing off. */
+  #pendingDecisionRetrying = false;
+  /** The Supervisor turn a completed-turn event was handed to the Decision Worker at; a later turn supersedes it. */
+  readonly #decisionTurnAtNotify = new WeakMap<WorkerEvent, number>();
   /** When the pending decision was requested; bounds how long an idle timeout defers to it. */
   #pendingDecisionSince = 0;
   /**
@@ -558,6 +562,15 @@ export class Supervisor {
             },
           } : {}),
           onAction: (action, event) => this.#applyDecision(action, event),
+          isSuperseded: (event) => this.#decisionSuperseded(event),
+          onSuperseded: (event, error) => {
+            this.#settlePendingDecision(event);
+            void this.#appendEvent({ type: "decision_ignored", taskId: this.#task?.taskId, workerId: event.handle.id, data: { reason: "superseded while its decision was failing", eventType: event.type, error: safeMessage(error) } }).catch(() => {});
+          },
+          onRetry: (event, info) => {
+            if (this.#pendingDecisionKey === workerEventKey(event)) this.#pendingDecisionRetrying = true;
+            void this.#appendEvent({ type: "decision_retry", taskId: this.#task?.taskId, workerId: event.handle.id, data: { eventType: event.type, attempt: info.attempt, delayMs: info.delayMs, error: safeMessage(info.error) } }).catch(() => {});
+          },
           onFailure: (event, error) => this.#decisionFailure(event, error),
           onStartupFailure: (error) => this.#decisionStartupFailure(error),
         });
@@ -1016,16 +1029,29 @@ export class Supervisor {
         await this.#appendDecisionIgnored(event, undefined);
         return;
       }
-      // A decision whose message the Worker could not take is not a model
-      // failure; say which one it was, so the operator looks in the right place.
+      // A *model* failure for an event overtaken while it failed decides
+      // nothing (the Pi Decision Worker already drops those itself; this
+      // covers other factories). A failure applying an action or delivering
+      // input is real whatever the turn is now, and must park with its reason.
+      if (!isDecisionActionError(error) && !isWorkerInputError(error) && this.#decisionSuperseded(event)) {
+        await this.#appendEvent({ type: "decision_ignored", taskId: this.#task?.taskId, workerId: event.handle.id, data: { reason: "superseded while its decision was failing", eventType: event.type, error: safeMessage(error) } }).catch(() => {});
+        return;
+      }
+      // A decision whose message the Worker could not take, or whose action
+      // failed to apply, is not a model failure; say which one it was, so the
+      // operator looks in the right place.
       const inputFailure = isWorkerInputError(error);
+      const kind = inputFailure ? "Worker input failed"
+        : isDecisionActionError(error) ? "Decision action failed"
+          : isDecisionConfigurationError(error) ? "Decision Worker configuration failed"
+            : "Decision Worker API failed";
       await this.#appendEvent({
-        type: inputFailure ? "worker_input_failed" : "decision_worker_failed",
+        type: inputFailure ? "worker_input_failed" : isDecisionActionError(error) ? "decision_action_failed" : "decision_worker_failed",
         taskId: this.#task?.taskId,
         workerId: event.handle.id,
         data: { eventType: event.type, error: safeMessage(error) },
       });
-      await this.#parkCandidate(`${inputFailure ? "Worker input failed" : "Decision Worker API failed"}: ${safeMessage(error)}`, event);
+      await this.#parkCandidate(`${kind}: ${safeMessage(error)}`, event);
     });
   }
 
@@ -1048,6 +1074,13 @@ export class Supervisor {
         return;
       }
       if (!task || !handle || !this.#automation || ["completed", "blocked", "failed", "stopped"].includes(this.#machine.state)) return;
+      // Overtaken while it was being decided (for instance backing off a
+      // provider outage while the watchdog or close-out verified).
+      if (this.#decisionSuperseded(event)) {
+        this.#settlePendingDecision(event);
+        await this.#appendEvent({ type: "decision_ignored", taskId: task.taskId, workerId: handle.id, data: { action: action.action, reason: "superseded by a later turn, message or verification", eventType: event.type } }).catch(() => {});
+        return;
+      }
       if (this.#humanRequired) {
         await this.#appendEvent({ type: "decision_deferred", taskId: task.taskId, workerId: handle.id, data: { action: action.action, reason: action.reason, eventType: event.type } }).catch(() => {});
         return;
@@ -1307,6 +1340,17 @@ export class Supervisor {
     else await this.#parkCandidate(`${origin} requested verification from state ${this.#machine.state}`, event);
   }
 
+  /**
+   * A decision for a completed turn that has since been overtaken (a later
+   * turn, a message sent after it, a verification already running) would act
+   * on a state that no longer exists.
+   */
+  #decisionSuperseded(event: WorkerEvent): boolean {
+    if (event.type !== "turn_completed") return false;
+    const notifiedTurn = this.#decisionTurnAtNotify.get(event);
+    return Boolean((this.#lastTurnCompleted && event !== this.#lastTurnCompleted) || (notifiedTurn !== undefined && notifiedTurn !== this.#turn) || this.#verificationAbortController);
+  }
+
   /** Refresh the Decision Worker's context and deliver (or re-deliver) an event; a completed turn is then pending a decision. */
   #notifyDecision(event: WorkerEvent, replay = false): void {
     if (!this.#decision) return;
@@ -1317,6 +1361,8 @@ export class Supervisor {
     if (event.type === "turn_completed") {
       this.#pendingDecisionKey = workerEventKey(event);
       this.#pendingDecisionSince = Date.now();
+      this.#pendingDecisionRetrying = false;
+      this.#decisionTurnAtNotify.set(event, this.#turn);
     }
     if (replay) this.#decision.replay!(event);
     else this.#decision.notify(event);
@@ -1761,6 +1807,19 @@ export class Supervisor {
   }
 
   async #verifyInternal(command?: VerificationCommand): Promise<AcceptanceReport> {
+    const before = this.#verificationAbortController;
+    try {
+      return await this.#verifyUnguarded(command);
+    } catch (error) {
+      // A verification that threw part-way (an event-log write, a git read)
+      // must not leave its controller behind: it would read as a verification
+      // still running to the supersede check, the close-out and the watchdog.
+      if (this.#verificationAbortController && this.#verificationAbortController !== before) this.#verificationAbortController = undefined;
+      throw error;
+    }
+  }
+
+  async #verifyUnguarded(command?: VerificationCommand): Promise<AcceptanceReport> {
     await this.#flushPendingEvents();
     if (!this.#task) throw new Error("no active task");
     if (this.#machine.state === "waiting" && canRepairInPlace(this.#adapter)) this.#machine.transition("verifying");
@@ -2790,8 +2849,11 @@ export class Supervisor {
     // which nothing else calls while the Worker is alive.
     if (this.#machine.state === "running" && !status.activeRequests) await this.#pollInternal();
     // A decision still in flight for the last turn owns the next step: it is
-    // applied under close-out (a `wait` becomes verify) once it arrives.
-    if (this.#pendingDecisionKey || this.#machine.state !== "waiting" || this.#verificationAbortController || status.activeRequests) return;
+    // applied under close-out (a `wait` becomes verify) once it arrives. One
+    // that is backing off a provider outage may not land before the grace
+    // runs out, so the idle Worker is verified now; the late decision is
+    // then ignored as superseded.
+    if ((this.#pendingDecisionKey && !this.#pendingDecisionRetrying) || this.#machine.state !== "waiting" || this.#verificationAbortController || status.activeRequests) return;
     this.#clearWaitTimer();
     await this.#appendEvent({ type: "deadline_close_out", taskId: task.taskId, workerId: handle.id, data: { action: "verify", reason: "task deadline reached with an idle Worker" } });
     try {

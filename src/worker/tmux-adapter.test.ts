@@ -1804,8 +1804,20 @@ render();
       await run({
         adapter,
         handle,
-        // Atomic, so the fake never reads a half-written config.
-        setConfig: async (config) => { await writeFile(`${configPath}.tmp`, JSON.stringify(config)); await rename(`${configPath}.tmp`, configPath); await new Promise((resolve) => setTimeout(resolve, 150)); },
+        // Atomic, so the fake never reads a half-written config; returns once the
+        // pane shows it, since a loaded CI runner can lag the fake's 30 ms poll.
+        setConfig: async (config) => {
+          await writeFile(`${configPath}.tmp`, JSON.stringify(config));
+          await rename(`${configPath}.tmp`, configPath);
+          const deadline = Date.now() + 5_000;
+          for (;;) {
+            const screen = spawnSync("tmux", ["-S", socketPath, "capture-pane", "-p", "-t", sessionName], { encoding: "utf8" }).stdout ?? "";
+            if (screen.includes("esc to interrupt") === config.busy) break;
+            if (Date.now() > deadline) throw new Error(`fake TUI did not show busy=${config.busy}`);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        },
         submitted,
         socketPath,
         sessionName,
@@ -1883,8 +1895,8 @@ test("a send waiting for the prompt yields to a turn someone else started, witho
     await setConfig({ busy: true, dropEnters: 0 });
     const sending = adapter.send(handle, "stale automated decision", "yield-1");
     const outcome = sending.then(() => "sent", (error) => error);
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    // An operator at the attached pane submits their own prompt, and that turn ends.
+    // An operator at the attached pane submits their own prompt, and that turn
+    // ends, right away: before the send has even queued for the input gate.
     await hook({ hook_event_name: "UserPromptSubmit", prompt: "operator's own request" });
     await hook({ hook_event_name: "Stop", last_assistant_message: "operator turn done" });
     await setConfig({ busy: false, dropEnters: 0 });

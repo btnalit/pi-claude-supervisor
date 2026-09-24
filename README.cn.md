@@ -326,7 +326,7 @@ commit,通知能说清已验证的 commit 是否在工作树变动之前就已�
 | `HUMAN_WEBHOOK_SECRET` | 未设置 | HMAC 签名密钥;以 `x-pi-supervisor-signature` header 发送 |
 | `UNATTENDED` | `true` | 任务无需同步人工回调即可运行 |
 | `REQUIRE_LOCAL_COMMIT` | `true` | 完成前要求在候选所在分支上有本地 commit |
-| `MAX_DECISION_RETRIES` | `4`(0–10) | Decision Worker 调用超时或失败(429/529、网络、鉴权)时的重试次数;两次尝试之间依次等待 15s、45s、60s |
+| `MAX_DECISION_RETRIES` | `4`(0–10) | Decision Worker 调用超时,或因等待无法解决的原因失败(prompt 过长、会话损坏)时的重试次数;依次等待 15s、45s、60s。已完成轮次遇到暂时性的 provider/网络故障(429/529、5xx、连接重置)时改为持续等待,每分钟重试一次;凭证被拒、计费问题、模型不存在则立即 park |
 | `PERMISSION_AUTHORITY` | `hybrid` | `policy` \| `hybrid` \| `decision-worker` |
 | `REMOTE_AUTHORITY` | `none` | `none` \| `push` \| `pr`;验收通过后开启发布阶段。`--remote` 可按任务覆盖 |
 | `REMOTE_NAME` | `origin` | 发布授权唯一允许的 remote 名 |

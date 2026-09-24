@@ -263,7 +263,8 @@ isolated temporary worktree. The current hardening plan and evidence paths are r
 in [`docs/automation-hardening-plan.md`](automation-hardening-plan.md). Deterministic
 coverage now includes repairable-vs-persistent capability assertions, cancellation
 of acceptance commands, stop-from-verifying precedence, paused watchdog baselining,
-staged/untracked evidence, and untracked symlink/hard-link rejection. The exact-head
+staged/untracked evidence, untracked symlinks and binaries named without their content
+while the evidence stays complete, and untracked hard links still incomplete. The exact-head
 independent read-only review was rerun. Its pathname TOCTOU finding is recorded as a
 false positive for the trusted local-development threat model: automatic workers are
 trusted development agents, and this policy is a metadata guard rather than a host
