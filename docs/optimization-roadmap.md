@@ -103,11 +103,13 @@
    触发来源：验收失败、截断证据、本地 commit 缺失、Reviewer revise，**以及通过验证后发布预检发现未提交改动**。
 4. **验证时效**：基于验证结果的 Decision 判断以 `atTurn` 标注其时效；例外——发布轮返回后，若 HEAD 与工作树未变，
    复用发布前的通过验证（`#settlePublish`），不重新验证。
-5. **发布**：`remoteAuthority = none` 时验证通过即 `completed`。否则 `#requestPublish` 检查前置条件（手动模式、
-   takeover、停止请求、传输能力、收尾窗口、受保护/未知分支、HEAD 不可读或已变、证据缺失、Git 目录非本地、Worker 忙、
-   远端 URL/基线变化、`pr` 模式缺仓库标识、状态非 verifying）；任一不满足 **不阻塞**，记 `publish_skipped` shortfall
-   后以 `completed` 结束（存在停止请求则为 `stopped`）。工作树有未提交改动 → 修复轮；无修复预算 → shortfall + `completed`。
-   发布轮返回后由 `#settlePublish` 得出 `completed`、publish-only `blocked`，或 HEAD/树变化 → abandoned → 重新验证。
+5. **发布**：`remoteAuthority = none` 时验证通过即 `completed`。否则 `#requestPublish` **按以下顺序** 检查：
+   手动模式 → takeover/停止请求 → 传输能力 → 收尾窗口 → 受保护/未知分支 → HEAD 不可读 → 证据缺失 →
+   **工作树有未提交/未跟踪改动（→ 修复轮；无修复预算 → shortfall + `completed`）** → 证据 HEAD 缺失或 HEAD 已变 →
+   Git 目录非本地 → Worker 忙 → 远端 URL/基线变化 → `pr` 模式缺仓库标识 → 状态非 verifying。
+   除未提交改动外，任一不满足 **不阻塞**：记 `publish_skipped` shortfall 后以 `completed` 结束（存在停止请求则为 `stopped`）。
+   发布 **只尝试一次**：发布轮返回后由 `#settlePublish` 得出 `completed`、publish-only `blocked`，或 HEAD/树变化 →
+   `publish_abandoned`（`#publishState` 置为 settled）→ 重新验证，且重新验证后不再发起发布，以带放弃说明的 `completed` 结束。
 6. **人工闸门**：闸门打开时 Decision 被记录为 `decision_deferred` 并 **丢弃**；`resumeAutomation` 只重新询问最后一个
    `turn_completed`（见 B2）。闸门检查位于已释放/终态检查之后。
 7. **无输出**：自动化下空闲 Worker 的无输出超时触发 **验证**（`worker_idle_timeout`）；轮次中途静默才 **停止**。
@@ -122,8 +124,11 @@
 3. **终态无挂起资源**：进入终态后清除计时器、中止控制器与 `#pendingDecisionKey`（当前 stop/park/finalize 不清除后者）。
 4. **裁决可审计**：每次覆盖带结构化 guard 标识（阶段 2.3 引入；当前 stale 丢弃记 `decision_ignored`，
    权限覆盖记 `permission_decision`，`decision_overridden` 仅有文本 `reason`）。
-5. **释放后不再驱动 Worker**：验收进行中 `release()` 时，中止被当作验收失败，`#requestRepair`（不检查 `#releasing`）
-   会向已交还操作员的 Worker 发送修复轮（复审临时测试复现）；证据采集或审查阶段的 release 则正确 park。
+5. **释放后不再驱动或停止 Worker**：验证进行中 `release()` 时，Supervisor 仍会尝试修复轮（`#requestRepair` 不检查
+   `#releasing`）并在收尾时对已释放的 handle 调用 `adapter.stop`。对真实 tmux 适配器：`send()` 在已释放记录上抛错，
+   修复未送达但已记 `repair_requested`；随后 `stop` 再次 release，面板仍在运行，owned handle 的清理确认失败 →
+   任务以 **`failed`**（`verification_failed`，恢复关闭原因 `recoverable_failure`）结束——验收与审查阶段皆然
+   （复审以 tmux 形态的假适配器复现）；adopted handle 则以 parked 结束。**直接影响 interactive tmux 模式。**
 
 ### 3.3 子生命周期（目标形态，覆盖现有真实路径）
 
@@ -137,15 +142,15 @@ Verification（每轮）：
   local commit check ── missing ▶ repair? / blocked
        ▼ ok
   review ── pass ▶ publish? ─┬─ remoteAuthority=none ▶ completed
-       │                     ├─ 前置条件不满足 ▶ publish_skipped（shortfall）▶ completed（有停止请求 ▶ stopped）
-       │                     ├─ 未提交/未跟踪改动 ▶ repair?（同上；无预算 ▶ shortfall ▶ completed）
+       │                     ├─ 按 §3.2 A5 顺序检查：未提交/未跟踪改动 ▶ repair?（无预算 ▶ shortfall ▶ completed）
+       │                     ├─ 其他前置条件不满足 ▶ publish_skipped（shortfall）▶ completed（有停止请求 ▶ stopped）
        │                     └─ requested ▶ (publish turn) ▶ HEAD/树未变 ▶ #settlePublish ▶ completed | publish-only blocked
        │                                                   ├ HEAD/树不可读 ▶ publish-only blocked
-       │                                                   └ 已变化 ▶ abandoned ▶ 重新验证
+       │                                                   └ 已变化 ▶ abandoned ▶ 重新验证 ▶ 不再发布 ▶ completed（附放弃说明）
        ├─ revise ▶ repair?（同上）；重复发现 ▶ human ▶ parked
        └─ human / Reviewer 失败 ▶ parked
   任一阶段：操作员停止 ▶ cancelled（stopped）；证据采集失败 ▶ parked
-  验证中 release：证据/审查阶段 ▶ parked；验收阶段 ▶ 被当作验收失败而发出修复轮（缺陷，见 §3.2 B5）
+  验证中 release：owned tmux handle ▶ 尝试修复/停止已释放的 handle ▶ failed；adopted handle ▶ parked（缺陷，见 §3.2 B5）
   验证中 takeover：在 #exclusive 队列中等待验证结束后才生效
   （注：所有 blocked 的验证结果都会置 #candidateParked，“blocked”与“parked”在状态上相同）
 StopIntent（终止意图，现状）：
@@ -153,7 +158,7 @@ StopIntent（终止意图，现状）：
   另：watchdog（deadline+grace）与无输出停止直接调用 #stopInternal，不设置 #stopRequested
       （自动化下仅轮次中途静默才停止；非自动化下空闲 Worker 也会被停止）
   decision_stop{verifyFirst} → operator_stop（操作员取代，现状只在此路径成立）
-  operator_stop → operator_stop（再次 stop 覆盖原因，现状）
+  operator_stop → operator_stop：验证进行中时最后一次生效；其他状态下第一次生效（见 §3.2 A1）
 Park（终止但非停止意图）：成本预算、Decision park/ask_human/noop —— running/waiting/paused/starting 下经
   #stopInternal(…, "blocked") 结束；verifying 下（含验证 blocked）经 #finalizeVerification 结束并记 candidate_parked
 Release（非终止）：断开 Supervisor；交互 Worker 移出 cgroup 交还操作员，任务状态与恢复记录不变
@@ -221,7 +226,7 @@ interface DecisionGuard {
 **验收**：现有测试全绿；新增“脱敏规则变化不影响路径/分支合法性”的测试；列出被新规则放行或拒绝的差异样例。
 
 **0.3 已知行为缺口修复**（显式行为变更，单独 PR）：实现 §3.2 B1（操作员停止唯一优先）、B3（终态清除待决决策）
-与 B5（释放后不再发出修复轮），各带竞态回归测试；B2（延迟而不丢失）需先确认权限请求重放的交互，单独评估。
+与 B5（`#releasing` 时跳过修复与 `adapter.stop`，以 released/parked 结束），各带竞态回归测试；B2（延迟而不丢失）需先确认权限请求重放的交互，单独评估。
 
 ### 阶段 1：通用无进展兜底（1 个 PR，先观察后覆盖）
 
@@ -272,8 +277,8 @@ B 的每条目标不变量在对应的行为变更 PR 中有违反即失败的�
   自动化恢复时：若最近验证失败，stale-failure / no-progress guard 从持久化计数继续；若中断时处于 Decision
   verify-first 停止，恢复自动化后的第一个动作是一次验证而不是发送 Worker 轮次。
 - 哪些终止会关闭恢复记录：清理已确认的 `completed` 与 `human_stop`。`blocked`、`failed`、关机停止
-  （`preserveDecisionSession` → `recoverable_failure`）、watchdog / 无输出停止、清理未确认的停止都会标记为可恢复中断；
-  `release` 不改动记录。正是这些任务需要完整的恢复状态。
+  （`preserveDecisionSession` → `recoverable_failure`）、watchdog / 无输出停止、Decision 普通 stop、启动期间的停止或失败、
+  清理未确认的停止都会标记为可恢复中断；`release()` 本身不改动记录（但验证中 release 会以 failed 结束，见 B5）。正是这些任务需要完整的恢复状态。
 - 同时消除 `index.ts` 中两处重复的进度持久化逻辑（启动与恢复路径共用一个函数）。
 - 测试：修复中途 recover、stop→verify 中途 recover；`spike:decision` 新增 `recover` 场景。
 
