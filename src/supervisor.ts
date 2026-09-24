@@ -563,6 +563,10 @@ export class Supervisor {
           } : {}),
           onAction: (action, event) => this.#applyDecision(action, event),
           isSuperseded: (event) => this.#decisionSuperseded(event),
+          onSuperseded: (event, error) => {
+            this.#settlePendingDecision(event);
+            void this.#appendEvent({ type: "decision_ignored", taskId: this.#task?.taskId, workerId: event.handle.id, data: { reason: "superseded while its decision was failing", eventType: event.type, error: safeMessage(error) } }).catch(() => {});
+          },
           onRetry: (event, info) => {
             if (this.#pendingDecisionKey === workerEventKey(event)) this.#pendingDecisionRetrying = true;
             void this.#appendEvent({ type: "decision_retry", taskId: this.#task?.taskId, workerId: event.handle.id, data: { eventType: event.type, attempt: info.attempt, delayMs: info.delayMs, error: safeMessage(info.error) } }).catch(() => {});
@@ -1023,6 +1027,12 @@ export class Supervisor {
       this.#settlePendingDecision(event);
       if (this.#releasing || this.#released) {
         await this.#appendDecisionIgnored(event, undefined);
+        return;
+      }
+      // The event was overtaken while it failed: parking would stop a Worker
+      // whose current turn is still undecided.
+      if (this.#decisionSuperseded(event)) {
+        await this.#appendEvent({ type: "decision_ignored", taskId: this.#task?.taskId, workerId: event.handle.id, data: { reason: "superseded while its decision was failing", eventType: event.type, error: safeMessage(error) } }).catch(() => {});
         return;
       }
       // A decision whose message the Worker could not take, or whose action

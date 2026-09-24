@@ -806,11 +806,12 @@ test("close() wakes a decision retry backoff instead of sitting it out", async (
   assert.equal(settled, true);
 });
 
-/** Flush until the condition holds, failing instead of hanging on a regression. */
-async function until(condition: () => boolean, maxFlushes = 20_000): Promise<void> {
-  for (let flushes = 0; !condition(); flushes += 1) {
-    if (flushes >= maxFlushes) throw new Error("condition not reached");
-    await flush();
+/** Wait until the condition holds, failing instead of hanging on a regression. */
+async function until(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("condition not reached");
+    await new Promise((resolve) => setTimeout(resolve, 1));
   }
 }
 
@@ -900,25 +901,38 @@ test("an exit is not waited out through an outage: after it, only this decision 
   await worker.close();
 });
 
-test("an outage is no longer waited out for a turn a later event has superseded", async () => {
+test("a turn superseded during an outage is dropped, not failed, and the next event is decided", async () => {
   const { session, prompts } = createFakeSession([
     { stopReason: "stop", text: "ack" },
-    ...Array.from({ length: 10 }, () => ({ stopReason: "error" as const, errorMessage: "529 overloaded_error" })),
+    ...Array.from({ length: 4 }, () => ({ stopReason: "error" as const, errorMessage: "529 overloaded_error" })),
+    { stopReason: "stop", text: JSON.stringify({ action: "verify", reason: "current turn" }) },
   ]);
+  const first = turnCompletedEvent(1);
+  const second = turnCompletedEvent(2);
   let superseded = false;
   const failures: unknown[] = [];
+  const dropped: WorkerEvent[] = [];
+  const decided: Array<{ action: string; sequence: number }> = [];
   const worker = new PiDecisionWorker(baseOptions({
+    onAction: (action, event) => { decided.push({ action: action.action, sequence: (event as { sequence: number }).sequence }); },
     onFailure: (_event, error) => { failures.push(error); },
-    onRetry: () => { superseded = true; },
-    isSuperseded: () => superseded,
+    // The outage outlasts maxDecisionRetries (1), then a later turn supersedes this one.
+    onRetry: (_event, info) => { if (info.attempt >= 4) superseded = true; },
+    isSuperseded: (event) => superseded && event === first,
+    onSuperseded: (event) => { dropped.push(event); },
     sessionFactory: async () => ({ session }),
     retryBackoffMs: 1,
     context: unattendedContext(1),
   }));
   await worker.start();
-  worker.notify(turnCompletedEvent());
-  await until(() => failures.length > 0);
-  // Waited out once; superseded afterwards, so bounded by maxDecisionRetries (1).
-  assert.equal(prompts.length, 3);
+  worker.notify(first);
+  worker.notify(second);
+  await until(() => decided.length > 0 || failures.length > 0);
+  assert.deepEqual(failures, []);
+  assert.deepEqual(dropped, [first]);
+  assert.deepEqual(decided, [{ action: "verify", sequence: 2 }]);
+  // The startup prompt, four failed attempts for the first turn, then the second turn.
+  assert.equal(prompts.length, 6);
   await worker.close();
 });
+

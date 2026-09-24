@@ -91,8 +91,10 @@ export interface DecisionWorkerOptions {
   onUsage?: (usage: PiUsageSample) => void;
   /** A decision request failed transiently and will be asked again after `delayMs`. */
   onRetry?: (event: WorkerEvent, info: { attempt: number; delayMs: number; error: unknown }) => void;
-  /** True once a later event has made this one moot; an outage is not waited out for it. */
+  /** True once a later event has made this one moot: it is then dropped, neither retried nor failed. */
   isSuperseded?: (event: WorkerEvent) => boolean;
+  /** A moot event was dropped while its decision was failing (for the audit log). */
+  onSuperseded?: (event: WorkerEvent, error: unknown) => void;
 }
 
 export type PiModel = NonNullable<NonNullable<Parameters<typeof createAgentSession>[0]>["model"]>;
@@ -115,7 +117,7 @@ const MAX_DECISION_RETRY_BACKOFF_MS = 60_000;
  * words, not bare status codes, which also turn up inside request ids, URLs
  * and wrapped upstream errors.
  */
-const CONFIGURATION_ERROR = /authentication|unauthori[sz]ed|incorrect api key|token has expired|invalid[_ ]?x?-?api[_ -]?key|api[_ ]key[_ ](?:not[_ ]valid|expired|invalid)|no api key found|security token[^\n]{0,40}invalid|UnrecognizedClient|ExpiredToken|AccessDenied|permission[_ ]denied|permission_error|payment[_ ]required|credit[_ ]balance|insufficient[_ ]quota|billing_error|not_found_error|models?\b[^\n]{0,80}\b(?:not[_ ]found|does not exist|is invalid)|model identifier is invalid|unsupported[_ ]model|invalid[_ ]model/iu;
+const CONFIGURATION_ERROR = /(?:account|organi[sz]ation)[^\n]{0,40}(?:terminated|disabled|suspended|deactivated)|authentication|unauthori[sz]ed|incorrect api key|token has expired|invalid[_ ]?x?-?api[_ -]?key|api[_ ]key[_ ](?:not[_ ]valid|expired|invalid)|no api key found|security token[^\n]{0,40}invalid|UnrecognizedClient|ExpiredToken|AccessDenied|permission[_ ]denied|permission_error|payment[_ ]required|credit[_ ]balance|insufficient[_ ]quota|billing_error|not_found_error|models?\b[^\n]{0,80}\b(?:not[_ ]found|does not exist|is invalid)|model identifier is invalid|unsupported[_ ]model|invalid[_ ]model/iu;
 
 /**
  * Errors that pass by themselves: provider load and rate limits (including a
@@ -316,6 +318,9 @@ export class PiDecisionWorker implements DecisionWorkerLike {
       } catch (error) {
         if (this.#closed) return;
         if (error instanceof Error && error.name === "AbortError") throw error;
+        // A later event made this one moot: its failure decides nothing, and
+        // failing it would park a task whose current turn is still undecided.
+        if (this.#dropIfSuperseded(event, error)) return;
         const kind = classifyDecisionError(error);
         // Waiting does not fix credentials, billing or a missing model: park now, with that reason.
         if (kind === "configuration") throw configurationError(error as Error);
@@ -328,8 +333,7 @@ export class PiDecisionWorker implements DecisionWorkerLike {
         // only this decision starts verification. Those, a turn a later event
         // has made moot, and anything that fails the same way on every
         // attempt stay bounded.
-        const superseded = this.#options.isSuperseded?.(event) === true;
-        const waitOut = kind === "transient" && event.type === "turn_completed" && !superseded;
+        const waitOut = kind === "transient" && event.type === "turn_completed";
         if (!waitOut && attempt >= maxRetries) throw error;
         attempt += 1;
         // 429/529 overloads last minutes, not seconds: 15s, 45s, then 60s.
@@ -341,6 +345,7 @@ export class PiDecisionWorker implements DecisionWorkerLike {
           this.#wakeRetryBackoff = () => { clearTimeout(timer); this.#wakeRetryBackoff = undefined; resolveWait(); };
         });
         if (!this.#session || this.#closed) return;
+        if (this.#dropIfSuperseded(event, error)) return;
         continue;
       }
       if (this.#closed) return;
@@ -408,6 +413,12 @@ export class PiDecisionWorker implements DecisionWorkerLike {
 
   get restored(): boolean {
     return Boolean(this.#options.sessionFile && this.#sessionFile === this.#options.sessionFile);
+  }
+
+  #dropIfSuperseded(event: WorkerEvent, error: unknown): boolean {
+    if (this.#options.isSuperseded?.(event) !== true) return false;
+    try { this.#options.onSuperseded?.(event, error); } catch { /* observability only */ }
+    return true;
   }
 
   /** Resolves once every queued decision has finished or given up (shutdown and tests). */

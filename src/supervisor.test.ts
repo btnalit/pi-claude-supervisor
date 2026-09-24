@@ -4529,3 +4529,17 @@ test("the Supervisor tells the Decision Worker when a turn it is still retrying 
     await supervisor.stop("test cleanup").catch(() => {});
   }
 });
+
+test("a decision failure for a turn a later turn has superseded does not park the task", async () => {
+  await withScriptedSend(async () => {}, async ({ supervisor, handle, events, fail, emit }) => {
+    const first: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 1 };
+    const second: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 2 };
+    emit(first);
+    emit(second);
+    await fail(first, Object.assign(new Error("Decision Worker request model request failed: 529 overloaded_error"), { name: "DecisionWorkerApiError" }));
+    assert.equal(supervisor.candidateParked, false);
+    assert.notEqual(supervisor.state, "blocked");
+    assert.ok(events.events.some((event) => event.type === "decision_ignored" && /superseded/u.test(String(event.data?.reason))));
+    assert.equal(events.events.some((event) => event.type === "decision_worker_failed"), false);
+  });
+});

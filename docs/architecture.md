@@ -573,9 +573,11 @@ no decision lands the idle watchdog verifies the Worker's finished work — the
 close-out verifies at once rather than wait on a decision that is backing off.
 Everything else stays bounded by `maxDecisionRetries` and then parks: a prompt
 that is too long, a corrupted session, the Decision Worker's own request
-timeout; a permission request, which blocks the Worker mid-turn; an exit, after
-which only this decision starts verification; and a completed turn that a later
-event has superseded, which stops being waited out as soon as it is. A
+timeout; a permission request, which blocks the Worker mid-turn; and an exit,
+after which only this decision starts verification. A completed turn that a
+later event supersedes while its decision is failing is dropped
+(`decision_ignored`) rather than retried or parked, so the current turn is
+decided next. A
 decision that lands for a turn a later turn, message or verification has since
 superseded is recorded as `decision_ignored` rather than applied. An error
 thrown while applying a decided action is recorded as `decision_action_failed`,
