@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented here.
 
+## [0.9.1](https://github.com/btnalit/pi-claude-supervisor/compare/v0.9.0...v0.9.1) (2026-09-24)
+
+
+### Bug Fixes
+
+* long-task stability findings from an independent 0.9.0 review ([#62](https://github.com/btnalit/pi-claude-supervisor/issues/62)) ([35c6789](https://github.com/btnalit/pi-claude-supervisor/commit/35c678962c357bc188eb2ed82141e4046ae793aa))
+* **review:** pin Reviewer finding key order so quoted text cannot swap a P0's description ([#64](https://github.com/btnalit/pi-claude-supervisor/issues/64)) ([6df3fd2](https://github.com/btnalit/pi-claude-supervisor/commit/6df3fd2b75a9555eb6dc9112b1c19f5e35bfa3cd))
+
 ## [0.9.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.8.1...v0.9.0) (2026-09-20)
 
 
