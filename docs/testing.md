@@ -113,6 +113,43 @@ PI_CLAUDE_SUPERVISOR_REAL_CLAUDE_PATH="$HOME/.local/share/mise/installs/claude/l
 PI_CLAUDE_SUPERVISOR_REAL_CLAUDE=1 npm run spike:tmux
 ```
 
+The Decision spike runs a real Pi Decision Worker and Reviewer, on any Pi
+model, against a scripted Worker that edits a temporary git repository. It
+needs no Claude Code, cgroup or tmux, so it runs on hosts that cannot run the
+real-Claude spikes. It is gated and excluded from normal CI:
+
+```bash
+# Default model: google/gemini-3.5-flash-lite
+PI_CLAUDE_SUPERVISOR_REAL_DECISION=1 npm run spike:decision
+# Optional: another Pi model, a subset of scenarios, a per-scenario deadline,
+# and keeping the temp repositories
+SPIKE_DECISION_MODEL=google/gemini-3.1-flash-lite \
+SPIKE_DECISION_SCENARIOS=review,stuck SPIKE_TIMEOUT_MS=600000 SPIKE_KEEP=1 \
+PI_CLAUDE_SUPERVISOR_REAL_DECISION=1 npm run spike:decision
+```
+
+Credentials come only from Pi's own sources (for example `GEMINI_API_KEY` in
+the environment, or `~/.pi/agent/auth.json`); the script never reads, prints or
+stores a key, and redacts what it prints. The scenarios cover:
+- `review`: an incomplete first turn is caught and repaired. Two model
+  behaviors fail it without being regressions: a Reviewer that passes the
+  incomplete turn, and a Decision Worker that answers the "task is complete"
+  turn with `stop`, which ends the task blocked with no repair;
+- `question`: a mid-task question is answered from the spec without a human;
+- `stuck`: a Worker that only claims success ends `blocked` within its repair
+  budget.
+
+The scripted Worker writes the full implementation only after a Supervisor
+message that mentions the RangeError (or min > max). A Decision Worker answer
+that never names it leaves the work undone, and the scenario fails.
+
+Each prints a redacted summary: state, decisions, overrides, Reviewer verdicts
+and answer-format failures. The script exits non-zero when a scenario misses
+its expected outcome. Weak and rate-limited models are useful here, because
+they exercise the deterministic guards that the prompt alone does not
+guarantee. A daily quota error at startup or mid-task is expected to fail
+closed (park), and is not a regression.
+
 The tmux spike is gated, authenticated, and excluded from normal CI. It uses
 plan mode with a fixed `opus` model, records only protocol metadata, and
 verifies three real Claude turns, exact screen-result markers, pause/resume,

@@ -35,3 +35,52 @@ test("token counts under a sensitive-looking key are numbers, not secrets", () =
     { role: "decision", input: 3156, totalTokens: 3324, contextTokens: 8000, token: "[REDACTED]", tokens: ["[REDACTED]"] },
   );
 });
+
+test("redacts OpenAI-style and Google model API keys wherever they appear", () => {
+  // Placeholders with the real shapes; none of these is a key.
+  const deepseekStyle = `sk-${"0123456789abcdef".repeat(2)}`;
+  const legacyOpenai = `sk-${"aB3dE5fG7hJ9kL1mN".repeat(1)}T3BlbkFJ${"pQ2rS4tU6vW8xY0z2a4c"}`;
+  // Project keys are base64url: a hyphen or underscore can come first.
+  const projectOpenai = `sk-proj-a-B_${"x9".repeat(34)}T3BlbkFJ${"-Yz_8".repeat(15)}`;
+  const serviceOpenai = `sk-svcacct-${"-q_1".repeat(18)}T3BlbkFJ${"w2-E".repeat(18)}`;
+  const openrouter = `sk-or-v1-${"0a1b2c3d".repeat(8)}`;
+  const googleClassic = `AIza${"X".repeat(35)}`;
+  const googleBound = `AQ.${"Ab8_example-placeholder".repeat(2)}`;
+  const keys = [deepseekStyle, legacyOpenai, projectOpenai, serviceOpenai, openrouter, googleClassic, googleBound];
+  for (const [before, after] of [[" ", " "], ["\"", "\""], ["=", "&"], ["{\"apiKey\":\"", "\"}"], ["?key=", ""]]) {
+    for (const key of keys) {
+      const redacted = String(redactSensitive(`provider said${before}${key}${after}`));
+      // No part of the key survives, head or tail.
+      assert.ok(!redacted.includes(key.slice(3, 19)) && !redacted.includes(key.slice(-16)), `${before}${key}`);
+      assert.match(redacted, /\[REDACTED\]/u);
+    }
+  }
+  assert.equal(redactSensitive("the task-scheduler and sk-learn stay"), "the task-scheduler and sk-learn stay");
+});
+
+test("hyphenated names that merely start with sk- are not treated as keys", () => {
+  // Session records reject a branch or path that redaction changes, so a
+  // false positive here fails the task, not just a log line.
+  for (const text of [
+    "sk-some-long-feature-branch-name",
+    "sk-1234-fix-login-redirect-loop",
+    "feature/sk-some-long-feature-branch-name",
+    "/home/user/projects/sk-learn-pipeline-experiments/src",
+    "-home-user-projects-sk-learn-pipeline-experiments",
+    "diff --git a/src/sk-utils-and-helpers-module.ts b/src/sk-utils-and-helpers-module.ts",
+    "@scope/sk-some-really-long-package-name",
+    ".sk-folding-cube-animation-delay-long { color: red }",
+    "the-sk-mask-rcnn-inference-component",
+    "/srv/sk-dataset_2024_v2_experiments",
+    "/home/u/code/sk-image_segmentation_v2",
+    "sk-1234_fix_login_redirect_loop",
+    "feature/sk-JIRA1234abcdefghijklmnop",
+    "sk-proj-some-long-feature-branch-name-here-and-more",
+    "sk-2024Q3experimentsRepo",
+    // 32+ characters but only letters, or only digits: names, not keys.
+    "sk-SklearnPipelineExperimentsRepositoryForTheTeam",
+    `sk-${"20240101".repeat(5)}`,
+    "sk-or-v1-fix-login-redirect-loop",
+    "AIzaSomethingInWordsNotAKeyButLongEnoughHere",
+  ]) assert.equal(redactSensitive(text), text, text);
+});
