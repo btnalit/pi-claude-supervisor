@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, rmdir, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
-import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS, claudeProjectSlug, effectiveToolInput, memoryRootFor, sweepDeadTmuxSockets, writeRootsOf } from "./tmux-adapter.ts";
+import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS, claudeProjectSlug, effectiveToolInput, inputHoldsMessage, memoryRootFor, sweepDeadTmuxSockets, writeRootsOf } from "./tmux-adapter.ts";
+import { isWorkerInputError } from "./input-error.ts";
 import { isRoutinePermission, shellQuote } from "../policy.ts";
 import { preflightCgroupContainment } from "./process-adapter.ts";
 import type { HookEventSource, HookRelayReply, HookRelayRequest } from "../hooks/types.ts";
@@ -185,7 +186,7 @@ let handler;
 const hookSource = {
   subscribe: async (cwd, h) => { handler = h; return async () => { handler = undefined; }; },
 };
-const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000 });
+const adapter = new TmuxWorkerAdapter({ stateDir, inputConfirmTimeoutMs: 300, pollIntervalMs: 40, startupTimeoutMs: 5_000 });
 const startPromise = adapter.start({
   task: "guardian release test",
   cwd: stateDir,
@@ -913,7 +914,7 @@ setInterval(() => {}, 10000);
   await chmod(fakeClaude, 0o700);
   const hookSource = createFakeHookSource();
   const events: WorkerEvent[] = [];
-  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+  const adapter = new TmuxWorkerAdapter({ stateDir, inputConfirmTimeoutMs: 300, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
   let handle;
   try {
     const startPromise = adapter.start({
@@ -978,7 +979,7 @@ setInterval(() => {}, 10000);
   await chmod(fakeClaude, 0o700);
   const hookSource = createFakeHookSource();
   const events: WorkerEvent[] = [];
-  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+  const adapter = new TmuxWorkerAdapter({ stateDir, inputConfirmTimeoutMs: 300, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
   let handle;
   try {
     // tmux reports #{pane_current_path} resolved (the real directory); the
@@ -1025,7 +1026,7 @@ test("a launcher-wrapped owned interactive session can be re-adopted after resta
     // child. Recovery must scan for that child instead of rejecting the
     // launcher as "not a Claude Code executable".
     await adapter.release(handle, "simulate Pi restart");
-    readoptedAdapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+    readoptedAdapter = new TmuxWorkerAdapter({ stateDir, inputConfirmTimeoutMs: 300, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
     const readoptedHookSource = createFakeHookSource();
     readopted = await readoptedAdapter.start({
       task: "must not replay after recovery",
@@ -1386,7 +1387,7 @@ setInterval(() => {}, 10000);
   assert.equal(created.status, 0, created.stderr);
   const hookSource = createFakeHookSource();
   const events: WorkerEvent[] = [];
-  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+  const adapter = new TmuxWorkerAdapter({ stateDir, inputConfirmTimeoutMs: 300, pollIntervalMs: 40, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
   let handle;
   try {
     handle = await adapter.start({
@@ -1499,7 +1500,7 @@ setInterval(() => {}, 10000);
   await chmod(fakeClaude, 0o700);
   const hookSource = createFakeHookSource();
   const events: WorkerEvent[] = [];
-  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 200, ...(options.permissionDecisionTimeoutMs !== undefined ? { permissionDecisionTimeoutMs: options.permissionDecisionTimeoutMs } : {}) });
+  const adapter = new TmuxWorkerAdapter({ stateDir, inputConfirmTimeoutMs: 300, pollIntervalMs: 30, startupTimeoutMs: 5_000, terminationGraceMs: 200, ...(options.permissionDecisionTimeoutMs !== undefined ? { permissionDecisionTimeoutMs: options.permissionDecisionTimeoutMs } : {}) });
   const startPromise = adapter.start({
     task: "interactive fixture task",
     cwd: stateDir,
@@ -1709,4 +1710,216 @@ test("a Bash request from a shell that left the task directory is judged where i
   } finally {
     await rm(taskCwd, { recursive: true, force: true });
   }
+});
+
+test("inputHoldsMessage recognizes the pasted message, Claude's long-paste placeholder, and not a selection menu", () => {
+  const separator = "\u2500".repeat(40);
+  assert.equal(inputHoldsMessage(`\u276f Fix the failing test in src/a.ts\n${separator}`, "Fix the failing test in src/a.ts please"), true);
+  assert.equal(inputHoldsMessage(`\u276f [Pasted text #1 +42 lines]\n${separator}`, "anything"), true);
+  assert.equal(inputHoldsMessage(`\u276f \n${separator}`, "Fix the failing test"), false);
+  assert.equal(inputHoldsMessage("Do you want to proceed?\n\u276f 1. Yes\n  2. No", "Fix the failing test"), false);
+  // After submission the message sits in the transcript above an empty box.
+  assert.equal(inputHoldsMessage(`\u276f Fix the failing test\n\nWorking on it.\n\u276f \n${separator}`, "Fix the failing test"), false);
+});
+
+interface FakeTuiConfig { busy: boolean; dropEnters: number }
+
+/**
+ * An adopted interactive session running a raw-mode fake of Claude's TUI:
+ * `❯ <input>` over a separator, a busy spinner while `busy`, and Enter
+ * submitting the input (appended to a log) unless `dropEnters` swallows it.
+ * The test flips the config file to change its state.
+ */
+async function withFakeTui(
+  options: { inputReadyTimeoutMs: number; inputConfirmTimeoutMs: number; acknowledge: boolean },
+  run: (context: { adapter: TmuxWorkerAdapter; handle: Awaited<ReturnType<TmuxWorkerAdapter["start"]>>; setConfig: (config: FakeTuiConfig) => Promise<void>; submitted: () => Promise<string[]>; socketPath: string; sessionName: string; output: () => Promise<string>; events: WorkerEvent[]; hook: (event: Omit<HookRelayRequest["event"], "session_id" | "cwd">) => Promise<unknown> }) => Promise<void>,
+): Promise<void> {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-fake-tui-"));
+  const socketPath = join(stateDir, "tmux.sock");
+  const sessionName = `pi-fake-tui-${process.pid}-${Date.now()}`;
+  const configPath = join(stateDir, "config.json");
+  const logPath = join(stateDir, "submitted.log");
+  const claudeScript = join(stateDir, "claude");
+  await writeFile(configPath, JSON.stringify({ busy: false, dropEnters: 0 }));
+  await writeFile(logPath, "");
+  await writeFile(claudeScript, `#!/usr/bin/env node
+const fs = require("fs");
+let buffer = "";
+let config = { busy: false, dropEnters: 0 };
+let raw = "";
+// Redraw in place like Ink (cursor up, erase below) rather than clearing
+// the screen, which tmux would push into the scrollback the adapter reads.
+let drawn = 0;
+process.stdout.write("fake claude\\r\\n");
+const render = () => {
+  const frame = (config.busy ? ["* Working (esc to interrupt)"] : []).concat(["\\u276f " + buffer, "\\u2500".repeat(40)]);
+  process.stdout.write((drawn ? "\\x1b[" + drawn + "A" : "") + "\\r\\x1b[J" + frame.join("\\r\\n") + "\\r\\n");
+  drawn = frame.length;
+};
+setInterval(() => {
+  let next;
+  try { next = fs.readFileSync(${JSON.stringify(configPath)}, "utf8"); } catch { return; }
+  if (next === raw) return;
+  try { config = JSON.parse(next); } catch { return; }
+  raw = next;
+  render();
+}, 30);
+process.stdin.setRawMode(true);
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  for (const char of chunk) {
+    if (char === "\\r") {
+      if (config.dropEnters > 0) { config.dropEnters -= 1; continue; }
+      fs.appendFileSync(${JSON.stringify(logPath)}, buffer + "\\n");
+      buffer = "";
+    } else if (char >= " ") buffer += char;
+  }
+  render();
+});
+render();
+`);
+  await chmod(claudeScript, 0o700);
+  const created = spawnSync("tmux", ["-S", socketPath, "new-session", "-d", "-s", sessionName, "-x", "200", "-c", stateDir, claudeScript], { encoding: "utf8" });
+  assert.equal(created.status, 0, created.stderr);
+  const hookSource = createFakeHookSource();
+  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000, terminationGraceMs: 200, inputReadyTimeoutMs: options.inputReadyTimeoutMs, inputConfirmTimeoutMs: options.inputConfirmTimeoutMs });
+  let stopAcks = false;
+  let collected = "";
+  const events: WorkerEvent[] = [];
+  try {
+    const handle = await adapter.start({ task: " ", cwd: stateDir, command: "claude", tmuxSession: sessionName, tmuxSocket: socketPath, automatic: true, interactive: true, hookSource, sendInitialInput: false, eventListener: (event) => { events.push(event); } });
+    const submitted = async () => (await readFile(logPath, "utf8")).split("\n").filter(Boolean);
+    // Claude reports each submitted prompt through UserPromptSubmit.
+    const acknowledger = (async () => {
+      let seen = 0;
+      while (options.acknowledge && !stopAcks) {
+        const lines = await submitted();
+        for (; seen < lines.length; seen += 1) {
+          await hookSource.dispatch(stateDir, { version: 1, pid: 111_111, ppid: handle.pid!, tmuxPane: handle.tmuxPaneId, event: { hook_event_name: "UserPromptSubmit", session_id: "session-1", cwd: stateDir, prompt: lines[seen] } });
+        }
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
+    })();
+    try {
+      await run({
+        adapter,
+        handle,
+        // Atomic, so the fake never reads a half-written config.
+        setConfig: async (config) => { await writeFile(`${configPath}.tmp`, JSON.stringify(config)); await rename(`${configPath}.tmp`, configPath); await new Promise((resolve) => setTimeout(resolve, 150)); },
+        submitted,
+        socketPath,
+        sessionName,
+        output: async () => { collected += (await adapter.readOutput(handle)).map((chunk) => chunk.text).join(""); return collected; },
+        events,
+        hook: (event) => hookSource.dispatch(stateDir, { version: 1, pid: 111_111, ppid: handle.pid!, tmuxPane: handle.tmuxPaneId, event: { session_id: "session-1", cwd: stateDir, ...event } as HookRelayRequest["event"] }),
+      });
+    } finally {
+      stopAcks = true;
+      await acknowledger;
+      await adapter.stop(handle, "fake tui test done").catch(() => {});
+    }
+  } finally {
+    spawnSync("tmux", ["-S", socketPath, "kill-server"], { stdio: "ignore" });
+    await rm(stateDir, { recursive: true, force: true });
+  }
+}
+
+test("an interactive send waits out a busy screen instead of refusing it", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 5_000, inputConfirmTimeoutMs: 1_000, acknowledge: true }, async ({ adapter, handle, setConfig, submitted }) => {
+    await setConfig({ busy: true, dropEnters: 0 });
+    setTimeout(() => { void setConfig({ busy: false, dropEnters: 0 }); }, 800);
+    await adapter.send(handle, "continue with the next step", "busy-1");
+    assert.deepEqual(await submitted(), ["continue with the next step"]);
+  });
+});
+
+test("a send that never finds an idle prompt is refused as retryable", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 600, inputConfirmTimeoutMs: 500, acknowledge: true }, async ({ adapter, handle, setConfig, submitted }) => {
+    await setConfig({ busy: true, dropEnters: 0 });
+    await assert.rejects(adapter.send(handle, "never delivered", "busy-2"), (error) => isWorkerInputError(error) && error.retryable);
+    assert.deepEqual(await submitted(), []);
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+  });
+});
+
+test("a lost Enter is resent while the input box still holds the message", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 400, acknowledge: true }, async ({ adapter, handle, setConfig, submitted, output }) => {
+    await setConfig({ busy: false, dropEnters: 1 });
+    await adapter.send(handle, "run the tests again", "enter-1");
+    assert.deepEqual(await submitted(), ["run the tests again"]);
+    assert.match(await output(), /sent Enter again/u);
+  });
+});
+
+test("a message stuck in the input box is not retryable and is not resent a third time", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 300, acknowledge: true }, async ({ adapter, handle, setConfig, submitted, output }) => {
+    await setConfig({ busy: false, dropEnters: 3 });
+    await assert.rejects(adapter.send(handle, "stuck message", "enter-2"), (error) => isWorkerInputError(error) && !error.retryable);
+    assert.deepEqual(await submitted(), []);
+    assert.equal((await output()).match(/sent Enter again/gu)?.length, 2);
+  });
+});
+
+test("an interactive send leaves tmux copy mode so Enter reaches Claude", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 1_000, acknowledge: true }, async ({ adapter, handle, submitted, socketPath, sessionName, output }) => {
+    assert.equal(spawnSync("tmux", ["-S", socketPath, "copy-mode", "-t", sessionName]).status, 0);
+    assert.equal(spawnSync("tmux", ["-S", socketPath, "display-message", "-p", "-t", sessionName, "#{pane_in_mode}"], { encoding: "utf8" }).stdout.trim(), "1");
+    await adapter.send(handle, "scrolled but still supervised", "copy-1");
+    assert.deepEqual(await submitted(), ["scrolled but still supervised"]);
+    assert.match(await output(), /left tmux copy mode/u);
+  });
+});
+
+test("a delivered message without a UserPromptSubmit hook is accepted and logged", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 300, acknowledge: false }, async ({ adapter, handle, submitted, output }) => {
+    await adapter.send(handle, "hooks are silent", "silent-1");
+    assert.deepEqual(await submitted(), ["hooks are silent"]);
+    assert.match(await output(), /no UserPromptSubmit hook confirmed the message/u);
+  });
+});
+
+test("a send waiting for the prompt yields to a turn someone else started, without pasting over it", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 5_000, inputConfirmTimeoutMs: 500, acknowledge: false }, async ({ adapter, handle, setConfig, submitted, hook, events }) => {
+    await setConfig({ busy: true, dropEnters: 0 });
+    const sending = adapter.send(handle, "stale automated decision", "yield-1");
+    const outcome = sending.then(() => "sent", (error) => error);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    // An operator at the attached pane submits their own prompt, and that turn ends.
+    await hook({ hook_event_name: "UserPromptSubmit", prompt: "operator's own request" });
+    await hook({ hook_event_name: "Stop", last_assistant_message: "operator turn done" });
+    await setConfig({ busy: false, dropEnters: 0 });
+    const result = await outcome;
+    assert.ok(isWorkerInputError(result) && result.retryable, String(result));
+    assert.match((result as Error).message, /started another turn/u);
+    assert.deepEqual(await submitted(), []);
+    assert.ok(events.some((event) => event.type === "human_input"));
+  });
+});
+
+test("an interactive send leaves every stacked tmux mode, not only a single copy mode", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 1_000, acknowledge: true }, async ({ adapter, handle, submitted, socketPath, sessionName }) => {
+    assert.equal(spawnSync("tmux", ["-S", socketPath, "choose-tree", "-t", sessionName]).status, 0);
+    assert.equal(spawnSync("tmux", ["-S", socketPath, "copy-mode", "-t", sessionName]).status, 0);
+    assert.equal(spawnSync("tmux", ["-S", socketPath, "display-message", "-p", "-t", sessionName, "#{pane_in_mode}"], { encoding: "utf8" }).stdout.trim(), "2");
+    await adapter.send(handle, "delivered through stacked modes", "modes-1");
+    assert.deepEqual(await submitted(), ["delivered through stacked modes"]);
+  });
+});
+
+test("an idle notification between paste and UserPromptSubmit does not count as delivery", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 400, acknowledge: false }, async ({ adapter, handle, setConfig, hook, events, output }) => {
+    await setConfig({ busy: false, dropEnters: 1 });
+    const sending = adapter.send(handle, "wait for the real submit", "idle-1");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await hook({ hook_event_name: "Notification", notification_type: "idle_prompt", message: "Claude is waiting for your input" });
+    await sending;
+    // The dropped Enter was resent: the idle notification did not short-circuit the check.
+    assert.match(await output(), /sent Enter again/u);
+    // The idle notice did not close the turn that was only starting.
+    assert.equal(events.some((event) => event.type === "turn_completed"), false);
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 1);
+    // The real submission still matches the pasted message rather than reading as a human prompt.
+    await hook({ hook_event_name: "UserPromptSubmit", prompt: "wait for the real submit" });
+    assert.equal(events.some((event) => event.type === "human_input"), false);
+  });
 });
