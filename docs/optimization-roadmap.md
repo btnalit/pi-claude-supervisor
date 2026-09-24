@@ -226,20 +226,20 @@ interface DecisionGuard {
 | # | 问题 | 后果 | 修复（倾向简单、确定性） | 等级 |
 |---|---|---|---|---|
 | T1 | hook 路由按 `event.cwd` 查找 socket，Claude 在 Bash 中 `cd` 子目录后 cwd 随之改变 [code][bin] | 此后所有 hook 静默 no-op：Stop 丢失、PreToolUse 策略跳过、权限对话框等人 → 20 分钟/4 小时后失败 | Worker 环境设 `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1`；relay 按 `CLAUDE_PROJECT_DIR` 路由（回退：沿 `event.cwd` 父目录查找），请求携带路由键 | 高 |
-| T2 | 发送无送达确认：paste → Enter 之间不检查 `pane_in_mode`，不等待对应 UserPromptSubmit [code][exp] | copy-mode 吞掉 Enter，文本滞留输入框，`activeRequests` 卡 1 → 无输出 watchdog 失败 | 发送前 `#{pane_in_mode}`=1 则 `send-keys -X cancel`；Enter 后 5–10 s 等匹配的 UserPromptSubmit，未到则截屏判断并重发 Enter（≤2 次），否则抛可重试错误 | 高 |
+| T2 | 发送无送达确认：paste → Enter 之间不检查 `pane_in_mode`，不等待对应 UserPromptSubmit [code][exp] | copy-mode 吞掉 Enter，文本滞留输入框，`activeRequests` 卡 1 → 无输出 watchdog 失败 | 发送前 `#{pane_in_mode}`=1 则 `send-keys -X cancel`；Enter 后 5–10 s 等匹配的 UserPromptSubmit，未到则截屏：**仅当** 输入框仍显示所粘贴文本且无任何对话框时重发 Enter（≤2 次，盲发 Enter 会选中对话框默认项、绕过策略）；否则抛可重试错误。hook 通道失效（T1、T10）导致 UserPromptSubmit 永不到达时告警/park，而不是与 D1 叠加无限重试 | 高 |
 | T3 | `#send` 在屏幕非“干净就绪”时直接抛错，经 `#decisionFailure` 标为“Decision Worker API failed”并 park、杀死 Worker [code] | 横幅、残留输入、prompt suggestion 幽灵文本 [hyp] 都会导致无故 park | 适配器内轮询就绪 30–60 s 后再拒绝，并标记为可重试；Supervisor 对发送失败单独分类并重试；owned `--settings` 关闭 `promptSuggestionEnabled` | 高 |
-| T4 | 与待发消息不精确匹配的 UserPromptSubmit 一律视为人工输入 → `humanRequired`，且 `worker_prompt` 来源不发 webhook，无输出 watchdog 暂停 [code] | 自动化 **无限期静默暂停** 直到 deadline 失败 | 适配器发送未确认的 30 s 窗口内的 UserPromptSubmit 视为自身消息；待发消息按时间过期而非在 Stop 时清空；无人值守时对 takeover 发告警；N 分钟无新人工输入且 Worker 空闲则自动恢复 | 高 |
-| T5 | Pi 正常关闭会 release owned 会话（移出 cgroup、停 guardian、退订 hooks、释放租约）；`recover` 总是启动 **新的** Claude [code] | 旧 Claude 在无监督下继续跑（hooks no-op），新 Claude 丢失上下文，二者同写一个工作树 | 最简：关闭时停止未完成任务的 owned Worker；更好：保留租约与 tmux 身份，`recover` 重新 adopt 存活的 pane（已有 `tmuxExpectedIdentity` 能力），不存在时才新起 | 高 |
-| T6 | `activeRequests` 只由发送或 UserPromptSubmit 置 1；忽略 `stop_hook_active` 与 Stop 的 `background_tasks`/`session_crons` [code][bin] | Stop-hook 续跑或后台代理运行时被当作空闲：发送被拒 → park，或边改文件边验证 | 主线程（无 `agent_id`）的 PreToolUse/PermissionRequest 在空闲时把 `activeRequests` 置回 1；Stop 的后台任务非空时确定性 `wait` | 中高 |
-| T7 | StopFailure 的 `error` 枚举（`rate_limit`/`overloaded`/`billing_error`/…）与 `error_details` 被丢弃；重试由 Decision 决定且立即重发 [code][bin] | 限流/配额期间重试风暴 → 修复预算或 Decision 失败 → park | 限流/过载/服务错误由 Supervisor 按退避或 `error_details` 中的重置时间 **自动续跑**（不消耗 Decision 与修复预算）；认证/计费错误立即 park 并告警；识别“continuing automatically”（等待）与“press enter to continue”（发 Enter） | 中高 |
-| T8 | interactive 模式下 `#monitor` 不看屏幕；`permission_prompt` 通知只记日志；AskUserQuestion 的 PreToolUse 超时返回 `{}` [code] | 对话框只能靠 20 分钟 watchdog（失败）发现；转圈卡住的轮次要等 4 小时 | AskUserQuestion 超时改为 deny（“无人可答，写明假设后继续”）；无待决请求时收到 `permission_prompt`/`elicitation_dialog` 通知 → 立即告警并 park；以“活跃轮次内 X 分钟无 hook 活动”作为卡死信号 | 中 |
-| T9 | hook 服务端单行 1 MB 上限，超限直接断开 [code] | 大文件 Write/Edit 权限请求或超长 Stop 失败 → 回退到等人的对话框 | relay 截断超长字段（保留长度与哈希），提高上限 | 中 |
+| T4 | 与待发消息不精确匹配的 UserPromptSubmit 一律视为人工输入 → `humanRequired`，且 `worker_prompt` 来源不发 webhook，无输出 watchdog 暂停 [code] | 自动化 **无限期静默暂停** 直到 deadline 失败 | 适配器发送未确认的 30 s 窗口内的 UserPromptSubmit 视为自身消息；待发消息按时间过期而非在 Stop 时清空；无人值守时对 takeover 发告警；为 `worker_prompt` 引起的闸门单独记来源（现与显式 `takeover()` 共用 `#humanGate="other"`），仅该来源在可选/无人值守配置下“N 分钟无新人工输入且 Worker 空闲则自动恢复”——**永不** 清除显式 takeover 或 recover 后的接管 | 高 |
+| T5 | Pi 正常关闭会 release owned 会话（移出 cgroup、停 guardian、退订 hooks、释放租约）；`recover` 总是启动 **新的** Claude [code] | 旧 Claude 在无监督下继续跑（hooks no-op），新 Claude 丢失上下文，二者同写一个工作树 | 最简：关闭时停止未完成任务的 owned Worker；更好：保留租约与 tmux 身份，`recover` 重新 adopt 存活的 pane（已有 `tmuxExpectedIdentity` 能力），不存在时才新起。须保持 `ownership=owned`（adopted 会话不允许 `killProcessGroup`）、重新挂回隔离、按“可能正处于轮次中”处理；并与 D12 协调——保留的租约 + 死掉的所有者 + 存活的 tmux 不能被当作孤儿回收 | 高 |
+| T6 | `activeRequests` 只由发送或 UserPromptSubmit 置 1；忽略 `stop_hook_active` 与 Stop 的 `background_tasks`/`session_crons` [code][bin] | Stop-hook 续跑或后台代理运行时被当作空闲：发送被拒 → park，或边改文件边验证 | 主线程（无 `agent_id`）的 PreToolUse/PermissionRequest 在空闲时把 `activeRequests` 置回 1；Stop 的后台任务非空时确定性 `wait`（有界：常驻开发服务器永不结束，依赖 §3.2 A7 的空闲 watchdog 收口） | 中高 |
+| T7 | StopFailure 的结构化 `error` 枚举（`rate_limit`/`overloaded`/`billing_error`/…）与 `error_details` 未被利用（`describeHookError` 只把类型/状态/消息作为文本交给 Decision）；重试由 Decision 决定且立即重发 [code][bin] | 限流/配额期间重试风暴 → 修复预算或 Decision 失败 → park | 限流/过载/服务错误由 Supervisor 按退避或 `error_details` 中的重置时间 **自动续跑**（不消耗 Decision 与修复预算）；认证/计费错误立即 park 并告警；识别“continuing automatically”（等待）与“press enter to continue”（发 Enter） | 中高 |
+| T8 | interactive 模式下 `#monitor` 不看屏幕；`permission_prompt` 通知只记日志；AskUserQuestion 的 PreToolUse 超时返回 `{}` [code] | 对话框只能靠 20 分钟 watchdog（失败）发现；转圈卡住的轮次要等 4 小时 | AskUserQuestion 超时改为 deny（“无人可答，写明假设后继续”）；无待决请求时收到 `permission_prompt`/`elicitation_dialog` 通知 → 立即告警并 park；以“活跃轮次内 X 分钟无 hook 活动”作为卡死信号（X 须大于最长单次 Bash 工具运行时间） | 中 |
+| T9 | hook 服务端单行 1 MB 上限，超限直接断开 [code] | 大文件 Write/Edit 权限请求或超长 Stop 失败 → 回退到等人的对话框 | relay 截断超长字段（保留长度与哈希），提高上限；**被截断的 Bash 命令一律拒绝**（不能对截断文本做策略判断） | 中 |
 | T10 | hook socket 位于 `$XDG_RUNTIME_DIR`（无 linger 时随最后会话退出被删）；自动模式要求可写的委派 cgroup（ssh `session-N.scope` 为 root 所有）[code][hyp] | 所有 hook 静默 no-op；从 ssh 启动即失败 | socket 移到 `/tmp/pi-claude-supervisor-<uid>` 并定期自检重建；与 D7 一并解决 cgroup；文档写明 `loginctl enable-linger` 与 `systemd-run --user --scope -p Delegate=yes` | 中 |
 | T11 | 验证中 release 以 `failed` 结束（§3.2 B5）；park 时 `#stopInternal` 关闭 owned tmux 会话 | 早上接手时 Claude 上下文已丢失 | 与 0.3 一并修 B5；interactive 模式下 park 改为 **交还会话（hand-back）**，保留 Claude 上下文供人接手 | 中 |
 
-**其余（小项）**：信任对话框按 500 ms 间隔循环处理（2.1.281 有输入保护）；其他启动对话框失败时附屏幕尾部；
+**其余（小项）**：信任对话框按 500 ms 间隔循环处理（2.1.281 有输入保护 [bin]）；其他启动对话框失败时附屏幕尾部；
 权限决策时长封顶在 hook 预算内并丢弃过期排队事件；验证持有 `#exclusive` 期间 pre-phase 策略回答移到锁外；
-以 `/`、`!`、`#` 开头的消息加安全前缀 [hyp]；重新 adopt 时关闭我方遗留的 `pipe-pane`；Worker 设 `DISABLE_AUTOUPDATER=1`
+以 `/`、`!`、`#` 开头的消息加安全前缀 [hyp]；重新 adopt 时关闭我方遗留的 `pipe-pane`；Worker 设 `DISABLE_AUTOUPDATER=1` [bin]
 （或恢复时接受同一安装根）；`#detachCgroup` 前先 `cgroup.freeze`；SessionStart 后按 `session_id` 绑定。
 
 **验收**：新增 **gated 真实 Claude interactive spike（走适配器 + hooks）**，覆盖：`cd` 后调用工具、>4 KB 消息、
@@ -251,28 +251,34 @@ copy-mode、Stop-hook block、后台任务、AskUserQuestion、限流模拟；�
 
 | # | 机制 | 对无人值守的伤害 | 建议 | 风险 |
 |---|---|---|---|---|
-| D1 | Decision 失败即 park：约 3 分钟重试后 park；应用动作时抛出的任何错误也被当作 API 失败 | 429/529 常持续更久；发送失败被误标为 API 失败 | 无人值守下按上限退避持续重试直到 deadline；权限请求回退到策略答案；动作应用错误单独分类（配合 T3） | 低 |
+| D1 | Decision 失败即 park：约 3 分钟重试后 park；应用动作时抛出的任何错误也被当作 API 失败 | 429/529 常持续更久；发送失败被误标为 API 失败 | 无人值守下对 **可重试的** provider 错误（限流、过载、5xx、超时）按上限退避持续重试直到 deadline；认证、计费、模型不存在等配置错误立即 park 并告警；权限请求回退到策略答案；动作应用错误单独分类（配合 T3） | 低 |
 | D2 | Reviewer 回复解析：前后散文、额外键、字段顺序、嵌套值、缺 reviewId 均判格式失败；二次失败 → human → park；Provider 失败 4 次即 park | 真实模型的正常输出被判失败 | 保留 reviewId 与重复键检查；取回复中第一个带匹配 reviewId 的对象；忽略未知键；**取消字段顺序与扁平值规则**；格式失败换新会话重试；Provider 耗尽后稍后重验而非 park | 低–中 |
 | D3 | 未跟踪的二进制、符号链接、硬链接、不可读文件使证据“不完整” → **无修复直接 park**（Reviewer 也拒绝） | Worker 加一张 PNG / fixture DB / symlink 就 park | 这类文件记为“omitted”，证据仍视为完整；git 读取失败重试一次；截断仍走修复 | 低 |
 | D4 | 远端边界正则对整条命令匹配：误拒 `git commit -m "fix: push handler"`、`git stash push`、`git merge --abort`、`git log --grep=merge`、`grep -rn shutdown src/` 等；同一拒绝表也用于验收命令 | 常规开发命令被拒，Worker 反复绕路 | 按语句、在 git 子命令位置匹配（已有 `gitSubcommandIndex`）；只拒 push/send-pack/受保护 ref 的 update-ref，merge 仅在当前或目标为受保护分支时拒；shutdown/reboot 锚定到命令位置 | 低–中 |
 | D5 | 含动态参数（`$VAR`、`$(…)`）的命令一律拒绝：`git show $SHA`、`npx vitest run $TEST_FILE` 等 | 频繁无谓拒绝 | 仅在 push/remote/config/改写分支语句中，或会被 shell/eval/xargs 执行时拒绝 | 低–中 |
 | D6 | 可信 Claude 可执行文件要求每级父目录都无组写/全局写；恢复时钉死旧 realpath | umask 002 的发行版直接启动失败；Claude 自动更新后恢复失败 | 只拒全局可写或他人所有的路径；恢复时重新解析并记 `worker_executable_changed` 事件 | 低 |
-| D7 | 自动模式强制 cgroup v2（`required`），父 cgroup 须可写，探针 1 s 超时 | ssh 会话、容器、高负载机器启动失败 | **（原阶段 5，按维护者指示采纳方案 B）** 默认 `auto`：cgroup 不可用时回退到进程组 + tmux `kill-server` 清理并告警一次；`required` 作为可选项 | 低–中 |
-| D8 | 基线被改写（amend/squash 起始提交）即 park；detached HEAD 即 park | rebase 冲突中途或整理提交就 park | 基线改写：记事件并继续（`git diff <base>` 仍可用）；detached HEAD：先发修复轮（完成/中止 rebase、切回分支）再 park | 低 |
+| D7 | 自动模式强制 cgroup v2（`required`），父 cgroup 须可写，探针 1 s 超时 | ssh 会话、容器、高负载机器启动失败 | **（原阶段 5，采纳方案 B）** 复用 `PI_CLAUDE_SUPERVISOR_CGROUP_MODE`，默认 `auto`：cgroup 不可用时回退到按进程树/会话清理（已有 `process-tree.ts`，不只依赖 `kill-server`），每个任务标注“降级隔离”；`required` 可选。**依赖**：`canTakeoverLease` 要求已验证的 cgroup 边界（`cwd-lease.ts`），回退主机上崩溃后无法 `recover --takeover`——须先完成 D12 的租约改造 | 低–中 |
+| D8 | 基线被改写（amend/squash 起始提交）即 park；detached HEAD 即 park | rebase 冲突中途或整理提交就 park | 基线改写：记事件并继续（`git diff <base>` 仍可用；须同时修改 `automaticRepositoryBoundary` 中同样的拒绝）；detached HEAD：先发修复轮（完成/中止 rebase、切回分支）再 park | 低 |
 | D9 | `hybrid` 授权下的常规命令集以 npm 为中心；Write/Edit 到 `/tmp` 被拒；cwd 内经符号链接目录或硬链接的路径被误报为“Git metadata” | python/cargo/go/make/pnpm 每次都要 Decision 裁决（又一个 park 来源） | interactive 无人值守默认 `policy` 授权（配合下方删除底线）；允许 `os.tmpdir()`；realpath 仍在根内的符号链接放行；去掉 `nlink>1` 规则，保留 `.git` realpath 检查 | 中 |
 | D10 | 重复相同发现 → human → park；Decision 回复中 `confidence` 越界或字段超 8 KB 使整个动作无效；noop 经再提示后 park | 可修复的情形被提前 park | 交给修复预算决定；clamp/忽略 `confidence`、截断长字段；`turn_completed` 上的 noop 映射为 verify | 低 |
 | D11 | 运行时目录的 lstat “非真实目录”检查（dotfiles 管理器常把 `~/.local/state` 做成符号链接）；adopt 身份检查要求 pane cwd 逐字节一致且把 Claude argv 过拒绝表 | 启动/接管无故失败 | 先解析路径再检查；argv 不过拒绝表（配合 D4） | 低 |
 | D12 | cwd 租约（1288 行）：崩溃的 Pi 留下的租约在 tmux/cgroup 仍存活时需人工 `recover --takeover` | 无人值守下无法自动接续 | 自动回收可证明为孤儿的 owned tmux 服务器；接管事务机制简化为“锁 + 所有者 pid/启动时间 + Worker 存活检查” | 中 |
 
 **底线清单（必须保留或新增）**：
-- **新增**：删除工作树之外的目标——`rm`/`mv`/`find -delete`/`git clean` 的字面目标位于 cwd、写入根与临时目录之外时拒绝
-  （**当前 `rm -rf ~/other-project` 被放行**，只拦截文件系统根；可复用 `namesPathOutsideCwd`）。须与 D9 同时上线。
+- **新增：删除/移动底线**（**必须先于 D9、D5 上线**）。现状：Bash 中只拦截 `/`、`/*`、`-- /`；`rm -rf ~/other-project`、
+  `rm -rf ~`、`rm -rf /home`、`rm -rf /usr`、`find ~ -delete`、`rm -rf "$HOME"`、`rm -rf $(pwd)/../x`、`cd /tmp && rm -rf *`、
+  `rm -rf .git` 均被放行（现有 `hybrid` 授权下这些不是常规命令，由 Decision LLM 把关；放宽为 `policy` 后只剩底线）。规则：
+  对 `rm`/`mv`/`find -delete`/`git clean`/`shred` 等删除或移动类语句——
+  1. 目标为动态（变量、命令替换、glob）时拒绝；同一命令中该语句前有 `cd`/`pushd`/`-C` 时拒绝；
+  2. 字面目标解析后位于 cwd、写入根与临时目录之外时拒绝（`namesPathOutsideCwd` 会把 `"$HOME"`/`$(...)` 当作 cwd 内路径，不能单独依赖）；
+  3. 删除或移动 `.git`，以及 `git gc --prune`、`git reflog expire` 拒绝（`remoteAuthority` 默认 none，本地提交是唯一副本）；
+  4. D5 的动态参数放宽 **不适用于** 删除/移动目标。
 - 保留：拒绝 push、send-pack/receive-pack、PR/release/API 变更、合并进受保护分支（按 D4 收窄匹配方式）；拒绝修改
-  git remote 与传输配置（`remote`、`url`、`push`、`credential`、`core.hooksPath`）；拒绝写 `.git` 元数据；拒绝改写/删除受保护分支；
+  git remote 与传输配置（`remote`、`url`、`push`、`credential`、`core.hooksPath`）；拒绝写 `.git` 元数据（现状仅覆盖 Write/Edit；Bash 侧由上条补齐）；拒绝改写/删除受保护分支；
   interactive 模式保留 PreToolUse 否决；开启推送授权时保留字面授权与远端 URL 基线；杀进程/tmux 服务器前的 pid + 启动时间身份核验；
   每个工作树一个租约（核心形态）；日志/prompt/webhook 的脱敏（与校验分离）；deadline、轮次与修复预算。
 
-**冻结或移除候选**：`#humanGate = "permission"` 死代码；structured bridge（约占 `tmux-adapter.ts` 一半）、process-pipe/manual 传输、
+**冻结或移除候选**：`#humanGate = "permission"` 死代码；structured bridge（审计估计约占 `tmux-adapter.ts` 一半，未精确统计）、process-pipe/manual 传输、
 仅 headless 的设置检查——若 interactive 为主力，冻结或移到独立文件；发布授权机制已默认关闭，保持现状。
 
 ### 阶段 0：先度量（2 个 PR）
@@ -363,12 +369,12 @@ automatic 模式强制 cgroup v2，容器、macOS、部分 NAS/WSL 无法使用�
 | 方案 | 说明 | 风险 |
 |---|---|---|
 | A. 维持现状 | 只在 cgroup v2 主机运行 | 可用范围窄 |
-| B. 显式降级模式（建议评估） | `PI_CLAUDE_SUPERVISOR_CONTAINMENT=process-group` 显式开启；事件与 `status` 醒目标注“降级隔离”；回收依赖进程组 + 超时强杀 | 后台逃逸进程可能残留 |
+| B. 降级模式（**已采纳，见 D7**） | 复用现有 `PI_CLAUDE_SUPERVISOR_CGROUP_MODE`，自动模式默认 `auto`：cgroup 不可用时回退到进程组/进程树清理，每个任务都在事件与 `status` 标注“降级隔离”；`required` 可选 | setsid/daemon 化的后台进程可能残留 |
 | C. 容器化隔离 | 每任务一个容器 | 复杂度与依赖显著上升，不建议现在做 |
 
 ## 6. 本路线图之外、但影响长任务的已知风险
 
-以下不在本轮范围内，但应作为后续独立议题跟踪（均为观察，未验证其严重程度）：
+以下议题中，tmux 屏幕/hooks 可靠性与策略拒绝已分别并入阶段 T 与阶段 D；其余作为后续独立议题跟踪：
 
 - `tmux-adapter.ts`（2665 行）：就绪判断依赖屏幕抓取（`isReadyScreen` / `readyStreak`），轮次检测依赖 hooks；
   Claude TUI 变化时最脆弱。
@@ -398,6 +404,9 @@ automatic 模式强制 cgroup v2，容器、macOS、部分 NAS/WSL 无法使用�
 
 ## 9. 成功标准
 
+- interactive 真实 spike（走适配器 + hooks）在发版清单中通过，覆盖 §5.1 验收列出的场景。
+- 阶段 0 报告中，“发送失败 / 误判人工接管 / 证据不完整 / 策略误拒”导致的 park 归零或有明确解释；删除底线测试覆盖 §5.2 列出的全部示例。
+
 - `StopIntent` 与 `VerificationCycle` 独立成模块，有转换表与表驱动测试；§3.2 A 有特征测试，B 已实现并有违反即失败的测试。
 - 报告命令可给出无人值守完成率、park 原因分布、覆盖次数；阶段 1 启用覆盖后，“无验证运行到 deadline/配额耗尽”归零。
 - recover 后所有确定性兜底仍然生效（阶段 3 测试）。
@@ -407,8 +416,8 @@ automatic 模式强制 cgroup v2，容器、macOS、部分 NAS/WSL 无法使用�
 
 ```text
 第一波（速赢，S 级，确定性）：T1 T2 T3 T4、D1 D3、0.3（B1 B3 B5）+ T11 hand-back、删除底线、0.1 报告、interactive 真实 spike
-第二波：T5 T6 T7 T8、D2 D4 D5 D6 D7 D8 D9 D10、0.2 校验拆分
-第三波：阶段1（无进展，先观察）→ 阶段2 核心（2.0→2.1→2.2→2.3）→ 阶段3（恢复补齐）；T9 T10、D11 D12、阶段4 并行
+第二波：T5 T6 T7 T8、D12（租约简化，先于 D7 与 T5 的重新 adopt）、D2 D4 D5 D6 D7 D8 D9 D10、0.2 校验拆分
+第三波：阶段1（无进展，先观察）→ 阶段2 核心（2.0→2.1→2.2→2.3）→ 阶段3（恢复补齐）；T9 T10、D11、阶段4 并行
 ```
 
 **依赖与顺序理由**：第一波每项都小且独立，直接消除“静默卡死 / 无故 park / 杀掉会话”；删除底线必须先于 D9 放宽上线；
