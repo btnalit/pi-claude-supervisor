@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented here.
 
+## [0.10.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.9.2...v0.10.0) (2026-09-24)
+
+
+### Features
+
+* **policy:** delete/move floor beneath every permission authority ([#75](https://github.com/btnalit/pi-claude-supervisor/issues/75)) ([967f679](https://github.com/btnalit/pi-claude-supervisor/commit/967f6796503b28c58a6523ceae51d066f17d2b56))
+
+
+### Bug Fixes
+
+* **automation:** wait out provider outages; stop parking on binaries and symlinks ([#72](https://github.com/btnalit/pi-claude-supervisor/issues/72)) ([c2969e0](https://github.com/btnalit/pi-claude-supervisor/commit/c2969e08e4070cf977699f3b2bf90697c730cb9e))
+* **hooks:** keep interactive supervision after the Worker changes directory ([#69](https://github.com/btnalit/pi-claude-supervisor/issues/69)) ([a46177a](https://github.com/btnalit/pi-claude-supervisor/commit/a46177a1769c180decef306f78418aa22be52216))
+* **supervisor:** park a self-started verification that throws part-way ([#73](https://github.com/btnalit/pi-claude-supervisor/issues/73)) ([dfc546a](https://github.com/btnalit/pi-claude-supervisor/commit/dfc546a6871a4ed89f0b126661fa96436d5cac78))
+* **supervisor:** stop a stray prompt from pausing unattended automation for good ([#74](https://github.com/btnalit/pi-claude-supervisor/issues/74)) ([7de0c6c](https://github.com/btnalit/pi-claude-supervisor/commit/7de0c6c09c58e20712659a3f24a97efc6eb704b3))
+* **tmux:** deliver interactive input reliably instead of parking on a busy prompt ([#71](https://github.com/btnalit/pi-claude-supervisor/issues/71)) ([46083d2](https://github.com/btnalit/pi-claude-supervisor/commit/46083d27973261a0e51615e9234cb3f682b3a9fc))
+
 ## [0.9.2](https://github.com/btnalit/pi-claude-supervisor/compare/v0.9.1...v0.9.2) (2026-09-24)
 
 
