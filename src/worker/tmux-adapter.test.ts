@@ -1732,7 +1732,7 @@ interface FakeTuiConfig { busy: boolean; dropEnters: number }
  */
 async function withFakeTui(
   options: { inputReadyTimeoutMs: number; inputConfirmTimeoutMs: number; acknowledge: boolean },
-  run: (context: { adapter: TmuxWorkerAdapter; handle: Awaited<ReturnType<TmuxWorkerAdapter["start"]>>; setConfig: (config: FakeTuiConfig) => Promise<void>; submitted: () => Promise<string[]>; socketPath: string; sessionName: string; output: () => Promise<string> }) => Promise<void>,
+  run: (context: { adapter: TmuxWorkerAdapter; handle: Awaited<ReturnType<TmuxWorkerAdapter["start"]>>; setConfig: (config: FakeTuiConfig) => Promise<void>; submitted: () => Promise<string[]>; socketPath: string; sessionName: string; output: () => Promise<string>; events: WorkerEvent[]; hook: (event: Omit<HookRelayRequest["event"], "session_id" | "cwd">) => Promise<unknown> }) => Promise<void>,
 ): Promise<void> {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-fake-tui-"));
   const socketPath = join(stateDir, "tmux.sock");
@@ -1785,8 +1785,9 @@ render();
   const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000, terminationGraceMs: 200, inputReadyTimeoutMs: options.inputReadyTimeoutMs, inputConfirmTimeoutMs: options.inputConfirmTimeoutMs });
   let stopAcks = false;
   let collected = "";
+  const events: WorkerEvent[] = [];
   try {
-    const handle = await adapter.start({ task: " ", cwd: stateDir, command: "claude", tmuxSession: sessionName, tmuxSocket: socketPath, automatic: true, interactive: true, hookSource, sendInitialInput: false });
+    const handle = await adapter.start({ task: " ", cwd: stateDir, command: "claude", tmuxSession: sessionName, tmuxSocket: socketPath, automatic: true, interactive: true, hookSource, sendInitialInput: false, eventListener: (event) => { events.push(event); } });
     const submitted = async () => (await readFile(logPath, "utf8")).split("\n").filter(Boolean);
     // Claude reports each submitted prompt through UserPromptSubmit.
     const acknowledger = (async () => {
@@ -1809,6 +1810,8 @@ render();
         socketPath,
         sessionName,
         output: async () => { collected += (await adapter.readOutput(handle)).map((chunk) => chunk.text).join(""); return collected; },
+        events,
+        hook: (event) => hookSource.dispatch(stateDir, { version: 1, pid: 111_111, ppid: handle.pid!, tmuxPane: handle.tmuxPaneId, event: { session_id: "session-1", cwd: stateDir, ...event } as HookRelayRequest["event"] }),
       });
     } finally {
       stopAcks = true;
@@ -1872,5 +1875,48 @@ test("a delivered message without a UserPromptSubmit hook is accepted and logged
     await adapter.send(handle, "hooks are silent", "silent-1");
     assert.deepEqual(await submitted(), ["hooks are silent"]);
     assert.match(await output(), /no UserPromptSubmit hook confirmed the message/u);
+  });
+});
+
+test("a send waiting for the prompt yields to a turn someone else started, without pasting over it", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 5_000, inputConfirmTimeoutMs: 500, acknowledge: false }, async ({ adapter, handle, setConfig, submitted, hook, events }) => {
+    await setConfig({ busy: true, dropEnters: 0 });
+    const sending = adapter.send(handle, "stale automated decision", "yield-1");
+    const outcome = sending.then(() => "sent", (error) => error);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    // An operator at the attached pane submits their own prompt, and that turn ends.
+    await hook({ hook_event_name: "UserPromptSubmit", prompt: "operator's own request" });
+    await hook({ hook_event_name: "Stop", last_assistant_message: "operator turn done" });
+    await setConfig({ busy: false, dropEnters: 0 });
+    const result = await outcome;
+    assert.ok(isWorkerInputError(result) && result.retryable, String(result));
+    assert.match((result as Error).message, /started another turn/u);
+    assert.deepEqual(await submitted(), []);
+    assert.ok(events.some((event) => event.type === "human_input"));
+  });
+});
+
+test("an interactive send leaves every stacked tmux mode, not only a single copy mode", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 1_000, acknowledge: true }, async ({ adapter, handle, submitted, socketPath, sessionName }) => {
+    assert.equal(spawnSync("tmux", ["-S", socketPath, "choose-tree", "-t", sessionName]).status, 0);
+    assert.equal(spawnSync("tmux", ["-S", socketPath, "copy-mode", "-t", sessionName]).status, 0);
+    assert.equal(spawnSync("tmux", ["-S", socketPath, "display-message", "-p", "-t", sessionName, "#{pane_in_mode}"], { encoding: "utf8" }).stdout.trim(), "2");
+    await adapter.send(handle, "delivered through stacked modes", "modes-1");
+    assert.deepEqual(await submitted(), ["delivered through stacked modes"]);
+  });
+});
+
+test("an idle notification between paste and UserPromptSubmit does not count as delivery", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 400, acknowledge: false }, async ({ adapter, handle, setConfig, hook, events, output }) => {
+    await setConfig({ busy: false, dropEnters: 1 });
+    const sending = adapter.send(handle, "wait for the real submit", "idle-1");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await hook({ hook_event_name: "Notification", notification_type: "idle_prompt", message: "Claude is waiting for your input" });
+    await sending;
+    // The dropped Enter was resent: the idle notification did not short-circuit the check.
+    assert.match(await output(), /sent Enter again/u);
+    // The real submission still matches the pasted message rather than reading as a human prompt.
+    await hook({ hook_event_name: "UserPromptSubmit", prompt: "wait for the real submit" });
+    assert.equal(events.some((event) => event.type === "human_input"), false);
   });
 });

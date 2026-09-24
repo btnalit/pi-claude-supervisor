@@ -147,6 +147,8 @@ interface TmuxRecord {
   pendingSentMessages: string[];
   /** Counts pasted messages Claude acknowledged (a matching UserPromptSubmit, or a turn that consumed them). */
   submitAcks: number;
+  /** Counts prompts nobody here sent (human or Claude runtime), so a waiting send can tell the Worker moved on. */
+  humanInputs: number;
   pendingPermissionRequests: Map<string, { phase: "pre" | "prompt"; resolve: (reply: HookRelayReply) => void }>;
   /** Hook requests that did not bind to this pane's identity, for diagnostics. */
   ignoredHookRequests: number;
@@ -698,6 +700,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       sessionStartReceived: false,
       pendingSentMessages: [],
       submitAcks: 0,
+      humanInputs: 0,
       pendingPermissionRequests: new Map(),
       ignoredHookRequests: 0,
     };
@@ -944,8 +947,8 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   async send(handle: WorkerHandle, message: string, idempotencyKey: string): Promise<void> {
     const record = this.#record(handle);
     if (record.sentKeys.has(idempotencyKey)) return;
-    if (record.released) throw new Error("tmux worker is no longer supervised");
-    if (record.activeRequests > 0) throw new Error("tmux worker has an active turn; wait for its prompt before sending another turn");
+    if (record.released) throw new WorkerInputError("tmux worker is no longer supervised", { retryable: false });
+    if (record.activeRequests > 0) throw new WorkerInputError("tmux worker has an active turn; wait for its prompt before sending another turn", { retryable: true });
     await this.#send(record, message, idempotencyKey);
   }
 
@@ -1132,14 +1135,14 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     record.inputTail = previous.then(() => gate);
     await previous;
     try {
-      if (record.stopping || record.released) throw new Error("tmux worker is stopping or released");
+      if (record.stopping || record.released) throw new WorkerInputError("tmux worker is stopping or released", { retryable: false });
       const pane = await this.#paneStatus(record);
-      if (pane.dead) throw new Error("tmux worker is not running");
+      if (pane.dead) throw new WorkerInputError("tmux worker is not running", { retryable: false });
       record.handle.pid = pane.pid;
       await this.#rememberPaneIdentity(record, pane.pid);
       await this.#collectOutput(record);
       const finalPane = await this.#paneStatus(record);
-      if (finalPane.dead) throw new Error("tmux worker exited before input reservation");
+      if (finalPane.dead) throw new WorkerInputError("tmux worker exited before input reservation", { retryable: false });
       await this.#rememberPaneIdentity(record, finalPane.pid);
       // This is the final reservation check immediately before paste. A
       // human typing after this point is inherently outside tmux's control;
@@ -1195,12 +1198,21 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     await this.#run(record, ["send-keys", "-t", record.target, "Enter"]);
   }
 
-  /** A pane someone scrolled in (copy mode) swallows Enter; leave it before typing. */
+  /**
+   * A pane someone scrolled in (copy mode, possibly stacked on another mode
+   * such as the tree chooser) swallows Enter; leave every mode before typing.
+   * Best effort: a failure here is logged, and the delivery check still
+   * catches a message that did not go through.
+   */
   async #leaveCopyMode(record: TmuxRecord): Promise<void> {
-    const mode = await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_in_mode}"]);
-    if (mode.stdout.trim() !== "1") return;
-    await this.#run(record, ["send-keys", "-t", record.target, "-X", "cancel"]);
-    this.#logOutput(record, "[supervisor] left tmux copy mode to deliver input\n");
+    try {
+      const mode = await this.#run(record, ["display-message", "-p", "-t", record.target, "#{pane_in_mode}"]);
+      if (mode.stdout.trim() === "0" || mode.stdout.trim() === "") return;
+      await this.#run(record, ["copy-mode", "-q", "-t", record.target]);
+      this.#logOutput(record, "[supervisor] left tmux copy mode to deliver input\n");
+    } catch (error) {
+      this.#logOutput(record, `[supervisor] could not leave tmux copy mode: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
   }
 
   /**
@@ -1211,13 +1223,23 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
    */
   async #awaitInputReady(record: TmuxRecord): Promise<void> {
     const deadline = Date.now() + this.#inputReadyTimeoutMs;
+    const turnSequence = record.turnSequence;
+    const humanInputs = record.humanInputs;
     for (let first = true; ; first = false) {
       if (record.stopping || record.released) throw new WorkerInputError("tmux worker is stopping or released", { retryable: false });
+      // Someone else started a turn while this send waited (a human at the
+      // attached pane, Claude's own background completion): the message was
+      // decided for a state that no longer exists. Nothing was typed; the
+      // Supervisor sees that turn's events and decides afresh.
+      if (record.activeRequests > 0 || record.turnSequence !== turnSequence || record.humanInputs !== humanInputs) {
+        throw new WorkerInputError("the Worker started another turn while this message waited for its prompt", { retryable: true });
+      }
       if (!first) {
         const pane = await this.#paneStatus(record);
         if (pane.dead) throw new WorkerInputError("tmux worker exited while waiting for its prompt", { retryable: false });
       }
-      if (!record.structured) await this.#leaveCopyMode(record);
+      // capture-pane reads the live screen even in copy mode, so an observer
+      // scrolling back is left alone until the paste itself.
       if (isReadyScreen(await this.#capture(record))) return;
       if (Date.now() >= deadline) break;
       await delay(Math.min(this.#pollIntervalMs, Math.max(1, deadline - Date.now())));
@@ -2136,8 +2158,12 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     record.turnSequence += 1;
     // Every message pasted before this turn ended has been consumed; a
     // confirmation that never arrived must not shadow a later human prompt.
-    if (record.pendingSentMessages.length > 0) record.submitAcks += 1;
-    record.pendingSentMessages.length = 0;
+    // An idle notification is not a consumed turn: it can land between a
+    // paste and its UserPromptSubmit, which must still match.
+    if (result.subtype !== "idle") {
+      if (record.pendingSentMessages.length > 0) record.submitAcks += 1;
+      record.pendingSentMessages.length = 0;
+    }
     this.#emit(record, { type: "turn_completed", handle: record.handle, sequence: record.turnSequence, result });
   }
 
@@ -2175,6 +2201,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         }
         // Claude Code delivers its own background-task, monitor and agent
         // completions through this hook as a user-role message; nobody typed it.
+        record.humanInputs += 1;
         if (!isClaudeRuntimePrompt(prompt)) {
           this.#emit(record, { type: "human_input", handle: record.handle, text: boundTextHead(prompt, 4_096) });
         }
@@ -2325,7 +2352,12 @@ function bridgeEnvironment(env: NodeJS.ProcessEnv, cwd: string, command: string,
     [BRIDGE_KEYS.cwd]: encode(cwd),
     [BRIDGE_KEYS.cgroup]: encode(cgroupPath ?? ""),
   };
-  if (hookSettingsPath !== undefined) result[INTERACTIVE_KEYS.settings] = encode(hookSettingsPath);
+  if (hookSettingsPath !== undefined) {
+    result[INTERACTIVE_KEYS.settings] = encode(hookSettingsPath);
+    // Claude reads this before the settings file's promptSuggestionEnabled,
+    // so an inherited =1 would bring the ghost suggestion text back.
+    result.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION = "false";
+  }
   return result;
 }
 

@@ -258,7 +258,7 @@ export class Supervisor {
   #waitTimeoutMs = 10 * 60_000;
   /** Re-applies a decision whose message the Worker could not take yet; any fresh Worker activity clears it with the wait timer. */
   #inputRetryTimer?: NodeJS.Timeout;
-  #inputRetry?: { event: WorkerEvent; attempts: number };
+  #inputRetry?: { event: WorkerEvent; attempts: number; turn: number };
   #inputRetryBaseMs = DEFAULT_INPUT_RETRY_BASE_MS;
   #turn = 0;
   #repairRound = 0;
@@ -1038,7 +1038,7 @@ export class Supervisor {
     }).catch(() => {});
   }
 
-  async #applyDecision(action: DecisionAction, event: WorkerEvent): Promise<void> {
+  async #applyDecision(action: DecisionAction, event: WorkerEvent, inputRetry = false): Promise<void> {
     return this.#exclusive(async () => {
       this.#settlePendingDecision(event);
       const task = this.#task;
@@ -1060,7 +1060,8 @@ export class Supervisor {
         if (this.#handledEvents.has(actionKey)) return;
         this.#handledEvents.add(actionKey);
       }
-      await this.#appendEvent({ type: "decision_made", taskId: task.taskId, workerId: handle.id, data: { action: action.action, reason: action.reason, confidence: action.confidence } });
+      // A deferred re-send applies the decision already recorded; its attempts are audited as worker_input_deferred.
+      if (!inputRetry) await this.#appendEvent({ type: "decision_made", taskId: task.taskId, workerId: handle.id, data: { action: action.action, reason: action.reason, confidence: action.confidence } });
       if (action.action === "allow_permission" || action.action === "deny_permission") {
         if (event.type !== "permission_request" || !this.#adapter.respondPermission) {
           await this.#parkCandidate(`Permission response is unavailable for ${event.type}`, event);
@@ -1205,7 +1206,7 @@ export class Supervisor {
       await this.#parkCandidate(`the Worker did not accept input after ${MAX_INPUT_RETRIES} deferred attempts: ${safeMessage(error)}`, event);
       return;
     }
-    this.#inputRetry = { event, attempts };
+    this.#inputRetry = { event, attempts, turn: this.#turn };
     const delayMs = Math.min(MAX_INPUT_RETRY_DELAY_MS, this.#inputRetryBaseMs * 2 ** (attempts - 1));
     await this.#appendEvent({ type: "worker_input_deferred", taskId: this.#task?.taskId, workerId: event.handle.id, data: { action: action.action, attempt: attempts, delayMs, error: safeMessage(error), eventType: event.type } }).catch(() => {});
     // The same decision is applied again, so it must not be deduplicated away.
@@ -1213,7 +1214,16 @@ export class Supervisor {
     this.#clearWaitTimer();
     this.#inputRetryTimer = setTimeout(() => {
       this.#inputRetryTimer = undefined;
-      void this.#applyDecision(action, event).catch((retryError) => this.#decisionFailure(event, retryError));
+      // The same guards as the wait timer: a later turn, an operator's own
+      // message or a state change means this decision no longer applies.
+      const pending = this.#inputRetry;
+      if (!pending || pending.event !== event || pending.turn !== this.#turn || this.#machine.state !== "waiting"
+        || (event.type === "turn_completed" && this.#lastTurnCompleted !== event)) return;
+      // #decisionFailure can itself reject (event log, Worker cleanup); nothing
+      // above this timer would catch it, and an unhandled rejection ends Pi.
+      void this.#applyDecision(action, event, true)
+        .catch((retryError) => this.#decisionFailure(event, retryError))
+        .catch(() => {});
     }, delayMs);
     this.#inputRetryTimer.unref?.();
   }

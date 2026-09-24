@@ -147,24 +147,31 @@ boundary without interpolating a task into a shell command. C0/C1 terminal
 control bytes are neutralized (escape sequences removed, a lone CR becomes a newline,
 other C0/C1 bytes become spaces); CRLF is normalized to a newline.
 
-A send first waits up to `inputReadyTimeoutMs` (30 s) for an idle prompt,
-leaving tmux copy mode if someone scrolled the pane (copy mode swallows
-Enter); a prompt still busy, showing a banner or leftover input after that is
-refused with a retryable `WorkerInputError` (`src/worker/input-error.ts`),
-since nothing was typed. An interactive send is then confirmed by its
+A send first waits up to `inputReadyTimeoutMs` (30 s) for an idle prompt; a
+prompt still busy, showing a banner or leftover input after that is refused
+with a retryable `WorkerInputError` (`src/worker/input-error.ts`), since
+nothing was typed. The wait also yields — retryable, nothing typed — as soon
+as another turn starts (a human prompt at the attached pane, Claude's own
+background completion, a turn ending), so a message decided for an earlier
+state is never pasted over it. Just before the paste and before Enter, every
+tmux mode is left (`copy-mode -q`; copy mode swallows Enter and can be stacked
+on the tree chooser). An interactive send is then confirmed by its
 `UserPromptSubmit` hook: if none arrives within `inputConfirmTimeoutMs` (8 s)
 and the input box visibly still holds the message (or Claude's long-paste
 placeholder), Enter is sent again, at most twice — never blindly, since Enter
 on a dialog would pick its default. A message still stuck after that is a
 non-retryable error (a resend would duplicate it); an empty box without the
 hook is accepted and logged, leaving a broken hook channel to the no-output
-watchdog. The Supervisor re-applies a Decision `continue`/`redirect`/`answer`/
+watchdog. An `idle_prompt` notification is not counted as delivery. The Supervisor re-applies a Decision `continue`/`redirect`/`answer`/
 `retry` whose message was refused as retryable after 15 s, doubling to at most
 a minute, up to five times (`worker_input_deferred`); any fresh Worker event
-supersedes the retry, and only then is the task parked, as a Worker input
-failure (`worker_input_failed`) rather than a Decision Worker failure. An owned
-interactive session's settings also turn `promptSuggestionEnabled` off: the
-suggestion's ghost text reads as leftover input.
+supersedes the retry, as do a later turn, an operator's own message or a
+state change, and only then is the task parked, as a Worker input failure
+(`worker_input_failed`) rather than a Decision Worker failure. An owned
+interactive session turns prompt suggestions off, both in its settings
+(`promptSuggestionEnabled`) and through `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION`,
+which Claude reads first: the suggestion's ghost text reads as leftover input.
+An adopted session keeps the user's own setting.
 
 Automatic agents,
 background tasks, plugins, MCP servers and nested Claude processes stay in the

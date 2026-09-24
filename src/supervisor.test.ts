@@ -4318,21 +4318,27 @@ test("a decision the Worker cannot take yet is re-sent later instead of parking 
   await withScriptedSend(async (message) => {
     if (refusals > 0) { refusals -= 1; throw new WorkerInputError("prompt is busy", { retryable: true }); }
     sent.push(message);
-  }, async ({ supervisor, handle, events, decide }) => {
-    await decide({ action: "continue", message: "Keep going with step two.", reason: "more to do" }, { type: "turn_completed", handle, result: {}, sequence: 1 });
+  }, async ({ supervisor, handle, events, decide, emit }) => {
+    const turn: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 1 };
+    emit(turn);
+    await decide({ action: "continue", message: "Keep going with step two.", reason: "more to do" }, turn);
     assert.equal(supervisor.candidateParked, false);
     await waitUntil(() => sent.length === 1);
     assert.deepEqual(sent, ["Keep going with step two."]);
     assert.equal(supervisor.state, "running");
     assert.equal(supervisor.candidateParked, false);
     assert.deepEqual(events.events.filter((event) => event.type === "worker_input_deferred").map((event) => (event.data as { attempt: number }).attempt), [1, 2]);
+    // The re-sends apply the recorded decision; they are not new decisions.
+    assert.equal(events.events.filter((event) => event.type === "decision_made").length, 1);
   });
 });
 
 test("a Worker that never takes input is parked with the real reason after bounded retries", async () => {
   let attempts = 0;
-  await withScriptedSend(async () => { attempts += 1; throw new WorkerInputError("prompt is busy", { retryable: true }); }, async ({ supervisor, handle, events, decide }) => {
-    await decide({ action: "continue", message: "Keep going.", reason: "more to do" }, { type: "turn_completed", handle, result: {}, sequence: 1 });
+  await withScriptedSend(async () => { attempts += 1; throw new WorkerInputError("prompt is busy", { retryable: true }); }, async ({ supervisor, handle, events, decide, emit }) => {
+    const turn: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 1 };
+    emit(turn);
+    await decide({ action: "continue", message: "Keep going.", reason: "more to do" }, turn);
     await waitUntil(() => supervisor.state === "blocked");
     assert.equal(supervisor.candidateParked, true);
     assert.equal(attempts, 6);
@@ -4344,7 +4350,9 @@ test("a Worker that never takes input is parked with the real reason after bound
 test("fresh Worker activity supersedes a deferred decision message", async () => {
   let attempts = 0;
   await withScriptedSend(async () => { attempts += 1; throw new WorkerInputError("prompt is busy", { retryable: true }); }, async ({ supervisor, handle, decide, emit }) => {
-    await decide({ action: "continue", message: "Keep going.", reason: "more to do" }, { type: "turn_completed", handle, result: {}, sequence: 1 });
+    const turn: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 1 };
+    emit(turn);
+    await decide({ action: "continue", message: "Keep going.", reason: "more to do" }, turn);
     assert.equal(attempts, 1);
     // The Worker produced a new turn on its own before the retry fired.
     emit({ type: "turn_completed", handle, result: { result: "done anyway" }, sequence: 2 });
@@ -4363,4 +4371,50 @@ test("a failed Worker send is reported as an input failure, not a Decision Worke
     assert.equal(events.events.some((event) => event.type === "decision_worker_failed"), false);
     assert.doesNotMatch(JSON.stringify(events.events.map((event) => event.data)), /Decision Worker API failed/u);
   });
+});
+
+test("a deferred decision message is dropped once the operator has sent a turn of their own", async () => {
+  let refuse = true;
+  const sent: string[] = [];
+  await withScriptedSend(async (message) => {
+    if (refuse) throw new WorkerInputError("prompt is busy", { retryable: true });
+    sent.push(message);
+  }, async ({ supervisor, handle, decide, emit }) => {
+    const turn: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 1 };
+    emit(turn);
+    await decide({ action: "continue", message: "Stale decision.", reason: "more to do" }, turn);
+    refuse = false;
+    await supervisor.send("Operator message.");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.deepEqual(sent, ["Operator message."]);
+  }, 150);
+});
+
+test("a retry whose failure handling itself fails does not raise an unhandled rejection", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  let attempts = 0;
+  try {
+    await withScriptedSend(async () => {
+      attempts += 1;
+      throw new WorkerInputError(attempts === 1 ? "prompt is busy" : "tmux worker is not running", { retryable: attempts === 1 });
+    }, async ({ supervisor, handle, decide, emit, events }) => {
+      const turn: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 1 };
+      emit(turn);
+      // The failure handler's own event write fails.
+      const append = events.append.bind(events);
+      events.append = async (event) => {
+        if (event.type === "worker_input_failed") throw new Error("event log is full");
+        return append(event);
+      };
+      await decide({ action: "continue", message: "Keep going.", reason: "more to do" }, turn);
+      await waitUntil(() => attempts === 2);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      void supervisor;
+    });
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
 });
