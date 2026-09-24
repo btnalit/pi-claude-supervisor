@@ -156,7 +156,10 @@ current work and is judged on its next `Stop` instead.
 pauses (`human_takeover`, visible as a warning) until you run `/supervise
 resume-auto <task-id>`; the turn that completed while you were driving is
 replayed to the Decision Worker at that point, so nothing already finished is
-lost.
+lost. If you type and walk away, the pause lifts on its own once the session
+has been idle with no further input from you for `HUMAN_IDLE_RESUME_MS`
+(default 30 minutes; `automation_auto_resumed`). An explicit `/supervise
+takeover`, and every recovered task, waits for `resume-auto`.
 
 **Completion hands the session back.** Unlike other transports, a completed
 task by default disconnects Pi from the session instead of closing it, so you
@@ -438,6 +441,7 @@ unparsable keeps the default and is reported once as a
 | `DEADLINE_GRACE_MS` | `30m` | Close-out window after the deadline for automatic tasks: an idle Worker is verified instead of stopped; `0` restores the immediate stop |
 | `DEADLINE_WARNING_MS` | `15m` | How long before the deadline the Decision Worker is warned and re-asked; `0` disables the warning |
 | `NO_OUTPUT_TIMEOUT_MS` | `20m` | Stop a Worker that has produced no output for this long; `0` disables the check |
+| `HUMAN_IDLE_RESUME_MS` | `30m` | After you type into a supervised session, resume automation once it has been idle with no further input from you this long (1 minute to 24 hours); `0` keeps the pause until `resume-auto`. Never applies to an explicit takeover |
 | `EVENT_LOG_MAX_BYTES` | `67108864` (64 MiB) | Rotates `events.jsonl` at this size; 5 rotated files are kept |
 
 ## Recovery, leases and state

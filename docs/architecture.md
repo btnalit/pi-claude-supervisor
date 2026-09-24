@@ -294,7 +294,16 @@ Worker event; the Supervisor appends a bounded `human_input` event, enters
 human takeover (`human_takeover` with `data.source: "worker_prompt"`) if not
 already active, and pauses Decision Worker notification of further
 `turn_completed` events (they are still recorded so `resume-auto` can replay
-the last one) until `/supervise resume-auto`. A `pre`-phase request is still
+the last one) until `/supervise resume-auto`. That pause (gate `worker_prompt`)
+also lifts on its own once the session has been idle with no further human
+input for `humanIdleResumeMs` (`PI_CLAUDE_SUPERVISOR_HUMAN_IDLE_RESUME_MS`,
+default 30 minutes): every further human prompt restarts the clock, a running
+turn defers it, and `automation_auto_resumed` replays the last completed turn
+like `resume-auto`. An explicit takeover and a recovered task use gate `other`
+and never resume on their own. Claude can submit a pasted message in another
+shape than it was pasted (a long paste as a placeholder); a prompt within 30
+seconds of an unconfirmed paste of the Supervisor's own is taken as that paste,
+not as a human. A `pre`-phase request is still
 answered automatically during a human takeover (policy deny or defer) since it
 is not something a human is expected to approve; only a `prompt`-phase request
 pends for `/supervise approve`.

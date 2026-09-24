@@ -12,7 +12,7 @@ import { TmuxWorkerAdapter, attachCommand, sweepDeadTmuxSockets } from "./worker
 import { Supervisor, extendedDeadlineMs, type DecisionSessionClosedInfo, type HumanInterventionNotice, type SupervisorProgress, type SupervisorTokenUsage } from "./supervisor.ts";
 import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
-import { autoInstallHooks, autonomyDefaults, closeWorkerOnCompletion, deadlineGraceMs, deadlineMs, deadlineWarningMs, decisionCompactionTokens, decisionModel, decisionSessionRetentionDays, eventLogMaxBytes, formatDurationMs, loadSupervisorEnvironment, noOutputTimeoutMs, parseDurationMs, progressHeartbeatMs, reviewTimeoutMs, reviewerModel, tmuxMode, workerAutocompactTokens, workerMcpConfigPath, workerModel } from "./config.ts";
+import { autoInstallHooks, autonomyDefaults, closeWorkerOnCompletion, deadlineGraceMs, deadlineMs, deadlineWarningMs, decisionCompactionTokens, decisionModel, decisionSessionRetentionDays, eventLogMaxBytes, formatDurationMs, humanIdleResumeMs, loadSupervisorEnvironment, noOutputTimeoutMs, parseDurationMs, progressHeartbeatMs, reviewTimeoutMs, reviewerModel, tmuxMode, workerAutocompactTokens, workerMcpConfigPath, workerModel } from "./config.ts";
 import { DecisionSessionStore, type DecisionSessionRecord } from "./decision-session-store.ts";
 import { CwdLeaseStore, type CwdLeaseHandle, leaseOwnerLive, pathsOverlap, workerIdentity } from "./cwd-lease.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
@@ -478,6 +478,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 deadlineGraceMs: deadlineGraceMs(),
                 deadlineWarningMs: deadlineWarningMs(),
                 noOutputTimeoutMs: noOutputTimeoutMs(),
+                humanIdleResumeMs: humanIdleResumeMs(),
                 hookSource: interactive ? hookServer : undefined,
                 hookSettingsPath,
                 keepWorkerOnCompletion: interactive ? !closeWorkerOnCompletion() : undefined,
@@ -825,6 +826,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 deadlineGraceMs: deadlineGraceMs(),
                 deadlineWarningMs: deadlineWarningMs(),
                 noOutputTimeoutMs: record.noOutputTimeoutMs,
+                humanIdleResumeMs: humanIdleResumeMs(),
                 startedAt: record.startedAt,
                 baseCommit: record.baseCommit,
                 baseBranch: record.baseBranch,

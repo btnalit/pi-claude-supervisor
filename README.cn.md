@@ -130,7 +130,9 @@ Pi 会在 Claude 结束一轮对话时(`Stop`;轮中 API/模型失败会以 `Sto
 **人机协同。** 如果你在已 attach 的 session 中输入内容,自动化会暂停
 (`human_takeover`,以警告形式呈现),直到你执行 `/supervise resume-auto
 <task-id>`;你接管期间完成的那一轮会在此时重放给 Decision Worker,因此不会
-丢失已经完成的工作。
+丢失已经完成的工作。如果你输入后离开,会话在 `HUMAN_IDLE_RESUME_MS`(默认 30 分钟)
+内既无你的新输入、Worker 又空闲时,自动化会自行恢复(`automation_auto_resumed`)。
+显式的 `/supervise takeover` 以及所有恢复出来的任务仍需 `resume-auto`。
 
 **完成后把会话交还给你。** 与其他 transport 不同,任务完成后默认只是让 Pi 与
 该会话断开,而不是关闭它,方便你在同一窗口中继续工作或查看 Claude 做了什么;
@@ -346,6 +348,7 @@ commit,通知能说清已验证的 commit 是否在工作树变动之前就已�
 | `DEADLINE_GRACE_MS` | `30m` | 自动任务到期后的收尾窗口:空闲的 Worker 会被验收而不是停止;`0` 恢复到期立即停止 |
 | `DEADLINE_WARNING_MS` | `15m` | 到期前多久提醒并重新询问 Decision Worker;`0` 关闭提醒 |
 | `NO_OUTPUT_TIMEOUT_MS` | `20m` | Worker 多久没有输出就停止;`0` 关闭该检查 |
+| `HUMAN_IDLE_RESUME_MS` | `30m` | 你在受监督会话中输入后,若这么久内没有你的新输入且会话空闲,自动恢复自动化(1 分钟到 24 小时);`0` 保持暂停直到 `resume-auto`。不适用于显式接管 |
 | `EVENT_LOG_MAX_BYTES` | `67108864`(64 MiB) | `events.jsonl` 达到该大小后滚动,保留 5 份滚动文件 |
 
 ## 恢复、租约与状态

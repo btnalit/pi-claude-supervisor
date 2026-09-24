@@ -457,6 +457,9 @@ input.on("close", () => { try { child.kill("SIGTERM"); } catch {} });
 prompt();
 `;
 
+/** How long after a paste of its own an unmatched prompt is still taken as that paste. */
+const OWN_PROMPT_WINDOW_MS = 30_000;
+
 /** Base64 characters per bridge control line; with its prefix, well under the PTY's 4095-byte line limit. */
 const BRIDGE_FRAME_CHUNK_CHARS = 2_000;
 
@@ -2212,6 +2215,17 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         if (matchedIndex >= 0) {
           record.pendingSentMessages.splice(matchedIndex, 1);
           record.submitAcks += 1;
+          return {};
+        }
+        // Claude can submit a pasted message in another shape than it was
+        // pasted (a long paste as a placeholder, reflowed or trimmed text).
+        // A prompt right after an unconfirmed paste of ours is that paste:
+        // reading it as a human at the keyboard would pause unattended
+        // automation for nothing.
+        if (record.pendingSentMessages.length > 0 && record.inputAt !== undefined && Date.now() - record.inputAt < OWN_PROMPT_WINDOW_MS && !isClaudeRuntimePrompt(prompt)) {
+          record.pendingSentMessages.shift();
+          record.submitAcks += 1;
+          this.#logOutput(record, "[supervisor] a submitted prompt did not match the pasted text exactly; counted as the Supervisor's own message\n");
           return {};
         }
         // Claude Code delivers its own background-task, monitor and agent

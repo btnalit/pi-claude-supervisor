@@ -4639,3 +4639,100 @@ test("a verification the watchdog starts for an exited Worker that throws part-w
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+/** An interactive automatic task whose Worker idleness and human input the test drives. */
+async function withHumanGateFixture(humanIdleResumeMs: number, run: (context: { supervisor: Supervisor; handle: WorkerHandle; events: FlakyEventLog; emit: (event: WorkerEvent) => void; replays: WorkerEvent[]; setActive: (active: number) => void }) => Promise<void>): Promise<void> {
+  const handle: WorkerHandle = { id: "human-gate-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  let listener: WorkerStartInput["eventListener"];
+  let activeRequests = 0;
+  const replays: WorkerEvent[] = [];
+  const events = new FlakyEventLog("never-fail");
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true }),
+    start: async (input) => { listener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running: true, activeRequests, processGroupCleaned: false }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => {},
+    release: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "human gate fixture",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    interactive: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    humanIdleResumeMs,
+    spec: automaticSpec(),
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, replay: (event) => { replays.push(event); }, close: async () => {} }),
+  });
+  try {
+    await run({ supervisor, handle, events, emit: (event) => { void listener?.(event); }, replays, setActive: (active) => { activeRequests = active; } });
+  } finally {
+    await supervisor.stop("test cleanup").catch(() => {});
+  }
+}
+
+test("a pause from typing into the session resumes automation once the human has left it idle", async () => {
+  await withHumanGateFixture(300, async ({ supervisor, handle, events, emit, replays }) => {
+    const turn: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 1 };
+    emit(turn);
+    emit({ type: "human_input", handle, text: "let me try something" });
+    await supervisor.poll();
+    assert.equal(supervisor.humanRequired, true);
+    const human: WorkerEvent = { type: "turn_completed", handle, result: { result: "done what the human asked" }, sequence: 2 };
+    emit(human);
+    await waitFor(() => !supervisor.humanRequired, 3_000);
+    const resumed = events.events.find((event) => event.type === "automation_auto_resumed");
+    assert.ok(resumed);
+    assert.ok(Number((resumed.data as { idleMs: number }).idleMs) >= 300);
+    // The turn the human left behind is decided now.
+    assert.deepEqual(replays.map((event) => (event as { sequence: number }).sequence), [2]);
+  });
+});
+
+test("each further human prompt restarts the idle clock", async () => {
+  await withHumanGateFixture(400, async ({ supervisor, handle, emit }) => {
+    emit({ type: "turn_completed", handle, result: {}, sequence: 1 });
+    emit({ type: "human_input", handle, text: "first" });
+    await supervisor.poll();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    emit({ type: "human_input", handle, text: "second" });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    // 500 ms after the first prompt but only 250 ms after the second.
+    assert.equal(supervisor.humanRequired, true);
+    await waitFor(() => !supervisor.humanRequired, 3_000);
+  });
+});
+
+test("an explicit takeover never resumes on its own, however long the session idles", async () => {
+  await withHumanGateFixture(200, async ({ supervisor, handle, events, emit }) => {
+    emit({ type: "turn_completed", handle, result: {}, sequence: 1 });
+    emit({ type: "human_input", handle, text: "typed first" });
+    await supervisor.poll();
+    await supervisor.takeover();
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(supervisor.humanRequired, true);
+    assert.equal(events.events.some((event) => event.type === "automation_auto_resumed"), false);
+  });
+});
+
+test("automation does not resume while the human's own turn is still running", async () => {
+  await withHumanGateFixture(200, async ({ supervisor, handle, emit, setActive }) => {
+    emit({ type: "turn_completed", handle, result: {}, sequence: 1 });
+    emit({ type: "human_input", handle, text: "run the long job" });
+    await supervisor.poll();
+    setActive(1);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(supervisor.humanRequired, true);
+    setActive(0);
+    await waitFor(() => !supervisor.humanRequired, 3_000);
+  });
+});
