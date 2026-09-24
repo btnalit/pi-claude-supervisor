@@ -4543,3 +4543,26 @@ test("a decision failure for a turn a later turn has superseded does not park th
     assert.equal(events.events.some((event) => event.type === "decision_worker_failed"), false);
   });
 });
+
+test("a verify action whose verification throws part-way parks with its reason instead of hanging in verifying", async () => {
+  await withScriptedSend(async () => {}, async ({ supervisor, handle, events, decide, fail, emit }) => {
+    const turn: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 1 };
+    emit(turn);
+    const append = events.append.bind(events);
+    let failed = false;
+    events.append = async (event) => {
+      if (event.type === "acceptance_started" && !failed) { failed = true; throw new Error("injected event log failure"); }
+      return append(event);
+    };
+    let thrown: unknown;
+    await Promise.resolve(decide({ action: "verify", reason: "looks done" }, turn)).catch((error: unknown) => { thrown = error; });
+    assert.ok(thrown, "the verification failure reaches the Decision Worker");
+    // The Pi Decision Worker tags an error thrown by the action handler before reporting it.
+    Object.assign(thrown as object, { decisionActionFailed: true });
+    await fail(turn, thrown);
+    assert.equal(supervisor.candidateParked, true);
+    assert.equal(supervisor.state, "blocked");
+    assert.ok(events.events.some((event) => event.type === "decision_action_failed"));
+    assert.equal(events.events.some((event) => event.type === "decision_ignored"), false);
+  });
+});

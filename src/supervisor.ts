@@ -1029,9 +1029,11 @@ export class Supervisor {
         await this.#appendDecisionIgnored(event, undefined);
         return;
       }
-      // The event was overtaken while it failed: parking would stop a Worker
-      // whose current turn is still undecided.
-      if (this.#decisionSuperseded(event)) {
+      // A *model* failure for an event overtaken while it failed decides
+      // nothing (the Pi Decision Worker already drops those itself; this
+      // covers other factories). A failure applying an action or delivering
+      // input is real whatever the turn is now, and must park with its reason.
+      if (!isDecisionActionError(error) && !isWorkerInputError(error) && this.#decisionSuperseded(event)) {
         await this.#appendEvent({ type: "decision_ignored", taskId: this.#task?.taskId, workerId: event.handle.id, data: { reason: "superseded while its decision was failing", eventType: event.type, error: safeMessage(error) } }).catch(() => {});
         return;
       }
@@ -1805,6 +1807,19 @@ export class Supervisor {
   }
 
   async #verifyInternal(command?: VerificationCommand): Promise<AcceptanceReport> {
+    const before = this.#verificationAbortController;
+    try {
+      return await this.#verifyUnguarded(command);
+    } catch (error) {
+      // A verification that threw part-way (an event-log write, a git read)
+      // must not leave its controller behind: it would read as a verification
+      // still running to the supersede check, the close-out and the watchdog.
+      if (this.#verificationAbortController && this.#verificationAbortController !== before) this.#verificationAbortController = undefined;
+      throw error;
+    }
+  }
+
+  async #verifyUnguarded(command?: VerificationCommand): Promise<AcceptanceReport> {
     await this.#flushPendingEvents();
     if (!this.#task) throw new Error("no active task");
     if (this.#machine.state === "waiting" && canRepairInPlace(this.#adapter)) this.#machine.transition("verifying");
