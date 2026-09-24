@@ -4487,3 +4487,45 @@ test("a decision that lands after a later turn superseded its own is ignored, no
     assert.deepEqual(sent, ["Guidance for turn two."]);
   });
 });
+
+test("the Supervisor tells the Decision Worker when a turn it is still retrying has been superseded", async () => {
+  const handle: WorkerHandle = { id: "supersede-hook-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  let options: Parameters<DecisionWorkerFactory>[0] | undefined;
+  let listener: WorkerStartInput["eventListener"] | undefined;
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+    start: async (input) => { listener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running: true, activeRequests: 0, processGroupCleaned: false }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "supersede hook",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: (factoryOptions) => { options = factoryOptions; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+  });
+  try {
+    const first: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 1 };
+    const second: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 2 };
+    listener?.(first);
+    await supervisor.poll();
+    assert.equal(options?.isSuperseded?.(first), false);
+    listener?.(second);
+    await supervisor.poll();
+    assert.equal(options?.isSuperseded?.(first), true);
+    assert.equal(options?.isSuperseded?.(second), false);
+  } finally {
+    await supervisor.stop("test cleanup").catch(() => {});
+  }
+});

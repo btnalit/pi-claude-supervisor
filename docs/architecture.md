@@ -566,14 +566,16 @@ API/model call fails, the system classifies the error. Rejected, missing or
 expired credentials, billing and a missing model are configuration errors and
 park at once ("Decision Worker configuration failed"). An explicitly listed
 transient provider or network failure (429/529 overloads and rate limits,
-including a quota that resets, 5xx, gateway and connection errors) on a
-completed turn or an exit is waited out, backing off to one attempt a minute
+including a quota that resets, 5xx, gateway, connection and transport timeout
+errors) on a completed turn is waited out, backing off to one attempt a minute
 and recording each `decision_retry`: the task has no human to resume it, and if
 no decision lands the idle watchdog verifies the Worker's finished work — the
 close-out verifies at once rather than wait on a decision that is backing off.
-Everything else (a prompt that is too long, a corrupted session, the Decision
-Worker's own request timeout), and a permission request, which blocks the
-Worker mid-turn, stays bounded by `maxDecisionRetries` and then parks. A
+Everything else stays bounded by `maxDecisionRetries` and then parks: a prompt
+that is too long, a corrupted session, the Decision Worker's own request
+timeout; a permission request, which blocks the Worker mid-turn; an exit, after
+which only this decision starts verification; and a completed turn that a later
+event has superseded, which stops being waited out as soon as it is. A
 decision that lands for a turn a later turn, message or verification has since
 superseded is recorded as `decision_ignored` rather than applied. An error
 thrown while applying a decided action is recorded as `decision_action_failed`,

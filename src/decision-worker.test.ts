@@ -754,6 +754,13 @@ test("provider errors are classified by what waiting can fix, from the real mess
     ["other", api("400 context_length_exceeded")],
     ["other", api("400 messages.3: tool_use ids were found without tool_result blocks immediately after")],
     ["other", new Error("Decision Worker request timed out after 120000ms")],
+    // SDK and transport timeouts are the provider's, not this worker's budget.
+    ["transient", api("Request timed out.")],
+    ["transient", api("terminated")],
+    ["transient", api("408 Request Timeout")],
+    ["transient", api("You have hit your ChatGPT usage limit. Try again in ~158 min.")],
+    ["configuration", api("401 Incorrect API key provided: sk-****. You can find your API key at …")],
+    ["configuration", api("401 OAuth token has expired")],
   ];
   for (const [expected, error] of cases) assert.equal(classifyDecisionError(error), expected, error.message);
 });
@@ -871,5 +878,47 @@ test("the Decision Worker's own request timeout stays bounded: the model ran its
   }
   assert.equal(prompts.length, 3);
   assert.match(String((failures[0] as Error).message), /timed out/u);
+  await worker.close();
+});
+
+test("an exit is not waited out through an outage: after it, only this decision starts verification", async () => {
+  const { session, prompts } = createFakeSession([
+    { stopReason: "stop", text: "ack" },
+    ...Array.from({ length: 10 }, () => ({ stopReason: "error" as const, errorMessage: "529 overloaded_error" })),
+  ]);
+  const failures: unknown[] = [];
+  const worker = new PiDecisionWorker(baseOptions({
+    onFailure: (_event, error) => { failures.push(error); },
+    sessionFactory: async () => ({ session }),
+    retryBackoffMs: 1,
+    context: unattendedContext(1),
+  }));
+  await worker.start();
+  worker.notify({ type: "exited", handle: fakeHandle(), exitCode: 0 });
+  await until(() => failures.length > 0);
+  assert.equal(prompts.length, 3);
+  await worker.close();
+});
+
+test("an outage is no longer waited out for a turn a later event has superseded", async () => {
+  const { session, prompts } = createFakeSession([
+    { stopReason: "stop", text: "ack" },
+    ...Array.from({ length: 10 }, () => ({ stopReason: "error" as const, errorMessage: "529 overloaded_error" })),
+  ]);
+  let superseded = false;
+  const failures: unknown[] = [];
+  const worker = new PiDecisionWorker(baseOptions({
+    onFailure: (_event, error) => { failures.push(error); },
+    onRetry: () => { superseded = true; },
+    isSuperseded: () => superseded,
+    sessionFactory: async () => ({ session }),
+    retryBackoffMs: 1,
+    context: unattendedContext(1),
+  }));
+  await worker.start();
+  worker.notify(turnCompletedEvent());
+  await until(() => failures.length > 0);
+  // Waited out once; superseded afterwards, so bounded by maxDecisionRetries (1).
+  assert.equal(prompts.length, 3);
   await worker.close();
 });

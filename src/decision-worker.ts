@@ -91,6 +91,8 @@ export interface DecisionWorkerOptions {
   onUsage?: (usage: PiUsageSample) => void;
   /** A decision request failed transiently and will be asked again after `delayMs`. */
   onRetry?: (event: WorkerEvent, info: { attempt: number; delayMs: number; error: unknown }) => void;
+  /** True once a later event has made this one moot; an outage is not waited out for it. */
+  isSuperseded?: (event: WorkerEvent) => boolean;
 }
 
 export type PiModel = NonNullable<NonNullable<Parameters<typeof createAgentSession>[0]>["model"]>;
@@ -113,7 +115,7 @@ const MAX_DECISION_RETRY_BACKOFF_MS = 60_000;
  * words, not bare status codes, which also turn up inside request ids, URLs
  * and wrapped upstream errors.
  */
-const CONFIGURATION_ERROR = /authentication|unauthori[sz]ed|invalid[_ ]?x?-?api[_ -]?key|api[_ ]key[_ ](?:not[_ ]valid|expired|invalid)|no api key found|security token[^\n]{0,40}invalid|UnrecognizedClient|ExpiredToken|AccessDenied|permission[_ ]denied|permission_error|payment[_ ]required|credit[_ ]balance|insufficient[_ ]quota|billing_error|not_found_error|models?\b[^\n]{0,80}\b(?:not[_ ]found|does not exist|is invalid)|model identifier is invalid|unsupported[_ ]model|invalid[_ ]model/iu;
+const CONFIGURATION_ERROR = /authentication|unauthori[sz]ed|incorrect api key|token has expired|invalid[_ ]?x?-?api[_ -]?key|api[_ ]key[_ ](?:not[_ ]valid|expired|invalid)|no api key found|security token[^\n]{0,40}invalid|UnrecognizedClient|ExpiredToken|AccessDenied|permission[_ ]denied|permission_error|payment[_ ]required|credit[_ ]balance|insufficient[_ ]quota|billing_error|not_found_error|models?\b[^\n]{0,80}\b(?:not[_ ]found|does not exist|is invalid)|model identifier is invalid|unsupported[_ ]model|invalid[_ ]model/iu;
 
 /**
  * Errors that pass by themselves: provider load and rate limits (including a
@@ -123,7 +125,7 @@ const CONFIGURATION_ERROR = /authentication|unauthori[sz]ed|invalid[_ ]?x?-?api[
  * session or this worker's own request timeout, fails the same way every time
  * and stays bounded by maxDecisionRetries.
  */
-const TRANSIENT_ERROR = /overloaded|rate.?limit|too many requests|resource.?exhausted|retry in \d|quota exceeded for metric|exceeded your current quota|\b(?:429|500|502|503|504|524|529)\b|service.?unavailable|temporarily unavailable|server.?error|internal.?error|provider.?returned.?error|network.?error|connection.?(?:error|refused|lost|reset)|other side closed|fetch failed|getaddrinfo|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|upstream.?connect|reset before headers|socket hang up|socket connection was closed|gateway.?time.?out|websocket.?(?:closed|error)|ended without|stream ended before|http2 request did not get a response|you can retry your request|try your request again|please retry your request/iu;
+const TRANSIENT_ERROR = /overloaded|rate.?limit|too many requests|resource.?exhausted|retry in \d|quota exceeded for metric|exceeded your current quota|\b(?:429|500|502|503|504|524|529)\b|service.?unavailable|temporarily unavailable|server.?error|internal.?error|provider.?returned.?error|network.?error|connection.?(?:error|refused|lost|reset)|other side closed|fetch failed|getaddrinfo|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|upstream.?connect|reset before headers|socket hang up|socket connection was closed|gateway.?time.?out|websocket.?(?:closed|error)|ended without|stream ended before|http2 request did not get a response|you can retry your request|try your request again|please retry your request|try again in|timed? ?out|timeout|terminated|premature close|\b408\b/iu;
 
 /** The Decision Worker's own per-request timeout: the model ran the whole budget. */
 const OWN_TIMEOUT = /^Decision Worker [^\n]* timed out after \d+ms$/u;
@@ -317,14 +319,17 @@ export class PiDecisionWorker implements DecisionWorkerLike {
         const kind = classifyDecisionError(error);
         // Waiting does not fix credentials, billing or a missing model: park now, with that reason.
         if (kind === "configuration") throw configurationError(error as Error);
-        // A transient provider or network outage on a completed turn or an
-        // exit is waited out rather than parking the task: nobody is there to
-        // resume it, and the Supervisor's idle watchdog verifies the Worker's
-        // finished work if no decision ever lands. A permission request is
-        // not waited out: the Worker is blocked mid-turn on it, and on some
-        // transports nothing else would ever answer it. Anything else fails
-        // the same way on every attempt and stays bounded.
-        const waitOut = kind === "transient" && event.type !== "permission_request";
+        // A transient provider or network outage on a completed turn is
+        // waited out rather than parking the task: nobody is there to resume
+        // it, and the Supervisor's idle watchdog verifies the Worker's
+        // finished work if no decision ever lands. Nothing like that backs up
+        // any other event: a permission request blocks the Worker mid-turn
+        // (on some transports nothing else answers it), and after an exit
+        // only this decision starts verification. Those, a turn a later event
+        // has made moot, and anything that fails the same way on every
+        // attempt stay bounded.
+        const superseded = this.#options.isSuperseded?.(event) === true;
+        const waitOut = kind === "transient" && event.type === "turn_completed" && !superseded;
         if (!waitOut && attempt >= maxRetries) throw error;
         attempt += 1;
         // 429/529 overloads last minutes, not seconds: 15s, 45s, then 60s.

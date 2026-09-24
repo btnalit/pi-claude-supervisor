@@ -562,6 +562,7 @@ export class Supervisor {
             },
           } : {}),
           onAction: (action, event) => this.#applyDecision(action, event),
+          isSuperseded: (event) => this.#decisionSuperseded(event),
           onRetry: (event, info) => {
             if (this.#pendingDecisionKey === workerEventKey(event)) this.#pendingDecisionRetrying = true;
             void this.#appendEvent({ type: "decision_retry", taskId: this.#task?.taskId, workerId: event.handle.id, data: { eventType: event.type, attempt: info.attempt, delayMs: info.delayMs, error: safeMessage(info.error) } }).catch(() => {});
@@ -1061,12 +1062,9 @@ export class Supervisor {
         return;
       }
       if (!task || !handle || !this.#automation || ["completed", "blocked", "failed", "stopped"].includes(this.#machine.state)) return;
-      // A decision for a completed turn that has since been overtaken (a later
-      // turn, a message sent after it, a verification the watchdog or the
-      // close-out started while it was backing off a provider outage) would
-      // act on a state that no longer exists.
-      const notifiedTurn = this.#decisionTurnAtNotify.get(event);
-      if (event.type === "turn_completed" && ((this.#lastTurnCompleted && event !== this.#lastTurnCompleted) || (notifiedTurn !== undefined && notifiedTurn !== this.#turn) || this.#verificationAbortController)) {
+      // Overtaken while it was being decided (for instance backing off a
+      // provider outage while the watchdog or close-out verified).
+      if (this.#decisionSuperseded(event)) {
         this.#settlePendingDecision(event);
         await this.#appendEvent({ type: "decision_ignored", taskId: task.taskId, workerId: handle.id, data: { action: action.action, reason: "superseded by a later turn, message or verification", eventType: event.type } }).catch(() => {});
         return;
@@ -1328,6 +1326,17 @@ export class Supervisor {
     }
     if (this.#machine.state === "verifying") await this.#verifyInternal();
     else await this.#parkCandidate(`${origin} requested verification from state ${this.#machine.state}`, event);
+  }
+
+  /**
+   * A decision for a completed turn that has since been overtaken (a later
+   * turn, a message sent after it, a verification already running) would act
+   * on a state that no longer exists.
+   */
+  #decisionSuperseded(event: WorkerEvent): boolean {
+    if (event.type !== "turn_completed") return false;
+    const notifiedTurn = this.#decisionTurnAtNotify.get(event);
+    return Boolean((this.#lastTurnCompleted && event !== this.#lastTurnCompleted) || (notifiedTurn !== undefined && notifiedTurn !== this.#turn) || this.#verificationAbortController);
   }
 
   /** Refresh the Decision Worker's context and deliver (or re-deliver) an event; a completed turn is then pending a decision. */
