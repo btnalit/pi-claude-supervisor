@@ -150,6 +150,17 @@ export function deadlineWarningMs(env: NodeJS.ProcessEnv = process.env): number 
   return readBoundedDurationWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_DEADLINE_WARNING_MS, DEFAULT_DEADLINE_WARNING_MS, 60_000, 24 * 60 * 60_000, "PI_CLAUDE_SUPERVISOR_DEADLINE_WARNING_MS");
 }
 
+/**
+ * How long a human who typed into a supervised interactive session may leave
+ * it idle before unattended automation resumes on its own. Only a pause caused
+ * by typing into the pane resumes this way, never an explicit takeover.
+ */
+export const DEFAULT_HUMAN_IDLE_RESUME_MS = 30 * 60_000;
+
+export function humanIdleResumeMs(env: NodeJS.ProcessEnv = process.env): number {
+  return readBoundedDurationWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_HUMAN_IDLE_RESUME_MS, DEFAULT_HUMAN_IDLE_RESUME_MS, 60_000, 24 * 60 * 60_000, "PI_CLAUDE_SUPERVISOR_HUMAN_IDLE_RESUME_MS");
+}
+
 /** Stop a Worker that has produced no output for this long (1 minute to 24 hours); "0" disables the check. */
 export function noOutputTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   return readBoundedDurationWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS, DEFAULT_NO_OUTPUT_TIMEOUT_MS, 60_000, 24 * 60 * 60_000, "PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS");

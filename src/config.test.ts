@@ -16,6 +16,7 @@ import {
   eventLogMaxBytes,
   formatDurationMs,
   noOutputTimeoutMs,
+  humanIdleResumeMs,
   parseDurationMs,
   progressHeartbeatMs,
   reviewerModel,
@@ -205,6 +206,11 @@ test("deadline budgets default, accept durations and honor the zero opt-out", ()
   assert.equal(noOutputTimeoutMs({ PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS: "45m" }), 45 * 60_000);
   assert.equal(noOutputTimeoutMs({ PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS: "0" }), 0);
   assert.equal(noOutputTimeoutMs({ PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS: "10s" }), 20 * 60_000, "below the 1-minute floor keeps the default");
+
+  assert.equal(humanIdleResumeMs({}), 30 * 60_000);
+  assert.equal(humanIdleResumeMs({ PI_CLAUDE_SUPERVISOR_HUMAN_IDLE_RESUME_MS: "2h" }), 2 * 60 * 60_000);
+  assert.equal(humanIdleResumeMs({ PI_CLAUDE_SUPERVISOR_HUMAN_IDLE_RESUME_MS: "0" }), 0);
+  assert.equal(humanIdleResumeMs({ PI_CLAUDE_SUPERVISOR_HUMAN_IDLE_RESUME_MS: "10s" }), 30 * 60_000, "below the 1-minute floor keeps the default");
 });
 
 test("remote authority never defaults on and only accepts the two grants", () => {

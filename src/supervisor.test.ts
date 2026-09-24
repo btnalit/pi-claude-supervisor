@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import type { SupervisorEvent } from "./events.ts";
 import type { PiUsageSample, WorkerAdapter, WorkerEvent, WorkerHandle, WorkerOutputChunk, WorkerStartInput, WorkerStatus } from "./types.ts";
 import type { DecisionWorkerFactory } from "./decision-worker.ts";
-import { Supervisor, extendedDeadlineMs } from "./supervisor.ts";
+import { Supervisor, extendedDeadlineMs, type HumanInterventionNotice } from "./supervisor.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
 import { TmuxWorkerAdapter } from "./worker/tmux-adapter.ts";
 import { WorkerInputError } from "./worker/input-error.ts";
@@ -4639,3 +4639,142 @@ test("a verification the watchdog starts for an exited Worker that throws part-w
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+/** An interactive automatic task whose Worker idleness and human input the test drives. */
+async function withHumanGateFixture(humanIdleResumeMs: number, run: (context: { supervisor: Supervisor; handle: WorkerHandle; events: FlakyEventLog; emit: (event: WorkerEvent) => void; replays: WorkerEvent[]; setActive: (active: number) => void; failStatus: (times: number) => void; setLastOutputAt: (at: string | undefined) => void; notices: HumanInterventionNotice[] }) => Promise<void>): Promise<void> {
+  const handle: WorkerHandle = { id: "human-gate-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  let listener: WorkerStartInput["eventListener"];
+  let activeRequests = 0;
+  let statusFailures = 0;
+  let lastOutputAt: string | undefined;
+  const notices: HumanInterventionNotice[] = [];
+  const replays: WorkerEvent[] = [];
+  const events = new FlakyEventLog("never-fail");
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true }),
+    start: async (input) => { listener = input.eventListener; return handle; },
+    getStatus: async () => {
+      if (statusFailures > 0) { statusFailures -= 1; throw new Error("tmux status unavailable"); }
+      return { handle, running: true, activeRequests, processGroupCleaned: false, ...(lastOutputAt ? { lastOutputAt } : {}) };
+    },
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => {},
+    release: async () => {},
+    killProcessGroup: async () => {},
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer(), onHumanRequired: (notice) => { notices.push(notice); } });
+  await supervisor.start({
+    task: "human gate fixture",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    interactive: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    humanIdleResumeMs,
+    spec: automaticSpec(),
+    decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, replay: (event) => { replays.push(event); }, close: async () => {} }),
+  });
+  try {
+    await run({ supervisor, handle, events, emit: (event) => { void listener?.(event); }, replays, setActive: (active) => { activeRequests = active; }, failStatus: (times) => { statusFailures = times; }, setLastOutputAt: (at) => { lastOutputAt = at; }, notices });
+  } finally {
+    await supervisor.stop("test cleanup").catch(() => {});
+  }
+}
+
+test("a pause from typing into the session resumes automation once the human has left it idle", async () => {
+  await withHumanGateFixture(300, async ({ supervisor, handle, events, emit, replays }) => {
+    const turn: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 1 };
+    emit(turn);
+    emit({ type: "human_input", handle, text: "let me try something" });
+    await supervisor.poll();
+    assert.equal(supervisor.humanRequired, true);
+    const human: WorkerEvent = { type: "turn_completed", handle, result: { result: "done what the human asked" }, sequence: 2 };
+    emit(human);
+    await waitFor(() => !supervisor.humanRequired, 3_000);
+    const resumed = events.events.find((event) => event.type === "automation_auto_resumed");
+    assert.ok(resumed);
+    assert.ok(Number((resumed.data as { idleMs: number }).idleMs) >= 300);
+    // The turn the human left behind is decided now.
+    assert.deepEqual(replays.map((event) => (event as { sequence: number }).sequence), [2]);
+  });
+});
+
+test("each further human prompt restarts the idle clock", async () => {
+  await withHumanGateFixture(1_500, async ({ supervisor, handle, emit }) => {
+    emit({ type: "turn_completed", handle, result: {}, sequence: 1 });
+    emit({ type: "human_input", handle, text: "first" });
+    await supervisor.poll();
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    emit({ type: "human_input", handle, text: "second" });
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    // 1.7 s after the first prompt, but only 1 s after the second.
+    assert.equal(supervisor.humanRequired, true);
+    await waitFor(() => !supervisor.humanRequired, 5_000);
+  });
+});
+
+
+test("an explicit takeover never resumes on its own, however long the session idles", async () => {
+  await withHumanGateFixture(200, async ({ supervisor, handle, events, emit }) => {
+    emit({ type: "turn_completed", handle, result: {}, sequence: 1 });
+    emit({ type: "human_input", handle, text: "typed first" });
+    await supervisor.poll();
+    await supervisor.takeover();
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(supervisor.humanRequired, true);
+    assert.equal(events.events.some((event) => event.type === "automation_auto_resumed"), false);
+  });
+});
+
+test("the idle clock starts when the human's own turn ends, however long it ran", async () => {
+  await withHumanGateFixture(1_000, async ({ supervisor, handle, emit, setActive }) => {
+    emit({ type: "turn_completed", handle, result: {}, sequence: 1 });
+    emit({ type: "human_input", handle, text: "run the long migration" });
+    await supervisor.poll();
+    setActive(1);
+    // The human's turn runs well past the idle period (the timer finds it busy).
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    assert.equal(supervisor.humanRequired, true);
+    setActive(0);
+    emit({ type: "turn_completed", handle, result: { result: "migration done" }, sequence: 2 });
+    // Counted from the prompt, the next busy re-check (at 3 s) would resume at
+    // once; counted from the turn's end, the human has until 3.5 s.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assert.equal(supervisor.humanRequired, true);
+    await waitFor(() => !supervisor.humanRequired, 3_000);
+  });
+});
+
+
+test("a failed status read does not end auto-resume for good", async () => {
+  await withHumanGateFixture(200, async ({ supervisor, handle, emit, failStatus }) => {
+    emit({ type: "turn_completed", handle, result: {}, sequence: 1 });
+    emit({ type: "human_input", handle, text: "typed" });
+    await supervisor.poll();
+    failStatus(1);
+    await waitFor(() => !supervisor.humanRequired, 3_000);
+  });
+});
+
+test("a human turn stuck silent mid-turn (an open dialog) is reported once, not resumed over", async () => {
+  await withHumanGateFixture(200, async ({ supervisor, handle, events, emit, setActive, setLastOutputAt, notices }) => {
+    emit({ type: "turn_completed", handle, result: {}, sequence: 1 });
+    emit({ type: "human_input", handle, text: "do the thing" });
+    await supervisor.poll();
+    setActive(1);
+    setLastOutputAt(new Date(Date.now() - 60_000).toISOString());
+    await waitFor(() => events.events.some((event) => event.type === "human_session_stalled"), 3_000);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(supervisor.humanRequired, true);
+    assert.equal(events.events.filter((event) => event.type === "human_session_stalled").length, 1);
+    const stalled = notices.filter((notice) => /waiting mid-turn/u.test(notice.reason));
+    assert.equal(stalled.length, 1);
+    assert.notEqual(stalled[0]!.source, "worker_prompt", "an outbound alert, since nobody is at the keyboard");
+  });
+});
+
