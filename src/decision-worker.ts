@@ -89,6 +89,8 @@ export interface DecisionWorkerOptions {
   compactionTokens?: number;
   /** Token accounting for every model call made by this session. */
   onUsage?: (usage: PiUsageSample) => void;
+  /** A decision request failed transiently and will be asked again after `delayMs`. */
+  onRetry?: (event: WorkerEvent, info: { attempt: number; delayMs: number; error: unknown }) => void;
 }
 
 export type PiModel = NonNullable<NonNullable<Parameters<typeof createAgentSession>[0]>["model"]>;
@@ -104,6 +106,30 @@ export const STALE_VERIFICATION_TURNS = 3;
 /** First retry wait; each later wait triples, capped at MAX_DECISION_RETRY_BACKOFF_MS. */
 const DEFAULT_DECISION_RETRY_BACKOFF_MS = 5_000;
 const MAX_DECISION_RETRY_BACKOFF_MS = 60_000;
+
+/**
+ * Provider errors that no amount of waiting fixes: rejected credentials,
+ * billing, a model that does not exist. Everything else a provider or the
+ * network produces (429/529 overloads, a daily quota that resets, 5xx,
+ * timeouts, resets) is transient.
+ */
+const CONFIGURATION_ERROR = /\b(?:401|403|404)\b|authenticat|unauthori[sz]ed|invalid[_ ]api[_ ]key|api[_ ]key[_ ]not[_ ]valid|permission[_ ]denied|forbidden|billing|payment[_ ]required|credit[_ ]balance|insufficient[_ ]quota|not[_ ]found[_ ]error|model\b[^\n]{0,80}\bnot[_ ]found|does not exist|unsupported[_ ]model|invalid[_ ]model/iu;
+
+export function isDecisionConfigurationError(error: unknown): boolean {
+  return error instanceof Error && (error.name === "DecisionWorkerConfigError"
+    || (error.name === "DecisionWorkerApiError" && CONFIGURATION_ERROR.test(error.message)));
+}
+
+function configurationError(error: Error): Error {
+  const wrapped = new Error(`Decision Worker configuration error (credentials, billing or model): ${error.message}`, { cause: error });
+  wrapped.name = "DecisionWorkerConfigError";
+  return wrapped;
+}
+
+/** Marks an error thrown while the Supervisor applied an action, as opposed to one from the model. */
+export function isDecisionActionError(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && (error as { decisionActionFailed?: unknown }).decisionActionFailed === true);
+}
 
 /**
  * A persistent Pi SDK session used only for supervision decisions.
@@ -122,6 +148,7 @@ export class PiDecisionWorker implements DecisionWorkerLike {
   readonly #timeoutMs: number;
   /** Ends a startup retry backoff early; set only while one is waiting. */
   #wakeStartupBackoff?: () => void;
+  #wakeRetryBackoff?: () => void;
   readonly #retryBackoffMs: number;
   readonly #compactionTokens: number;
   /** Set after a compaction; the next primary decision prompt re-sends the startup instructions once. */
@@ -187,7 +214,7 @@ export class PiDecisionWorker implements DecisionWorkerLike {
           if (this.#closed) throw closedDuringStartup();
           // Only a provider error is worth another attempt: a timeout already
           // spent the whole prompt budget and would only multiply it.
-          const retryable = error instanceof Error && error.name === "DecisionWorkerApiError";
+          const retryable = error instanceof Error && error.name === "DecisionWorkerApiError" && !isDecisionConfigurationError(error);
           if (attempt >= maxRetries || !retryable) {
             try { await this.#options.onStartupFailure?.(error); } catch { /* preserve the original startup failure */ }
             throw error;
@@ -259,10 +286,22 @@ export class PiDecisionWorker implements DecisionWorkerLike {
       } catch (error) {
         if (this.#closed) return;
         if (error instanceof Error && error.name === "AbortError") throw error;
-        if (attempt >= maxRetries) throw error;
+        // Waiting does not fix credentials, billing or a missing model: park now, with that reason.
+        if (isDecisionConfigurationError(error)) throw configurationError(error as Error);
+        // Unattended, a transient outage is waited out rather than parking the
+        // task: nobody is there to resume it. The Supervisor's idle watchdog
+        // still verifies the Worker's finished work if no decision ever lands.
+        const unattended = this.#context.spec?.autonomy.unattended === true;
+        if (!unattended && attempt >= maxRetries) throw error;
         attempt += 1;
         // 429/529 overloads last minutes, not seconds: 15s, 45s, then 60s.
-        await new Promise<void>((resolveWait) => setTimeout(resolveWait, Math.min(MAX_DECISION_RETRY_BACKOFF_MS, this.#retryBackoffMs * 3 ** attempt)));
+        const delayMs = Math.min(MAX_DECISION_RETRY_BACKOFF_MS, this.#retryBackoffMs * 3 ** attempt);
+        try { this.#options.onRetry?.(event, { attempt, delayMs, error }); } catch { /* observability only */ }
+        await new Promise<void>((resolveWait) => {
+          const timer = setTimeout(() => { this.#wakeRetryBackoff = undefined; resolveWait(); }, delayMs);
+          // close() wakes this wait, so a stop does not sit out the backoff.
+          this.#wakeRetryBackoff = () => { clearTimeout(timer); this.#wakeRetryBackoff = undefined; resolveWait(); };
+        });
         if (!this.#session || this.#closed) return;
         continue;
       }
@@ -285,8 +324,14 @@ export class PiDecisionWorker implements DecisionWorkerLike {
         continue;
       }
       // An action handler may stop or close the session. Do not replay an
-      // already-decoded action if the handler itself fails.
-      await this.#options.onAction(action, event);
+      // already-decoded action if the handler itself fails, and do not let
+      // its failure read as a model failure.
+      try {
+        await this.#options.onAction(action, event);
+      } catch (error) {
+        if (error && typeof error === "object") (error as { decisionActionFailed?: boolean }).decisionActionFailed = true;
+        throw error;
+      }
       await this.#maybeCompact();
       return;
     }
@@ -332,6 +377,7 @@ export class PiDecisionWorker implements DecisionWorkerLike {
     // the same queued decision, which would otherwise deadlock shutdown.
     this.#closed = true;
     this.#wakeStartupBackoff?.();
+    this.#wakeRetryBackoff?.();
     const session = this.#session;
     this.#session = undefined;
     if (session) await session.abort().catch(() => {});

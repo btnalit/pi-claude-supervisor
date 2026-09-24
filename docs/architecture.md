@@ -562,9 +562,17 @@ approval for ordinary actions; a task that cannot safely produce a candidate is
 parked or failed without granting remote/main authority. Model/API failures are
 detected from the Pi `stopReason` (a provider error resolves the prompt normally
 rather than throwing); if the Decision Worker
-API/model call fails, the system records `decision_worker_failed`, applies the
-bounded retry/park policy and preserves the candidate evidence. The startup
-instructions prompt retries provider errors on the same backoff and budget, so a
+API/model call fails, the system classifies the error. Rejected credentials,
+billing and a missing model are configuration errors and park at once
+("Decision Worker configuration failed"); everything else (429/529 overloads,
+a quota that resets, 5xx, timeouts, network resets) is transient. An
+unattended task waits a transient outage out, backing off to one attempt a
+minute and recording each `decision_retry`, instead of parking after
+`maxDecisionRetries` (which still bounds an attended task); if no decision
+lands, the idle watchdog verifies the Worker's finished work. An error thrown
+while applying a decided action is recorded as `decision_action_failed`, not as
+a model failure. The startup
+instructions prompt retries transient provider errors on the same backoff within `maxDecisionRetries`, so a
 provider overload at start does not fail the task before its first turn. An abort is never
 retried, and a `noop` reply on a completed turn or a permission request parks the
 candidate rather than being treated as a resolved decision, while a `noop` on a
@@ -666,7 +674,9 @@ park it without requiring a human to be online. The Reviewer retries provider
 errors with a fresh session within a total review budget
 (`PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS`, default 10 minutes). Truncated
 (oversize) evidence requests a bounded repair before parking, while incomplete
-evidence still parks.
+evidence (an unsafe path, a read or git failure) still parks. An untracked
+binary, symlink, hard link or special file is named in the evidence with its
+size or link target but no content; that is complete evidence, not a park.
 
 A `revise` result produces an audited repair round and sends a bounded corrective
 instruction to a still-live `repairableSession` Worker. Checks and review then run again.

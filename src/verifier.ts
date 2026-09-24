@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { lstat, open, readlink, realpath } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { AcceptanceCheck, AcceptanceCheckResult, AcceptanceReport, VerificationResult } from "./types.ts";
 import { evidenceMaxBytes, evidenceMaxUntrackedFiles } from "./config.ts";
@@ -526,10 +526,19 @@ async function collectUntrackedEvidence(cwd: string, signal?: AbortSignal): Prom
     }
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
-      await assertNoSymlinkComponents(root, relativePath);
+      // Directory components must be real; the leaf itself may be a link, reported below.
+      await assertNoSymlinkComponents(root, dirname(relativePath));
+      // A symlink, an FD-less special file, a hard link or a binary is named
+      // with what can be said about it, but its content is not read. Its
+      // presence is complete evidence in itself: parking a task because the
+      // Worker added a PNG, a fixture database or a symlink helps nobody.
       const info = await lstat(fullPath);
-      if (info.isSymbolicLink() || !info.isFile()) {
-        complete = false;
+      if (info.isSymbolicLink()) {
+        const target = await readlink(fullPath).catch(() => "?");
+        sections.push(`--- ${JSON.stringify(path)} [symbolic link to ${JSON.stringify(target)}; not followed]`);
+        continue;
+      }
+      if (!info.isFile()) {
         sections.push(`--- ${JSON.stringify(path)} [non-regular file omitted]`);
         continue;
       }
@@ -537,29 +546,27 @@ async function collectUntrackedEvidence(cwd: string, signal?: AbortSignal): Prom
       handle = await open(fullPath, fsConstants.O_RDONLY | noFollow);
       const opened = await handle.stat();
       if (!opened.isFile()) {
-        complete = false;
         sections.push(`--- ${JSON.stringify(path)} [non-regular file omitted]`);
         continue;
       }
       if (opened.nlink > 1) {
-        complete = false;
-        sections.push(`--- ${JSON.stringify(path)} [hard-link file omitted]`);
+        sections.push(`--- ${JSON.stringify(path)} [hard-linked file, ${opened.size} bytes; content omitted]`);
         continue;
       }
       await assertOpenedEvidencePath(root, handle.fd);
       const buffer = Buffer.alloc(MAX_UNTRACKED_FILE_BYTES + 1);
       const read = await handle.read(buffer, 0, buffer.length, 0);
       const bytes = buffer.subarray(0, read.bytesRead);
+      if (bytes.includes(0)) {
+        // Omitted whatever its size: a large binary is not truncated text.
+        sections.push(`--- ${JSON.stringify(path)} [binary file, ${opened.size} bytes; content omitted]`);
+        continue;
+      }
       if (read.bytesRead > MAX_UNTRACKED_FILE_BYTES) {
         complete = false;
         truncated = true;
       }
-      if (bytes.includes(0)) {
-        complete = false;
-        sections.push(`--- ${JSON.stringify(path)} [binary file omitted]`);
-      } else {
-        sections.push(`--- ${JSON.stringify(path)}${read.bytesRead > MAX_UNTRACKED_FILE_BYTES ? " [TRUNCATED]" : ""}\n${bytes.toString("utf8")}`);
-      }
+      sections.push(`--- ${JSON.stringify(path)}${read.bytesRead > MAX_UNTRACKED_FILE_BYTES ? " [TRUNCATED]" : ""}\n${bytes.toString("utf8")}`);
     } catch (error) {
       complete = false;
       sections.push(`--- ${JSON.stringify(path)} [read failed: ${error instanceof Error ? error.message : String(error)}]`);
@@ -587,7 +594,7 @@ async function assertOpenedEvidencePath(root: string, fd: number): Promise<void>
 }
 
 async function assertNoSymlinkComponents(root: string, relativePath: string): Promise<void> {
-  const parts = relativePath.split(sep).filter(Boolean);
+  const parts = relativePath.split(sep).filter((part) => part && part !== ".");
   let current = root;
   for (const part of parts) {
     current = resolve(current, part);

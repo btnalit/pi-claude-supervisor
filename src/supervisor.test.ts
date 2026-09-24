@@ -4418,3 +4418,19 @@ test("a retry whose failure handling itself fails does not raise an unhandled re
     process.off("unhandledRejection", onUnhandled);
   }
 });
+
+test("a Decision configuration error and an action failure are parked under their own labels", async () => {
+  const configError = Object.assign(new Error("Decision Worker configuration error (credentials, billing or model): 401 invalid x-api-key"), { name: "DecisionWorkerConfigError" });
+  await withScriptedSend(async () => {}, async ({ supervisor, handle, events, fail }) => {
+    await fail({ type: "turn_completed", handle, result: {}, sequence: 1 }, configError);
+    assert.equal(supervisor.candidateParked, true);
+    assert.match(JSON.stringify(events.events.map((event) => event.data)), /Decision Worker configuration failed/u);
+  });
+  const actionError = Object.assign(new Error("respondPermission failed"), { decisionActionFailed: true });
+  await withScriptedSend(async () => {}, async ({ supervisor, handle, events, fail }) => {
+    await fail({ type: "turn_completed", handle, result: {}, sequence: 1 }, actionError);
+    assert.equal(supervisor.candidateParked, true);
+    assert.ok(events.events.some((event) => event.type === "decision_action_failed"));
+    assert.doesNotMatch(JSON.stringify(events.events.map((event) => event.data)), /Decision Worker API failed/u);
+  });
+});

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { EventLog, type SupervisorEvent } from "./events.ts";
 import { SupervisorStateMachine } from "./state.ts";
 import { evaluatePermission, isCommitId, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, type PermissionPolicyOptions, type PolicyResult, type RemoteGrant } from "./policy.ts";
-import { PiDecisionWorker, STALE_VERIFICATION_TURNS, type DecisionAction, type DecisionContext, type DecisionDeadlineContext, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
+import { PiDecisionWorker, STALE_VERIFICATION_TURNS, isDecisionActionError, isDecisionConfigurationError, type DecisionAction, type DecisionContext, type DecisionDeadlineContext, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
 import { DEFAULT_DEADLINE_GRACE_MS, DEFAULT_DEADLINE_MS, DEFAULT_DEADLINE_WARNING_MS, DEFAULT_NO_OUTPUT_TIMEOUT_MS, formatDurationMs } from "./config.ts";
 import { collectRepositoryEvidence, remoteBranchHead, remoteUrl, runReadOnly, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryIsAncestor, repositoryWorkTree, verifyAll, repositoryClean, repositoryGitDirectoryIsLocal, repositorySlug, sameDestination, type RemoteBranchLookup, type RemoteDestination, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
@@ -558,6 +558,9 @@ export class Supervisor {
             },
           } : {}),
           onAction: (action, event) => this.#applyDecision(action, event),
+          onRetry: (event, info) => {
+            void this.#appendEvent({ type: "decision_retry", taskId: this.#task?.taskId, workerId: event.handle.id, data: { eventType: event.type, attempt: info.attempt, delayMs: info.delayMs, error: safeMessage(info.error) } }).catch(() => {});
+          },
           onFailure: (event, error) => this.#decisionFailure(event, error),
           onStartupFailure: (error) => this.#decisionStartupFailure(error),
         });
@@ -1016,16 +1019,21 @@ export class Supervisor {
         await this.#appendDecisionIgnored(event, undefined);
         return;
       }
-      // A decision whose message the Worker could not take is not a model
-      // failure; say which one it was, so the operator looks in the right place.
+      // A decision whose message the Worker could not take, or whose action
+      // failed to apply, is not a model failure; say which one it was, so the
+      // operator looks in the right place.
       const inputFailure = isWorkerInputError(error);
+      const kind = inputFailure ? "Worker input failed"
+        : isDecisionActionError(error) ? "Decision action failed"
+          : isDecisionConfigurationError(error) ? "Decision Worker configuration failed"
+            : "Decision Worker API failed";
       await this.#appendEvent({
-        type: inputFailure ? "worker_input_failed" : "decision_worker_failed",
+        type: inputFailure ? "worker_input_failed" : isDecisionActionError(error) ? "decision_action_failed" : "decision_worker_failed",
         taskId: this.#task?.taskId,
         workerId: event.handle.id,
         data: { eventType: event.type, error: safeMessage(error) },
       });
-      await this.#parkCandidate(`${inputFailure ? "Worker input failed" : "Decision Worker API failed"}: ${safeMessage(error)}`, event);
+      await this.#parkCandidate(`${kind}: ${safeMessage(error)}`, event);
     });
   }
 

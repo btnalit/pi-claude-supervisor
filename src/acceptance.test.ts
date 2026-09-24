@@ -120,16 +120,16 @@ test("repository evidence includes commits after an explicit task baseline", asy
   }
 });
 
-test("repository evidence rejects untracked symlinks", async () => {
+test("repository evidence names an untracked symlink without following it, and stays complete", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-evidence-symlink-"));
   const outside = await mkdtemp(join(tmpdir(), "pi-claude-evidence-outside-"));
   try {
-    await execFileAsync("git", ["init", "-q"], { cwd });
+    await initWithCommit(cwd);
     await writeFile(join(outside, "secret.txt"), "outside content\\n");
     await symlink(join(outside, "secret.txt"), join(cwd, "link.txt"));
     const evidence = await collectRepositoryEvidence(cwd);
-    assert.equal(evidence.complete, false);
-    assert.match(evidence.untracked ?? "", /non-regular file|symlink|read failed/u);
+    assert.equal(evidence.complete, true);
+    assert.match(evidence.untracked ?? "", /"link\.txt" \[symbolic link to .*secret\.txt.*not followed\]/u);
     assert.doesNotMatch(evidence.untracked ?? "", /outside content/u);
   } finally {
     await rm(cwd, { recursive: true, force: true });
@@ -137,16 +137,32 @@ test("repository evidence rejects untracked symlinks", async () => {
   }
 });
 
-test("repository evidence omits untracked hard-link aliases", async () => {
+test("repository evidence omits the content of untracked hard-link aliases, and stays complete", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-evidence-hard-link-"));
   try {
-    await execFileAsync("git", ["init", "-q"], { cwd });
+    await initWithCommit(cwd);
     await writeFile(join(cwd, "secret.txt"), "sensitive metadata\n");
     await link(join(cwd, "secret.txt"), join(cwd, "alias.txt"));
     const evidence = await collectRepositoryEvidence(cwd);
-    assert.equal(evidence.complete, false);
-    assert.match(evidence.untracked ?? "", /hard-link|read failed|untracked/i);
+    assert.equal(evidence.complete, true);
+    assert.match(evidence.untracked ?? "", /hard-linked file, \d+ bytes; content omitted/u);
     assert.doesNotMatch(evidence.untracked ?? "", /sensitive metadata/u);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("an untracked binary file, even a large one, is omitted without making the evidence incomplete", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-evidence-binary-"));
+  try {
+    await initWithCommit(cwd);
+    await writeFile(join(cwd, "logo.png"), Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00]), Buffer.alloc(512 * 1024, 1)]));
+    await writeFile(join(cwd, "notes.txt"), "plain text\n");
+    const evidence = await collectRepositoryEvidence(cwd);
+    assert.equal(evidence.complete, true);
+    assert.equal(evidence.truncated, false);
+    assert.match(evidence.untracked ?? "", /"logo\.png" \[binary file, \d+ bytes; content omitted\]/u);
+    assert.match(evidence.untracked ?? "", /plain text/u);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -215,3 +231,9 @@ test("a spec file that omits a key, or the whole autonomy block, keeps the opera
   // Without defaults the hardcoded values still apply.
   assert.deepEqual(normalizeTaskSpec({ goal: "g" }, "g").autonomy, { unattended: true, requireLocalCommit: true, maxDecisionRetries: 4, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
 });
+
+/** An initialized repository with one commit, so HEAD-relative evidence can be complete. */
+async function initWithCommit(cwd: string): Promise<void> {
+  await execFileAsync("git", ["init", "-q"], { cwd });
+  await execFileAsync("git", ["-c", "user.email=test@example.invalid", "-c", "user.name=test", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "init"], { cwd });
+}

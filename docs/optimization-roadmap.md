@@ -251,9 +251,9 @@ copy-mode、Stop-hook block、后台任务、AskUserQuestion、限流模拟；�
 
 | # | 机制 | 对无人值守的伤害 | 建议 | 风险 |
 |---|---|---|---|---|
-| D1 | Decision 失败即 park：约 3 分钟重试后 park；应用动作时抛出的任何错误也被当作 API 失败 | 429/529 常持续更久；发送失败被误标为 API 失败 | 无人值守下对 **可重试的** provider 错误（限流、过载、5xx、超时）按上限退避持续重试直到 deadline；认证、计费、模型不存在等配置错误立即 park 并告警；权限请求回退到策略答案；动作应用错误单独分类（配合 T3） | 低 |
+| D1 ✅ | Decision 失败即 park：约 3 分钟重试后 park；应用动作时抛出的任何错误也被当作 API 失败 | 429/529 常持续更久；发送失败被误标为 API 失败 | 无人值守下对 **可重试的** provider 错误（限流、过载、5xx、超时）按上限退避持续重试直到 deadline；认证、计费、模型不存在等配置错误立即 park 并告警；权限请求回退到策略答案；动作应用错误单独分类（配合 T3）。**已实现**：配置错误立即 park；无人值守下瞬时错误退避（≤60 s）持续重试并记 `decision_retry`，由空闲 watchdog 兜底验证；动作错误记 `decision_action_failed`。**未做**：权限请求回退到策略答案——须在删除底线上线后再做 | 低 |
 | D2 | Reviewer 回复解析：前后散文、额外键、字段顺序、嵌套值、缺 reviewId 均判格式失败；二次失败 → human → park；Provider 失败 4 次即 park | 真实模型的正常输出被判失败 | 保留 reviewId 与重复键检查；取回复中第一个带匹配 reviewId 的对象；忽略未知键；**取消字段顺序与扁平值规则**；格式失败换新会话重试；Provider 耗尽后稍后重验而非 park | 低–中 |
-| D3 | 未跟踪的二进制、符号链接、硬链接、不可读文件使证据“不完整” → **无修复直接 park**（Reviewer 也拒绝） | Worker 加一张 PNG / fixture DB / symlink 就 park | 这类文件记为“omitted”，证据仍视为完整；git 读取失败重试一次；截断仍走修复 | 低 |
+| D3 ✅ | 未跟踪的二进制、符号链接、硬链接、不可读文件使证据“不完整” → **无修复直接 park**（Reviewer 也拒绝） | Worker 加一张 PNG / fixture DB / symlink 就 park | 这类文件记为“omitted”，证据仍视为完整；git 读取失败重试一次；截断仍走修复。**已实现**：二进制（不论大小）、符号链接（记目标、不跟随）、硬链接、特殊文件记名与大小，证据完整。**未做**：git 读取失败重试 | 低 |
 | D4 | 远端边界正则对整条命令匹配：误拒 `git commit -m "fix: push handler"`、`git stash push`、`git merge --abort`、`git log --grep=merge`、`grep -rn shutdown src/` 等；同一拒绝表也用于验收命令 | 常规开发命令被拒，Worker 反复绕路 | 按语句、在 git 子命令位置匹配（已有 `gitSubcommandIndex`）；只拒 push/send-pack/受保护 ref 的 update-ref，merge 仅在当前或目标为受保护分支时拒；shutdown/reboot 锚定到命令位置 | 低–中 |
 | D5 | 含动态参数（`$VAR`、`$(…)`）的命令一律拒绝：`git show $SHA`、`npx vitest run $TEST_FILE` 等 | 频繁无谓拒绝 | 仅在 push/remote/config/改写分支语句中，或会被 shell/eval/xargs 执行时拒绝 | 低–中 |
 | D6 | 可信 Claude 可执行文件要求每级父目录都无组写/全局写；恢复时钉死旧 realpath | umask 002 的发行版直接启动失败；Claude 自动更新后恢复失败 | 只拒全局可写或他人所有的路径；恢复时重新解析并记 `worker_executable_changed` 事件 | 低 |
