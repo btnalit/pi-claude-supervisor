@@ -36,6 +36,8 @@ export interface DecisionContext {
 /** A compact view of the last verification: what failed and what the Reviewer asked for. */
 export interface DecisionVerificationSummary {
   ok: boolean;
+  /** The Worker turn it judged: turns after it are not reflected in it. */
+  atTurn?: number;
   failedChecks: string[];
   reviewVerdict?: string;
   findings: string[];
@@ -92,6 +94,13 @@ export interface DecisionWorkerOptions {
 export type PiModel = NonNullable<NonNullable<Parameters<typeof createAgentSession>[0]>["model"]>;
 
 const DEFAULT_COMPACTION_TOKENS = 60_000;
+/**
+ * Worker turns after a failed verification before the Supervisor verifies on
+ * its own: the Decision Worker only sees that failure as it was, so left to
+ * itself it can keep sending "it still fails" guidance to a Worker that has
+ * already fixed it. The first of these turns is the repair turn itself.
+ */
+export const STALE_VERIFICATION_TURNS = 3;
 /** First retry wait; each later wait triples, capped at MAX_DECISION_RETRY_BACKOFF_MS. */
 const DEFAULT_DECISION_RETRY_BACKOFF_MS = 5_000;
 const MAX_DECISION_RETRY_BACKOFF_MS = 60_000;
@@ -163,11 +172,28 @@ export class PiDecisionWorker implements DecisionWorkerLike {
       await this.#options.onSessionReady({ sessionFile: this.#sessionFile, sessionId: session.sessionId, restored });
     }
     if (!restored) {
-      try {
-        await promptForText(session, decisionInstructions(this.#context), this.#timeoutMs, "Decision Worker startup", MAX_DECISION_RESPONSE_BYTES, { role: "decision", onUsage: this.#options.onUsage });
-      } catch (error) {
-        try { await this.#options.onStartupFailure?.(error); } catch { /* preserve the original startup failure */ }
-        throw error;
+      // A provider hiccup (503 overload, 429) here would otherwise fail the
+      // whole task before its first turn: retry it like any decision.
+      const maxRetries = this.#context.spec?.autonomy.maxDecisionRetries ?? DEFAULT_MAX_DECISION_RETRIES;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          await promptForText(session, decisionInstructions(this.#context), this.#timeoutMs, "Decision Worker startup", MAX_DECISION_RESPONSE_BYTES, { role: "decision", onUsage: this.#options.onUsage });
+          break;
+        } catch (error) {
+          // Only a provider error is worth another attempt: a timeout already
+          // spent the whole prompt budget and would only multiply it.
+          const retryable = error instanceof Error && error.name === "DecisionWorkerApiError";
+          if (this.#closed || attempt >= maxRetries || !retryable) {
+            try { await this.#options.onStartupFailure?.(error); } catch { /* preserve the original startup failure */ }
+            throw error;
+          }
+          await new Promise<void>((resolveWait) => setTimeout(resolveWait, Math.min(MAX_DECISION_RETRY_BACKOFF_MS, this.#retryBackoffMs * 3 ** (attempt + 1))));
+          if (this.#closed) {
+            const closed = new Error("Decision Worker was closed during startup");
+            closed.name = "AbortError";
+            throw closed;
+          }
+        }
       }
     }
   }
@@ -338,9 +364,20 @@ means the Worker's own API/model call failed mid-turn: choose retry (optionally 
 corrective message) or continue to resume it, and park only after repeated failures; a subtype
 "idle" result means the turn ended without a normal stop signal, so inspect the repository and
 decide as for any other turn. CURRENT CONTEXT.lastVerification, when present, is the last acceptance
-and Review round (failed check ids, Reviewer verdict and findings): after a repair turn, check
-Claude's claim against it before choosing verify. Use verify when a turn result indicates the task is complete, even if
+and Review round (failed check ids, Reviewer verdict and findings) as of Worker turn atTurn. It
+does not change until verification runs again: it is not evidence that the failures remain after
+Claude's later turns. Use it to judge whether Claude's reply addresses those failures; once
+Claude reports them fixed, choose verify rather than re-judging the old result. (After a failed
+verification the Supervisor verifies by itself once ${STALE_VERIFICATION_TURNS} Worker turns, the repair turn included,
+have passed without one; do not rely on it.)
+A continue, redirect or answer message is sent verbatim to Claude Code as its next instruction:
+write it as a direct instruction to Claude, not a description of what you will do yourself (use
+your own read-only tools to inspect the repository before deciding).
+Use verify when a turn result indicates the task is complete, even if
 Claude says it will stop; choose stop only for an explicit stop or technical containment reason.
+In an unattended task without remote authority, a stop on a completed turn stops the Worker
+and then still verifies its work, but no repair round can follow, so a fixable problem would
+be lost: when the work looks done, choose verify.
 Use park only when the task cannot safely produce a candidate because required evidence,
 authority, or runtime capability is unavailable. A parked candidate is asynchronous and must not
 wait for a human to be online. For an exited event choose verify, park or stop; a noop on an exited event is treated as

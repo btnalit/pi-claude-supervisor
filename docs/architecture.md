@@ -517,10 +517,17 @@ parked or failed without granting remote/main authority. Model/API failures are
 detected from the Pi `stopReason` (a provider error resolves the prompt normally
 rather than throwing); if the Decision Worker
 API/model call fails, the system records `decision_worker_failed`, applies the
-bounded retry/park policy and preserves the candidate evidence. An abort is never
+bounded retry/park policy and preserves the candidate evidence. The startup
+instructions prompt retries provider errors on the same backoff and budget, so a
+provider overload at start does not fail the task before its first turn. An abort is never
 retried, and a `noop` reply on a completed turn or a permission request parks the
 candidate rather than being treated as a resolved decision, while a `noop` on a
-clean Worker exit proceeds to verification. Optional alert
+clean Worker exit proceeds to verification. A `stop` on a completed turn of an
+unattended task without remote authority stops the Worker (never keeping it open)
+and then verifies its finished work instead of discarding it (`decision_overridden`);
+no repair round may follow, so a failure blocks the candidate. A `stop` on a
+pending permission, on a turn the Worker has already resumed, or on a task with
+remote authority stays a plain stop. Optional alert
 delivery remains independent from event-log persistence, but notification is not
 the control boundary.
 
@@ -617,6 +624,10 @@ evidence still parks.
 
 A `revise` result produces an audited repair round and sends a bounded corrective
 instruction to a still-live `repairableSession` Worker. Checks and review then run again.
+The Decision Worker sees the last result tagged with the Worker turn it judged, and chooses
+when to verify again; if it keeps steering instead, the Supervisor verifies on its own once
+the Worker has taken three turns since that failure (`decision_overridden`), so a Decision
+Worker reasoning from the stale failure cannot hold a fixed Worker in a loop until the deadline.
 The repair budget defaults to three rounds. P0/P1 findings block a `pass` but are repair
 inputs like any other concrete finding (a `pass` carrying one is treated as `revise`); a
 `human` verdict, repeated findings or an exhausted budget stop automation and park a
