@@ -1131,9 +1131,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   }
 
   async #send(record: TmuxRecord, message: string, idempotencyKey: string): Promise<void> {
-    // The Worker's state as the message was decided, before queueing for the
+    // The Worker's state when the send was requested, before queueing for the
     // input gate and the pane checks: a turn someone else starts from here on
-    // makes the message stale, however long those take.
+    // makes the message stale, however long those take. (Input that arrived
+    // while the message was being decided already shows as activeRequests.)
     const decidedAt = { turnSequence: record.turnSequence, humanInputs: record.humanInputs };
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
