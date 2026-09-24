@@ -1,7 +1,7 @@
 # 后续优化路线图（0.9.2 之后）
 
-> 状态：提案（未实施）。本文区分 **现状（Current Reality）**、**目标（Target）** 与 **迁移路径（Migration）**；
-> 文中所有新模块、新事件、新字段均为提案，尚不存在于代码中。
+> 状态：实施中（已完成项以 ✅ 标注，其余仍为提案）。本文区分 **现状（Current Reality）**、**目标（Target）** 与 **迁移路径（Migration）**；
+> 除 ✅ 项外，文中新模块、新事件、新字段均为提案，尚不存在于代码中；§2 现状描述的是路线图起草时（0.9.2）的代码。
 > 与既有文档的关系：[`engineering-plan.md`](engineering-plan.md) 描述整体设计，
 > [`automation-hardening-plan.md`](automation-hardening-plan.md) 记录自动化加固；本文只覆盖 0.9.2 之后的
 > **收敛与稳定性** 工作，不改变它们确立的边界与目标。
@@ -225,7 +225,7 @@ interface DecisionGuard {
 
 | # | 问题 | 后果 | 修复（倾向简单、确定性） | 等级 |
 |---|---|---|---|---|
-| T1 | hook 路由按 `event.cwd` 查找 socket，Claude 在 Bash 中 `cd` 子目录后 cwd 随之改变 [code][bin] | 此后所有 hook 静默 no-op：Stop 丢失、PreToolUse 策略跳过、权限对话框等人 → 20 分钟/4 小时后失败 | Worker 环境设 `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1`；relay 按 `CLAUDE_PROJECT_DIR` 路由（回退：沿 `event.cwd` 父目录查找），请求携带路由键 | 高 |
+| T1 ✅ | hook 路由按 `event.cwd` 查找 socket，Claude 在 Bash 中 `cd` 子目录后 cwd 随之改变 [code][bin] | 此后所有 hook 静默 no-op：Stop 丢失、PreToolUse 策略跳过、权限对话框等人 → 20 分钟/4 小时后失败 | Worker 环境设 `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1`；relay 按 `CLAUDE_PROJECT_DIR` 路由（回退：`event.cwd`；不沿父目录查找，否则 Worker 在子目录启动的嵌套 Claude 会被路由到本任务），请求携带路由键；shell cwd 偏离任务目录的 Bash 请求以 `cd <cwd> && <命令>` 呈现（不再被判为 routine，由 Decision 按真实目录判断；遗留：策略本身不跟踪 `cd`，偏离目录时的已授权 publish 会被拒直到 `cd` 回任务目录） | 高 |
 | T2 | 发送无送达确认：paste → Enter 之间不检查 `pane_in_mode`，不等待对应 UserPromptSubmit [code][exp] | copy-mode 吞掉 Enter，文本滞留输入框，`activeRequests` 卡 1 → 无输出 watchdog 失败 | 发送前 `#{pane_in_mode}`=1 则 `send-keys -X cancel`；Enter 后 5–10 s 等匹配的 UserPromptSubmit，未到则截屏：**仅当** 输入框仍显示所粘贴文本且无任何对话框时重发 Enter（≤2 次，盲发 Enter 会选中对话框默认项、绕过策略）；否则抛可重试错误。hook 通道失效（T1、T10）导致 UserPromptSubmit 永不到达时告警/park，而不是与 D1 叠加无限重试 | 高 |
 | T3 | `#send` 在屏幕非“干净就绪”时直接抛错，经 `#decisionFailure` 标为“Decision Worker API failed”并 park、杀死 Worker [code] | 横幅、残留输入、prompt suggestion 幽灵文本 [hyp] 都会导致无故 park | 适配器内轮询就绪 30–60 s 后再拒绝，并标记为可重试；Supervisor 对发送失败单独分类并重试；owned `--settings` 关闭 `promptSuggestionEnabled` | 高 |
 | T4 | 与待发消息不精确匹配的 UserPromptSubmit 一律视为人工输入 → `humanRequired`，且 `worker_prompt` 来源不发 webhook，无输出 watchdog 暂停 [code] | 自动化 **无限期静默暂停** 直到 deadline 失败 | 适配器发送未确认的 30 s 窗口内的 UserPromptSubmit 视为自身消息；待发消息按时间过期而非在 Stop 时清空；无人值守时对 takeover 发告警；为 `worker_prompt` 引起的闸门单独记来源（现与显式 `takeover()` 共用 `#humanGate="other"`），仅该来源在可选/无人值守配置下“N 分钟无新人工输入且 Worker 空闲则自动恢复”——**永不** 清除显式 takeover 或 recover 后的接管 | 高 |

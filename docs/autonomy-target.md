@@ -119,7 +119,8 @@ control. They are not entered by ordinary uncertainty, and a legacy approval obj
 the deterministic known-command remote push/main merge denial. The existing independent Review
 and protected CI/release paths remain the final external checks. Automatic Claude workers preserve
 Claude Code's normal environment, network, tool, agent and MCP surface; `CLAUDECODE` is removed
-only to permit intentional nested Claude sessions. The Supervisor-owned cgroup remains a cleanup
+only to permit intentional nested Claude sessions, and `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1`
+is defaulted so Bash returns to the task directory after each command. The Supervisor-owned cgroup remains a cleanup
 boundary, not a capability allowlist. Automatic tmux parent-death recovery leaves an empty
 cgroup as evidence and permits `recover --takeover` only after Supervisor ownership, persisted
 Worker/cgroup identity (including the cgroup device/inode), dead tmux-server identity, a gone

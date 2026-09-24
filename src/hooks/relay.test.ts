@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawn } from "node:child_process";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HOOK_EMBEDDED_SCRIPTS, HOOK_RELAY_SCRIPT } from "./relay.ts";
@@ -38,8 +38,8 @@ interface RelayRunResult {
 }
 
 /** Runs the relay via `node -e SCRIPT`, feeding `event` on stdin. */
-async function runRelay(event: unknown, hookDir: string): Promise<RelayRunResult> {
-  return runScript(["-e", HOOK_RELAY_SCRIPT], event, hookDir);
+async function runRelay(event: unknown, hookDir: string, extraEnv: NodeJS.ProcessEnv = {}): Promise<RelayRunResult> {
+  return runScript(["-e", HOOK_RELAY_SCRIPT], event, hookDir, extraEnv);
 }
 
 /** Runs the relay as a written file, mirroring what install.ts produces. */
@@ -48,11 +48,12 @@ async function runRelayFile(event: unknown, hookDir: string, relayPath: string):
   return runScript([relayPath], event, hookDir);
 }
 
-async function runScript(args: string[], event: unknown, hookDir: string | undefined): Promise<RelayRunResult> {
+async function runScript(args: string[], event: unknown, hookDir: string | undefined, extraEnv: NodeJS.ProcessEnv = {}): Promise<RelayRunResult> {
   const start = Date.now();
-  const { PI_CLAUDE_SUPERVISOR_HOOK_DIR: _ignored, ...inherited } = process.env;
+  // The test runner may itself run under Claude Code; its project directory must not steer routing here.
+  const { PI_CLAUDE_SUPERVISOR_HOOK_DIR: _ignored, CLAUDE_PROJECT_DIR: _project, ...inherited } = process.env;
   const child = spawn(process.execPath, args, {
-    env: hookDir === undefined ? inherited : { ...inherited, PI_CLAUDE_SUPERVISOR_HOOK_DIR: hookDir },
+    env: { ...inherited, ...(hookDir === undefined ? {} : { PI_CLAUDE_SUPERVISOR_HOOK_DIR: hookDir }), ...extraEnv },
     stdio: ["pipe", "pipe", "pipe"],
   });
   const stdoutChunks: Buffer[] = [];
@@ -225,6 +226,89 @@ test("PermissionRequest ask reply prints nothing (not representable in the docum
         const result = await runRelay(event, hookDir);
         assert.equal(result.code, 0);
         assert.equal(result.stdout, "");
+      } finally {
+        await unsubscribe();
+      }
+    });
+  });
+});
+
+test("a Worker that cd'd into a subdirectory is still routed by CLAUDE_PROJECT_DIR", async () => {
+  await withServer(async (server, hookDir) => {
+    await withTempCwd(async (cwd) => {
+      const subdir = join(cwd, "packages", "app");
+      await mkdir(subdir, { recursive: true });
+      const seen: HookRelayRequest[] = [];
+      const unsubscribe = await server.subscribe(cwd, async (request) => {
+        seen.push(request);
+        return { permissionDecision: "deny", permissionDecisionReason: "routed" };
+      });
+      try {
+        const event = baseEvent({ hook_event_name: "PreToolUse", cwd: subdir, tool_name: "Bash", tool_use_id: "tool-cd" });
+        const result = await runRelay(event, hookDir, { CLAUDE_PROJECT_DIR: cwd });
+        assert.equal(result.code, 0);
+        assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecisionReason, "routed");
+        assert.equal(seen.length, 1);
+        assert.equal(seen[0]!.routeCwd, cwd);
+        assert.equal(seen[0]!.event.cwd, subdir);
+        // Without the project directory the same event has no owner, as before.
+        const unrouted = await runRelay(event, hookDir);
+        assert.equal(unrouted.stdout, "");
+        assert.equal(seen.length, 1);
+      } finally {
+        await unsubscribe();
+      }
+    });
+  });
+});
+
+test("an unsupervised CLAUDE_PROJECT_DIR falls back to routing by the event cwd", async () => {
+  await withServer(async (server, hookDir) => {
+    await withTempCwd(async (cwd) => {
+      const unsubscribe = await server.subscribe(cwd, async () => ({ permissionDecision: "allow" }));
+      try {
+        const event = baseEvent({ hook_event_name: "PreToolUse", cwd, tool_name: "Bash", tool_use_id: "tool-fallback" });
+        const result = await runRelay(event, hookDir, { CLAUDE_PROJECT_DIR: join(tmpdir(), "pi-cs-no-such-project") });
+        assert.deepEqual(JSON.parse(result.stdout), { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" } });
+      } finally {
+        await unsubscribe();
+      }
+    });
+  });
+});
+
+test("CLAUDE_PROJECT_DIR takes precedence over an event cwd that another Supervisor owns", async () => {
+  await withServer(async (server, hookDir) => {
+    await withTempCwd(async (project) => {
+      await withTempCwd(async (other) => {
+        const unsubscribeProject = await server.subscribe(project, async () => ({ permissionDecision: "deny", permissionDecisionReason: "project" }));
+        const unsubscribeOther = await server.subscribe(other, async () => ({ permissionDecision: "deny", permissionDecisionReason: "cwd" }));
+        try {
+          const event = baseEvent({ hook_event_name: "PreToolUse", cwd: other, tool_name: "Bash", tool_use_id: "tool-precedence" });
+          const result = await runRelay(event, hookDir, { CLAUDE_PROJECT_DIR: project });
+          assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecisionReason, "project");
+        } finally {
+          await unsubscribeProject();
+          await unsubscribeOther();
+        }
+      });
+    });
+  });
+});
+
+test("a nested Claude in a subdirectory of a supervised cwd is not routed to that Supervisor", async () => {
+  await withServer(async (server, hookDir) => {
+    await withTempCwd(async (cwd) => {
+      const subdir = join(cwd, "nested");
+      await mkdir(subdir);
+      let calls = 0;
+      const unsubscribe = await server.subscribe(cwd, async () => { calls += 1; return { permissionDecision: "deny" }; });
+      try {
+        const event = baseEvent({ hook_event_name: "PreToolUse", cwd: subdir, tool_name: "Bash", tool_use_id: "tool-nested" });
+        // A nested Claude reports its own launch directory as the project directory.
+        const result = await runRelay(event, hookDir, { CLAUDE_PROJECT_DIR: subdir });
+        assert.equal(result.stdout, "");
+        assert.equal(calls, 0);
       } finally {
         await unsubscribe();
       }

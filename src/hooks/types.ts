@@ -59,6 +59,13 @@ export interface HookRelayRequest {
   ppid: number;
   /** Inherited from Claude's environment when it runs inside tmux. */
   tmuxPane?: string;
+  /**
+   * The canonical directory the relay routed by: Claude's `CLAUDE_PROJECT_DIR`
+   * when a Supervisor owns it, else the event's `cwd`. The server routes by
+   * this when present, so a Worker that `cd`s into a subdirectory stays
+   * supervised. Absent from older relays, which routed by `cwd`.
+   */
+  routeCwd?: string;
   event: ClaudeHookEvent;
 }
 
@@ -84,10 +91,11 @@ export const HOOK_TIMEOUT_SECONDS = 180;
 /**
  * Socket routing: one socket per Pi process under `<stateDir>/hooks/`, plus a
  * per-cwd symlink `<stateDir>/hooks/by-cwd/<sha256(cwd)>` created when the
- * Supervisor takes the cwd lease, so a relay only needs the cwd to find its
- * supervisor and a cwd with no supervisor is a no-op.
+ * Supervisor takes the cwd lease, so a relay only needs the task directory
+ * (Claude's `CLAUDE_PROJECT_DIR`, else the event's `cwd`) to find its
+ * supervisor and a directory with no supervisor is a no-op.
  */
 export interface HookEventSource {
-  /** Route every event whose canonical cwd matches to this handler until unsubscribed. */
+  /** Route every event whose canonical routing directory (`routeCwd`, else `event.cwd`) matches to this handler until unsubscribed. */
   subscribe(cwd: string, handler: (request: HookRelayRequest) => Promise<HookRelayReply | undefined>): Promise<() => Promise<void>>;
 }

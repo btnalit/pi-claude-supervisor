@@ -16,6 +16,12 @@ test("worker environment keeps essentials and excludes unrelated credentials", (
   assert.equal(result.RANDOM_TOKEN, undefined);
 });
 
+test("automatic Worker environment keeps Claude's Bash in the task directory unless the caller chose otherwise", () => {
+  assert.equal(automaticWorkerEnvironment({}, { PATH: "/bin" }).CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR, "1");
+  assert.equal(automaticWorkerEnvironment({ CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR: "0" }, {}).CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR, "0");
+  assert.equal(automaticWorkerEnvironment({}, { CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR: "0" }).CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR, "0");
+});
+
 test("automatic Worker environment preserves credentials, helpers and custom settings", () => {
   const result = automaticWorkerEnvironment({
     ANTHROPIC_API_KEY: "provider-key",

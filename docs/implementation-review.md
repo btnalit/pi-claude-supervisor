@@ -33,7 +33,8 @@ custom/nested descendants are trusted rather than denied by a nested-process gua
 - Manual Worker and verifier processes retain the baseline environment behavior;
   automatic Workers pass the full Supervisor environment, including credentials,
   helpers, custom settings and proxy/network variables, with only `CLAUDECODE`
-  removed so nested Claude can start.
+  removed so nested Claude can start and `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1`
+  defaulted so Bash stays in the task directory.
 - Startup failures clean up a worker and do not let event-log failures hide the
   original error.
 - Default wall-clock and no-output watchdogs stop stalled workers.

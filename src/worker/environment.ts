@@ -53,6 +53,12 @@ export function workerEnvironment(
  * their normal capabilities. CLAUDECODE is removed because Claude Code uses it
  * to reject a deliberately nested session; process/cgroup cleanup still owns
  * every descendant of the Worker.
+ *
+ * `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1` (unless the caller chose a
+ * value) returns Claude's Bash tool to the task directory after every
+ * command. The permission policy resolves relative paths against the task
+ * directory and interactive hooks are routed by it, so a `cd` that persisted
+ * across commands would silently skew both.
  */
 export function automaticWorkerEnvironment(
   explicit: NodeJS.ProcessEnv = {},
@@ -65,6 +71,7 @@ export function automaticWorkerEnvironment(
   for (const [name, value] of Object.entries(explicit)) {
     if (value !== undefined && name !== "CLAUDECODE") result[name] = value;
   }
+  result.CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR ??= "1";
   return result;
 }
 
