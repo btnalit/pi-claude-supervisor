@@ -611,25 +611,36 @@ the control boundary.
 
 Beneath every authority sits the delete floor (`deleteFloorViolation` in
 `src/policy.ts`, applied inside `evaluatePermission` to every Bash request, so no
-authority mode, human `/supervise approve` included, can lift it). A delete or
-move — `rm`, `rmdir`, `unlink`, `shred`, `mv`, `find -delete`/`-exec rm`, and
-`git clean` pointed elsewhere with `-C`/`--work-tree` — is read through wrappers
-(`sudo`, `env`, `timeout`, `nohup`, …), `sh -c`/`eval` with a literal script, and
-heredocs fed to a shell, while `cd`/`pushd` to a literal directory is followed.
-It is refused when a target is dynamic (`$VAR`, `$(…)`), follows a `cd` the
-reading cannot resolve, or comes from input (`xargs`, `parallel`); when it
-resolves (parent through realpath, last name as written, so `rm link` stays a
-link removal) outside the task directory, the extra write roots and the temp
-directory; when it is the task directory itself, a directory that contains the
-task, a whole write/temp root or a glob across its top; when it is a glob over
-hidden entries or an unfiltered `find` over the whole task tree (both would
-take `.git`); and when it is Git's own store. `git prune`, `git gc --prune*` and
-`git reflog expire/delete` are refused because with no remote authority the
-local commits are the only copy. Literal globs (`rm -rf dist/*`) and names bound
-to literal text inside the task stay allowed. An interpreter
-(`python -c "shutil.rmtree(...)"`, a script file the Worker wrote) is outside
-what a static reading can see. That residual risk is not covered here (the
-cgroup boundary limits resources, not paths); an operator who needs it closed
+authority mode, human `/supervise approve` included, can lift it). It reads
+fail-closed rather than modelling each wrapper: any word of a statement that
+names `rm`, `rmdir`, `unlink`, `shred`, `mv` or `rimraf` counts wherever it
+stands (so `sudo`, `busybox`, `env -i`, `command -p`, function and `case` bodies
+are seen through), as do `find -delete`/`-exec rm`, `git clean -C`, `rsync
+--delete` and `git worktree remove --force`. Only text commands (`echo`,
+`grep`, `cat`, …), interpreters, and tools whose `rm` subcommand is not a file
+delete (`git rm`, `npm rm`, `docker rm`) end the scan. Quoted arguments that
+mention a delete (`sh -lc '…'`, `watch '…'`, `trap '…'`), text piped into a
+shell, unquoted heredocs, and `$(…)`/backtick/`<(…)` bodies are judged as
+scripts; beyond six levels of nesting a delete is refused outright. A target is
+refused when it is dynamic, follows a `cd` the reading cannot resolve, or comes
+from `xargs`/`parallel`; when it resolves (parent through realpath, last name as
+written, so `rm link` stays a link removal) outside the task directory, the
+extra write roots and the temp directory; when it is the task directory itself,
+a directory that contains the task, a whole write/temp root or a glob across its
+top; when it is a glob over hidden entries, a glob followed by `..`, or a `find`
+over the task tree whose filter could reach `.git` (a `!`/`-not`/`-o` branch, or
+a pattern matching `.git` or its entries); and when it is Git's own store (a
+stale `.git/*.lock` excepted). Brace alternatives are expanded and judged one by
+one. `git prune`, `git gc --prune*` and `git reflog expire/delete` are refused
+because with no remote authority the local commits are the only copy. Literal
+globs (`rm -rf dist/*`), names bound to literal text, to `$(mktemp …)` or to a
+`for f in *.tmp` glob, and `$HOME`/`$TMPDIR`/`$PWD` are judged as the paths they
+spell. Outside what this floor reads: interpreters and script files
+(`python -c "shutil.rmtree(...)"`, `bash ./cleanup.sh`), overwrites (`cp`,
+`ln -sf`, `install`, `truncate`, `tar -C`, `>`), history rewrites such as
+`git reset --hard` or `git stash clear` (the protected-branch rules cover only
+protected branches), and a sibling task under the same temp directory. The
+cgroup boundary limits resources, not paths; an operator who needs those closed
 runs the Worker in a container or OS sandbox with a read-only view of the rest.
 
 Permission requests are not all routed to the Decision Worker model. `autonomy.permissionAuthority`

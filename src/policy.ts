@@ -168,89 +168,148 @@ export interface DeleteFloorOptions {
 /**
  * The delete floor: the one line that holds whatever else is relaxed, so no
  * authority mode (policy, hybrid, Decision Worker) can let a Bash command
- * delete or move something it cannot give back. A delete or move (`rm`,
- * `rmdir`, `unlink`, `shred`, `mv`, `find -delete`/`-exec rm`, `git clean`),
- * also under a wrapper (`sudo`, `env`, `timeout`, `nohup`, `sh -c`, `eval`, a
- * heredoc fed to a shell, …), is refused when a target
+ * delete or move something outside the task. It is read fail-closed: every
+ * word of a statement that names a delete or move (`rm`, `rmdir`, `unlink`,
+ * `shred`, `mv`, `rimraf`), and `find -delete`/`-exec rm`, `git clean`,
+ * `rsync --delete`, counts wherever it stands, so any wrapper (`sudo`,
+ * `busybox`, `env -i`, a function or `case` body) is seen through without a
+ * table of its options. Only text commands (`echo`, `grep`, …), interpreters
+ * and tools whose own `rm` subcommand is not a file delete (`git rm`, `npm rm`,
+ * `docker rm`) end the scan. Quoted scripts that mention a delete (`sh -lc
+ * '…'`, `watch '…'`, `trap '…'`), text piped into a shell, and the bodies of
+ * `$(…)`, backticks and `<(…)` are judged as scripts of their own; past the
+ * nesting limit a delete is refused outright. A target is refused when it
  * - is not literal (a variable, a command substitution), follows a `cd` that
  *   cannot be resolved, or comes from input (`xargs`, `parallel`);
  * - resolves outside the task directory, its extra write roots and the temp
  *   directory, or is one of those roots itself (or a glob across its top);
  * - is the task directory itself, or any directory that contains it;
- * - is a glob over hidden entries (`.*` would take `.git`), or a `find`
- *   over the whole task tree without a name/path filter;
- * - is Git's own store (`.git` or anything in it).
- * A literal glob (`rm -rf dist/*`) and a name bound to literal text inside the
- * task are judged like the path they spell. `git gc --prune`, `git prune` and
- * `git reflog expire/delete` are refused too: with no remote authority the
- * local commits are the only copy. Returns the reason, or undefined.
- * Interpreters (`python -c "shutil.rmtree(...)"`) remain outside what a static
- * reading can see.
+ * - is a glob over hidden entries (`.*` would take `.git`), a glob followed by
+ *   `..`, or a `find` over the whole task tree whose filter could reach `.git`;
+ * - is Git's own store (`.git` or anything in it, bar a stale `*.lock`).
+ * Brace alternatives are expanded and judged one by one; literal globs, names
+ * bound to literal text or to `$(mktemp …)`, and `$HOME`/`$TMPDIR`/`$PWD` are
+ * judged like the paths they spell. `git gc --prune`, `git prune` and `git
+ * reflog expire/delete` are refused too: with no remote authority the local
+ * commits are the only copy. Returns the reason, or undefined. Interpreters
+ * (`python -c "shutil.rmtree(...)"`, a script file) and overwrites (`cp`,
+ * `ln -sf`, `>`) remain outside what this floor reads.
  */
-export function deleteFloorViolation(command: string, cwd: string, options: DeleteFloorOptions = {}, depth = 0): string | undefined {
-  const lexical = lexShell(command.trim());
-  // An unparsable command is already refused by evaluateCommand.
-  if (lexical.error) return undefined;
-  const { tokens: dataResolved, embedded } = resolveDataTokens(lexical.tokens);
-  if (depth < 4) {
-    for (const body of embedded) {
-      const nested = deleteFloorViolation(body, cwd, options, depth + 1);
-      if (nested) return nested;
-    }
-  }
-  const tokens = resolveLiteralBindings(dataResolved);
+export function deleteFloorViolation(command: string, cwd: string, options: DeleteFloorOptions = {}): string | undefined {
   const roots = deleteFloorRoots(cwd, options.writeRoots ?? [], options.tempRoots ?? [tmpdir(), "/tmp"]);
+  return floorScript(command, cwd, roots, new Map(), 0);
+}
+
+interface FloorRoots { cwd: string; others: string[] }
+
+const FLOOR_MAX_DEPTH = 6;
+const DELETE_COMMANDS = new Set(["rm", "rmdir", "unlink", "shred", "mv", "rimraf"]);
+const DELETE_WORD = /(?:^|[^A-Za-z0-9_.-])(?:rm|rmdir|unlink|shred|mv|rimraf)(?:[^A-Za-z0-9_.-]|$)|-delete\b|--delete\b/u;
+/** Commands whose words are text, code in another language, or their own `rm` subcommand: the scan stops at them. */
+const FLOOR_STOP_COMMANDS = new Set([
+  // DATA_SINK_COMMANDS is declared further down, so its words are repeated here.
+  "cat", "tee", "head", "tail", "grep", "rg", "wc", "sort", "uniq", "cut", "tr", "diff", "less", "more", "base64", "md5sum",
+  "sha1sum", "sha256sum", "jq", "column", "fold", "paste", "comm", "cmp", "od", "hexdump", "xxd", "nl", "tac", "rev", "echo", "printf",
+  "egrep", "fgrep", "ag", "ack", "man", "which", "type", "whatis", "apropos", "info", "help", "tldr", "alias", "logger", "yq",
+  "python", "python2", "python3", "node", "deno", "perl", "ruby", "php", "lua", "awk", "gawk", "mawk", "sed", "Rscript",
+  "npm", "pnpm", "yarn", "bun", "docker", "podman", "nerdctl", "kubectl", "helm", "conda", "mamba", "micromamba", "brew",
+  "pip", "pip3", "uv", "poetry", "cargo", "go", "gh", "hg", "svn", "jj", "dvc", "aws", "gsutil", "gcloud", "az", "mc",
+  "rclone", "s3cmd", "snap", "flatpak", "apt", "apt-get", "dnf", "yum", "zypper", "pacman", "systemctl", "ssh", "scp",
+]);
+/** Git subcommands that run shell text they are given. */
+const GIT_SHELL_SUBCOMMANDS = new Set(["rebase", "submodule", "bisect", "filter-branch", "filter-repo"]);
+const REDIRECT_OPERATORS = new Set([">", ">>", "<", "<<", ">|", "&>", ">&"]);
+/** Entries under `.git` a find filter must not be able to match. */
+const GIT_STORE_PROBES = [".git", ".git/HEAD", ".git/index", ".git/config", ".git/packed-refs", ".git/objects", ".git/objects/ab/cdef0123",
+  ".git/objects/pack/pack-1.pack", ".git/refs/heads/main", ".git/hooks/pre-commit", ".git/logs/HEAD"];
+
+function floorScript(command: string, start: string | undefined, roots: FloorRoots, inherited: ReadonlyMap<string, string>, depth: number): string | undefined {
+  if (depth >= FLOOR_MAX_DEPTH) {
+    return DELETE_WORD.test(command) ? "Worker cannot delete through commands nested this deep; flatten the command" : undefined;
+  }
+  const lexical = lexShell(command.trim());
+  // At the top an unparsable command is already refused by evaluateCommand;
+  // nested text that does not parse cannot be read, so a delete in it is refused.
+  if (lexical.error) return depth > 0 && DELETE_WORD.test(command) ? "Worker cannot delete through a script the policy cannot parse" : undefined;
+  const bindings = floorBindings(command, lexical.tokens, inherited);
+  const nested = (body: string, directory: string | undefined): string | undefined => floorScript(body, directory, roots, bindings, depth + 1);
+  for (const body of substitutionBodies(command)) {
+    const violation = nested(body, start);
+    if (violation) return violation;
+  }
+  const { tokens: dataResolved, embedded } = resolveDataTokens(lexical.tokens);
+  for (const body of embedded) {
+    const violation = nested(body, start);
+    if (violation) return violation;
+  }
+  const tokens = resolveLiteralBindings(applyFloorBindings(dataResolved, bindings));
+  const segments = floorSegments(tokens);
   // The directory each statement runs in, as far as a static reading can
   // tell; undefined once a `cd` it cannot resolve has run.
-  let directory: string | undefined = cwd;
-  for (const segment of segmentsOf(tokens)) {
-    const argv = statementArgv(segment);
-    if (!argv) continue;
-    const { name, args } = unwrapCommand(argv);
-    if (name === undefined) continue;
-    if (name === "cd" || name === "pushd") {
-      directory = resolveCd(args, directory);
-      continue;
+  let directory = start;
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index]!;
+    const words = segmentWords(segment.tokens);
+    let first = 0;
+    while (first < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[first]!.value) || FLOOR_KEYWORDS.has(words[first]!.value))) first += 1;
+    if (first >= words.length) continue;
+    const head = floorCommandName(words[first]!);
+    // Text piped into a shell is a script.
+    const intoShell = segment.joiner === "|" && SHELL_NAMES.has(floorCommandName(segmentWords(segments[index + 1]?.tokens ?? [])[0]) ?? "");
+    if (intoShell) {
+      const violation = nested(words.slice(first + 1).map((word) => word.value).join(" "), directory);
+      if (violation) return violation;
     }
-    if (name === "popd") { directory = undefined; continue; }
-    if (SHELL_NAMES.has(name) || name === "eval") {
-      const script = name === "eval" ? args : args.slice(args.findIndex((token) => token.value === "-c") + 1, args.findIndex((token) => token.value === "-c") + 2);
-      if (name !== "eval" && !args.some((token) => token.value === "-c")) continue;
-      if (script.some((token) => token.dynamic)) {
-        if (script.some((token) => DELETE_WORD.test(token.value))) return "Worker cannot delete through a shell command built at run time";
+    // A quoted argument that mentions a delete is a script for whatever runs it
+    // (`sh -lc`, `watch`, `trap`, `su -c`), unless the command only reads text.
+    const readsText = head !== undefined && FLOOR_STOP_COMMANDS.has(head)
+      || (head === "git" && !words.slice(first + 1).some((word) => GIT_SHELL_SUBCOMMANDS.has(word.value)));
+    if (!readsText) {
+      for (const word of words.slice(first + 1)) {
+        if (/\s/u.test(word.value) && DELETE_WORD.test(word.value)) {
+          const violation = nested(word.value, directory);
+          if (violation) return violation;
+        }
+      }
+    }
+    let local = directory;
+    for (let cursor = first; cursor < words.length; cursor += 1) {
+      const word = words[cursor]!;
+      const name = floorCommandName(word);
+      if (name === undefined) continue;
+      if (name === "cd" || name === "pushd") { directory = resolveCd(words.slice(cursor + 1), directory); break; }
+      if (name === "popd") { directory = undefined; break; }
+      if (FLOOR_STOP_COMMANDS.has(name)) break;
+      // `env -C DIR` and `sudo -D DIR` run the command elsewhere.
+      if (name === "env" || name === "sudo") {
+        const next = words[cursor + 1]?.value;
+        const flags = name === "env" ? ["-C", "--chdir"] : ["-D", "--chdir"];
+        if (next !== undefined && flags.includes(next)) local = resolveCd(words.slice(cursor + 2, cursor + 3), local);
+        else if (next?.startsWith("--chdir=")) local = resolveCd([{ ...words[cursor + 1]!, value: next.slice("--chdir=".length) }], local);
         continue;
       }
-      if (depth >= 4) continue;
-      const nested = deleteFloorViolation(script.map((token) => token.value).join(" "), directory ?? cwd, options, depth + 1);
-      if (nested) return nested;
-      continue;
-    }
-    if (name === "xargs" || name === "parallel") {
-      const inner = unwrapCommand(args.filter((token) => !token.value.startsWith("-")));
-      if (inner.name !== undefined && DELETE_COMMANDS.has(inner.name)) return `Worker cannot ${inner.name} targets taken from input (${name}); name the paths, or use find -delete inside the task directory`;
-      continue;
-    }
-    const found = deleteTargets(name, args);
-    if (!found) continue;
-    for (const target of found.targets) {
-      const violation = judgeDeleteTarget(target, directory, roots, name, found.contentsOnly);
-      if (violation) return violation;
+      if (name === "xargs" || name === "parallel") {
+        const inner = words.slice(cursor + 1).find((later) => DELETE_COMMANDS.has(floorCommandName(later) ?? ""));
+        if (inner) return `Worker cannot ${floorCommandName(inner)} targets taken from input (${name}); name the paths, or use find -delete inside the task directory`;
+        break;
+      }
+      const args = words.slice(cursor + 1).map((arg) => (/^(?:\$\(|<\(|>\(|\(|`)/u.test(word.value) ? { ...arg, value: arg.value.replace(/[)`]+$/u, "") } : arg));
+      const found = deleteTargets(name, args);
+      if (found) {
+        for (const target of found.targets) {
+          const violation = judgeDeleteTarget(target, local, roots, name, found.contentsOnly);
+          if (violation) return violation;
+        }
+      }
+      if (found || DELETE_COMMANDS.has(name) || name === "find" || name === "git" || name === "rsync") break;
     }
   }
   return undefined;
 }
 
-const DELETE_COMMANDS = new Set(["rm", "rmdir", "unlink", "shred", "mv"]);
-const DELETE_WORD = /(?:^|[\s;&|(`'"])(?:rm|rmdir|unlink|shred|mv)(?:\s|$)|-delete\b/u;
-/** Wrappers whose argv is another command: option words are skipped, then this many positionals. */
-const COMMAND_WRAPPERS = new Map<string, number>([
-  ["sudo", 0], ["doas", 0], ["env", 0], ["command", 0], ["builtin", 0], ["exec", 0], ["nohup", 0], ["time", 0],
-  ["nice", 0], ["ionice", 0], ["setsid", 0], ["stdbuf", 0], ["timeout", 1], ["taskset", 1], ["flock", 1], ["chrt", 1],
-]);
-/** Wrapper options that take the next word as their value. */
-const WRAPPER_VALUE_OPTIONS = new Set(["-u", "-g", "-C", "-h", "-p", "-n", "-c", "-s", "-k", "-o", "-e", "-i", "--user", "--group", "--signal", "--kill-after"]);
+const FLOOR_KEYWORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "!", "(", "{", "}", "done", "fi", "esac"]);
 
-function deleteFloorRoots(cwd: string, writeRoots: readonly string[], tempRoots: readonly string[]): { cwd: string; others: string[] } {
+function deleteFloorRoots(cwd: string, writeRoots: readonly string[], tempRoots: readonly string[]): FloorRoots {
   const canonical = (path: string): string => {
     try { return realpathSync.native(path); } catch { return resolve(path); }
   };
@@ -258,45 +317,127 @@ function deleteFloorRoots(cwd: string, writeRoots: readonly string[], tempRoots:
   return { cwd: canonical(cwd), others: [...new Set(others)] };
 }
 
-/** The words of one statement that reach argv: no redirections or their targets, no leading assignments or keywords. */
-function statementArgv(segment: readonly ShellToken[]): ShellToken[] | undefined {
+/** Statements split at `|`, `&&`, `||`, `;` and `&`, each with the operator that follows it. */
+function floorSegments(tokens: readonly ShellToken[]): { tokens: ShellToken[]; joiner?: string }[] {
+  const segments: { tokens: ShellToken[]; joiner?: string }[] = [{ tokens: [] }];
+  for (const token of tokens) {
+    if (token.operator && SEGMENT_SPLIT_OPERATORS.has(token.value)) {
+      segments.at(-1)!.joiner = token.value;
+      segments.push({ tokens: [] });
+      continue;
+    }
+    segments.at(-1)!.tokens.push(token);
+  }
+  return segments;
+}
+
+/** A statement's words: no operators, quoted heredoc data or redirection targets (a process substitution and a here-string stay). */
+function segmentWords(segment: readonly ShellToken[]): ShellToken[] {
   const words: ShellToken[] = [];
-  let afterRedirect = false;
+  let skipNext = false;
   for (const token of segment) {
-    if (token.operator) { afterRedirect = [">", ">>", "<", "<<", "<<<", ">|", "&>", ">&"].includes(token.value); continue; }
-    if (afterRedirect || token.data) { afterRedirect = false; continue; }
+    if (token.operator) { skipNext = REDIRECT_OPERATORS.has(token.value); continue; }
+    const skip = skipNext && !token.value.startsWith("(");
+    skipNext = false;
+    if (skip || token.data) continue;
     words.push(token);
   }
-  let start = 0;
-  while (start < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[start]!.value) || ["if", "then", "elif", "else", "while", "until", "do", "!", "(", "{"].includes(words[start]!.value))) start += 1;
-  const argv = words.slice(start);
-  return argv.length > 0 ? argv : undefined;
+  return words;
 }
 
-function commandBaseName(token: ShellToken | undefined): string | undefined {
-  if (!token) return undefined;
-  return token.value.replace(/^\(+/u, "").split(/[\\/]/u).at(-1)?.toLowerCase();
+/** The command a word would run: the basename, with a leading `(`, `$(`, `<(`, backtick or `{` and trailing `)`/`;` stripped. */
+function floorCommandName(token: ShellToken | undefined): string | undefined {
+  if (!token || token.operator) return undefined;
+  const bare = token.value.replace(/^(?:\$\(|<\(|>\(|[({`])+/u, "").replace(/[)`;]+$/u, "");
+  const name = bare.split(/[\\/]/u).at(-1);
+  return name ? name.toLowerCase() : undefined;
 }
 
-/** Strip wrappers (`sudo`, `env VAR=x`, `timeout 5`, `nohup`, …) down to the command that really runs. */
-function unwrapCommand(argv: readonly ShellToken[]): { name: string | undefined; args: ShellToken[] } {
-  let rest = [...argv];
-  for (let guard = 0; guard < 8; guard += 1) {
-    const name = commandBaseName(rest[0]);
-    if (name === undefined) return { name: undefined, args: [] };
-    const positionals = COMMAND_WRAPPERS.get(name);
-    if (positionals === undefined) return { name, args: rest.slice(1) };
-    let cursor = 1;
-    while (cursor < rest.length) {
-      const word = rest[cursor]!.value;
-      if (name === "env" && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(word)) { cursor += 1; continue; }
-      if (word === "--") { cursor += 1; break; }
-      if (!word.startsWith("-") || word === "-") break;
-      cursor += WRAPPER_VALUE_OPTIONS.has(word) ? 2 : 1;
+/** The bodies of `$(…)`, `<(…)`, `>(…)` and backticks outside single quotes. */
+function substitutionBodies(command: string): string[] {
+  const bodies: string[] = [];
+  let single = false;
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index]!;
+    if (character === "\\" && !single) { index += 1; continue; }
+    if (character === "'") { single = !single; continue; }
+    if (single) continue;
+    if (character === "`") {
+      const close = command.indexOf("`", index + 1);
+      if (close < 0) break;
+      bodies.push(command.slice(index + 1, close));
+      index = close;
+      continue;
     }
-    rest = rest.slice(cursor + positionals);
+    if (character === "(" && index > 0 && "$<>".includes(command[index - 1]!)) {
+      let level = 1;
+      let cursor = index + 1;
+      for (; cursor < command.length && level > 0; cursor += 1) {
+        if (command[cursor] === "(") level += 1;
+        else if (command[cursor] === ")") level -= 1;
+      }
+      bodies.push(command.slice(index + 1, level === 0 ? cursor - 1 : cursor));
+      index = cursor - 1;
+    }
   }
-  return { name: commandBaseName(rest[0]), args: rest.slice(1) };
+  return bodies;
+}
+
+/**
+ * Names whose value the floor can still tell: `NAME=$(mktemp …)` is a fresh
+ * entry under the temp directory, `for NAME in *.tmp` is that glob, and
+ * `$HOME`/`$TMPDIR` are the process's own — each only while the command
+ * does not assign the name again.
+ */
+function floorBindings(command: string, tokens: readonly ShellToken[], inherited: ReadonlyMap<string, string>): Map<string, string> {
+  const bindings = new Map(inherited);
+  const assignedOnce = (name: string): boolean => (command.match(new RegExp(`(?:^|[^A-Za-z0-9_])${name}=`, "gu")) ?? []).length <= 1
+    && !new RegExp(`\\b(?:read|for|local|declare|typeset|export)\\b[^;&|\\n]*\\b${name}\\b(?!=)`, "u").test(command.replace(new RegExp(`\\bfor\\s+${name}\\s+in\\b`, "u"), ""));
+  for (const [name, value] of [["HOME", homedir()], ["TMPDIR", tmpdir()]] as const) {
+    if (!bindings.has(name) && !new RegExp(`(?:^|[^A-Za-z0-9_])${name}=|\\b(?:read|for|export)\\b[^;&|\\n]*\\b${name}\\b`, "u").test(command)) bindings.set(name, value);
+  }
+  for (const match of command.matchAll(/(?:^|[\s;&|(])([A-Za-z_][A-Za-z0-9_]*)=["']?\$\(\s*mktemp\b([^)]*)\)/gu)) {
+    const name = match[1]!;
+    if (!assignedOnce(name)) { bindings.delete(name); continue; }
+    const words = match[2]!.trim().split(/\s+/u).filter(Boolean);
+    let directory: string | undefined = tmpdir();
+    for (let index = 0; index < words.length; index += 1) {
+      const word = words[index]!;
+      if (word === "-p" || word === "--tmpdir") directory = words[index + 1];
+      else if (word.startsWith("--tmpdir=")) directory = word.slice("--tmpdir=".length);
+      else if (!word.startsWith("-") && word.includes("/")) directory = dirname(word);
+      if (word === "-p") index += 1;
+    }
+    if (directory !== undefined && /^\$\{?TMPDIR\}?(?=\/|$)/u.test(directory)) directory = tmpdir() + directory.replace(/^\$\{?TMPDIR\}?/u, "");
+    if (directory === undefined || !isAbsolute(directory) || /[$`*?[{~]/u.test(directory)) bindings.delete(name);
+    else bindings.set(name, join(directory, `mktemp-${name}`));
+  }
+  for (let index = 0; index + 2 < tokens.length; index += 1) {
+    if (tokens[index]!.value !== "for" || tokens[index + 2]!.value !== "in") continue;
+    const name = tokens[index + 1]!.value;
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name)) continue;
+    const items: string[] = [];
+    let literal = true;
+    for (let cursor = index + 3; cursor < tokens.length; cursor += 1) {
+      const item = tokens[cursor]!;
+      if (item.operator || item.value === "do") break;
+      if (item.data || /[$`]/u.test(item.value)) literal = false;
+      items.push(item.value);
+    }
+    if (literal && items.some((item) => /[*?[]/u.test(item)) && assignedOnce(name)) bindings.set(name, items.join(" "));
+  }
+  return bindings;
+}
+
+function applyFloorBindings(tokens: readonly ShellToken[], bindings: ReadonlyMap<string, string>): ShellToken[] {
+  if (bindings.size === 0) return [...tokens];
+  return tokens.map((token) => {
+    if (token.operator || token.data || !token.dynamic) return token;
+    const value = token.value.replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?::?[-?=+][^}]*)?\}|([A-Za-z_][A-Za-z0-9_]*))/gu,
+      (match, braced: string | undefined, bare: string | undefined) => bindings.get(braced ?? bare ?? "") ?? match);
+    if (value === token.value) return token;
+    return { ...token, value, dynamic: /[$`*?[\]{}~]/u.test(value) };
+  });
 }
 
 /** The directory a `cd`/`pushd` leads to, or undefined when a static reading cannot tell. */
@@ -304,26 +445,20 @@ function resolveCd(args: readonly ShellToken[], directory: string | undefined): 
   const target = args.find((token) => !token.value.startsWith("-") || token.value === "-");
   if (!target) return homedir();
   if (target.value === "-") return undefined;
-  const literal = literalPath(target);
-  if (literal === undefined) return undefined;
+  const value = target.value.replace(/[)`;]+$/u, "");
+  let literal = value;
+  if (target.dynamic) {
+    if (literal === "~" || literal.startsWith("~/")) literal = homedir() + literal.slice(1);
+    if (/[$`*?[{~]/u.test(literal)) return undefined;
+  }
   if (isAbsolute(literal)) return resolve(literal);
   return directory === undefined ? undefined : resolve(directory, literal);
 }
 
-/** A target's text with `~` expanded, or undefined when it is not literal. */
-function literalPath(token: ShellToken): string | undefined {
-  let value = token.value;
-  if (!token.dynamic) return value;
-  if (value === "~" || value.startsWith("~/")) value = homedir() + value.slice(1);
-  if (/[$`]/u.test(value) || value.startsWith("~")) return undefined;
-  return value;
-}
-
-/** The paths a delete or move command acts on, or undefined when the command deletes nothing. */
 /**
- * What a command would delete or move away. `contentsOnly` marks a find whose
- * name/path filter picks entries under its start paths rather than the whole
- * tree, so a start at the task directory itself is fine.
+ * What a command would delete or move away. `contentsOnly` marks a target
+ * whose own directory survives (a filtered find, `git clean -C`), so a start at
+ * the task directory itself is fine.
  */
 function deleteTargets(name: string, args: readonly ShellToken[]): { targets: ShellToken[]; contentsOnly?: boolean } | undefined {
   if (DELETE_COMMANDS.has(name)) {
@@ -354,10 +489,25 @@ function deleteTargets(name: string, args: readonly ShellToken[]): { targets: Sh
     const starts = expression < 0 ? [...args] : args.slice(0, expression);
     const rest = expression < 0 ? [] : args.slice(expression);
     const deletes = rest.some((token, index) => token.value === "-delete"
-      || (FIND_EXEC_ACTIONS.has(token.value) && DELETE_COMMANDS.has(commandBaseName(rest[index + 1]) ?? "")));
+      || (FIND_EXEC_ACTIONS.has(token.value) && DELETE_COMMANDS.has(floorCommandName(rest[index + 1]) ?? "")));
     if (!deletes) return undefined;
-    const contentsOnly = rest.some((token) => FIND_NAME_FILTERS.has(token.value));
+    const startValues = starts.length > 0 ? starts.map((token) => token.value) : ["."];
+    // A filter keeps the start directory only when every branch of the
+    // expression passes it and it cannot match Git's own store.
+    const branches = rest.some((token) => ["!", "-not", "-o", "-or", ","].includes(token.value));
+    const filters = rest.flatMap((token, index) => (FIND_NAME_FILTERS.has(token.value) ? [{ kind: token.value, pattern: rest[index + 1]?.value }] : []));
+    const contentsOnly = !branches && filters.length > 0 && filters.every(({ kind, pattern }) => pattern !== undefined && !findFilterReachesGit(kind, pattern, startValues));
     return { targets: starts.length > 0 ? starts : [{ value: ".", operator: false, dynamic: false }], contentsOnly };
+  }
+  if (name === "rsync") {
+    const words = args.map((token) => token.value);
+    const removesSources = words.includes("--remove-source-files");
+    if (!removesSources && !words.some((word) => word.startsWith("--delete"))) return undefined;
+    // A `host:path` operand is remote and outside this floor.
+    const operands = args.filter((token) => !token.value.startsWith("-") && !/^[^/]*:/u.test(token.value));
+    const destination = args.filter((token) => !token.value.startsWith("-")).at(-1);
+    const targets = removesSources ? operands : operands.filter((token) => token === destination);
+    return { targets };
   }
   if (name === "git") {
     const words = args.map((token) => token.value.toLowerCase());
@@ -377,8 +527,29 @@ function deleteTargets(name: string, args: readonly ShellToken[]): { targets: Sh
       }
       return targets.length > 0 ? { targets, contentsOnly: true } : undefined;
     }
+    // A forced worktree removal throws away its uncommitted files.
+    if (verb === "worktree" && words[subcommand + 1] === "remove" && words.some((word) => word === "-f" || word === "--force")) {
+      const path = args.slice(subcommand + 2).find((token) => !token.value.startsWith("-"));
+      return path ? { targets: [path] } : undefined;
+    }
   }
   return undefined;
+}
+
+/** True when a find name/path/regex filter could select `.git` or a file inside it. */
+function findFilterReachesGit(kind: string, pattern: string, starts: readonly string[]): boolean {
+  if (kind === "-name" || kind === "-iname") return GIT_STORE_PROBES.some((probe) => globMatches(pattern, probe.split("/").at(-1)!));
+  const candidates = GIT_STORE_PROBES.flatMap((probe) => ["./", ...starts.map((start) => `${start.replace(/\/+$/u, "")}/`)].map((prefix) => `${prefix}${probe}`));
+  let matcher: RegExp;
+  try {
+    if (kind === "-regex" || kind === "-iregex") matcher = new RegExp(`^(?:${pattern})$`, kind === "-iregex" ? "iu" : "u");
+    else {
+      // find's -path wildcards also match `/`.
+      const source = pattern.replace(/[.+^${}()|\\]/gu, "\\$&").replace(/\*/gu, ".*").replace(/\?/gu, ".");
+      matcher = new RegExp(`^${source}$`, kind === "-ipath" || kind === "-iwholename" ? "iu" : "u");
+    }
+  } catch { return true; }
+  return candidates.some((candidate) => matcher.test(candidate));
 }
 
 /** Index of git's subcommand in its argv, after global options such as `-C dir` and `-c k=v`. */
@@ -390,37 +561,104 @@ function gitSubcommandIndexOf(words: readonly string[]): number {
   return index;
 }
 
-function judgeDeleteTarget(target: ShellToken, directory: string | undefined, roots: { cwd: string; others: string[] }, name: string, contentsOnly = false): string | undefined {
+/** Brace expansion is textual: every alternative a word can spell, or undefined past a sane count. `{a..z}` ranges stand for a wildcard. */
+function expandBraces(word: string): string[] | undefined {
+  const results: string[] = [];
+  const pending = [word];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    const group = firstBraceGroup(current);
+    if (!group) { results.push(current); continue; }
+    for (const part of group.parts) pending.push(current.slice(0, group.start) + part + current.slice(group.end + 1));
+    if (pending.length + results.length > 256) return undefined;
+  }
+  return results;
+}
+
+function firstBraceGroup(word: string): { start: number; end: number; parts: string[] } | undefined {
+  for (let start = word.indexOf("{"); start >= 0; start = word.indexOf("{", start + 1)) {
+    let level = 0;
+    const commas: number[] = [];
+    let end = -1;
+    for (let cursor = start; cursor < word.length; cursor += 1) {
+      const character = word[cursor];
+      if (character === "{") level += 1;
+      else if (character === "}") { level -= 1; if (level === 0) { end = cursor; break; } }
+      else if (character === "," && level === 1) commas.push(cursor);
+    }
+    if (end < 0) return undefined;
+    const inner = word.slice(start + 1, end);
+    if (commas.length > 0) {
+      const bounds = [start, ...commas, end];
+      return { start, end, parts: bounds.slice(0, -1).map((bound, index) => word.slice(bound + 1, bounds[index + 1])) };
+    }
+    if (/^[^{}]+\.\.[^{}]+$/u.test(inner)) return { start, end, parts: ["*"] };
+  }
+  return undefined;
+}
+
+function judgeDeleteTarget(target: ShellToken, directory: string | undefined, roots: FloorRoots, name: string, contentsOnly = false): string | undefined {
   const verb = name === "mv" ? "move" : name === "git" ? "prune" : "delete";
-  const literal = literalPath(target);
-  if (literal === undefined) return `Worker cannot ${verb} a path that is only known at run time (${target.value}); name it literally`;
-  if (!isAbsolute(literal) && directory === undefined) return `Worker cannot ${verb} a relative path after a cd the policy cannot follow (${target.value})`;
-  // A glob is judged by its literal directory part and must not reach hidden
-  // entries (`.*` would take `.git` with it) or span a whole root.
-  const globAt = target.dynamic ? literal.search(/[*?[{]/u) : -1;
-  const literalPart = globAt < 0 ? literal : literal.slice(0, globAt);
-  const base = globAt < 0 ? literalPart : literalPart.slice(0, literalPart.lastIndexOf("/") + 1);
-  const absolute = resolve(directory ?? "/", base || ".");
-  const resolved = resolveForDelete(absolute, globAt < 0 && !literal.endsWith("/"));
-  if (globAt >= 0 && literal.slice(literalPart.lastIndexOf("/") + 1).startsWith(".")) return `Worker cannot ${verb} hidden entries with a glob (${target.value})`;
-  if (resolved.split("/").some((segment) => segment === ".git")) return `Worker cannot ${verb} Git's own store (${target.value}); with no remote authority the local commits are the only copy`;
+  let value = target.value;
+  let dynamic = target.dynamic;
+  if (directory !== undefined && /\$(?:\{PWD\}|PWD(?![A-Za-z0-9_]))/u.test(value)) {
+    value = value.replace(/\$(?:\{PWD\}|PWD(?![A-Za-z0-9_]))/gu, directory);
+    dynamic = /[$`*?[\]{}~]/u.test(value);
+  }
+  const alternatives = dynamic && value.includes("{") ? expandBraces(value) : [value];
+  if (!alternatives) return `Worker cannot ${verb} a brace expansion this large (${target.value}); name the paths`;
+  for (const alternative of alternatives) {
+    // A value bound from a loop or a split word holds several paths.
+    for (const part of alternative.split(/\s+/u).filter(Boolean)) {
+      const violation = judgeDeletePath(part, dynamic, target.value, directory, roots, name, verb, contentsOnly);
+      if (violation) return violation;
+    }
+  }
+  return undefined;
+}
+
+function judgeDeletePath(path: string, dynamic: boolean, shown: string, directory: string | undefined, roots: FloorRoots, name: string, verb: string, contentsOnly: boolean): string | undefined {
+  let literal = path;
+  if (dynamic) {
+    if (literal === "~" || literal.startsWith("~/")) literal = homedir() + literal.slice(1);
+    if (/[$`]/u.test(literal) || literal.startsWith("~")) return `Worker cannot ${verb} a path that is only known at run time (${shown}); name it literally`;
+  }
+  if (!isAbsolute(literal) && directory === undefined) return `Worker cannot ${verb} a relative path after a cd the policy cannot follow (${shown})`;
+  // A glob is judged by the literal directory before it; what follows must not
+  // climb out (`*/../..`), reach hidden entries (`.*` would take `.git`) or name `.git`.
+  const segments = literal.split("/");
+  const globAt = dynamic ? segments.findIndex((segment) => /[*?[]/u.test(segment)) : -1;
+  if (globAt >= 0) {
+    for (const segment of segments.slice(globAt)) {
+      if (segment === "..") return `Worker cannot ${verb} through a glob followed by .. (${shown})`;
+      if (segment === ".git") return `Worker cannot ${verb} Git's own store (${shown}); with no remote authority the local commits are the only copy`;
+      if (/[*?[]/u.test(segment) && (segment.startsWith(".") || /^\[[^\]]*\./u.test(segment))) return `Worker cannot ${verb} hidden entries with a glob (${shown})`;
+    }
+  }
+  const base = globAt < 0 ? literal : (segments.slice(0, globAt).join("/") || (literal.startsWith("/") ? "/" : "."));
+  const resolved = resolveForDelete(resolve(directory ?? "/", base), globAt < 0 && !literal.endsWith("/"));
   // Checked first: a task under a shared root (/tmp) must still not take its own parent.
-  if (roots.cwd.startsWith(resolved === "/" ? "/" : `${resolved}/`)) return `Worker cannot ${verb} a directory that contains the task (${target.value})`;
+  if (roots.cwd.startsWith(resolved === "/" ? "/" : `${resolved}/`)) return `Worker cannot ${verb} a directory that contains the task (${shown})`;
   const within = (root: string): boolean => resolved === root || resolved.startsWith(root === "/" ? "/" : `${root}/`);
+  if (resolved.split("/").includes(".git")) {
+    // A lock left by an interrupted git command is routine to clear.
+    const staleLock = globAt < 0 && (name === "rm" || name === "unlink") && within(roots.cwd) && resolved.endsWith(".lock");
+    if (!staleLock) return `Worker cannot ${verb} Git's own store (${shown}); with no remote authority the local commits are the only copy`;
+  }
   if (within(roots.cwd)) {
     if (resolved === roots.cwd && globAt < 0 && !contentsOnly) {
       return name === "find"
-        ? `Worker cannot delete the whole task tree with find (${target.value}); it would take .git too — filter with -name/-path`
-        : `Worker cannot ${verb} the task directory itself (${target.value})`;
+        ? `Worker cannot delete the whole task tree with find (${shown}); it would take .git too — filter with -name/-path`
+        : `Worker cannot ${verb} the task directory itself (${shown})`;
     }
     return undefined;
   }
   const other = roots.others.find(within);
   if (other !== undefined) {
-    if (resolved === other) return `Worker cannot ${verb} ${globAt < 0 ? "a whole" : "everything at the top of a"} shared directory (${target.value})`;
+    if (resolved === other) return `Worker cannot ${verb} ${globAt < 0 ? "a whole" : "everything at the top of a"} shared directory (${shown})`;
     return undefined;
   }
-  return `Worker cannot ${verb} outside the task directory (${target.value})`;
+  return `Worker cannot ${verb} outside the task directory (${shown})`;
 }
 
 /**
