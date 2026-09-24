@@ -11,6 +11,7 @@ import { redactSensitive } from "./redaction.ts";
 import { assertAutomaticClaudePermissionConfiguration, assertTrustedAutomaticClaudeExecutable, automaticClaudeArgs, automaticWorkerEnvironment, type AutomaticClaudeArgOptions } from "./worker/environment.ts";
 import { normalizeReviewReport, type ReviewInput, type TaskReviewer } from "./reviewer.ts";
 import { attachCommand } from "./worker/tmux-adapter.ts";
+import { isWorkerInputError } from "./worker/input-error.ts";
 import type { HookEventSource } from "./hooks/types.ts";
 import type {
   AcceptanceReport,
@@ -27,6 +28,11 @@ import type {
   WorkerStartInput,
   WorkerStatus,
 } from "./types.ts";
+
+/** Deferred re-sends of a decision's message the Worker could not take yet, before the task is parked. */
+const MAX_INPUT_RETRIES = 5;
+const DEFAULT_INPUT_RETRY_BASE_MS = 15_000;
+const MAX_INPUT_RETRY_DELAY_MS = 60_000;
 
 const DEFAULT_REVIEW_TIMEOUT_MS = 600_000;
 /** A repair round shorter than this cannot finish inside the close-out window; block the candidate instead. */
@@ -115,6 +121,12 @@ export interface SupervisorStartOptions {
   noOutputTimeoutMs?: number;
   /** After a `wait` decision, how long the Worker may stay silent before the Decision Worker is asked again; defaults to 10 minutes. Set to 0 to disable. */
   waitTimeoutMs?: number;
+  /**
+   * First delay before a decision's message is sent again after the Worker
+   * could not take input (busy prompt, banner, leftover input); doubles per
+   * attempt up to a minute, for at most five attempts. Defaults to 15 s.
+   */
+  inputRetryBaseMs?: number;
   /** Human approval for a review-level worker command. */
   approval?: { actor: "human"; reason: string };
   /** Adopt an existing tmux session instead of starting a new worker. */
@@ -244,6 +256,10 @@ export class Supervisor {
   /** Armed by a `wait` decision: re-asks the Decision Worker if the Worker never resumes on its own. */
   #waitTimer?: NodeJS.Timeout;
   #waitTimeoutMs = 10 * 60_000;
+  /** Re-applies a decision whose message the Worker could not take yet; any fresh Worker activity clears it with the wait timer. */
+  #inputRetryTimer?: NodeJS.Timeout;
+  #inputRetry?: { event: WorkerEvent; attempts: number };
+  #inputRetryBaseMs = DEFAULT_INPUT_RETRY_BASE_MS;
   #turn = 0;
   #repairRound = 0;
   #lastFindingSignature?: string;
@@ -403,6 +419,8 @@ export class Supervisor {
     this.#deadlineNotices = { approaching: false, reached: false, warningReplayed: false };
     this.#noOutputTimeoutMs = options.noOutputTimeoutMs ?? DEFAULT_NO_OUTPUT_TIMEOUT_MS;
     this.#waitTimeoutMs = options.waitTimeoutMs ?? 10 * 60_000;
+    this.#inputRetryBaseMs = Math.max(0, options.inputRetryBaseMs ?? DEFAULT_INPUT_RETRY_BASE_MS);
+    this.#inputRetry = undefined;
     this.#noOutputBaselineAt = undefined;
     this.#verificationAbortController = undefined;
     this.#progressPhase = undefined;
@@ -998,13 +1016,16 @@ export class Supervisor {
         await this.#appendDecisionIgnored(event, undefined);
         return;
       }
+      // A decision whose message the Worker could not take is not a model
+      // failure; say which one it was, so the operator looks in the right place.
+      const inputFailure = isWorkerInputError(error);
       await this.#appendEvent({
-        type: "decision_worker_failed",
+        type: inputFailure ? "worker_input_failed" : "decision_worker_failed",
         taskId: this.#task?.taskId,
         workerId: event.handle.id,
         data: { eventType: event.type, error: safeMessage(error) },
       });
-      await this.#parkCandidate(`Decision Worker API failed: ${safeMessage(error)}`, event);
+      await this.#parkCandidate(`${inputFailure ? "Worker input failed" : "Decision Worker API failed"}: ${safeMessage(error)}`, event);
     });
   }
 
@@ -1090,7 +1111,7 @@ export class Supervisor {
         if (await this.#decisionIsStale(event)) return;
         if (await this.#verifyOnTurnBudget(handle, event, action)) return;
         if (await this.#verifyStaleFailure(handle, event, action)) return;
-        await this.#sendInternal(action.message);
+        await this.#sendDecisionMessage(action.message, action, event);
         return;
       }
       if (action.action === "wait") {
@@ -1154,9 +1175,47 @@ export class Supervisor {
         if (await this.#decisionIsStale(event)) return;
         if (await this.#verifyOnTurnBudget(handle, event, action)) return;
         if (await this.#verifyStaleFailure(handle, event, action)) return;
-        await this.#sendInternal(message);
+        await this.#sendDecisionMessage(message, action, event);
       }
     });
+  }
+
+  /**
+   * Send a decision's message. A Worker that cannot take input yet (the
+   * prompt stayed busy, showed a banner or leftover text through the
+   * adapter's own wait) has received nothing, so the same decision is
+   * applied again later instead of parking the task; only after
+   * MAX_INPUT_RETRIES deferrals is it parked, with the real reason.
+   */
+  async #sendDecisionMessage(message: string, action: DecisionAction, event: WorkerEvent): Promise<void> {
+    try {
+      await this.#sendInternal(message);
+    } catch (error) {
+      if (!isWorkerInputError(error) || !error.retryable) throw error;
+      await this.#deferDecisionInput(action, event, error);
+      return;
+    }
+    if (this.#inputRetry?.event === event) this.#inputRetry = undefined;
+  }
+
+  async #deferDecisionInput(action: DecisionAction, event: WorkerEvent, error: Error): Promise<void> {
+    const attempts = (this.#inputRetry?.event === event ? this.#inputRetry.attempts : 0) + 1;
+    if (attempts > MAX_INPUT_RETRIES) {
+      this.#inputRetry = undefined;
+      await this.#parkCandidate(`the Worker did not accept input after ${MAX_INPUT_RETRIES} deferred attempts: ${safeMessage(error)}`, event);
+      return;
+    }
+    this.#inputRetry = { event, attempts };
+    const delayMs = Math.min(MAX_INPUT_RETRY_DELAY_MS, this.#inputRetryBaseMs * 2 ** (attempts - 1));
+    await this.#appendEvent({ type: "worker_input_deferred", taskId: this.#task?.taskId, workerId: event.handle.id, data: { action: action.action, attempt: attempts, delayMs, error: safeMessage(error), eventType: event.type } }).catch(() => {});
+    // The same decision is applied again, so it must not be deduplicated away.
+    this.#handledEvents.delete(`${workerEventKey(event)}:${action.action}`);
+    this.#clearWaitTimer();
+    this.#inputRetryTimer = setTimeout(() => {
+      this.#inputRetryTimer = undefined;
+      void this.#applyDecision(action, event).catch((retryError) => this.#decisionFailure(event, retryError));
+    }, delayMs);
+    this.#inputRetryTimer.unref?.();
   }
 
   /**
@@ -1304,6 +1363,10 @@ export class Supervisor {
   #clearWaitTimer(): void {
     if (this.#waitTimer) clearTimeout(this.#waitTimer);
     this.#waitTimer = undefined;
+    // A deferred input retry is a pending wait of the same kind: fresh Worker
+    // activity, a new decision or the end of the task supersedes it.
+    if (this.#inputRetryTimer) clearTimeout(this.#inputRetryTimer);
+    this.#inputRetryTimer = undefined;
   }
 
   /**

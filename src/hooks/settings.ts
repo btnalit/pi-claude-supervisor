@@ -13,15 +13,20 @@ interface HookCommandEntry {
 
 export interface HookSettingsDocument {
   hooks: Record<ClaudeHookEventName, Array<{ hooks: HookCommandEntry[] }>>;
+  /**
+   * Off for a supervised session: a suggestion is ghost text in the input
+   * box, which reads as leftover input and holds every send back.
+   */
+  promptSuggestionEnabled: false;
 }
 
-/** A Claude Code settings document that runs `relayCommand` for every hook event the relay supports. */
+/** A Claude Code settings document for a supervised session: runs `relayCommand` for every hook event the relay supports. */
 export function hookSettingsDocument(relayCommand: string): HookSettingsDocument {
   const hooks = {} as HookSettingsDocument["hooks"];
   for (const name of HOOK_EVENT_NAMES) {
     hooks[name] = [{ hooks: [{ type: "command", command: relayCommand, timeout: HOOK_TIMEOUT_SECONDS }] }];
   }
-  return { hooks };
+  return { hooks, promptSuggestionEnabled: false };
 }
 
 /** Writes a standalone settings file (e.g. for `--settings <path>` on an owned interactive session). */
