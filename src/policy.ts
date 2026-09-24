@@ -1,4 +1,4 @@
-import { lstatSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 
@@ -219,8 +219,10 @@ const FLOOR_STOP_COMMANDS = new Set([
 /** Stop-set tools that run an arbitrary command after one of RUNNER_SUBCOMMANDS. */
 const PACKAGE_RUNNERS = new Set(["npm", "pnpm", "yarn", "bun", "uv", "poetry", "conda", "mamba", "micromamba", "cargo", "go"]);
 const RUNNER_SUBCOMMANDS = new Set(["exec", "run", "dlx", "x"]);
+/** Runners that also run a package bin named directly (`yarn rimraf …`). */
+const BIN_RUNNERS = new Set(["yarn", "pnpm", "bun"]);
 /** Git options whose value is message or search text, not shell. */
-const GIT_MESSAGE_OPTIONS = new Set(["-m", "--message", "-F", "--file", "--grep"]);
+const GIT_MESSAGE_OPTIONS = new Set(["-m", "--message", "-F", "--file", "--grep", "-S", "-G"]);
 const REDIRECT_OPERATORS = new Set([">", ">>", "<", "<<", ">|", "&>", ">&"]);
 /** Entries under `.git` a find filter must not be able to match. */
 const GIT_STORE_PROBES = [".git", ".git/HEAD", ".git/index", ".git/config", ".git/packed-refs", ".git/objects", ".git/objects/ab/cdef0123",
@@ -268,7 +270,8 @@ function floorScript(command: string, start: string | undefined, roots: FloorRoo
     // (`sh -lc`, `watch`, `trap`, `su -c`), unless the command only reads text.
     // Package runners run whatever follows `exec`/`run`/`dlx`/`x`; git runs
     // shell text from options (`-c core.pager=…`, `difftool -x`) but not from a message.
-    const runs = head !== undefined && PACKAGE_RUNNERS.has(head) && words.slice(first + 1).some((word) => RUNNER_SUBCOMMANDS.has(word.value));
+    const runs = head !== undefined && PACKAGE_RUNNERS.has(head) && words.slice(first + 1).some((word) => RUNNER_SUBCOMMANDS.has(word.value)
+      || (BIN_RUNNERS.has(head) && DELETE_COMMANDS.has(floorCommandName(word) ?? "")));
     const stops = head !== undefined && FLOOR_STOP_COMMANDS.has(head) && !runs;
     if (!stops) {
       for (let cursor = first + 1; cursor < words.length; cursor += 1) {
@@ -302,7 +305,9 @@ function floorScript(command: string, start: string | undefined, roots: FloorRoo
         continue;
       }
       if (name === "xargs" || name === "parallel") {
-        const inner = words.slice(cursor + 1).find((later) => DELETE_COMMANDS.has(floorCommandName(later) ?? "") || DELETE_WORD.test(later.value));
+        const later = words.slice(cursor + 1);
+        const shell = later.some((word) => SHELL_NAMES.has(floorCommandName(word) ?? "") || floorCommandName(word) === "eval");
+        const inner = later.find((word) => DELETE_COMMANDS.has(floorCommandName(word) ?? "") || (shell && DELETE_WORD.test(word.value)));
         if (inner) return `Worker cannot delete targets taken from input (${name} ${inner.value}); name the paths, or use find -delete inside the task directory`;
         break;
       }
@@ -376,7 +381,7 @@ function floorCommandName(token: ShellToken | undefined): string | undefined {
 
 /** The command with quoted heredoc bodies removed: nothing in them expands, so a backtick there is text. */
 function withoutQuotedHeredocs(command: string): string {
-  return command.replace(/<<-?[ \t]*(['"])([^'"\s]+)\1[^\n]*\n[\s\S]*?(?:\n[ \t]*\2[ \t]*(?=\n|\)|$)|$)/gu, "<<$1$2$1");
+  return command.replace(/<<-?[ \t]*(['"])([^'"\s]+)\1([^\n]*)\n[\s\S]*?(?:\n[ \t]*\2[ \t]*(?=\n|\)|$)|$)/gu, "<<$1$2$1$3");
 }
 
 /** The bodies of `$(…)`, `<(…)`, `>(…)` and backticks outside single quotes. */
@@ -461,7 +466,9 @@ function applyFloorBindings(tokens: readonly ShellToken[], bindings: ReadonlyMap
   if (bindings.size === 0) return [...tokens];
   return tokens.map((token) => {
     if (token.operator || token.data || !token.dynamic) return token;
-    const value = token.value.replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?::?[-?=+][^}]*|[%#]{1,2}[^}]*)?\}|([A-Za-z_][A-Za-z0-9_]*))/gu,
+    // `${f%.bak}` keeps the directory part, so it reads as the bound value; a
+    // `#` prefix strip or a `%` pattern with `/` can drop directories and stays unknown.
+    const value = token.value.replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?::?[-?=+][^}]*|%{1,2}[^}/]*)?\}|([A-Za-z_][A-Za-z0-9_]*))/gu,
       (match, braced: string | undefined, bare: string | undefined) => bindings.get(braced ?? bare ?? "") ?? match);
     if (value === token.value) return token;
     return { ...token, value, dynamic: /[$`*?[\]{}~]/u.test(value) };
@@ -473,6 +480,8 @@ function resolveCd(args: readonly ShellToken[], directory: string | undefined): 
   const target = args.find((token) => !token.value.startsWith("-") || token.value === "-");
   if (!target) return homedir();
   if (target.value === "-") return undefined;
+  // `cd "$(git rev-parse --show-toplevel)"`: the work tree that holds the current directory.
+  if (/^\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)$/u.test(target.value)) return directory === undefined ? undefined : gitTopLevel(directory);
   const value = target.value.replace(/[)`;]+$/u, "");
   let literal = value;
   if (target.dynamic) {
@@ -481,6 +490,13 @@ function resolveCd(args: readonly ShellToken[], directory: string | undefined): 
   }
   if (isAbsolute(literal)) return resolve(literal);
   return directory === undefined ? undefined : resolve(directory, literal);
+}
+
+function gitTopLevel(directory: string): string | undefined {
+  for (let current = resolve(directory); ; current = dirname(current)) {
+    if (existsSync(join(current, ".git"))) return current;
+    if (dirname(current) === current) return undefined;
+  }
 }
 
 /**
@@ -516,8 +532,13 @@ function deleteTargets(name: string, args: readonly ShellToken[]): { targets: Sh
     const expression = args.findIndex((token) => /^[-(!]/u.test(token.value));
     const starts = expression < 0 ? [...args] : args.slice(0, expression);
     const rest = expression < 0 ? [] : args.slice(expression);
-    const deletes = rest.some((token, index) => token.value === "-delete"
-      || (FIND_EXEC_ACTIONS.has(token.value) && DELETE_COMMANDS.has(floorCommandName(rest[index + 1]) ?? "")));
+    const execEnd = (index: number): number => {
+      const end = rest.findIndex((later, cursor) => cursor > index + 1 && (later.value === ";" || later.value === "+"));
+      return end < 0 ? rest.length : end;
+    };
+    // The command an `-exec` runs, read through any wrapper (`sudo`, `env`).
+    const execDelete = (index: number): number => rest.slice(index + 1, execEnd(index)).findIndex((word) => DELETE_COMMANDS.has(floorCommandName(word) ?? ""));
+    const deletes = rest.some((token, index) => token.value === "-delete" || (FIND_EXEC_ACTIONS.has(token.value) && execDelete(index) >= 0));
     if (!deletes) return undefined;
     const startValues = starts.length > 0 ? starts.map((token) => token.value) : ["."];
     // A filter keeps the start directory only when every `-o` branch carries a
@@ -539,10 +560,12 @@ function deleteTargets(name: string, args: readonly ShellToken[]): { targets: Sh
     let refuse: string | undefined;
     rest.forEach((token, index) => {
       if (!FIND_EXEC_ACTIONS.has(token.value)) return;
-      const execName = floorCommandName(rest[index + 1]) ?? "";
-      if (!DELETE_COMMANDS.has(execName)) return;
-      const end = rest.findIndex((later, cursor) => cursor > index + 1 && (later.value === ";" || later.value === "+"));
-      const words = rest.slice(index + 2, end < 0 ? rest.length : end).filter((word) => !word.value.includes("{}"));
+      const offset = execDelete(index);
+      if (offset < 0) return;
+      const execName = floorCommandName(rest[index + 1 + offset]) ?? "";
+      const argv = rest.slice(index + 2 + offset, execEnd(index));
+      if (argv.some((word) => word.value.includes("{}") && word.value !== "{}")) refuse ??= `Worker cannot ${execName} a path built around find's {} (${argv.find((word) => word.value.includes("{}") && word.value !== "{}")!.value}); pass {} alone`;
+      const words = argv.filter((word) => word.value !== "{}");
       const extra = deleteTargets(execName, words)?.targets ?? [];
       if (token.value.endsWith("dir") && extra.some((word) => !isAbsolute(word.value))) refuse ??= `Worker cannot ${execName} a relative path from find ${token.value}; it runs in every matched directory`;
       plain.push(...extra);
