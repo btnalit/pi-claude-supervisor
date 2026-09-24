@@ -1804,8 +1804,20 @@ render();
       await run({
         adapter,
         handle,
-        // Atomic, so the fake never reads a half-written config.
-        setConfig: async (config) => { await writeFile(`${configPath}.tmp`, JSON.stringify(config)); await rename(`${configPath}.tmp`, configPath); await new Promise((resolve) => setTimeout(resolve, 150)); },
+        // Atomic, so the fake never reads a half-written config; returns once the
+        // pane shows it, since a loaded CI runner can lag the fake's 30 ms poll.
+        setConfig: async (config) => {
+          await writeFile(`${configPath}.tmp`, JSON.stringify(config));
+          await rename(`${configPath}.tmp`, configPath);
+          const deadline = Date.now() + 5_000;
+          for (;;) {
+            const screen = spawnSync("tmux", ["-S", socketPath, "capture-pane", "-p", "-t", sessionName], { encoding: "utf8" }).stdout ?? "";
+            if (screen.includes("esc to interrupt") === config.busy) break;
+            if (Date.now() > deadline) throw new Error(`fake TUI did not show busy=${config.busy}`);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        },
         submitted,
         socketPath,
         sessionName,
