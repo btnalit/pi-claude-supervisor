@@ -15,7 +15,7 @@ test("legacy tasks receive a default acceptance check", () => {
   assert.equal(spec.goal, "inspect the repository");
   assert.deepEqual(spec.acceptance.map((check) => check.id), ["diff-check"]);
   assert.equal(spec.maxRepairRounds, 3);
-  assert.deepEqual(spec.autonomy, { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
+  assert.deepEqual(spec.autonomy, { unattended: true, requireLocalCommit: true, maxDecisionRetries: 4, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
 });
 
 test("task specs validate checks and reject duplicate ids", () => {
@@ -213,5 +213,5 @@ test("a spec file that omits a key, or the whole autonomy block, keeps the opera
   const partial = normalizeTaskSpec({ goal: "g", autonomy: { remoteAuthority: "none", unattended: true } }, "g", defaults).autonomy;
   assert.deepEqual(partial, { ...defaults, remoteAuthority: "none", unattended: true });
   // Without defaults the hardcoded values still apply.
-  assert.deepEqual(normalizeTaskSpec({ goal: "g" }, "g").autonomy, { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
+  assert.deepEqual(normalizeTaskSpec({ goal: "g" }, "g").autonomy, { unattended: true, requireLocalCommit: true, maxDecisionRetries: 4, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
 });

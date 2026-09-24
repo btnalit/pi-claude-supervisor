@@ -202,8 +202,11 @@ stream-json` 的方式运行 Claude,完全没有终端界面;一旦设置
   时间。只有收尾窗口也耗尽,Worker 才会被硬停(`worker_watchdog_timeout`);对
   接管的交互式会话来说这个硬停只是 release:Claude 继续运行,但不再受监督。
   收尾窗口只属于自动模式任务;手动任务仍在到期时停止,`DEADLINE_GRACE_MS=0`
-  让自动任务也恢复这一行为。20 分钟无输出 watchdog(`NO_OUTPUT_TIMEOUT_MS`)
-  随时会停止沉默的 Worker。
+  让自动任务也恢复这一行为。20 分钟无输出 watchdog(`NO_OUTPUT_TIMEOUT_MS`,
+  从 Worker 最后一次输出或 Supervisor 最后一次发给它的消息起算)会停止在一轮
+  中途沉默的 Worker;自动模式下只是空闲了这么久的 Worker(在等永远没回来的
+  后台工作)则改为直接验收(`worker_idle_timeout`),人工接管中的 Worker 不会
+  因沉默超时。
 - 验收命令、证据收集和 Reviewer 共用一个 abort signal,因此 stop 或 shutdown
   不必等待完整的命令或模型超时。
 - 每个任务只持有一个 cwd 租约;并发任务需要各自独立的 worktree。
@@ -285,7 +288,7 @@ commit,通知能说清已验证的 commit 是否在工作树变动之前就已�
   "autonomy": {
     "unattended": true,
     "requireLocalCommit": true,
-    "maxDecisionRetries": 2,
+    "maxDecisionRetries": 4,
     "permissionAuthority": "hybrid",
     "maxWorkerCostUsd": 20
   }
@@ -298,7 +301,9 @@ commit,通知能说清已验证的 commit 是否在工作树变动之前就已�
 ## 配置参考
 
 环境变量(或 `~/.config/pi-claude-supervisor/env`),均以 `PI_CLAUDE_SUPERVISOR_`
-为前缀;完整模板见 `.env.example`。
+为前缀;完整模板见 `.env.example`。env 文件每行是 `KEY=value`,可以带 `export `
+前缀和行尾 ` # 注释`。数值、时长或布尔类配置超出范围或无法解析时会沿用默认值,
+并以 `pi-claude-supervisor: ignoring …` 警告报告一次。
 
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -321,7 +326,7 @@ commit,通知能说清已验证的 commit 是否在工作树变动之前就已�
 | `HUMAN_WEBHOOK_SECRET` | 未设置 | HMAC 签名密钥;以 `x-pi-supervisor-signature` header 发送 |
 | `UNATTENDED` | `true` | 任务无需同步人工回调即可运行 |
 | `REQUIRE_LOCAL_COMMIT` | `true` | 完成前要求在候选所在分支上有本地 commit |
-| `MAX_DECISION_RETRIES` | `2`(0–10) | Decision Worker 调用超时或失败(429/529、网络、鉴权)时的重试次数 |
+| `MAX_DECISION_RETRIES` | `4`(0–10) | Decision Worker 调用超时或失败(429/529、网络、鉴权)时的重试次数;两次尝试之间依次等待 15s、45s、60s |
 | `PERMISSION_AUTHORITY` | `hybrid` | `policy` \| `hybrid` \| `decision-worker` |
 | `REMOTE_AUTHORITY` | `none` | `none` \| `push` \| `pr`;验收通过后开启发布阶段。`--remote` 可按任务覆盖 |
 | `REMOTE_NAME` | `origin` | 发布授权唯一允许的 remote 名 |
@@ -336,8 +341,8 @@ commit,通知能说清已验证的 commit 是否在工作树变动之前就已�
 | `DECISION_SESSION_RETENTION_DAYS` | `30` | 启动时清理早于此天数的已关闭 Decision Worker session 记录;`0` 表示永久保留 |
 | `EVIDENCE_MAX_BYTES` | `1048576`(1 MiB) | 每个任务收集的最大仓库证据字节数 |
 | `EVIDENCE_MAX_UNTRACKED_FILES` | `512` | 每个任务作为证据收集的最大未跟踪文件数 |
-| `REVIEW_TIMEOUT_MS` | `600000`(10 分钟) | 每轮独立 Reviewer 的总预算,含一次针对 provider 错误的重试 |
-| `DEADLINE_MS` | `4h` | 每个任务的累计总时限(`8h`、`90m`、`2h30m` 或毫秒;5 分钟到 7 天);`0`(或 `0m`)关闭;`--deadline` 可按任务覆盖 |
+| `REVIEW_TIMEOUT_MS` | `10m`(30s–1h) | 每轮独立 Reviewer 的总预算;预算未用完时,provider 错误会用新会话重试 |
+| `DEADLINE_MS` | `4h` | 每个任务从启动起算的墙钟总时限,Pi 停机期间也计入,因此恢复时用 `recover --extend` 重新给预算(`8h`、`90m`、`2h30m` 或毫秒;5 分钟到 7 天);`0`(或 `0m`)关闭;`--deadline` 可按任务覆盖 |
 | `DEADLINE_GRACE_MS` | `30m` | 自动任务到期后的收尾窗口:空闲的 Worker 会被验收而不是停止;`0` 恢复到期立即停止 |
 | `DEADLINE_WARNING_MS` | `15m` | 到期前多久提醒并重新询问 Decision Worker;`0` 关闭提醒 |
 | `NO_OUTPUT_TIMEOUT_MS` | `20m` | Worker 多久没有输出就停止;`0` 关闭该检查 |
@@ -358,7 +363,10 @@ Worker,它不会静默恢复或重复执行任务。只有在租约证明旧 Wor
 会拒绝它;`recover --takeover --extend <duration> <task-id>` 从现在起再给这么
 多预算(恢复后的 Supervisor 会把新时限持久化),`--extend 0` 则立即进入收尾:
 新 Worker 的第一个 watchdog tick 就会对仓库现状做验收和 review,修复轮会告诉
-它还剩多少时间。确定不再恢复的记录用 `/supervise discard <task-id>` 丢弃
+它还剩多少时间。带 `--extend` 时,恢复的任务会直接交回自动化:非零的延长会
+给新 Worker 发送原任务的续做指令(先让它查看已有的工作),`--extend 0` 则无需
+指令。不带 `--extend` 的普通 `recover` 仍让 Worker 在人工接管下空闲——先发送
+续做指令,再执行 `resume-auto`。确定不再恢复的记录用 `/supervise discard <task-id>` 丢弃
 (会话文件保留到保留期清理为止)。
 
 每个任务在 `CWD_LEASE_DIR` 下持有一个 cwd 租约;并发任务需要各自独立的

@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { lstat, open, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
 import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_DECISION_RETRIES } from "./config.ts";
 import { extractJsonObjects } from "./json-extract.ts";
 import type { PiUsageSample, TaskSpec, WorkerEvent } from "./types.ts";
 import { redactSensitive } from "./redaction.ts";
@@ -28,6 +29,16 @@ export interface DecisionContext {
   spec?: TaskSpec;
   /** Wall-clock budget of the task; absent when no deadline is configured. */
   deadline?: DecisionDeadlineContext;
+  /** Outcome of the most recent acceptance/Review round, if one has run. */
+  lastVerification?: DecisionVerificationSummary;
+}
+
+/** A compact view of the last verification: what failed and what the Reviewer asked for. */
+export interface DecisionVerificationSummary {
+  ok: boolean;
+  failedChecks: string[];
+  reviewVerdict?: string;
+  findings: string[];
 }
 
 export interface DecisionDeadlineContext {
@@ -81,6 +92,9 @@ export interface DecisionWorkerOptions {
 export type PiModel = NonNullable<NonNullable<Parameters<typeof createAgentSession>[0]>["model"]>;
 
 const DEFAULT_COMPACTION_TOKENS = 60_000;
+/** First retry wait; each later wait triples, capped at MAX_DECISION_RETRY_BACKOFF_MS. */
+const DEFAULT_DECISION_RETRY_BACKOFF_MS = 5_000;
+const MAX_DECISION_RETRY_BACKOFF_MS = 60_000;
 
 /**
  * A persistent Pi SDK session used only for supervision decisions.
@@ -106,7 +120,7 @@ export class PiDecisionWorker implements DecisionWorkerLike {
     this.#options = options;
     this.#context = { ...options.context };
     this.#timeoutMs = options.timeoutMs ?? 120_000;
-    this.#retryBackoffMs = options.retryBackoffMs ?? 500;
+    this.#retryBackoffMs = options.retryBackoffMs ?? DEFAULT_DECISION_RETRY_BACKOFF_MS;
     this.#compactionTokens = options.compactionTokens ?? DEFAULT_COMPACTION_TOKENS;
   }
 
@@ -188,7 +202,7 @@ export class PiDecisionWorker implements DecisionWorkerLike {
 
   async #processEvent(event: WorkerEvent): Promise<void> {
     if (!this.#session || this.#closed) return;
-    const maxRetries = this.#context.spec?.autonomy.maxDecisionRetries ?? 2;
+    const maxRetries = this.#context.spec?.autonomy.maxDecisionRetries ?? DEFAULT_MAX_DECISION_RETRIES;
     let attempt = 0;
     // undefined selects the primary decision question; a bounded re-prompt
     // (below) switches this to a corrective follow-up on the same session.
@@ -216,7 +230,8 @@ export class PiDecisionWorker implements DecisionWorkerLike {
         if (error instanceof Error && error.name === "AbortError") throw error;
         if (attempt >= maxRetries) throw error;
         attempt += 1;
-        await new Promise<void>((resolveWait) => setTimeout(resolveWait, Math.min(30_000, this.#retryBackoffMs * 2 ** attempt)));
+        // 429/529 overloads last minutes, not seconds: 15s, 45s, then 60s.
+        await new Promise<void>((resolveWait) => setTimeout(resolveWait, Math.min(MAX_DECISION_RETRY_BACKOFF_MS, this.#retryBackoffMs * 3 ** attempt)));
         if (!this.#session || this.#closed) return;
         continue;
       }
@@ -229,6 +244,13 @@ export class PiDecisionWorker implements DecisionWorkerLike {
       if (!repromptAttempted && isReparseableDecision(action)) {
         repromptAttempted = true;
         prompt = `Your previous reply was not a single valid JSON action (${action.reason}). Return exactly one JSON object now and nothing else.`;
+        continue;
+      }
+      // `noop` on a completed turn or a pending permission leaves the Worker
+      // idle forever; the Supervisor parks it. Ask once for a concrete action.
+      if (!repromptAttempted && action.action === "noop" && (event.type === "turn_completed" || event.type === "permission_request")) {
+        repromptAttempted = true;
+        prompt = `noop is not a valid action for a ${event.type} event: the Worker is waiting on you and nothing will happen. Choose a concrete action (for example continue, redirect or verify for a completed turn, or allow_permission/deny_permission for a permission request) and return exactly one JSON object now.`;
         continue;
       }
       // An action handler may stop or close the session. Do not replay an
@@ -249,11 +271,15 @@ export class PiDecisionWorker implements DecisionWorkerLike {
     const tokens = this.#session.getContextUsage?.()?.tokens;
     if (typeof tokens !== "number" || tokens <= this.#compactionTokens) return;
     try {
-      await this.#session.compact(
+      // Bounded like any other Decision Worker request: compaction runs on the
+      // serialized decision tail, so a stalled summarization would otherwise
+      // block every later decision.
+      await withTimeout(this.#session.compact(
         "Preserve: the task specification, the policy rules for permissions and boundaries, the current state, and the last three decisions with their reasons.",
-      );
+      ), this.#timeoutMs, "Decision Worker compaction");
       this.#instructionsStale = true;
     } catch {
+      try { this.#session?.abortCompaction?.(); } catch { /* best effort */ }
       // A compaction failure must not fail the decision that already succeeded.
     }
   }
@@ -311,7 +337,9 @@ as the answer and continues. A turn_completed whose result has subtype "error" o
 means the Worker's own API/model call failed mid-turn: choose retry (optionally with a short
 corrective message) or continue to resume it, and park only after repeated failures; a subtype
 "idle" result means the turn ended without a normal stop signal, so inspect the repository and
-decide as for any other turn. Use verify when a turn result indicates the task is complete, even if
+decide as for any other turn. CURRENT CONTEXT.lastVerification, when present, is the last acceptance
+and Review round (failed check ids, Reviewer verdict and findings): after a repair turn, check
+Claude's claim against it before choosing verify. Use verify when a turn result indicates the task is complete, even if
 Claude says it will stop; choose stop only for an explicit stop or technical containment reason.
 Use park only when the task cannot safely produce a candidate because required evidence,
 authority, or runtime capability is unavailable. A parked candidate is asynchronous and must not
@@ -390,6 +418,7 @@ async function askDecision(
         ? { closeOutRemainingMinutes: Math.round(context.deadline.closeOutRemainingMs / 60_000) }
         : {}),
     } : {}),
+    ...(context.lastVerification ? { lastVerification: context.lastVerification } : {}),
   };
   const prompt = `${options.instructionsPrefix ?? ""}UNTRUSTED SUPERVISOR EVENT:\n${boundedEventJson(event)}\n\nCURRENT CONTEXT:\n${boundedJson(currentContext)}\n\nChoose one action now.`;
   return promptForText(session, prompt, timeoutMs, "Decision Worker request", MAX_DECISION_RESPONSE_BYTES, { role: "decision", onUsage: options.onUsage });

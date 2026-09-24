@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants as fsConstants, readFileSync } from "node:fs";
-import { access, mkdir, readFile, readdir, rmdir, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rmdir, stat, statfs, writeFile } from "node:fs/promises";
 import { delimiter, isAbsolute, join } from "node:path";
 import type {
   WorkerAdapter,
@@ -59,6 +59,8 @@ interface ProcessRecord {
   seenResultIds: Set<string>;
   seenPermissionRequestIds: Set<string>;
   protocolBuffer: string;
+  /** Byte length of protocolBuffer, kept incrementally so a long line is not re-measured per chunk. */
+  protocolBufferBytes: number;
   discardProtocolLine: boolean;
   exitCode?: number | null;
   signal?: NodeJS.Signals;
@@ -114,7 +116,11 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
     this.#killGraceMs = boundedDelay(options.killGraceMs ?? 500);
     this.#maxOutputChunks = boundedPositiveInteger(options.maxOutputChunks ?? 10_000, "maxOutputChunks");
     this.#maxOutputBytes = boundedPositiveInteger(options.maxOutputBytes ?? 8 * 1024 * 1024, "maxOutputBytes");
-    this.#maxProtocolBufferBytes = boundedPositiveInteger(options.maxProtocolBufferBytes ?? 256 * 1024, "maxProtocolBufferBytes");
+    // One JSONL record, not the stream: a permission request for a Write of a
+    // large file, or a long final result, is a single line. A dropped
+    // control_request leaves Claude waiting forever for its answer and a
+    // dropped result never ends the turn, so the bound only guards memory.
+    this.#maxProtocolBufferBytes = boundedPositiveInteger(options.maxProtocolBufferBytes ?? 32 * 1024 * 1024, "maxProtocolBufferBytes");
     this.#inputWriteTimeoutMs = boundedDelay(options.inputWriteTimeoutMs ?? 10_000);
     this.#cgroupMode = options.cgroupMode ?? "auto";
     this.#cgroupParentPath = options.cgroupParentPath;
@@ -258,6 +264,7 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       seenResultIds: new Set(),
       seenPermissionRequestIds: new Set(),
       protocolBuffer: "",
+      protocolBufferBytes: 0,
       discardProtocolLine: false,
       exited,
       resolveExit,
@@ -300,6 +307,12 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
       this.#emit(record, { type: "output", handle: record.handle, chunk: outputChunk });
       if (stream === "stdout" && this.#mode === "claude-jsonl") this.#observeJsonl(record, text);
     };
+    // A stream decoder keeps a multi-byte character that straddles two pipe
+    // reads intact; String(buffer) per chunk turned it into U+FFFD, and a
+    // permission `updatedInput` echoed back from that text then wrote the
+    // corruption into the Worker's files.
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
     child.stdout?.on("data", capture("stdout"));
     child.stderr?.on("data", capture("stderr"));
     child.stdin?.on("error", (error) => {
@@ -602,28 +615,33 @@ export class ProcessWorkerAdapter implements WorkerAdapter {
         if (newline < 0) return;
         record.discardProtocolLine = false;
         record.protocolBuffer = "";
+        record.protocolBufferBytes = 0;
         offset = newline + 1;
         continue;
       }
       const newline = chunk.indexOf("\n", offset);
       if (newline < 0) {
         const tail = chunk.slice(offset);
-        if (Buffer.byteLength(record.protocolBuffer, "utf8") + Buffer.byteLength(tail, "utf8") > this.#maxProtocolBufferBytes) {
+        const tailBytes = Buffer.byteLength(tail, "utf8");
+        if (record.protocolBufferBytes + tailBytes > this.#maxProtocolBufferBytes) {
           record.protocolBuffer = "";
+          record.protocolBufferBytes = 0;
           record.discardProtocolLine = true;
           record.outputTruncated = true;
         } else {
           record.protocolBuffer += tail;
+          record.protocolBufferBytes += tailBytes;
         }
         return;
       }
       const linePart = chunk.slice(offset, newline);
-      if (Buffer.byteLength(record.protocolBuffer, "utf8") + Buffer.byteLength(linePart, "utf8") > this.#maxProtocolBufferBytes) {
+      if (record.protocolBufferBytes + Buffer.byteLength(linePart, "utf8") > this.#maxProtocolBufferBytes) {
         record.outputTruncated = true;
       } else {
         this.#processJsonlLine(record, `${record.protocolBuffer}${linePart}`.trim());
       }
       record.protocolBuffer = "";
+      record.protocolBufferBytes = 0;
       offset = newline + 1;
     }
   }
@@ -983,10 +1001,24 @@ async function assertExecutable(command: string, pathValue: string | undefined):
   throw new Error(`worker executable preflight failed (ENOENT): ${command}`);
 }
 
+/** statfs(2) f_type of a cgroup v2 mount (CGROUP2_SUPER_MAGIC). */
+const CGROUP2_SUPER_MAGIC = 0x63677270;
+
 export async function currentCgroupPath(): Promise<string> {
   const contents = await readFile("/proc/self/cgroup", "utf8");
   const match = contents.match(/^0::([^\n]*)$/mu);
   if (!match) throw new Error("cgroup v2 is not active");
+  // A hybrid (v1 + v2) host also lists a `0::` line, but its unified
+  // hierarchy is not mounted at /sys/fs/cgroup — that is a tmpfs holding the
+  // v1 controllers. Creating a "cgroup" there only makes an ordinary directory
+  // with no controls, so require the real cgroup2 filesystem first.
+  let type: number;
+  try {
+    type = (await statfs("/sys/fs/cgroup")).type;
+  } catch (error) {
+    throw new Error(`cgroup v2 is not mounted at /sys/fs/cgroup: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  }
+  if (type !== CGROUP2_SUPER_MAGIC) throw new Error("cgroup v2 is not mounted at /sys/fs/cgroup (a cgroup v1 or hybrid host)");
   // /proc/self/cgroup uses the same escaped component spelling as the cgroup
   // filesystem (for example, a literal `\\x2d` in a systemd scope name).
   return `/sys/fs/cgroup${match[1]}`;
@@ -1043,7 +1075,10 @@ export async function preflightCgroupContainment(parentPath?: string): Promise<v
     throw new Error(`required cgroup preflight failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
   } finally {
     if (probePath) {
-      try { await writeFile(`${probePath}/cgroup.kill`, "1" + String.fromCharCode(10)); } catch {}
+      // O_WRONLY without O_CREAT: kill through an existing control file only.
+      // The default `w` flag would create a regular file in a directory that
+      // turned out not to be a cgroup, and that file then blocks its rmdir.
+      try { await writeFile(`${probePath}/cgroup.kill`, "1" + String.fromCharCode(10), { flag: fsConstants.O_WRONLY }); } catch {}
     }
     const child = probeChild;
     if (child && child.exitCode === null) {

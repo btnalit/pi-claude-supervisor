@@ -6,7 +6,7 @@ import { lstat, mkdir, mkdtemp, readlink, realpath, rm, stat } from "node:fs/pro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hookSocketDirectory, HookServer } from "./server.ts";
-import type { ClaudeHookEvent, HookRelayReply, HookRelayRequest } from "./types.ts";
+import { CLAUDE_HOOK_EVENT_NAMES, type ClaudeHookEvent, type HookRelayReply, type HookRelayRequest } from "./types.ts";
 
 async function withServer<T>(run: (server: HookServer, directory: string) => Promise<T>): Promise<T> {
   const directory = await mkdtemp(join(tmpdir(), "pi-cs-hook-server-"));
@@ -106,6 +106,26 @@ test("routes a request to the handler subscribed for its canonical cwd and repli
       try {
         const result = await send(server.socketPath!, JSON.stringify(request(cwd)));
         assert.deepEqual(JSON.parse(result.reply), { permissionDecision: "allow" });
+      } finally {
+        await unsubscribe();
+      }
+    });
+  });
+});
+
+test("every hook event the Supervisor installs reaches its handler through the server", async () => {
+  await withServer(async (server) => {
+    await withTempCwd(async (cwd) => {
+      const seen: string[] = [];
+      const unsubscribe = await server.subscribe(cwd, async (req) => {
+        seen.push(req.event.hook_event_name);
+        return {};
+      });
+      try {
+        // StopFailure (a turn ended by an API/model error) used to be dropped
+        // here while install and settings registered it.
+        for (const name of CLAUDE_HOOK_EVENT_NAMES) await send(server.socketPath!, JSON.stringify(request(cwd, { hook_event_name: name })));
+        assert.deepEqual(seen, [...CLAUDE_HOOK_EVENT_NAMES]);
       } finally {
         await unsubscribe();
       }

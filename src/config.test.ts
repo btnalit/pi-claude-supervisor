@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   autonomyDefaults,
@@ -20,19 +23,21 @@ import {
   workerAutocompactTokens,
   workerMcpConfigPath,
   workerModel,
+  envFileValue,
+  loadSupervisorEnvironment,
 } from "./config.ts";
 
 test("autonomy environment defaults are unattended and bounded", () => {
-  assert.deepEqual(autonomyDefaults({}), { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
+  assert.deepEqual(autonomyDefaults({}), { unattended: true, requireLocalCommit: true, maxDecisionRetries: 4, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
   assert.deepEqual(autonomyDefaults({
     PI_CLAUDE_SUPERVISOR_UNATTENDED: "0",
     PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT: "false",
-    PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES: "4",
-  }), { unattended: false, requireLocalCommit: false, maxDecisionRetries: 4, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
+    PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES: "1",
+  }), { unattended: false, requireLocalCommit: false, maxDecisionRetries: 1, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
   assert.deepEqual(autonomyDefaults({
     PI_CLAUDE_SUPERVISOR_UNATTENDED: "not-a-boolean",
     PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES: "99",
-  }), { unattended: true, requireLocalCommit: true, maxDecisionRetries: 2, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
+  }), { unattended: true, requireLocalCommit: true, maxDecisionRetries: 4, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" });
 });
 
 test("reviewTimeoutMs defaults and rejects out-of-range overrides", () => {
@@ -40,6 +45,50 @@ test("reviewTimeoutMs defaults and rejects out-of-range overrides", () => {
   assert.equal(reviewTimeoutMs({ PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS: "120000" }), 120_000);
   assert.equal(reviewTimeoutMs({ PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS: "1000" }), 600_000);
   assert.equal(reviewTimeoutMs({ PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS: "9999999" }), 600_000);
+  // Durations are accepted like the other timeouts.
+  assert.equal(reviewTimeoutMs({ PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS: "20m" }), 20 * 60_000);
+});
+
+test("a rejected setting keeps its default but is reported once", (t) => {
+  const warnings: string[] = [];
+  t.mock.method(console, "warn", (message: string) => { warnings.push(message); });
+  assert.equal(reviewTimeoutMs({ PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS: "2d" }), 600_000);
+  assert.equal(reviewTimeoutMs({ PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS: "2d" }), 600_000);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0]!, /ignoring PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS="2d" \(expected a duration from 30s to 1h\); using 10m/u);
+});
+
+test("env-file values accept quotes and trailing comments", () => {
+  assert.equal(envFileValue("auto"), "auto");
+  assert.equal(envFileValue("8h # overnight"), "8h");
+  assert.equal(envFileValue('"auto" # enable'), "auto");
+  assert.equal(envFileValue("'a # b'"), "a # b");
+  assert.equal(envFileValue("https://example.invalid/hook?key=x#frag"), "https://example.invalid/hook?key=x#frag");
+  assert.equal(envFileValue("#starts-with-a-hash"), "#starts-with-a-hash");
+  assert.equal(envFileValue("  # optional"), "");
+  assert.equal(envFileValue(' "auto"'), "auto");
+});
+
+test("the env file accepts shell-style export lines and comments", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-env-file-"));
+  const path = join(directory, "env");
+  const keys = ["PI_CLAUDE_SUPERVISOR_ENV_FILE", "PI_CLAUDE_SUPERVISOR_DEADLINE_MS", "PI_CLAUDE_SUPERVISOR_WORKER_MODEL"] as const;
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    await writeFile(path, "export PI_CLAUDE_SUPERVISOR_DEADLINE_MS=8h # overnight\nPI_CLAUDE_SUPERVISOR_WORKER_MODEL=\"sonnet\" # cheaper\n");
+    delete process.env.PI_CLAUDE_SUPERVISOR_DEADLINE_MS;
+    delete process.env.PI_CLAUDE_SUPERVISOR_WORKER_MODEL;
+    process.env.PI_CLAUDE_SUPERVISOR_ENV_FILE = path;
+    assert.equal(loadSupervisorEnvironment(), path);
+    assert.equal(deadlineMs(), 8 * 60 * 60_000);
+    assert.equal(workerModel(), "sonnet");
+  } finally {
+    for (const key of keys) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("eventLogMaxBytes defaults and rejects out-of-range overrides", () => {

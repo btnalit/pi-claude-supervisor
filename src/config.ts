@@ -60,22 +60,22 @@ export interface AutonomyDefaults {
 
 export function autonomyDefaults(env: NodeJS.ProcessEnv = process.env): AutonomyDefaults {
   return {
-    unattended: readBoolean(env.PI_CLAUDE_SUPERVISOR_UNATTENDED, true),
-    requireLocalCommit: readBoolean(env.PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT, true),
-    maxDecisionRetries: readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES, 2, 0, 10),
+    unattended: readBoolean(env.PI_CLAUDE_SUPERVISOR_UNATTENDED, true, "PI_CLAUDE_SUPERVISOR_UNATTENDED"),
+    requireLocalCommit: readBoolean(env.PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT, true, "PI_CLAUDE_SUPERVISOR_REQUIRE_LOCAL_COMMIT"),
+    maxDecisionRetries: readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES, DEFAULT_MAX_DECISION_RETRIES, 0, 10, "PI_CLAUDE_SUPERVISOR_MAX_DECISION_RETRIES"),
     permissionAuthority: readPermissionAuthority(env.PI_CLAUDE_SUPERVISOR_PERMISSION_AUTHORITY),
     remoteAuthority: readRemoteAuthority(env.PI_CLAUDE_SUPERVISOR_REMOTE_AUTHORITY),
     remoteName: readRemoteName(env.PI_CLAUDE_SUPERVISOR_REMOTE_NAME),
-    ...(readPositiveNumber(env.PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD) !== undefined ? { maxWorkerCostUsd: readPositiveNumber(env.PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD) } : {}),
+    ...(readPositiveNumber(env.PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD, "PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD") !== undefined ? { maxWorkerCostUsd: readPositiveNumber(env.PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD, "PI_CLAUDE_SUPERVISOR_WORKER_MAX_BUDGET_USD") } : {}),
   };
 }
 
 export function reviewTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
-  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS, 600_000, 30_000, 3_600_000);
+  return readBoundedDuration(env.PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS, 600_000, 30_000, 3_600_000, "PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS");
 }
 
 export function eventLogMaxBytes(env: NodeJS.ProcessEnv = process.env): number {
-  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_EVENT_LOG_MAX_BYTES, 64 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024);
+  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_EVENT_LOG_MAX_BYTES, 64 * 1024 * 1024, 1024 * 1024, 1024 * 1024 * 1024, "PI_CLAUDE_SUPERVISOR_EVENT_LOG_MAX_BYTES");
 }
 
 export function workerModel(env: NodeJS.ProcessEnv = process.env): string | undefined {
@@ -84,7 +84,7 @@ export function workerModel(env: NodeJS.ProcessEnv = process.env): string | unde
 
 /** The 200_000 default applies only in automatic mode; "0" is an explicit opt-out that omits --autocompact. */
 export function workerAutocompactTokens(env: NodeJS.ProcessEnv = process.env): number {
-  return readBoundedIntegerWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS, 200_000, 100_000, 1_000_000);
+  return readBoundedIntegerWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS, 200_000, 100_000, 1_000_000, "PI_CLAUDE_SUPERVISOR_WORKER_AUTOCOMPACT_TOKENS");
 }
 
 export function workerMcpConfigPath(env: NodeJS.ProcessEnv = process.env): string | undefined {
@@ -101,25 +101,27 @@ export function reviewerModel(env: NodeJS.ProcessEnv = process.env): string | un
 
 /** "0" is an explicit opt-out that disables Decision Worker session compaction. */
 export function decisionCompactionTokens(env: NodeJS.ProcessEnv = process.env): number {
-  return readBoundedIntegerWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS, 60_000, 10_000, 500_000);
+  return readBoundedIntegerWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS, 60_000, 10_000, 500_000, "PI_CLAUDE_SUPERVISOR_DECISION_COMPACT_TOKENS");
 }
 
 export function progressHeartbeatMs(env: NodeJS.ProcessEnv = process.env): number {
-  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_PROGRESS_HEARTBEAT_MS, 60_000, 5_000, 3_600_000);
+  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_PROGRESS_HEARTBEAT_MS, 60_000, 5_000, 3_600_000, "PI_CLAUDE_SUPERVISOR_PROGRESS_HEARTBEAT_MS");
 }
 
 export function decisionSessionRetentionDays(env: NodeJS.ProcessEnv = process.env): number {
-  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_DECISION_SESSION_RETENTION_DAYS, 30, 0, 3650);
+  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_DECISION_SESSION_RETENTION_DAYS, 30, 0, 3650, "PI_CLAUDE_SUPERVISOR_DECISION_SESSION_RETENTION_DAYS");
 }
 
 export function evidenceMaxBytes(env: NodeJS.ProcessEnv = process.env): number {
-  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES, 1024 * 1024, 64 * 1024, 64 * 1024 * 1024);
+  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES, 1024 * 1024, 64 * 1024, 64 * 1024 * 1024, "PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES");
 }
 
 export function evidenceMaxUntrackedFiles(env: NodeJS.ProcessEnv = process.env): number {
-  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES, 512, 16, 10_000);
+  return readBoundedInteger(env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES, 512, 16, 10_000, "PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_UNTRACKED_FILES");
 }
 
+/** Retries of a failed Decision Worker request before the task is parked. */
+export const DEFAULT_MAX_DECISION_RETRIES = 4;
 export const DEFAULT_DEADLINE_MS = 4 * 60 * 60_000;
 export const DEFAULT_DEADLINE_GRACE_MS = 30 * 60_000;
 export const DEFAULT_DEADLINE_WARNING_MS = 15 * 60_000;
@@ -131,7 +133,7 @@ export const DEFAULT_NO_OUTPUT_TIMEOUT_MS = 20 * 60_000;
  * accepted as well as plain milliseconds.
  */
 export function deadlineMs(env: NodeJS.ProcessEnv = process.env): number {
-  return readBoundedDurationWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_DEADLINE_MS, DEFAULT_DEADLINE_MS, 5 * 60_000, 7 * 24 * 60 * 60_000);
+  return readBoundedDurationWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_DEADLINE_MS, DEFAULT_DEADLINE_MS, 5 * 60_000, 7 * 24 * 60 * 60_000, "PI_CLAUDE_SUPERVISOR_DEADLINE_MS");
 }
 
 /**
@@ -140,17 +142,17 @@ export function deadlineMs(env: NodeJS.ProcessEnv = process.env): number {
  * restores the immediate stop at the deadline. Up to 24 hours.
  */
 export function deadlineGraceMs(env: NodeJS.ProcessEnv = process.env): number {
-  return readBoundedDurationWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_DEADLINE_GRACE_MS, DEFAULT_DEADLINE_GRACE_MS, 60_000, 24 * 60 * 60_000);
+  return readBoundedDurationWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_DEADLINE_GRACE_MS, DEFAULT_DEADLINE_GRACE_MS, 60_000, 24 * 60 * 60_000, "PI_CLAUDE_SUPERVISOR_DEADLINE_GRACE_MS");
 }
 
 /** How long before the deadline the Decision Worker is warned (up to 24 hours); "0" disables the warning. */
 export function deadlineWarningMs(env: NodeJS.ProcessEnv = process.env): number {
-  return readBoundedDurationWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_DEADLINE_WARNING_MS, DEFAULT_DEADLINE_WARNING_MS, 60_000, 24 * 60 * 60_000);
+  return readBoundedDurationWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_DEADLINE_WARNING_MS, DEFAULT_DEADLINE_WARNING_MS, 60_000, 24 * 60 * 60_000, "PI_CLAUDE_SUPERVISOR_DEADLINE_WARNING_MS");
 }
 
 /** Stop a Worker that has produced no output for this long (1 minute to 24 hours); "0" disables the check. */
 export function noOutputTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
-  return readBoundedDurationWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS, DEFAULT_NO_OUTPUT_TIMEOUT_MS, 60_000, 24 * 60 * 60_000);
+  return readBoundedDurationWithZeroOptOut(env.PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS, DEFAULT_NO_OUTPUT_TIMEOUT_MS, 60_000, 24 * 60 * 60_000, "PI_CLAUDE_SUPERVISOR_NO_OUTPUT_TIMEOUT_MS");
 }
 
 const DURATION_UNITS_MS: Record<string, number> = { ms: 1, s: 1_000, m: 60_000, h: 60 * 60_000, d: 24 * 60 * 60_000 };
@@ -193,10 +195,12 @@ export function loadSupervisorEnvironment(): string | undefined {
     // Best effort: the file is local configuration, never a repository asset.
     try { chmodSync(path, 0o600); } catch { /* read-only filesystems may reject chmod */ }
     for (const line of contents.split(/\r?\n/u)) {
-      const match = line.match(/^\s*([A-Z][A-Z0-9_]*)\s*=\s*(.*?)\s*$/u);
+      // Shell-style: an optional `export ` prefix, and a trailing `# comment`
+      // after an unquoted value or a closing quote. Keeping the comment made
+      // `MODE="auto" # enable` a value no reader accepts.
+      const match = line.match(/^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=(.*?)\s*$/u);
       if (!match || !allowed.has(match[1]) || process.env[match[1]] !== undefined) continue;
-      const value = match[2].replace(/^(?:"([\s\S]*)"|'([\s\S]*)')$/u, (_, doubleQuoted, singleQuoted) => doubleQuoted ?? singleQuoted);
-      process.env[match[1]] = value;
+      process.env[match[1]] = envFileValue(match[2]);
     }
     return path;
   } catch (error) {
@@ -205,32 +209,72 @@ export function loadSupervisorEnvironment(): string | undefined {
   }
 }
 
-function readBoolean(value: string | undefined, fallback: boolean): boolean {
+const reportedSettings = new Set<string>();
+
+/**
+ * An unusable value keeps the default, but never silently: `DEADLINE_MS=10d`
+ * quietly running a 4h task is exactly the surprise an unattended run cannot
+ * afford. Each distinct rejected value is reported once per process.
+ */
+function rejectSetting(name: string | undefined, value: string, reason: string, fallback: unknown): void {
+  // An empty assignment (`KEY=`) is how an env file leaves a key unset.
+  if (!name || value.trim() === "") return;
+  const key = `${name}=${value}`;
+  if (reportedSettings.has(key)) return;
+  reportedSettings.add(key);
+  console.warn(`pi-claude-supervisor: ignoring ${name}=${JSON.stringify(String(redactSensitive(value)))} (${reason}); using ${String(fallback)}`);
+}
+
+/** The value of one env-file assignment: quoted text verbatim, or an unquoted word before any ` #` comment. */
+export function envFileValue(raw: string): string {
+  // `KEY= # note` is an empty value with a comment, as in a shell; only a
+  // `#` right after the `=` (`KEY=#abc`) belongs to the value.
+  if (/^\s+#/u.test(raw)) return "";
+  raw = raw.trimStart();
+  const quoted = raw.match(/^(?:"([^"]*)"|'([^']*)')(?:\s+#.*)?$/u);
+  if (quoted) return quoted[1] ?? quoted[2] ?? "";
+  // A comment needs whitespace before its `#`, as in a shell: `KEY=#abc`
+  // is the value `#abc` (a webhook secret may well start with one).
+  return raw.replace(/\s+#.*$/u, "").trim();
+}
+
+function readBoolean(value: string | undefined, fallback: boolean, name?: string): boolean {
   if (value === undefined) return fallback;
   if (/^(?:1|true|yes|on)$/iu.test(value.trim())) return true;
   if (/^(?:0|false|no|off)$/iu.test(value.trim())) return false;
+  rejectSetting(name, value, "expected 1/0, true/false, yes/no or on/off", fallback);
   return fallback;
 }
 
-function readBoundedInteger(value: string | undefined, fallback: number, minimum: number, maximum: number): number {
+function readBoundedInteger(value: string | undefined, fallback: number, minimum: number, maximum: number, name?: string): number {
   if (value === undefined) return fallback;
   const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+  if (Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum) return parsed;
+  rejectSetting(name, value, `expected an integer from ${minimum} to ${maximum}`, fallback);
+  return fallback;
 }
 
 /** Like readBoundedInteger, but the literal "0" is always honored as an opt-out below the normal minimum. */
-function readBoundedIntegerWithZeroOptOut(value: string | undefined, fallback: number, minimum: number, maximum: number): number {
+function readBoundedIntegerWithZeroOptOut(value: string | undefined, fallback: number, minimum: number, maximum: number, name?: string): number {
   if (value !== undefined && value.trim() === "0") return 0;
-  return readBoundedInteger(value, fallback, minimum, maximum);
+  return readBoundedInteger(value, fallback, minimum, maximum, name);
+}
+
+/** A duration (`20m`, `1h30m`, or plain milliseconds) within bounds; anything else keeps the fallback. */
+function readBoundedDuration(value: string | undefined, fallback: number, minimum: number, maximum: number, name?: string): number {
+  if (value === undefined) return fallback;
+  const parsed = parseDurationMs(value);
+  if (parsed !== undefined && parsed >= minimum && parsed <= maximum) return parsed;
+  rejectSetting(name, value, `expected a duration from ${formatDurationMs(minimum)} to ${formatDurationMs(maximum)}`, formatDurationMs(fallback));
+  return fallback;
 }
 
 /** Like readBoundedIntegerWithZeroOptOut, but also accepts a duration suffix (`8h`, `90m`); out-of-range values keep the fallback. */
-function readBoundedDurationWithZeroOptOut(value: string | undefined, fallback: number, minimum: number, maximum: number): number {
+function readBoundedDurationWithZeroOptOut(value: string | undefined, fallback: number, minimum: number, maximum: number, name?: string): number {
   if (value === undefined) return fallback;
-  const parsed = parseDurationMs(value);
   // "0", "0m", "0h": any zero duration is the opt-out, not a below-minimum typo.
-  if (parsed === 0) return 0;
-  return parsed !== undefined && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+  if (parseDurationMs(value) === 0) return 0;
+  return readBoundedDuration(value, fallback, minimum, maximum, name);
 }
 
 function readTrimmedString(value: string | undefined): string | undefined {
@@ -262,10 +306,12 @@ function readPermissionAuthority(value: string | undefined): PermissionAuthority
   return normalized === "policy" || normalized === "decision-worker" ? normalized : "hybrid";
 }
 
-function readPositiveNumber(value: string | undefined): number | undefined {
+function readPositiveNumber(value: string | undefined, name?: string): number | undefined {
   if (value === undefined || value.trim() === "") return undefined;
   const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  rejectSetting(name, value, "expected a positive number", "no limit");
+  return undefined;
 }
 
 /** How automatic tmux supervision drives Claude: the real TUI through hooks (default) or the stream-json bridge. */
@@ -275,10 +321,10 @@ export function tmuxMode(env: NodeJS.ProcessEnv = process.env): "interactive" | 
 
 /** Exit the interactive Worker and its tmux session once a task completes; default keeps it open for the operator. */
 export function closeWorkerOnCompletion(env: NodeJS.ProcessEnv = process.env): boolean {
-  return readBoolean(env.PI_CLAUDE_SUPERVISOR_CLOSE_WORKER_ON_COMPLETION, false);
+  return readBoolean(env.PI_CLAUDE_SUPERVISOR_CLOSE_WORKER_ON_COMPLETION, false, "PI_CLAUDE_SUPERVISOR_CLOSE_WORKER_ON_COMPLETION");
 }
 
 /** Install the user-level Claude Code hook entries automatically when the interactive tmux mode is configured. */
 export function autoInstallHooks(env: NodeJS.ProcessEnv = process.env): boolean {
-  return readBoolean(env.PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS, true);
+  return readBoolean(env.PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS, true, "PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS");
 }

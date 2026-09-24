@@ -1,18 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { HOOK_TIMEOUT_SECONDS, type ClaudeHookEventName } from "./types.ts";
+import { CLAUDE_HOOK_EVENT_NAMES, HOOK_TIMEOUT_SECONDS, type ClaudeHookEventName } from "./types.ts";
 
-const HOOK_EVENT_NAMES: readonly ClaudeHookEventName[] = [
-  "SessionStart",
-  "SessionEnd",
-  "UserPromptSubmit",
-  "PreToolUse",
-  "PermissionRequest",
-  "Stop",
-  "StopFailure",
-  "Notification",
-];
+const HOOK_EVENT_NAMES: readonly ClaudeHookEventName[] = CLAUDE_HOOK_EVENT_NAMES;
 
 interface HookCommandEntry {
   type: "command";

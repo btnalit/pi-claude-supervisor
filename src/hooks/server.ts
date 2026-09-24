@@ -3,19 +3,11 @@ import { createServer, type Server, type Socket } from "node:net";
 import { chmod, lstat, mkdir, readdir, readlink, realpath, rename, rm, symlink, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import type { ClaudeHookEvent, ClaudeHookEventName, HookEventSource, HookRelayReply, HookRelayRequest } from "./types.ts";
+import { CLAUDE_HOOK_EVENT_NAMES, type ClaudeHookEvent, type ClaudeHookEventName, type HookEventSource, type HookRelayReply, type HookRelayRequest } from "./types.ts";
 
 const MAX_LINE_BYTES = 1024 * 1024;
 
-const VALID_EVENT_NAMES: ReadonlySet<string> = new Set<ClaudeHookEventName>([
-  "SessionStart",
-  "SessionEnd",
-  "UserPromptSubmit",
-  "PreToolUse",
-  "PermissionRequest",
-  "Stop",
-  "Notification",
-]);
+const VALID_EVENT_NAMES: ReadonlySet<string> = new Set<ClaudeHookEventName>(CLAUDE_HOOK_EVENT_NAMES);
 
 type HookHandler = (request: HookRelayRequest) => Promise<HookRelayReply | undefined>;
 

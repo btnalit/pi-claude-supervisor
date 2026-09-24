@@ -40,6 +40,23 @@ test("event log removes an old lock owned by a dead process", async () => {
   assert.equal(entry.seq, 1);
 });
 
+test("event log removes an old lock whose pid was reused by another process", { skip: process.platform !== "linux" }, async () => {
+  // After a crash and a container restart the new Pi often gets the old pid.
+  // The pid is alive, but its start time no longer matches the lock's owner.
+  const dir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-reused-pid-lock-"));
+  const path = join(dir, "events.jsonl");
+  const lockPath = `${path}.lock`;
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(join(lockPath, "owner.json"), JSON.stringify({ pid: process.pid, startTime: "1", at: new Date(0).toISOString() }));
+  const old = new Date(Date.now() - 6_000);
+  await utimes(join(lockPath, "owner.json"), old, old);
+  await utimes(lockPath, old, old);
+  const started = Date.now();
+  const entry = await new EventLog(path).append({ type: "after-reused-pid-lock" });
+  assert.equal(entry.seq, 1);
+  assert.ok(Date.now() - started < 2_000, "the abandoned lock is reclaimed, not waited out");
+});
+
 test("event log repairs a corrupt tail and resumes from the maximum sequence", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-corrupt-tail-"));
   const path = join(dir, "events.jsonl");

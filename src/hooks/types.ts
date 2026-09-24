@@ -5,15 +5,23 @@
  * event over a unix socket and prints the reply as Claude's hook output.
  */
 
-export type ClaudeHookEventName =
-  | "SessionStart"
-  | "SessionEnd"
-  | "UserPromptSubmit"
-  | "PreToolUse"
-  | "PermissionRequest"
-  | "Stop"
-  | "StopFailure"
-  | "Notification";
+/**
+ * Every hook event the Supervisor consumes. The one list that the installed
+ * hook settings, the per-session settings and the server's request parser all
+ * derive from, so an event cannot be registered and then dropped on arrival.
+ */
+export const CLAUDE_HOOK_EVENT_NAMES = [
+  "SessionStart",
+  "SessionEnd",
+  "UserPromptSubmit",
+  "PreToolUse",
+  "PermissionRequest",
+  "Stop",
+  "StopFailure",
+  "Notification",
+] as const;
+
+export type ClaudeHookEventName = typeof CLAUDE_HOOK_EVENT_NAMES[number];
 
 /** The subset of Claude Code hook input the Supervisor consumes (all fields untrusted). */
 export interface ClaudeHookEvent {

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, chmod, constants, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, constants, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { claudeJsonlArgs, cleanupCgroup, PROCESS_EMBEDDED_SCRIPTS, preflightCgroupContainment, ProcessWorkerAdapter, processGroupHasLiveMember } from "./process-adapter.ts";
+import { claudeJsonlArgs, cleanupCgroup, currentCgroupPath, PROCESS_EMBEDDED_SCRIPTS, preflightCgroupContainment, ProcessWorkerAdapter, processGroupHasLiveMember } from "./process-adapter.ts";
 
 const requiredCgroupTestAvailable = process.platform === "linux" && await canCreateCgroup();
 
@@ -190,6 +190,19 @@ test("automatic natural exit retains an empty cgroup until lease finalization", 
 
 test("cgroup preflight probes attachment and returns within its bounded cleanup", { skip: !requiredCgroupTestAvailable, timeout: 5_000 }, async () => {
   await preflightCgroupContainment();
+});
+
+test("cgroup preflight against a non-cgroup directory fails without leaving a probe behind", { skip: process.platform !== "linux" }, async () => {
+  // A hybrid host's /sys/fs/cgroup is a tmpfs: mkdir succeeds there but no
+  // control files appear. The probe must fail and remove its directory
+  // rather than create a regular `cgroup.kill` that blocks the rmdir.
+  const parent = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-not-cgroup-"));
+  try {
+    await assert.rejects(() => preflightCgroupContainment(parent), /required cgroup preflight failed/u);
+    assert.deepEqual(await readdir(parent), []);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
 });
 
 test("process adapter reports spawn failures instead of leaving a running record", async () => {
@@ -493,13 +506,31 @@ test("stop cleans descendants after the worker leader exits", async () => {
   await new Promise((resolve) => setTimeout(resolve, 25));
   await adapter.stop(handle, "test orphan cleanup");
   for (let attempt = 0; attempt < 20; attempt++) {
-    try { process.kill(childPid, 0); } catch (error) {
-      if (error instanceof Error && /ESRCH/u.test(error.message)) return;
-      throw error;
-    }
+    // A killed orphan can linger as a zombie when the container's PID 1 does
+    // not reap; that is dead for cleanup purposes.
+    if (!(await processIsLive(childPid))) return;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   assert.fail(`descendant process ${childPid} survived group cleanup`);
+});
+
+test("a multi-byte character split across two pipe reads is decoded intact", async () => {
+  const adapter = new ProcessWorkerAdapter();
+  // "中" is e4 b8 ad: write its first two bytes, pause so they arrive as their
+  // own read, then the last byte.
+  const handle = await adapter.start({
+    task: "",
+    cwd: process.cwd(),
+    command: process.execPath,
+    args: ["-e", "process.stdout.write(Buffer.from([0xe4, 0xb8])); setTimeout(() => { process.stdout.write(Buffer.from([0xad, 0x0a])); setTimeout(() => process.exit(0), 50); }, 150);", "--"],
+  });
+  let text = "";
+  for (let attempt = 0; attempt < 60 && !text.includes("\n"); attempt += 1) {
+    text += (await adapter.readOutput(handle)).filter((chunk) => chunk.stream === "stdout").map((chunk) => chunk.text).join("");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(text, "中\n");
+  await adapter.stop(handle, "test cleanup").catch(() => {});
 });
 
 test("claude-jsonl result sequence distinguishes repeated session ids", async () => {
@@ -524,6 +555,32 @@ test("claude-jsonl result sequence distinguishes repeated session ids", async ()
   const completed = events.filter((event): event is Extract<import("../types.ts").WorkerEvent, { type: "turn_completed" }> => event.type === "turn_completed");
   assert.deepEqual(completed.map((event) => event.sequence), [1, 2]);
   await adapter.stop(handle, "test complete");
+});
+
+test("claude-jsonl delivers a permission request for a large Write by default", async () => {
+  const adapter = new ProcessWorkerAdapter({ mode: "claude-jsonl" });
+  const events: import("../types.ts").WorkerEvent[] = [];
+  // A 1 MB file body in one can_use_tool request: dropping it would leave
+  // Claude waiting forever for the control_response.
+  const script = "process.stdin.once('data', () => { process.stdout.write(JSON.stringify({type:'control_request', request_id:'req-large', request:{subtype:'can_use_tool', tool_use_id:'tool-large', tool_name:'Write', input:{file_path:'/tmp/big.txt', content:'x'.repeat(1024*1024)}}}) + '\\n'); }); setInterval(() => {}, 1000)";
+  const handle = await adapter.start({
+    task: "write a large file",
+    cwd: process.cwd(),
+    command: process.execPath,
+    eventListener: (event) => { events.push(event); },
+    args: ["-e", script, "--"],
+  });
+  try {
+    for (let attempt = 0; attempt < 100 && !events.some((event) => event.type === "permission_request"); attempt += 1) {
+      await adapter.readOutput(handle);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const request = events.find((event): event is Extract<import("../types.ts").WorkerEvent, { type: "permission_request" }> => event.type === "permission_request");
+    assert.equal(request?.request.requestId, "req-large");
+    assert.equal(((request?.request.input as { content?: string }).content ?? "").length, 1024 * 1024);
+  } finally {
+    await adapter.stop(handle, "large permission request test complete");
+  }
 });
 
 test("claude-jsonl discards split continuations after an overlong protocol record", async () => {
@@ -804,10 +861,7 @@ test("processGroupHasLiveMember detects live and reaped process groups", { skip:
 
 async function canCreateCgroup(): Promise<boolean> {
   try {
-    const contents = await readFile("/proc/self/cgroup", "utf8");
-    const match = contents.match(/^0::([^\n]*)$/mu);
-    if (!match) return false;
-    await access(`/sys/fs/cgroup${match[1]}`, constants.W_OK);
+    await access(await currentCgroupPath(), constants.W_OK);
     return true;
   } catch {
     return false;

@@ -73,6 +73,11 @@ async function userHooksInstalled(settingsPath: string): Promise<boolean> {
  * sessions may run concurrently, but active sessions must use different
  * working directories so workers cannot silently overwrite one another.
  */
+/** The first message a recovered Worker gets: it is a fresh process that never saw the task. */
+function recoveryContinuation(goal: string): string {
+  return `The Supervisor restarted this task after an interruption; you are a fresh session and earlier work may already be in the repository. First inspect git status, git log and the uncommitted diff to see what was done. Then continue the original task to completion, run the relevant checks and commit locally. Original task:\n${goal}`;
+}
+
 export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   loadSupervisorEnvironment();
   const automation = process.env.PI_CLAUDE_SUPERVISOR_MODE === "auto" || process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION === "1";
@@ -185,6 +190,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     return new PiReadOnlyReviewer({ timeoutMs: reviewTimeoutMs(), model: await reviewerPiModelPromise });
   };
   const sessions = new Map<string, Supervisor>();
+  /** The last few tasks that finished and were released, newest last, for `status`/`sessions`. */
+  const finishedSessions = new Map<string, { finishedAt: number; detail: string }>();
   const cwdLeases = new Map<string, CwdLeaseHandle>();
   const cleanupRequiredTasks = new Set<string>();
   const reservedCwds = new Map<string, string>();
@@ -230,6 +237,14 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     }
   };
   const forgetSession = (taskId: string): void => {
+    // Keep what a finished task ended as: after an overnight run, `status`
+    // is exactly where the operator looks, and the live session is gone.
+    const finished = sessions.get(taskId);
+    if (finished) {
+      finishedSessions.delete(taskId);
+      finishedSessions.set(taskId, { finishedAt: Date.now(), detail: formatSessionDetail(taskId, finished, tmuxModeLabel()) });
+      while (finishedSessions.size > MAX_FINISHED_SESSIONS) finishedSessions.delete(finishedSessions.keys().next().value!);
+    }
     sessions.delete(taskId);
     reservedCwds.delete(taskId);
     cleanupRequiredTasks.delete(taskId);
@@ -885,6 +900,34 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 throw new Error("Pi session shut down during recovery");
               }
               message = `Worker recovered idle: task=${record.taskId} worker=${handle.id}; original task was not replayed; send an explicit continuation, then use resume-auto`;
+              // `--extend` is an explicit request to carry on unattended: hand
+              // the task back to automation instead of leaving it under
+              // takeover. `--extend 0` needs no message — the close-out
+              // verifies the idle Worker on the next watchdog tick; a real
+              // extension sends a continuation, since the fresh Worker does
+              // not remember the task. A failure here leaves the recovered
+              // Worker idle under takeover, exactly as a plain recover would.
+              if (automaticRecovery && extendMs !== undefined) {
+                const turnBefore = session.turn;
+                try {
+                  await session.resumeAutomation();
+                  if (extendMs > 0) await session.send(recoveryContinuation(record.spec?.goal ?? record.task));
+                  message = extendMs > 0
+                    ? `Worker recovered: task=${record.taskId} worker=${handle.id}; automation resumed with a continuation of the original task; ${formatDurationMs(Math.max(0, recoveryDeadlineMs - elapsedMs))} of budget from now`
+                    : `Worker recovered: task=${record.taskId} worker=${handle.id}; automation resumed; the close-out verifies and reviews the repository as it stands`;
+                } catch (error) {
+                  const detail = redactText(error instanceof Error ? error.message : String(error));
+                  if (session.turn > turnBefore) {
+                    // The continuation reached the Worker (only its audit
+                    // record failed): it is working under automation now,
+                    // and taking it over would leave that turn undecided.
+                    message = `Worker recovered: task=${record.taskId} worker=${handle.id}; automation resumed with a continuation of the original task (warning: ${detail})`;
+                  } else {
+                    await session.takeover().catch(() => {});
+                    message = `${message} (automatic resume failed: ${detail})`;
+                  }
+                }
+              }
             } catch (error) {
               const handle = session.handle ?? startedHandle;
               let cleanupConfirmed = !handle;
@@ -960,15 +1003,22 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         } else if (operation === "sessions") {
           const recoverable = await decisionStore.list({ activeOnly: true });
           message = formatSessions(sessions, recoverable, tmuxModeLabel());
+          if (finishedSessions.size > 0) message += `\nRecently finished:\n${formatFinishedSessions(finishedSessions)}`;
           const quarantined = await cwdLeaseStore.quarantined();
           if (quarantined.length > 0) {
             message += `\nQuarantined cwd lease records (${quarantined.length}) in ${leaseDir}/quarantine: ${redactText(quarantined.join(", "))}`;
           }
         } else if (operation === "status") {
-          const { session, sessionId } = resolveSession(sessions, activeTaskId, rest, true);
-          message = session
-            ? `task=${sessionId} state=${session.state} worker=${session.handle?.id ?? "none"}${tmuxModeLabel() ? ` mode=${tmuxModeLabel()}` : ""}${formatDeadline(session.deadline)} ${formatUsageDetail(session.usage)}`
-            : formatSessions(sessions, await decisionStore.list({ activeOnly: true }), tmuxModeLabel());
+          const finished = rest[0] && !sessions.has(rest[0]) ? finishedSessions.get(rest[0]) : undefined;
+          if (finished) {
+            message = `finished ${formatDurationMs(Date.now() - finished.finishedAt)} ago: ${finished.detail}`;
+          } else {
+            const { session, sessionId } = resolveSession(sessions, activeTaskId, rest, true);
+            message = session && sessionId
+              ? formatSessionDetail(sessionId, session, tmuxModeLabel())
+              : formatSessions(sessions, await decisionStore.list({ activeOnly: true }), tmuxModeLabel())
+                + (finishedSessions.size > 0 ? `\nRecently finished:\n${formatFinishedSessions(finishedSessions)}` : "");
+          }
         } else if (operation === "capabilities") {
           message = JSON.stringify(adapter.capabilities(), null, 2);
         } else if (operation === "install-hooks" || operation === "uninstall-hooks") {
@@ -1147,6 +1197,35 @@ function formatDeadline(deadline: Supervisor["deadline"]): string {
   if (!deadline) return "";
   if (!deadline.closeOut) return ` deadline=${formatDurationMs(deadline.remainingMs)} left`;
   return ` deadline=close-out (${formatDurationMs(deadline.closeOutRemainingMs ?? 0)} left)`;
+}
+
+const MAX_FINISHED_SESSIONS = 20;
+
+/**
+ * One task's state in a line: what it is doing, how far it got, and — the
+ * question an operator of an unattended run actually has — whether it is
+ * waiting on them.
+ */
+function formatSessionDetail(taskId: string, session: Supervisor, tmuxModeLabel?: string): string {
+  const task = session.task;
+  const parts = [`task=${taskId}`, `state=${session.state}`, `worker=${session.handle?.id ?? "none"}`];
+  if (tmuxModeLabel) parts.push(`mode=${tmuxModeLabel}`);
+  if (session.humanRequired) parts.push("automation=paused(resume-auto)");
+  if (session.candidateParked) parts.push("candidate=parked");
+  if (task) {
+    parts.push(`turn=${session.turn}/${task.maxTurns}`);
+    if (session.repairRound > 0) parts.push(`repair=${session.repairRound}`);
+    const startedAt = Date.parse(task.startedAt);
+    if (Number.isFinite(startedAt)) parts.push(`elapsed=${formatDurationMs(Math.max(0, Date.now() - startedAt))}`);
+  }
+  const verification = session.lastVerification;
+  if (verification) parts.push(`lastVerify=${verification.ok ? "pass" : "fail"}${verification.review ? `(review=${verification.review.verdict})` : ""}`);
+  const terminal = ["completed", "blocked", "stopped", "failed"].includes(session.state);
+  return `${parts.join(" ")}${terminal ? "" : formatDeadline(session.deadline)} ${formatUsageDetail(session.usage)}`;
+}
+
+function formatFinishedSessions(finished: Map<string, { finishedAt: number; detail: string }>): string {
+  return [...finished.values()].reverse().map((entry) => `  ${formatDurationMs(Date.now() - entry.finishedAt)} ago: ${entry.detail}`).join("\n");
 }
 
 function formatSessions(sessions: Map<string, Supervisor>, recoverable: DecisionSessionRecord[] = [], tmuxModeLabel?: string): string {

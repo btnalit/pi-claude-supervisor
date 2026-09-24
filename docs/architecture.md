@@ -143,7 +143,8 @@ start); credentials are not copied into a file, and credential-shaped command
 arguments are still rejected.
 `load-buffer`, bracketed `paste-buffer` and `send-keys Enter` provide the input
 boundary without interpolating a task into a shell command. C0/C1 terminal
-control bytes are rejected; CRLF is normalized to a newline. Automatic agents,
+control bytes are neutralized (escape sequences removed, a lone CR becomes a newline,
+other C0/C1 bytes become spaces); CRLF is normalized to a newline. Automatic agents,
 background tasks, plugins, MCP servers and nested Claude processes stay in the
 same cgroup and are cleaned with the Worker; they are intentionally not rejected
 or polled as a nested-process policy failure. The lexical Bash/file-tool policy
@@ -399,8 +400,11 @@ For Claude JSONL, the adapter tracks `activeRequests`, `lastInputAt` and
 `lastOutputAt`. A `result` record closes an active request; malformed output does
 not. JSONL sends are rejected while a request is active, and a valid terminal
 result moves the session to `waiting`; only then may the next turn be sent. A paused
-Worker does not consume its no-output budget; resume establishes a fresh no-output
-baseline while the cumulative wall-clock deadline remains active.
+Worker does not consume its no-output budget; resume, and every message the
+Supervisor sends, establishes a fresh no-output baseline while the cumulative
+wall-clock deadline remains active. An idle automatic Worker that reaches the
+no-output timeout is verified (`worker_idle_timeout`) rather than stopped, and a
+Worker under human takeover is exempt.
 
 The wall-clock deadline is a budget, not a kill switch. The watchdog drives it
 through three phases, each recorded once per task: `worker_deadline_approaching`
@@ -587,19 +591,27 @@ When automatic supervision is enabled, a successful check set is passed to a
 fresh read-only Reviewer session. The Reviewer receives the task specification, repository status/diff evidence,
 check results and bounded Worker completion evidence, but not the Decision Worker
 conversation or control channel. It can inspect only `read`, `grep`, `find` and `ls`, and must return
-`pass`, `revise` or `human` with bounded structured findings. Invalid Reviewer
+`pass`, `revise` or `human` with bounded structured findings. Its whole reply
+must be that one JSON object (an optional ```json fence aside), carrying a
+random `reviewId` that appears only in its own prompt, with no key repeated and
+nothing beyond the schema (a string `summary`, and `findings` as flat objects of
+the finding fields with scalar values) — so repository text it quotes or copies
+can neither stand in for the answer nor rewrite it. A reply that breaks any of
+these earns one corrective re-prompt. Invalid Reviewer
 output, incomplete evidence or a Reviewer API failure must prevent a candidate
 from crossing the remote/main boundary; the local system may retry, repair or
-park it without requiring a human to be online. The Reviewer retries a provider
-error once within a total review budget
+park it without requiring a human to be online. The Reviewer retries provider
+errors with a fresh session within a total review budget
 (`PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS`, default 10 minutes). Truncated
 (oversize) evidence requests a bounded repair before parking, while incomplete
 evidence still parks.
 
 A `revise` result produces an audited repair round and sends a bounded corrective
 instruction to a still-live `repairableSession` Worker. Checks and review then run again.
-The repair budget defaults to three rounds; repeated findings and P0/P1 findings
-stop automation and park a non-publishable candidate. A Worker that has already exited cannot be silently recreated
+The repair budget defaults to three rounds. P0/P1 findings block a `pass` but are repair
+inputs like any other concrete finding (a `pass` carrying one is treated as `revise`); a
+`human` verdict, repeated findings or an exhausted budget stop automation and park a
+non-publishable candidate. A Worker that has already exited cannot be silently recreated
 for repair; it remains failed/recoverable rather than replaying the original task. If a repair
 or candidate branch cannot continue, a single idempotent terminalizer records
 `verification_failed`, closes the Decision Worker and reports cleanup evidence; it never performs

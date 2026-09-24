@@ -219,6 +219,8 @@ export class Supervisor {
   #lastTurnCompleted?: WorkerEvent;
   /** Key of the completed turn whose decision is still in flight; the deadline must not verify underneath it. */
   #pendingDecisionKey?: string;
+  /** When the pending decision was requested; bounds how long an idle timeout defers to it. */
+  #pendingDecisionSince = 0;
   /**
    * Publish phase. Authority exists only between "acceptance and Reviewer
    * passed" and "the publish turn completed", and only for `#verifiedHead` on
@@ -275,6 +277,7 @@ export class Supervisor {
   #usageRecordedEvents = new Set<string>();
   #pendingPermissions = new Map<string, WorkerPermissionRequest>();
   #humanRequired = false;
+  #watchdogTickPending = false;
   #humanGate: "permission" | "other" | undefined;
   #candidateParked = false;
   #stopRequested?: string;
@@ -315,6 +318,9 @@ export class Supervisor {
   get task() { return this.#task; }
   get handle() { return this.#handle; }
   get lastVerification() { return this.#lastVerification; }
+  /** Worker turns sent so far (the task's own opening turn is 0). */
+  get turn() { return this.#turn; }
+  get repairRound() { return this.#repairRound; }
   /** True only after an explicit takeover, never for ordinary uncertainty. */
   get humanRequired() { return this.#humanRequired; }
   get candidateParked() { return this.#candidateParked; }
@@ -1076,6 +1082,7 @@ export class Supervisor {
       }
       if (action.action === "continue" || action.action === "redirect" || action.action === "answer") {
         if (await this.#decisionIsStale(event)) return;
+        if (await this.#verifyOnTurnBudget(handle, event, action)) return;
         await this.#sendInternal(action.message);
         return;
       }
@@ -1106,6 +1113,10 @@ export class Supervisor {
         return;
       }
       if (action.action === "verify") {
+        // Background work can re-invoke the Worker while this decision was in
+        // flight; verifying then would judge a tree that is still changing
+        // and stop a busy Worker. Its next completed turn is decided afresh.
+        if (await this.#decisionIsStale(event)) return;
         await this.#startVerification(handle, event, "Decision Worker");
         return;
       }
@@ -1129,11 +1140,26 @@ export class Supervisor {
         return;
       }
       if (action.action === "retry") {
-        if (!action.message?.trim()) { await this.#parkCandidate(`Retry requires a concrete corrective instruction: ${action.reason}`, event); return; }
+        // The prompt invites a bare retry after a Worker API error; resume the
+        // turn rather than parking a task over a single transient failure.
+        const message = action.message?.trim() ? action.message : RETRY_RESUME_MESSAGE;
         if (await this.#decisionIsStale(event)) return;
-        await this.#sendInternal(action.message);
+        if (await this.#verifyOnTurnBudget(handle, event, action)) return;
+        await this.#sendInternal(message);
       }
     });
+  }
+
+  /**
+   * The turn budget is spent: another message would only throw (and park the
+   * task as a "Decision Worker failure"). Judge the work that exists instead.
+   */
+  async #verifyOnTurnBudget(handle: WorkerHandle, event: WorkerEvent, action: DecisionAction): Promise<boolean> {
+    const maxTurns = this.#task?.maxTurns ?? 100;
+    if (this.#turn + 1 <= maxTurns) return false;
+    await this.#appendEvent({ type: "decision_overridden", taskId: this.#task?.taskId, workerId: handle.id, data: { action: action.action, override: "verify", reason: `turn budget of ${maxTurns} is exhausted`, eventType: event.type } }).catch(() => {});
+    await this.#startVerification(handle, event, "turn budget");
+    return true;
   }
 
   /**
@@ -1163,7 +1189,10 @@ export class Supervisor {
     // nothing must be marked as pending on its account.
     if (replay && !this.#decision.replay) return;
     this.#decision.updateContext(this.#decisionContextPatch());
-    if (event.type === "turn_completed") this.#pendingDecisionKey = workerEventKey(event);
+    if (event.type === "turn_completed") {
+      this.#pendingDecisionKey = workerEventKey(event);
+      this.#pendingDecisionSince = Date.now();
+    }
     if (replay) this.#decision.replay!(event);
     else this.#decision.notify(event);
   }
@@ -1379,6 +1408,10 @@ export class Supervisor {
     const nextTurn = this.#turn + 1;
     if (nextTurn > (this.#task?.maxTurns ?? 100)) throw new Error("supervisor turn budget exhausted");
     await this.#adapter.send(handle, message, `${taskId}:turn:${nextTurn}`);
+    // The silence being timed starts now, not at the Worker's last output: a
+    // repair or publish turn follows an acceptance/Review run that can easily
+    // outlast the no-output timeout on its own.
+    this.#noOutputBaselineAt = Date.now();
     this.#turn = nextTurn;
     if (this.#machine.state === "waiting") this.#machine.transition("running");
     await this.#appendEvent({ type: "worker_message_sent", taskId, workerId: handle.id, idempotencyKey: `${taskId}:turn:${this.#turn}`, data: { message } });
@@ -1757,6 +1790,9 @@ export class Supervisor {
       this.#reportProgress("review", "collecting repository evidence and running independent Reviewer", true);
       let review: ReviewReport;
       let reviewUsageReceived = false;
+      // Until this round finishes, #lastVerification still holds the round
+      // whose findings the Worker was just asked to repair.
+      const previousFindings = this.#repairRound > 0 ? this.#lastVerification?.review?.findings : undefined;
       try {
         const evidence = repositoryEvidence ?? redactRepositoryEvidence(await collectRepositoryEvidence(this.#task.cwd, { signal: verificationAbortController.signal, baseRef: this.#task.baseCommit }));
         judgedEvidence = evidence;
@@ -1769,6 +1805,7 @@ export class Supervisor {
           workerOutput: String(redactSensitive(this.#workerOutput)),
           workerResult: this.#lastWorkerResult ? redactSensitive(this.#lastWorkerResult) as Record<string, unknown> : undefined,
           round: this.#repairRound,
+          ...(previousFindings?.length ? { previousFindings } : {}),
           signal: verificationAbortController.signal,
           onUsage: (sample) => { reviewUsageReceived = true; this.#recordPiUsage(sample); },
         } satisfies ReviewInput), this.#reviewTimeoutMs + 30_000, "independent Reviewer", verificationAbortController.signal);
@@ -1781,8 +1818,12 @@ export class Supervisor {
         if (error instanceof Error && error.name === "TimeoutError") verificationAbortController.abort(error.message);
         review = { verdict: "human" as const, summary: `independent Reviewer failed: ${safeMessage(error)}`, findings: [], round: this.#repairRound, checkedAt: new Date().toISOString() };
       }
+      // A P0/P1 finding blocks a pass, but it is a repair input like any other
+      // concrete finding: the bounded repair loop is where serious, fixable
+      // defects get fixed. Only a `human` verdict (or an exhausted/repeating
+      // repair loop) parks the candidate.
       const hasBlockingFinding = review.findings.some((finding) => finding.severity === "P0" || finding.severity === "P1");
-      if (hasBlockingFinding) review = { ...review, verdict: "human" as const, summary: `${review.summary}; blocking findings require human review` };
+      if (hasBlockingFinding && review.verdict === "pass") review = { ...review, verdict: "revise" as const, summary: `${review.summary}; blocking findings must be repaired before the candidate can pass` };
       if (review.verdict === "revise") {
         const signature = findingSignature(review);
         if (signature === this.#lastFindingSignature) {
@@ -2373,7 +2414,16 @@ export class Supervisor {
 
   #armWatchdog(): void {
     if (!this.#automation && this.#deadlineMs <= 0 && this.#noOutputTimeoutMs <= 0) return;
-    this.#watchdog = setInterval(() => { void this.#checkWatchdog().catch(() => { /* lifecycle state is retained for the next explicit operation */ }); }, 1_000);
+    // One tick at a time: a tick queues behind #exclusive, so while a long
+    // acceptance/Review run holds it, un-guarded ticks would pile up by the
+    // thousand and then all run back to back.
+    this.#watchdog = setInterval(() => {
+      if (this.#watchdogTickPending) return;
+      this.#watchdogTickPending = true;
+      void this.#checkWatchdog()
+        .catch(() => { /* lifecycle state is retained for the next explicit operation */ })
+        .finally(() => { this.#watchdogTickPending = false; });
+    }, 1_000);
     this.#watchdog.unref();
   }
 
@@ -2428,7 +2478,9 @@ export class Supervisor {
     // for the grace period as well (an empty grace keeps the old immediate stop).
     const reason = deadlineReached && elapsed >= this.#deadlineMs + this.#deadlineGraceMs
       ? "worker deadline exceeded"
-      : this.#machine.state !== "paused" && this.#noOutputTimeoutMs > 0 && now - lastOutputAt >= this.#noOutputTimeoutMs
+      // Under human takeover (including every recovered task until
+      // resume-auto) an idle Worker is waiting for the operator, not stuck.
+      : this.#machine.state !== "paused" && !this.#humanRequired && this.#noOutputTimeoutMs > 0 && now - lastOutputAt >= this.#noOutputTimeoutMs
         ? "worker produced no output before timeout"
         : undefined;
     if (!reason) {
@@ -2436,6 +2488,40 @@ export class Supervisor {
       else if (this.#deadlineMs > 0 && this.#deadlineWarningMs > 0 && !this.#deadlineNotices.approaching && this.#deadlineMs - elapsed <= this.#deadlineWarningMs) {
         await this.#warnDeadlineApproaching(status, this.#deadlineMs - elapsed);
       }
+      return;
+    }
+    // An *idle* automatic Worker that stayed silent is not hung: it finished a
+    // turn and is waiting (typically on background work that never came
+    // back). Judge the work instead of killing it and discarding the chance
+    // of a candidate; a Worker silent in the middle of a turn is still stopped.
+    // A Worker that never completed a turn under this Supervisor (recovered,
+    // or adopted) still reads `running`; classify it first, as the close-out does.
+    if (reason === "worker produced no output before timeout" && this.#automation && this.#machine.state === "running" && !status.activeRequests) {
+      await this.#pollInternal();
+      // The Worker exited in between: the poll has already classified it.
+      // As at the top of this function, a classified exit is verified here
+      // too, in case its `exited` event (which normally drives it) was lost.
+      const polled: string = this.#machine.state;
+      if (polled !== "running" && polled !== "waiting") {
+        if (polled === "verifying" && !this.#verificationAbortController) {
+          try {
+            await this.#verifyInternal();
+          } catch (error) {
+            await this.#appendEvent({ type: "worker_event_error", taskId, workerId, data: { error: safeMessage(error), eventType: "watchdog_verify" } }).catch(() => {});
+          }
+        }
+        return;
+      }
+    }
+    if (reason === "worker produced no output before timeout" && this.#automation && this.#machine.state === "waiting" && !status.activeRequests) {
+      // A decision about this idle Worker is still being made (it may be
+      // backing off a provider outage); let it land rather than race it —
+      // but not forever: one that has not landed within another timeout
+      // period never will.
+      if (this.#pendingDecisionKey && now - this.#pendingDecisionSince < this.#noOutputTimeoutMs) return;
+      this.#clearWaitTimer();
+      await this.#appendEvent({ type: "worker_idle_timeout", taskId, workerId, data: { reason, action: "verify", noOutputTimeoutMs: this.#noOutputTimeoutMs } }).catch(() => {});
+      await this.#startVerification(this.#handle, this.#lastTurnCompleted, "no-output timeout");
       return;
     }
     // A close-out window that was skipped entirely (a task recovered past its
@@ -2486,7 +2572,16 @@ export class Supervisor {
   /** The per-event context refresh sent to the Decision Worker before every notification or replay. */
   #decisionContextPatch(): Partial<DecisionContext> {
     const deadline = this.#deadlineContext();
-    return { state: this.#machine.state, turn: this.#turn, repairRound: this.#repairRound, ...(deadline ? { deadline } : {}) };
+    const verification = this.#lastVerification;
+    // The Worker's own repair prompt carries these; without them the Decision
+    // Worker judges a repair turn only by Claude's claim that it is done.
+    const lastVerification = verification ? {
+      ok: verification.ok,
+      failedChecks: verification.checks.filter((check) => check.check.required && !check.ok).map((check) => check.check.id).slice(0, 16),
+      ...(verification.review ? { reviewVerdict: verification.review.verdict } : {}),
+      findings: (verification.review?.findings ?? []).slice(0, 8).map((finding) => `${finding.id} [${finding.severity}] ${finding.message}`.slice(0, 200)),
+    } : undefined;
+    return { state: this.#machine.state, turn: this.#turn, repairRound: this.#repairRound, ...(deadline ? { deadline } : {}), ...(lastVerification ? { lastVerification } : {}) };
   }
 
   /**
@@ -2823,11 +2918,13 @@ function removeFlagWithValue(args: readonly string[], flag: string): string[] {
 /**
  * The deadline (in ms since the task started) that grants `extendMs` more
  * from now: measured from the later of the current deadline and the present,
- * so extending an expired task by 30 minutes means 30 minutes from now, and
- * extending by 0 opens its close-out immediately.
+ * so extending an expired task by 30 minutes means 30 minutes from now.
+ * Extending by 0 means "close out now" for any task, expired or not: the
+ * deadline lands on the present so the close-out opens at once.
  */
 export function extendedDeadlineMs(currentDeadlineMs: number, elapsedMs: number, extendMs: number): number {
-  return Math.max(currentDeadlineMs, elapsedMs) + Math.max(0, extendMs);
+  if (extendMs <= 0) return elapsedMs;
+  return Math.max(currentDeadlineMs, elapsedMs) + extendMs;
 }
 
 function canRepairInPlace(adapter: WorkerAdapter): boolean {
@@ -2905,15 +3002,30 @@ function cancelledAcceptanceReport(reason: string): AcceptanceReport {
   };
 }
 
+function tailText(value: string, maxChars: number): string {
+  return value.length <= maxChars ? value : `[…${value.length - maxChars} earlier characters omitted]\n${value.slice(-maxChars)}`;
+}
+
+const RETRY_RESUME_MESSAGE = "Your previous turn stopped before finishing. Resume the task where you left off.";
+
 function repairInstruction(result: AcceptanceReport, reason: string, round: number): string {
+  // Each check keeps the *end* of its output: that is where test runners
+  // print the failure summary, while the head is usually progress noise.
   const failedChecks = result.checks
     .filter((check) => check.check.required && !check.ok)
-    .map((check) => `${check.check.id}: ${check.output}`)
+    .map((check) => `${check.check.id}: ${tailText(check.output, 4_000)}`)
     .join("\n");
+  // Findings carry their location and evidence: they are what points the
+  // Worker at the fix. They go first so the 16 KB bound never cuts them.
   const findings = result.review?.findings
-    .map((finding) => `${finding.id} [${finding.severity}] ${finding.message}${finding.requiredFix ? `; required fix: ${finding.requiredFix}` : ""}`)
+    .map((finding) => {
+      const location = finding.file ? ` ${finding.file}${finding.line ? `:${finding.line}` : ""}` : "";
+      const fix = finding.requiredFix ? `; required fix: ${finding.requiredFix}` : "";
+      const evidence = finding.evidence ? `; evidence: ${tailText(finding.evidence, 1_000)}` : "";
+      return `${finding.id} [${finding.severity}]${location}: ${finding.message}${fix}${evidence}`;
+    })
     .join("\n") ?? "";
-  const evidence = [failedChecks ? `Failed acceptance checks:\n${failedChecks}` : "", findings ? `Reviewer findings:\n${findings}` : ""].filter(Boolean).join("\n\n");
+  const evidence = [findings ? `Reviewer findings:\n${findings}` : "", failedChecks ? `Failed acceptance checks:\n${failedChecks}` : ""].filter(Boolean).join("\n\n");
   const commitRequirement = reason.includes("local commit") || reason.includes("uncommitted")
     ? "Before reporting completion, inspect the final diff, run the relevant checks, and create a local git commit on the task branch. Do not push, merge, publish, or modify main/integration."
     : "";

@@ -1,3 +1,4 @@
+import { DEFAULT_MAX_DECISION_RETRIES } from "./config.ts";
 import { isPlainRemoteName } from "./policy.ts";
 import type { AcceptanceCheck, TaskSpec } from "./types.ts";
 
@@ -94,7 +95,7 @@ function normalizeAutonomy(value: unknown, defaults?: Partial<TaskSpec["autonomy
   const source = value as Record<string, unknown>;
   if (source.unattended !== undefined && typeof source.unattended !== "boolean") throw new Error("task spec autonomy.unattended must be boolean");
   if (source.requireLocalCommit !== undefined && typeof source.requireLocalCommit !== "boolean") throw new Error("task spec autonomy.requireLocalCommit must be boolean");
-  const retries = source.maxDecisionRetries ?? defaults?.maxDecisionRetries ?? 2;
+  const retries = source.maxDecisionRetries ?? defaults?.maxDecisionRetries ?? DEFAULT_MAX_DECISION_RETRIES;
   if (typeof retries !== "number" || !Number.isSafeInteger(retries) || retries < 0 || retries > 10) throw new Error("task spec autonomy.maxDecisionRetries must be between 0 and 10");
   const authority = source.permissionAuthority ?? defaults?.permissionAuthority ?? "hybrid";
   if (authority !== "policy" && authority !== "hybrid" && authority !== "decision-worker") throw new Error("task spec autonomy.permissionAuthority must be policy, hybrid or decision-worker");

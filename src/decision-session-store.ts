@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { currentLockOwner, lockOwnerAlive } from "./lock-owner.ts";
 import { redactSensitive } from "./redaction.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import type { TaskSpec } from "./types.ts";
@@ -363,10 +364,7 @@ export class DecisionSessionStore {
     while (true) {
       try {
         await mkdir(lockPath, { mode: 0o700 });
-        await writeFile(join(lockPath, "owner.json"), JSON.stringify({
-          pid: process.pid,
-          at: new Date().toISOString(),
-        }), { encoding: "utf8", mode: 0o600 });
+        await writeFile(join(lockPath, "owner.json"), JSON.stringify(await currentLockOwner()), { encoding: "utf8", mode: 0o600 });
         break;
       } catch (error) {
         if (!(error instanceof Error) || !/EEXIST/u.test(error.message)) throw error;
@@ -554,17 +552,10 @@ async function removeStaleLock(lockPath: string): Promise<boolean> {
         throw error;
       }
     }
-    let owner: { pid?: unknown } = {};
-    try { owner = JSON.parse(await readFile(ownerPath, "utf8")) as { pid?: unknown }; }
+    let owner: unknown;
+    try { owner = JSON.parse(await readFile(ownerPath, "utf8")); }
     catch { /* an old/incomplete lock is reclaimable after the grace period */ }
-    if (typeof owner.pid === "number" && Number.isSafeInteger(owner.pid) && owner.pid > 0) {
-      try {
-        process.kill(owner.pid, 0);
-        return false;
-      } catch (error) {
-        if (error instanceof Error && /EPERM/u.test(error.message)) return false;
-      }
-    }
+    if (await lockOwnerAlive(owner)) return false;
     await rm(lockPath, { recursive: true, force: true });
     return true;
   } catch (error) {

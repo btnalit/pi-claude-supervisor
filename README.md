@@ -247,8 +247,11 @@ Supervisor being able to see it, or when you don't need to attach.
   is a release: Claude keeps running, unsupervised. The close-out belongs to
   automatic tasks; a manual task is stopped at the deadline as before, and
   `DEADLINE_GRACE_MS=0` restores that for automatic ones too. A 20-minute
-  no-output watchdog (`NO_OUTPUT_TIMEOUT_MS`) still stops a silent Worker at
-  any time.
+  no-output watchdog (`NO_OUTPUT_TIMEOUT_MS`, counted from the Worker's last
+  output or the Supervisor's last message to it) stops a Worker that falls
+  silent mid-turn; an automatic Worker that is merely idle that long (waiting on
+  background work that never came back) is verified instead
+  (`worker_idle_timeout`), and a Worker under human takeover is never timed out.
 - Acceptance checks, evidence collection, and the Reviewer share an abort
   signal, so a stop or shutdown does not wait for a full command or model
   timeout.
@@ -374,7 +377,7 @@ confirmed publish says so in its candidate notice instead of reporting a bare
   "autonomy": {
     "unattended": true,
     "requireLocalCommit": true,
-    "maxDecisionRetries": 2,
+    "maxDecisionRetries": 4,
     "permissionAuthority": "hybrid",
     "maxWorkerCostUsd": 20
   }
@@ -388,7 +391,11 @@ check (120s timeout) and the env autonomy defaults below.
 ## Configuration reference
 
 Environment variables (or `~/.config/pi-claude-supervisor/env`), all prefixed
-`PI_CLAUDE_SUPERVISOR_`; see `.env.example` for a template.
+`PI_CLAUDE_SUPERVISOR_`; see `.env.example` for a template. The env file takes
+`KEY=value` lines, optionally prefixed with `export ` and followed by a
+` # comment`. A numeric, duration or boolean value that is out of range or
+unparsable keeps the default and is reported once as a
+`pi-claude-supervisor: ignoring …` warning.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -411,7 +418,7 @@ Environment variables (or `~/.config/pi-claude-supervisor/env`), all prefixed
 | `HUMAN_WEBHOOK_SECRET` | unset | HMAC signing secret; sent as the `x-pi-supervisor-signature` header |
 | `UNATTENDED` | `true` | Task runs without a synchronous human callback |
 | `REQUIRE_LOCAL_COMMIT` | `true` | Require a local commit on the candidate's branch before completion |
-| `MAX_DECISION_RETRIES` | `2` (0–10) | Retries of a Decision Worker call that times out or fails (429/529, network, auth) |
+| `MAX_DECISION_RETRIES` | `4` (0–10) | Retries of a Decision Worker call that times out or fails (429/529, network, auth); waits 15s, 45s, then 60s between attempts |
 | `PERMISSION_AUTHORITY` | `hybrid` | `policy` \| `hybrid` \| `decision-worker` |
 | `REMOTE_AUTHORITY` | `none` | `none` \| `push` \| `pr`; grants the publish phase after verification passes. `--remote` overrides it per task |
 | `REMOTE_NAME` | `origin` | The single remote a publish grant may name |
@@ -426,8 +433,8 @@ Environment variables (or `~/.config/pi-claude-supervisor/env`), all prefixed
 | `DECISION_SESSION_RETENTION_DAYS` | `30` | Prunes closed Decision Worker session records older than this; `0` keeps forever |
 | `EVIDENCE_MAX_BYTES` | `1048576` (1 MiB) | Maximum repository evidence bytes collected per task |
 | `EVIDENCE_MAX_UNTRACKED_FILES` | `512` | Maximum untracked files collected as evidence per task |
-| `REVIEW_TIMEOUT_MS` | `600000` (10 min) | Total independent Reviewer budget per round, including one retry on a provider error |
-| `DEADLINE_MS` | `4h` | Cumulative wall-clock budget per task (`8h`, `90m`, `2h30m` or ms; 5m–7d); `0` (or `0m`) disables it; `--deadline` overrides it per task |
+| `REVIEW_TIMEOUT_MS` | `10m` (30s–1h) | Total independent Reviewer budget per round; a provider error is retried with a fresh session while budget remains |
+| `DEADLINE_MS` | `4h` | Wall-clock budget per task, measured from its start — time Pi was down counts too, so `recover --extend` grants a fresh budget (`8h`, `90m`, `2h30m` or ms; 5m–7d); `0` (or `0m`) disables it; `--deadline` overrides it per task |
 | `DEADLINE_GRACE_MS` | `30m` | Close-out window after the deadline for automatic tasks: an idle Worker is verified instead of stopped; `0` restores the immediate stop |
 | `DEADLINE_WARNING_MS` | `15m` | How long before the deadline the Decision Worker is warned and re-asked; `0` disables the warning |
 | `NO_OUTPUT_TIMEOUT_MS` | `20m` | Stop a Worker that has produced no output for this long; `0` disables the check |
@@ -452,7 +459,11 @@ A task that stopped at its wall-clock deadline is listed with `deadline=expired
 <task-id>` grants that much budget from now (the recovered Supervisor persists
 the new deadline), and `--extend 0` opens the close-out at once, so the fresh
 Worker's first watchdog tick verifies and reviews the repository as it stands
-and any repair round tells it how long it has. A record nobody will recover is
+and any repair round tells it how long it has. With `--extend` the recovered
+task goes straight back to automation: a real extension sends the fresh Worker a
+continuation of the original task (telling it to inspect the earlier work first),
+and `--extend 0` needs none. A plain `recover` still leaves the Worker idle under
+takeover — send it a continuation, then `resume-auto`. A record nobody will recover is
 dropped with `/supervise discard <task-id>` (its session file is kept until
 retention pruning).
 

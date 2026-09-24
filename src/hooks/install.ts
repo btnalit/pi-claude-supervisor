@@ -2,20 +2,11 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { HOOK_TIMEOUT_SECONDS, type ClaudeHookEventName } from "./types.ts";
+import { CLAUDE_HOOK_EVENT_NAMES, HOOK_TIMEOUT_SECONDS, type ClaudeHookEventName } from "./types.ts";
 import { HOOK_RELAY_SCRIPT, hookRelayCommand } from "./relay.ts";
 import { hookSocketDirectory } from "./server.ts";
 
-const HOOK_EVENT_NAMES: readonly ClaudeHookEventName[] = [
-  "SessionStart",
-  "SessionEnd",
-  "UserPromptSubmit",
-  "PreToolUse",
-  "PermissionRequest",
-  "Stop",
-  "StopFailure",
-  "Notification",
-];
+const HOOK_EVENT_NAMES: readonly ClaudeHookEventName[] = CLAUDE_HOOK_EVENT_NAMES;
 
 /** Substring that marks a hook command entry as ours, regardless of which stateDir produced it. */
 const RELAY_MARKER = "/hooks/relay.js";
