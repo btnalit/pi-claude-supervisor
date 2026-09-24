@@ -2647,12 +2647,7 @@ export class Supervisor {
       // re-entrancy with #verificationAbortController, so this cannot race an
       // already-running verification.
       if (this.#automation && this.#machine.state === "verifying" && !this.#verificationAbortController) {
-        try {
-          await this.#verifyInternal();
-        } catch (error) {
-          // automation failures are parked inside #verifyInternal; audit the rest
-          await this.#appendEvent({ type: "worker_event_error", taskId, workerId, data: { error: safeMessage(error), eventType: "watchdog_verify" } }).catch(() => {});
-        }
+        await this.#guardOwnVerification(this.#handle, undefined, "watchdog_verify", () => this.#verifyInternal());
       }
       return;
     }
@@ -2697,11 +2692,7 @@ export class Supervisor {
       const polled: string = this.#machine.state;
       if (polled !== "running" && polled !== "waiting") {
         if (polled === "verifying" && !this.#verificationAbortController) {
-          try {
-            await this.#verifyInternal();
-          } catch (error) {
-            await this.#appendEvent({ type: "worker_event_error", taskId, workerId, data: { error: safeMessage(error), eventType: "watchdog_verify" } }).catch(() => {});
-          }
+          await this.#guardOwnVerification(this.#handle, undefined, "watchdog_verify", () => this.#verifyInternal());
         }
         return;
       }
@@ -2714,7 +2705,7 @@ export class Supervisor {
       if (this.#pendingDecisionKey && now - this.#pendingDecisionSince < this.#noOutputTimeoutMs) return;
       this.#clearWaitTimer();
       await this.#appendEvent({ type: "worker_idle_timeout", taskId, workerId, data: { reason, action: "verify", noOutputTimeoutMs: this.#noOutputTimeoutMs } }).catch(() => {});
-      await this.#startVerification(this.#handle, this.#lastTurnCompleted, "no-output timeout");
+      await this.#startOwnVerification(this.#handle, this.#lastTurnCompleted, "no-output timeout");
       return;
     }
     // A close-out window that was skipped entirely (a task recovered past its
@@ -2856,11 +2847,30 @@ export class Supervisor {
     if ((this.#pendingDecisionKey && !this.#pendingDecisionRetrying) || this.#machine.state !== "waiting" || this.#verificationAbortController || status.activeRequests) return;
     this.#clearWaitTimer();
     await this.#appendEvent({ type: "deadline_close_out", taskId: task.taskId, workerId: handle.id, data: { action: "verify", reason: "task deadline reached with an idle Worker" } });
+    await this.#startOwnVerification(handle, this.#lastTurnCompleted, "deadline close-out");
+  }
+
+  /**
+   * A verification the Supervisor starts on its own (the idle watchdog, the
+   * close-out) has no Decision Worker failure path behind it. One that throws
+   * part-way (an event-log write, a git read) would leave the task in
+   * `verifying`, where the watchdog no longer looks: no deadline, no stop, no
+   * notice. Park it instead, keeping the candidate and the real reason.
+   */
+  async #startOwnVerification(handle: WorkerHandle, event: WorkerEvent | undefined, origin: string): Promise<void> {
+    await this.#guardOwnVerification(handle, event, origin, () => this.#startVerification(handle, event, origin));
+  }
+
+  async #guardOwnVerification(handle: WorkerHandle | undefined, event: WorkerEvent | undefined, origin: string, verify: () => Promise<unknown>): Promise<void> {
     try {
-      await this.#startVerification(handle, this.#lastTurnCompleted, "deadline close-out");
+      await verify();
     } catch (error) {
-      // Verification failures are parked inside #verifyInternal; audit the rest.
-      await this.#appendEvent({ type: "worker_event_error", taskId: task.taskId, workerId: handle.id, data: { error: safeMessage(error), eventType: "deadline_close_out" } }).catch(() => {});
+      await this.#appendEvent({ type: "worker_event_error", taskId: this.#task?.taskId, workerId: handle?.id, data: { error: safeMessage(error), eventType: origin } }).catch(() => {});
+      // A release in progress finishes the task its own way.
+      if (this.#releasing || this.#released) return;
+      if (this.#machine.state === "verifying" && !this.#verificationAbortController) {
+        await this.#parkCandidate(`${origin} verification failed part-way: ${safeMessage(error)}`, event).catch(() => {});
+      }
     }
   }
 

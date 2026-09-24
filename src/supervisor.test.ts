@@ -4566,3 +4566,76 @@ test("a verify action whose verification throws part-way parks with its reason i
     assert.equal(events.events.some((event) => event.type === "decision_ignored"), false);
   });
 });
+
+for (const origin of ["idle watchdog", "close-out"] as const) {
+  test(`a verification the ${origin} starts that throws part-way parks the candidate instead of hanging in verifying`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-own-verify-throws-"));
+    try {
+      await initializeGitRepository(cwd, "worker/own-verify-throws");
+      const fixture = closeOutFixture(cwd);
+      const events = new FlakyEventLog("acceptance_started");
+      const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+      await supervisor.start({
+        task: `${origin} verification throws`,
+        cwd,
+        command: "claude",
+        automation: true,
+        spec: automaticSpec(),
+        ...(origin === "close-out"
+          ? { startedAt: new Date(Date.now() - 3_000).toISOString(), deadlineMs: 2_000, deadlineGraceMs: 60_000, deadlineWarningMs: 0, noOutputTimeoutMs: 0 }
+          : { deadlineMs: 0, noOutputTimeoutMs: 500 }),
+        decisionWorkerFactory: fixture.decisionWorkerFactory,
+      });
+      const turn = fixture.turn(1);
+      fixture.state.listener?.(turn);
+      await supervisor.poll();
+      // The decision for the turn is backing off an outage, so the Supervisor verifies on its own.
+      fixture.state.onRetry?.(turn, { attempt: 1, delayMs: 60_000, error: new Error("529 overloaded_error") });
+      await waitFor(() => supervisor.state === "blocked");
+      assert.equal(supervisor.candidateParked, true);
+      assert.ok(events.events.some((event) => event.type === "worker_event_error" && /injected event failure/u.test(String(event.data?.error))));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+test("a verification the watchdog starts for an exited Worker that throws part-way parks the candidate", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-watchdog-verify-throws-"));
+  try {
+    await initializeGitRepository(cwd, "worker/watchdog-verify-throws");
+    const handle: WorkerHandle = { id: "watchdog-verify-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true, repairableSession: true }),
+      start: async () => handle,
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running, ...(running ? {} : { exitReason: "completed" as const, exitCode: 0 }) }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const events = new FlakyEventLog("acceptance_started");
+    const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "watchdog verification throws",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    });
+    // The Worker exits and its `exited` event is lost: the watchdog classifies and verifies it.
+    running = false;
+    await waitFor(() => supervisor.state === "blocked");
+    assert.equal(supervisor.candidateParked, true);
+    assert.ok(events.events.some((event) => event.type === "worker_event_error" && event.data?.eventType === "watchdog_verify"));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
