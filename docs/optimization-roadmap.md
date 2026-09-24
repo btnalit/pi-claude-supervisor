@@ -50,7 +50,7 @@
 | 启动 | `#startAbortController` `#startToken` `#startStopReason` `#startAbortError` `#startAbortCompletion` |
 
 - **Decision 的现有裁决顺序**（`#applyDecision`，由代码顺序隐式决定）：
-  已释放/终态 → 人工闸门延迟（`decision_deferred`）→ 事件去重 → 按动作分支；
+  已释放/终态 → 人工闸门（记 `decision_deferred` 并丢弃）→ 事件去重 → 按动作分支；
   分支内：`stop` 先经 `#verifyStop`（其中过期 stop 退化为普通 stop）；`continue/redirect/answer/retry`
   依次经 `#decisionIsStale` → `#verifyOnTurnBudget` → `#verifyStaleFailure`；
   `wait` 另有收尾期 `wait → verify` 覆盖与 deadline 预警重放。**staleness 语义随动作不同**
@@ -94,7 +94,8 @@
 
 1. **Decision verify-first 停止让位于操作员停止**：`#verifyStop` 与 `#finalizeVerification` 检查操作员停止，
    已存在操作员停止时以其为准。其余路径（Decision 普通 stop、`park` / `ask_human` / `noop` → park）**不检查**
-   操作员停止（见 B1）。再次调用 `stop()` 会覆盖原因与关闭原因。
+   操作员停止（见 B1）。重复 `stop()`：验证进行中时，最后一次的原因与关闭原因生效（`#finalizeVerification`
+   读取被覆盖的字段）；其他状态下第一次生效，后续调用在任务已 `stopped` 时直接返回。
 2. **收尾与停止正交**：deadline 收尾不是停止；收尾期间允许修复轮（剩余 ≥ `MIN_CLOSE_OUT_REPAIR_MS`），
    Decision 停止照常经 `#verifyStop`。deadline + grace 到期由 watchdog **停止** Worker（`worker_watchdog_timeout`）。
 3. **修复前置条件**（`#requestRepair`）：自动化模式 ∧ 人工闸门关闭 ∧ 无 verify-first 停止 ∧ 修复预算未耗尽 ∧
@@ -102,12 +103,15 @@
    触发来源：验收失败、截断证据、本地 commit 缺失、Reviewer revise，**以及通过验证后发布预检发现未提交改动**。
 4. **验证时效**：基于验证结果的 Decision 判断以 `atTurn` 标注其时效；例外——发布轮返回后，若 HEAD 与工作树未变，
    复用发布前的通过验证（`#settlePublish`），不重新验证。
-5. **发布前置条件**：存在对 `verifiedHead` 的通过验证 ∧ 远端授权有效 ∧ 远端基线未变化；用户拒绝发布时仍以
-   completed 结束并记录 shortfall。
+5. **发布**：`remoteAuthority = none` 时验证通过即 `completed`。否则 `#requestPublish` 检查前置条件（手动模式、
+   takeover、停止请求、传输能力、收尾窗口、受保护/未知分支、HEAD 不可读或已变、证据缺失、Git 目录非本地、Worker 忙、
+   远端 URL/基线变化、`pr` 模式缺仓库标识、状态非 verifying）；任一不满足 **不阻塞**，记 `publish_skipped` shortfall
+   后以 `completed` 结束（存在停止请求则为 `stopped`）。工作树有未提交改动 → 修复轮；无修复预算 → shortfall + `completed`。
+   发布轮返回后由 `#settlePublish` 得出 `completed`、publish-only `blocked`，或 HEAD/树变化 → abandoned → 重新验证。
 6. **人工闸门**：闸门打开时 Decision 被记录为 `decision_deferred` 并 **丢弃**；`resumeAutomation` 只重新询问最后一个
    `turn_completed`（见 B2）。闸门检查位于已释放/终态检查之后。
 7. **无输出**：自动化下空闲 Worker 的无输出超时触发 **验证**（`worker_idle_timeout`）；轮次中途静默才 **停止**。
-8. **成本预算**：超出 `maxWorkerCostUsd`（或 Claude `error_max_budget_usd`）**立即 park**，不验证、不停止意图。
+8. **成本预算**（仅自动化模式）：超出 `maxWorkerCostUsd`（或 Claude `error_max_budget_usd`）**立即 park**，不验证。
 
 **B. 目标不变量**——当前不成立，须以 **独立的行为变更 PR** 实现（建议作为阶段 0.3，见 §5）：
 
@@ -118,6 +122,8 @@
 3. **终态无挂起资源**：进入终态后清除计时器、中止控制器与 `#pendingDecisionKey`（当前 stop/park/finalize 不清除后者）。
 4. **裁决可审计**：每次覆盖带结构化 guard 标识（阶段 2.3 引入；当前 stale 丢弃记 `decision_ignored`，
    权限覆盖记 `permission_decision`，`decision_overridden` 仅有文本 `reason`）。
+5. **释放后不再驱动 Worker**：验收进行中 `release()` 时，中止被当作验收失败，`#requestRepair`（不检查 `#releasing`）
+   会向已交还操作员的 Worker 发送修复轮（复审临时测试复现）；证据采集或审查阶段的 release 则正确 park。
 
 ### 3.3 子生命周期（目标形态，覆盖现有真实路径）
 
@@ -130,20 +136,28 @@ Verification（每轮）：
        ▼ ok
   local commit check ── missing ▶ repair? / blocked
        ▼ ok
-  review ── pass ▶ publish? ─┬─ none / 用户拒绝 ▶ completed（拒绝时记 shortfall）
-       │                     ├─ 预检：未提交/未跟踪改动 ▶ repair?（同上）
-       │                     └─ requested ▶ (publish turn) ▶ HEAD/树未变 ▶ settled（复用通过验证）▶ completed
-       │                                                   └ 变化 ▶ abandoned ▶ 重新验证 | publish-only blocked
+  review ── pass ▶ publish? ─┬─ remoteAuthority=none ▶ completed
+       │                     ├─ 前置条件不满足 ▶ publish_skipped（shortfall）▶ completed（有停止请求 ▶ stopped）
+       │                     ├─ 未提交/未跟踪改动 ▶ repair?（同上；无预算 ▶ shortfall ▶ completed）
+       │                     └─ requested ▶ (publish turn) ▶ HEAD/树未变 ▶ #settlePublish ▶ completed | publish-only blocked
+       │                                                   ├ HEAD/树不可读 ▶ publish-only blocked
+       │                                                   └ 已变化 ▶ abandoned ▶ 重新验证
        ├─ revise ▶ repair?（同上）；重复发现 ▶ human ▶ parked
        └─ human / Reviewer 失败 ▶ parked
-  任一阶段：操作员停止 ▶ cancelled（stopped）；证据采集失败 / 验证中 takeover 或 release ▶ parked
+  任一阶段：操作员停止 ▶ cancelled（stopped）；证据采集失败 ▶ parked
+  验证中 release：证据/审查阶段 ▶ parked；验收阶段 ▶ 被当作验收失败而发出修复轮（缺陷，见 §3.2 B5）
+  验证中 takeover：在 #exclusive 队列中等待验证结束后才生效
   （注：所有 blocked 的验证结果都会置 #candidateParked，“blocked”与“parked”在状态上相同）
 StopIntent（终止意图，现状）：
-  none → decision_stop{verifyFirst | plain} | operator_stop{human | watchdog(deadline+grace) | mid-turn no_output | abort_start | recoverable_failure}
+  none → decision_stop{verifyFirst | plain} | operator_stop{human | abort_start | recoverable_failure}
+  另：watchdog（deadline+grace）与无输出停止直接调用 #stopInternal，不设置 #stopRequested
+      （自动化下仅轮次中途静默才停止；非自动化下空闲 Worker 也会被停止）
   decision_stop{verifyFirst} → operator_stop（操作员取代，现状只在此路径成立）
   operator_stop → operator_stop（再次 stop 覆盖原因，现状）
-Park（终止但非停止意图）：成本预算、Decision park/ask_human/noop、验证 blocked —— 经 #stopInternal(…, "blocked") 结束
+Park（终止但非停止意图）：成本预算、Decision park/ask_human/noop —— running/waiting/paused/starting 下经
+  #stopInternal(…, "blocked") 结束；verifying 下（含验证 blocked）经 #finalizeVerification 结束并记 candidate_parked
 Release（非终止）：断开 Supervisor；交互 Worker 移出 cgroup 交还操作员，任务状态与恢复记录不变
+  （验证进行中 release 的影响见上方 Verification 注释）
 Budget：turns 耗尽 → 验证；deadline 收尾 → 验证空闲 Worker；deadline+grace → watchdog 停止；cost → 立即 park
 ```
 
@@ -178,13 +192,15 @@ interface DecisionGuard {
 }
 // 顺序（现状；标 * 者为提案新增）：
 //   已释放 → 终态 → 人工闸门（defer，现状为丢弃，见 §3.2 B2）→ 去重（wait 不去重）→ 记录 decision_made → 按动作：
-//   allow/deny_permission: 策略 deny 覆盖 Decision 的 allow；无法回应权限 → park
+//   allow/deny_permission: 无法回应权限 → park（先检查）；策略 deny 覆盖 Decision 的 allow；
+//                          AskUserQuestion 的 deny_permission 以 reason 携带答案
 //   continue/redirect/answer 且待决 AskUserQuestion: 以权限 deny 携带答案（先于过期检查）
 //   continue/redirect/answer/retry: stale-event(drop) → turn-budget → *no-progress → stale-failure
 //   verify:   stale-event(drop, decision_ignored) → 验证
-//   stop:     verify-stop(handled；过期或有远端授权 → pass→普通 stop)
+//   stop:     verify-stop(handled)；以下回落为普通 stop：非 turn_completed 事件、状态非 waiting、非自动化、
+//             人工闸门打开、有远端授权、决策已过期
 //   park/ask_human/noop: → park（noop 在 clean exit 上 → 验证）
-//   wait:     收尾期 wait→verify、deadline 预警重放
+//   wait:     deadline 预警重放（先检查）或收尾期 wait→verify（二者互斥），否则重设等待计时器
 ```
 
 ## 5. 分阶段实施
@@ -204,8 +220,8 @@ interface DecisionGuard {
 分支跟踪、detached HEAD 判断与发布授权的分支/受保护分支检查改用原始分支名，仅在输出时脱敏。
 **验收**：现有测试全绿；新增“脱敏规则变化不影响路径/分支合法性”的测试；列出被新规则放行或拒绝的差异样例。
 
-**0.3 已知行为缺口修复**（显式行为变更，单独 PR）：实现 §3.2 B1（操作员停止唯一优先）与 B3（终态清除待决决策），
-各带竞态回归测试；B2（延迟而不丢失）需先确认权限请求重放的交互，单独评估。
+**0.3 已知行为缺口修复**（显式行为变更，单独 PR）：实现 §3.2 B1（操作员停止唯一优先）、B3（终态清除待决决策）
+与 B5（释放后不再发出修复轮），各带竞态回归测试；B2（延迟而不丢失）需先确认权限请求重放的交互，单独评估。
 
 ### 阶段 1：通用无进展兜底（1 个 PR，先观察后覆盖）
 
@@ -234,9 +250,9 @@ continue/redirect/answer/retry → 覆盖为 verify；Worker 自身 API 错误�
 | 2.0 | **行为基线**：可控时钟（`node:test` 的 `mock.timers` 或注入 clock）+ 在 `automation-replay.test.ts` 的 `ReplayEventLog` 基础上录制 12–15 个场景的 **归一化事件序列**（事件类型 + 关键字段；剔除 `at` 与 `data` 内的时间戳如 `checkedAt`/`startedAt`、临时路径、耗时、成本） | ✅ |
 | 2.1 | 抽出 `StopIntent`（保持 §3.2 A1、A2、A7），替换 `#stopRequested` `#stopVerification` `#stopCloseReason` `#preemptiveStop`，纳入 watchdog / 无输出 / abortStart 来源 | ✅ |
 | 2.2 | 抽出 `VerificationCycle`（保持 §3.2 A3、A4、A5，§3.3 全部路径） | ✅ |
-| 2.3 | 抽出 Decision 裁决管线，保持现有顺序与语义；事件增加结构化 guard 字段 | ✅ |
+| 2.3 | 抽出 Decision 裁决管线，保持现有顺序与语义（含 §3.2 A6）；事件增加结构化 guard 字段（B4） | ✅ |
 | 2.4 | 抽出 `PublishCycle`（保持 §3.2 A5） | 可选 |
-| 2.5 | 抽出 watchdog / usage；进一步缩减 `supervisor.ts` | 可选 |
+| 2.5 | 抽出 watchdog / usage（保持 §3.2 A7、A8）；进一步缩减 `supervisor.ts` | 可选 |
 
 **场景清单**（2.0）：正常完成；验收失败→修复→通过；Reviewer revise→修复；截断证据→修复；本地 commit 缺失→修复；
 修复预算耗尽；重复发现→human；Decision stop→verify 通过/失败；可发布任务上的 Decision stop（普通 stop）；
@@ -255,8 +271,8 @@ B 的每条目标不变量在对应的行为变更 PR 中有违反即失败的�
 - 恢复后的任务先处于 `takeover()` 空闲状态，直到 resume-auto 或 `--extend` 才恢复自动化（`index.ts`）；
   自动化恢复时：若最近验证失败，stale-failure / no-progress guard 从持久化计数继续；若中断时处于 Decision
   verify-first 停止，恢复自动化后的第一个动作是一次验证而不是发送 Worker 轮次。
-- 哪些终止会关闭恢复记录：只有清理已确认的 `human_stop`。关机停止（`preserveDecisionSession` →
-  `recoverable_failure`）、watchdog / 无输出停止、清理未确认的 `human_stop` 都会标记为可恢复中断；
+- 哪些终止会关闭恢复记录：清理已确认的 `completed` 与 `human_stop`。`blocked`、`failed`、关机停止
+  （`preserveDecisionSession` → `recoverable_failure`）、watchdog / 无输出停止、清理未确认的停止都会标记为可恢复中断；
   `release` 不改动记录。正是这些任务需要完整的恢复状态。
 - 同时消除 `index.ts` 中两处重复的进度持久化逻辑（启动与恢复路径共用一个函数）。
 - 测试：修复中途 recover、stop→verify 中途 recover；`spike:decision` 新增 `recover` 场景。
