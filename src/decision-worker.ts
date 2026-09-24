@@ -120,6 +120,8 @@ export class PiDecisionWorker implements DecisionWorkerLike {
   #sessionFile?: string;
   #context: DecisionContext;
   readonly #timeoutMs: number;
+  /** Ends a startup retry backoff early; set only while one is waiting. */
+  #wakeStartupBackoff?: () => void;
   readonly #retryBackoffMs: number;
   readonly #compactionTokens: number;
   /** Set after a compaction; the next primary decision prompt re-sends the startup instructions once. */
@@ -180,19 +182,22 @@ export class PiDecisionWorker implements DecisionWorkerLike {
           await promptForText(session, decisionInstructions(this.#context), this.#timeoutMs, "Decision Worker startup", MAX_DECISION_RESPONSE_BYTES, { role: "decision", onUsage: this.#options.onUsage });
           break;
         } catch (error) {
+          // Closed by the Supervisor (an operator stop): not a startup
+          // failure to report, whatever the interrupted prompt returned.
+          if (this.#closed) throw closedDuringStartup();
           // Only a provider error is worth another attempt: a timeout already
           // spent the whole prompt budget and would only multiply it.
           const retryable = error instanceof Error && error.name === "DecisionWorkerApiError";
-          if (this.#closed || attempt >= maxRetries || !retryable) {
+          if (attempt >= maxRetries || !retryable) {
             try { await this.#options.onStartupFailure?.(error); } catch { /* preserve the original startup failure */ }
             throw error;
           }
-          await new Promise<void>((resolveWait) => setTimeout(resolveWait, Math.min(MAX_DECISION_RETRY_BACKOFF_MS, this.#retryBackoffMs * 3 ** (attempt + 1))));
-          if (this.#closed) {
-            const closed = new Error("Decision Worker was closed during startup");
-            closed.name = "AbortError";
-            throw closed;
-          }
+          // close() wakes this wait, so a stop does not sit out the backoff.
+          await new Promise<void>((resolveWait) => {
+            const timer = setTimeout(() => { this.#wakeStartupBackoff = undefined; resolveWait(); }, Math.min(MAX_DECISION_RETRY_BACKOFF_MS, this.#retryBackoffMs * 3 ** (attempt + 1)));
+            this.#wakeStartupBackoff = () => { clearTimeout(timer); this.#wakeStartupBackoff = undefined; resolveWait(); };
+          });
+          if (this.#closed) throw closedDuringStartup();
         }
       }
     }
@@ -326,11 +331,18 @@ export class PiDecisionWorker implements DecisionWorkerLike {
     // Do not await #tail here: onAction may be closing the worker from inside
     // the same queued decision, which would otherwise deadlock shutdown.
     this.#closed = true;
+    this.#wakeStartupBackoff?.();
     const session = this.#session;
     this.#session = undefined;
     if (session) await session.abort().catch(() => {});
     session?.dispose();
   }
+}
+
+function closedDuringStartup(): Error {
+  const error = new Error("Decision Worker was closed during startup");
+  error.name = "AbortError";
+  return error;
 }
 
 function decisionInstructions(context: DecisionContext): string {

@@ -1131,6 +1131,58 @@ for (const variant of ["passing", "failing", "stale", "permission"] as const) {
   });
 }
 
+test("an operator stop racing a Decision Worker stop ends the task stopped, not blocked", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-stop-race-"));
+  try {
+    await initializeGitRepository(cwd, "worker/stop-race");
+    const handle: WorkerHandle = { id: "stop-race-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    let releaseStop!: () => void;
+    const stopGate = new Promise<void>((resolve) => { releaseStop = resolve; });
+    let stopCalls = 0;
+    let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+    let eventListener: WorkerStartInput["eventListener"] | undefined;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async (input) => { eventListener = input.eventListener; return handle; },
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      // The Decision Worker's stop is slow to finish; the operator's lands meanwhile.
+      stop: async () => { stopCalls += 1; if (stopCalls === 1) await stopGate; running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(adapter, events as never, { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "stop race fixture",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 5_000 }] },
+      decisionWorkerFactory: (options) => { onAction = options.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+    });
+    const event: WorkerEvent = { type: "turn_completed", handle, result: { subtype: "success", result: "Done." }, sequence: 1 };
+    await eventListener?.(event);
+    await supervisor.poll();
+    const decided = onAction?.({ action: "stop", reason: "done" }, event);
+    while (stopCalls === 0) await new Promise((resolve) => setImmediate(resolve));
+    const operator = supervisor.stop("operator cancelled");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    releaseStop();
+    await Promise.all([decided, operator]);
+    assert.equal(supervisor.state, "stopped");
+    assert.ok(!events.events.some((entry) => entry.type === "candidate_parked"));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("automatic candidates require and review a local commit", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-local-commit-"));
   try {

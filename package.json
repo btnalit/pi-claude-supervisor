@@ -61,6 +61,7 @@
     "spike:permissions": "node scripts/spike-claude-permissions.mjs",
     "spike:signals": "node scripts/spike-claude-signals.mjs",
     "spike:automation": "node scripts/spike-claude-automation.mjs",
+    "spike:decision": "node scripts/spike-decision.mjs",
     "check": "npm run typecheck && npm test && npm run check:package && npm run check:docs && npm run check:automation",
     "build": "node scripts/build-package.mjs"
   },

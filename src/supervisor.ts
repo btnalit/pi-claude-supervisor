@@ -1211,6 +1211,8 @@ export class Supervisor {
     await this.#pollInternal(true);
     // Re-read after the awaits: the poll moves the stopped Worker on.
     const after: string = this.#machine.state;
+    // An operator stop arrived meanwhile: it owns the outcome ("stopped").
+    if (this.#stopRequested !== undefined) return true;
     if (after === "verifying") await this.#verifyInternal();
     else await this.#parkCandidate(`Decision Worker stop left the task in state ${after} before verification`, event);
     return true;
