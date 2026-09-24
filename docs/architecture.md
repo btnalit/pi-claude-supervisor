@@ -617,6 +617,10 @@ evidence still parks.
 
 A `revise` result produces an audited repair round and sends a bounded corrective
 instruction to a still-live `repairableSession` Worker. Checks and review then run again.
+The Decision Worker sees the last result tagged with the Worker turn it judged, and chooses
+when to verify again; if it keeps steering instead, the Supervisor verifies on its own once
+the Worker has taken three turns since that failure (`decision_overridden`), so a Decision
+Worker reasoning from the stale failure cannot hold a fixed Worker in a loop until the deadline.
 The repair budget defaults to three rounds. P0/P1 findings block a `pass` but are repair
 inputs like any other concrete finding (a `pass` carrying one is treated as `revise`); a
 `human` verdict, repeated findings or an exhausted budget stop automation and park a

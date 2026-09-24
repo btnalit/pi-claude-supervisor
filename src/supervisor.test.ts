@@ -996,6 +996,62 @@ test("automatic acceptance review requests a bounded repair before completing", 
   assert.equal(supervisor.state, "completed");
 });
 
+test("after a failed verification, Worker turns without a new one end in a Supervisor verify", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-stale-verification-"));
+  try {
+    await initializeGitRepository(cwd, "worker/stale-verification");
+    const handle: WorkerHandle = { id: "stale-verification-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    const sends: string[] = [];
+    let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+    let eventListener: WorkerStartInput["eventListener"] | undefined;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async (input) => { eventListener = input.eventListener; return handle; },
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+      readOutput: async () => [],
+      // The repair turn fixes the work; the Decision Worker never notices.
+      send: async (_handle, message) => { sends.push(message); await writeFile(join(cwd, "fixed"), "yes\n"); },
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(adapter, events as never, { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "stale verification fixture",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "fixed", name: "fixed", command: process.execPath, args: ["-e", "process.exit(require('node:fs').existsSync('fixed') ? 0 : 1)"], required: true, timeoutMs: 5_000 }] },
+      decisionWorkerFactory: (options) => { onAction = options.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+    });
+    await supervisor.poll();
+    const first = await supervisor.verify();
+    assert.equal(first.ok, false);
+    assert.match(sends[0] ?? "", /Automatic repair round 1/u);
+    // The Decision Worker keeps judging by the old failure and only continues.
+    for (let sequence = 1; sequence <= 3; sequence += 1) {
+      const event: WorkerEvent = { type: "turn_completed", handle, result: { subtype: "success", result: "Fixed; all checks pass." }, sequence };
+      await eventListener?.(event);
+      await supervisor.poll();
+      await onAction?.({ action: "continue", message: "Verification still fails; look again.", reason: "last verification failed" }, event);
+    }
+    // Two of those continues reached Claude; the third became a verify.
+    assert.equal(sends.length, 3);
+    const override = events.events.find((event) => event.type === "decision_overridden");
+    assert.equal((override?.data as { override?: string } | undefined)?.override, "verify");
+    assert.equal(supervisor.lastVerification?.ok, true);
+    assert.equal(supervisor.state, "completed");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("automatic candidates require and review a local commit", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-local-commit-"));
   try {

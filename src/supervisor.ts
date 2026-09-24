@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { EventLog, type SupervisorEvent } from "./events.ts";
 import { SupervisorStateMachine } from "./state.ts";
 import { evaluatePermission, isCommitId, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, type PermissionPolicyOptions, type PolicyResult, type RemoteGrant } from "./policy.ts";
-import { PiDecisionWorker, type DecisionAction, type DecisionContext, type DecisionDeadlineContext, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
+import { PiDecisionWorker, STALE_VERIFICATION_TURNS, type DecisionAction, type DecisionContext, type DecisionDeadlineContext, type DecisionWorkerFactory, type DecisionWorkerLike, type PiModel } from "./decision-worker.ts";
 import { DEFAULT_DEADLINE_GRACE_MS, DEFAULT_DEADLINE_MS, DEFAULT_DEADLINE_WARNING_MS, DEFAULT_NO_OUTPUT_TIMEOUT_MS, formatDurationMs } from "./config.ts";
 import { collectRepositoryEvidence, remoteBranchHead, remoteUrl, runReadOnly, repositoryBranch, repositoryCommitExists, repositoryHead, repositoryIsAncestor, repositoryWorkTree, verifyAll, repositoryClean, repositoryGitDirectoryIsLocal, repositorySlug, sameDestination, type RemoteBranchLookup, type RemoteDestination, type RepositoryEvidence, type VerificationCommand } from "./verifier.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
@@ -214,6 +214,8 @@ export class Supervisor {
   #lastObservedBranch?: string;
   #handle?: WorkerHandle;
   #lastVerification?: AcceptanceReport;
+  /** The Worker turn the last verification judged; later turns are not reflected in it. */
+  #lastVerificationTurn?: number;
   #workerOutput = "";
   #lastWorkerResult?: Record<string, unknown>;
   #lastTurnCompleted?: WorkerEvent;
@@ -352,6 +354,7 @@ export class Supervisor {
     this.#handle = undefined;
     this.#lastObservedBranch = undefined;
     this.#lastVerification = undefined;
+    this.#lastVerificationTurn = undefined;
     this.#workerOutput = "";
     this.#lastWorkerResult = undefined;
     this.#lastTurnCompleted = undefined;
@@ -1083,6 +1086,7 @@ export class Supervisor {
       if (action.action === "continue" || action.action === "redirect" || action.action === "answer") {
         if (await this.#decisionIsStale(event)) return;
         if (await this.#verifyOnTurnBudget(handle, event, action)) return;
+        if (await this.#verifyStaleFailure(handle, event, action)) return;
         await this.#sendInternal(action.message);
         return;
       }
@@ -1145,6 +1149,7 @@ export class Supervisor {
         const message = action.message?.trim() ? action.message : RETRY_RESUME_MESSAGE;
         if (await this.#decisionIsStale(event)) return;
         if (await this.#verifyOnTurnBudget(handle, event, action)) return;
+        if (await this.#verifyStaleFailure(handle, event, action)) return;
         await this.#sendInternal(message);
       }
     });
@@ -1159,6 +1164,22 @@ export class Supervisor {
     if (this.#turn + 1 <= maxTurns) return false;
     await this.#appendEvent({ type: "decision_overridden", taskId: this.#task?.taskId, workerId: handle.id, data: { action: action.action, override: "verify", reason: `turn budget of ${maxTurns} is exhausted`, eventType: event.type } }).catch(() => {});
     await this.#startVerification(handle, event, "turn budget");
+    return true;
+  }
+
+  /**
+   * A verification failed and the Worker has since taken several turns with
+   * no new one: judge the work as it is now instead of sending more guidance
+   * based on the old failure. Another failure goes through the ordinary
+   * repair-round budget, so a stuck task parks instead of running to its
+   * deadline.
+   */
+  async #verifyStaleFailure(handle: WorkerHandle, event: WorkerEvent, action: DecisionAction): Promise<boolean> {
+    if (event.type !== "turn_completed" || !this.#lastVerification || this.#lastVerification.ok || this.#lastVerificationTurn === undefined) return false;
+    const turnsSince = this.#turn - this.#lastVerificationTurn;
+    if (turnsSince < STALE_VERIFICATION_TURNS) return false;
+    await this.#appendEvent({ type: "decision_overridden", taskId: this.#task?.taskId, workerId: handle.id, data: { action: action.action, override: "verify", reason: `${turnsSince} Worker turns since the last failed verification`, eventType: event.type } }).catch(() => {});
+    await this.#startVerification(handle, event, "stale failed verification");
     return true;
   }
 
@@ -1636,6 +1657,7 @@ export class Supervisor {
     if (!this.#task) throw new Error("no active task");
     if (this.#machine.state === "waiting" && canRepairInPlace(this.#adapter)) this.#machine.transition("verifying");
     if (this.#machine.state !== "verifying") throw new Error(`cannot verify from ${this.#machine.state}`);
+    this.#lastVerificationTurn = this.#turn;
     const verificationAbortController = new AbortController();
     this.#verificationAbortController = verificationAbortController;
 
@@ -2577,6 +2599,7 @@ export class Supervisor {
     // Worker judges a repair turn only by Claude's claim that it is done.
     const lastVerification = verification ? {
       ok: verification.ok,
+      ...(this.#lastVerificationTurn !== undefined ? { atTurn: this.#lastVerificationTurn } : {}),
       failedChecks: verification.checks.filter((check) => check.check.required && !check.ok).map((check) => check.check.id).slice(0, 16),
       ...(verification.review ? { reviewVerdict: verification.review.verdict } : {}),
       findings: bySeverity(verification.review?.findings ?? []).slice(0, 8).map((finding) => `${finding.id} [${finding.severity}] ${finding.message}`.slice(0, 200)),

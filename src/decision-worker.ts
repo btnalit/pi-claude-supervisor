@@ -36,6 +36,8 @@ export interface DecisionContext {
 /** A compact view of the last verification: what failed and what the Reviewer asked for. */
 export interface DecisionVerificationSummary {
   ok: boolean;
+  /** The Worker turn it judged: turns after it are not reflected in it. */
+  atTurn?: number;
   failedChecks: string[];
   reviewVerdict?: string;
   findings: string[];
@@ -92,6 +94,13 @@ export interface DecisionWorkerOptions {
 export type PiModel = NonNullable<NonNullable<Parameters<typeof createAgentSession>[0]>["model"]>;
 
 const DEFAULT_COMPACTION_TOKENS = 60_000;
+/**
+ * Worker turns after a failed verification before the Supervisor verifies on
+ * its own: the Decision Worker only sees that failure as it was, so left to
+ * itself it can keep sending "it still fails" guidance to a Worker that has
+ * already fixed it. The first of these turns is the repair turn itself.
+ */
+export const STALE_VERIFICATION_TURNS = 3;
 /** First retry wait; each later wait triples, capped at MAX_DECISION_RETRY_BACKOFF_MS. */
 const DEFAULT_DECISION_RETRY_BACKOFF_MS = 5_000;
 const MAX_DECISION_RETRY_BACKOFF_MS = 60_000;
@@ -338,8 +347,15 @@ means the Worker's own API/model call failed mid-turn: choose retry (optionally 
 corrective message) or continue to resume it, and park only after repeated failures; a subtype
 "idle" result means the turn ended without a normal stop signal, so inspect the repository and
 decide as for any other turn. CURRENT CONTEXT.lastVerification, when present, is the last acceptance
-and Review round (failed check ids, Reviewer verdict and findings): after a repair turn, check
-Claude's claim against it before choosing verify. Use verify when a turn result indicates the task is complete, even if
+and Review round (failed check ids, Reviewer verdict and findings) as of Worker turn atTurn. It
+does not change until verification runs again: it is not evidence that the failures remain after
+Claude's later turns. Use it to judge whether Claude's reply addresses those failures; once
+Claude reports them fixed, choose verify rather than re-judging the old result. After a failed
+verification the Supervisor verifies by itself once the Worker has taken ${STALE_VERIFICATION_TURNS} turns.
+A continue, redirect or answer message is sent verbatim to Claude Code as its next instruction:
+write it as a direct instruction to Claude, not a description of what you will do yourself (use
+your own read-only tools to inspect the repository before deciding).
+Use verify when a turn result indicates the task is complete, even if
 Claude says it will stop; choose stop only for an explicit stop or technical containment reason.
 Use park only when the task cannot safely produce a candidate because required evidence,
 authority, or runtime capability is unavailable. A parked candidate is asynchronous and must not
