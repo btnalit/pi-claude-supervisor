@@ -8,6 +8,10 @@ export function redactSensitive(value: unknown, key?: string): unknown {
   if (typeof value === "string") {
     return value
       .replace(/\b(sk-ant-[A-Za-z0-9_-]+)\b/gu, "[REDACTED]")
+      // OpenAI-style (OpenAI, DeepSeek, …) and Google (classic and bound) API keys.
+      .replace(/\bsk-[A-Za-z0-9_-]{20,}/gu, "[REDACTED]")
+      .replace(/\bAIza[0-9A-Za-z_-]{35}/gu, "[REDACTED]")
+      .replace(/\bAQ\.[A-Za-z0-9_-]{40,}/gu, "[REDACTED]")
       .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|npm_[A-Za-z0-9]{20,})\b/gu, "[REDACTED]")
       .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/gu, "[REDACTED]")
       .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/gu, "[REDACTED]")

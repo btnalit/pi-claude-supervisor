@@ -35,3 +35,14 @@ test("token counts under a sensitive-looking key are numbers, not secrets", () =
     { role: "decision", input: 3156, totalTokens: 3324, contextTokens: 8000, token: "[REDACTED]", tokens: ["[REDACTED]"] },
   );
 });
+
+test("redacts OpenAI-style and Google model API keys wherever they appear", () => {
+  // Placeholders with the real shapes; none of these is a key.
+  const openaiStyle = `sk-${"0123456789abcdef".repeat(2)}`;
+  const googleClassic = `AIza${"X".repeat(35)}`;
+  const googleBound = `AQ.${"Ab8_example-placeholder".repeat(2)}`;
+  const redacted = String(redactSensitive(`provider said: invalid key ${openaiStyle}; retry with ${googleClassic} or ${googleBound}.`));
+  for (const key of [openaiStyle, googleClassic, googleBound]) assert.ok(!redacted.includes(key), key);
+  assert.equal(redacted.match(/\[REDACTED\]/gu)?.length, 3);
+  assert.equal(redactSensitive("the task-scheduler and sk-learn stay"), "the task-scheduler and sk-learn stay");
+});

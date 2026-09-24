@@ -24,7 +24,6 @@ const modelSpec = process.env.SPIKE_DECISION_MODEL ?? "google/gemini-3.5-flash-l
 const scenarios = (process.env.SPIKE_DECISION_SCENARIOS ?? "review,question,stuck").split(",").map((name) => name.trim()).filter(Boolean);
 const deadlineMs = Number(process.env.SPIKE_TIMEOUT_MS ?? 600_000);
 const keep = process.env.SPIKE_KEEP === "1";
-const model = await resolvePiModel(modelSpec);
 
 const goal = "Add clamp(value, min, max) to src/clamp.js (ES module) returning value limited to [min, max]. If min > max it must throw a RangeError. Add node:test tests in test/clamp.test.js covering normal clamping and the RangeError case.";
 const partial = "export function clamp(value, min, max) {\n  return Math.min(Math.max(value, min), max);\n}\n";
@@ -40,20 +39,21 @@ const testFull = `${testBase}\ntest("rejects min > max", () => {\n  assert.throw
  *           task must end blocked within its repair budget, not loop.
  */
 const expected = {
-  review: (r) => r.state === "completed" && r.verified,
+  // The fix must actually have been asked for and made: a Reviewer that
+  // waves the incomplete first turn through does not pass this scenario.
+  review: (r) => r.state === "completed" && r.verified && r.workerFixed,
   question: (r) => r.state === "completed" && r.verified && r.humanRequired.length === 0,
   stuck: (r) => r.state === "blocked" && !r.verified,
 };
 
-async function runScenario(scenario) {
-  const cwd = await mkdtemp(join(tmpdir(), `pi-claude-supervisor-spike-decision-${scenario}-`));
-  const git = (...args) => execFileSync("git", args, { cwd, stdio: "pipe" }).toString();
-  git("init", "-q", "-b", "task/clamp");
-  git("config", "user.email", "spike@example.invalid");
-  git("config", "user.name", "spike");
-  await writeFile(join(cwd, "package.json"), `${JSON.stringify({ name: "clamp-spike", type: "module", private: true }, null, 2)}\n`);
-  git("add", "-A");
-  git("commit", "-q", "-m", "init");
+async function runScenario(scenario, model) {
+  // The repository under review holds only the task: the event log lives
+  // beside it, or the Reviewer would judge the Supervisor's own log as work.
+  const root = await mkdtemp(join(tmpdir(), `pi-claude-supervisor-spike-decision-${scenario}-`));
+  const cwd = join(root, "repo");
+  await mkdir(cwd);
+  // Isolated from the user's git config: no signing prompts, no hooks.
+  const git = (...args) => execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", ...args], { cwd, stdio: "pipe" }).toString();
   const writeImpl = async (done) => {
     await mkdir(join(cwd, "src"), { recursive: true });
     await mkdir(join(cwd, "test"), { recursive: true });
@@ -100,7 +100,7 @@ async function runScenario(scenario) {
     resumeSession: async () => handle,
   };
 
-  const logPath = join(cwd, ".spike-events.jsonl");
+  const logPath = join(root, "events.jsonl");
   const human = [];
   const supervisor = new Supervisor(adapter, new EventLog(logPath), {
     reviewer: new PiReadOnlyReviewer({ model, timeoutMs: Math.min(deadlineMs, 300_000) }),
@@ -110,6 +110,12 @@ async function runScenario(scenario) {
   const started = Date.now();
   let error;
   try {
+    git("init", "-q", "-b", "task/clamp");
+    git("config", "user.email", "spike@example.invalid");
+    git("config", "user.name", "spike");
+    await writeFile(join(cwd, "package.json"), `${JSON.stringify({ name: "clamp-spike", type: "module", private: true }, null, 2)}\n`);
+    git("add", "-A");
+    git("commit", "-q", "-m", "init");
     await supervisor.start({
       task: goal,
       cwd,
@@ -133,7 +139,11 @@ async function runScenario(scenario) {
   } finally {
     if (["running", "waiting", "paused", "verifying"].includes(supervisor.state)) await supervisor.stop("spike cleanup").catch(() => {});
   }
-  const events = (await readFile(logPath, "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  // Let a pending scripted reply fire before the directory goes away.
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const events = (await readFile(logPath, "utf8").catch(() => "")).trim().split("\n").filter(Boolean).flatMap((line) => {
+    try { return [JSON.parse(line)]; } catch { return []; }
+  });
   const count = (type) => events.filter((event) => event.type === type).length;
   const result = {
     scenario,
@@ -142,6 +152,7 @@ async function runScenario(scenario) {
     state: supervisor.state,
     verified: supervisor.lastVerification?.ok ?? false,
     repairRound: supervisor.repairRound,
+    workerFixed: fixed,
     humanRequired: human,
     decisions: events.filter((event) => event.type === "decision_made").map((event) => `${event.data?.action}: ${String(event.data?.reason ?? "").slice(0, 160)}`),
     overrides: count("decision_overridden"),
@@ -151,15 +162,26 @@ async function runScenario(scenario) {
     transcript: transcript.map((line) => line.slice(0, 200)),
   };
   result.ok = !error && expected[scenario](result);
-  if (keep) result.keptAt = cwd;
-  else await rm(cwd, { recursive: true, force: true });
+  if (keep) result.keptAt = root;
+  else await rm(root, { recursive: true, force: true });
   return result;
 }
 
+const unknown = scenarios.filter((scenario) => !expected[scenario]);
+if (unknown.length > 0 || scenarios.length === 0 || !Number.isFinite(deadlineMs) || deadlineMs <= 0) {
+  console.error(`Scenarios must be some of ${Object.keys(expected).join(", ")}${unknown.length ? ` (unknown: ${unknown.join(", ")})` : ""}, and SPIKE_TIMEOUT_MS a positive number of milliseconds.`);
+  process.exit(2);
+}
+let model;
+try {
+  model = await resolvePiModel(modelSpec);
+} catch (caught) {
+  console.error(String(redactSensitive(caught instanceof Error ? caught.message : String(caught))));
+  process.exit(2);
+}
 const results = [];
 for (const scenario of scenarios) {
-  if (!expected[scenario]) throw new Error(`unknown scenario: ${scenario}`);
-  const result = await runScenario(scenario);
+  const result = await runScenario(scenario, model);
   results.push(result);
   console.log(JSON.stringify(redactSensitive(result), null, 2));
 }

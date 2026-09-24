@@ -119,17 +119,21 @@ needs no Claude Code, cgroup or tmux, so it runs on hosts that cannot run the
 real-Claude spikes. It is gated and excluded from normal CI:
 
 ```bash
+# Default model: google/gemini-3.5-flash-lite
 PI_CLAUDE_SUPERVISOR_REAL_DECISION=1 npm run spike:decision
-# Optional: another Pi model, a subset of scenarios, keep the temp repositories
+# Optional: another Pi model, a subset of scenarios, a per-scenario deadline,
+# and keeping the temp repositories
 SPIKE_DECISION_MODEL=google/gemini-3.1-flash-lite \
-SPIKE_DECISION_SCENARIOS=review,stuck SPIKE_KEEP=1 \
+SPIKE_DECISION_SCENARIOS=review,stuck SPIKE_TIMEOUT_MS=600000 SPIKE_KEEP=1 \
 PI_CLAUDE_SUPERVISOR_REAL_DECISION=1 npm run spike:decision
 ```
 
 Credentials come only from Pi's own sources (for example `GEMINI_API_KEY` in
 the environment, or `~/.pi/agent/auth.json`); the script never reads, prints or
 stores a key, and redacts what it prints. The scenarios cover:
-- `review`: an incomplete first turn is caught and repaired;
+- `review`: an incomplete first turn is caught and repaired (a model that
+  answers the "task is complete" turn with `stop` ends it blocked, with no
+  repair, so the scenario fails; that is model behavior, not a regression);
 - `question`: a mid-task question is answered from the spec without a human;
 - `stuck`: a Worker that only claims success ends `blocked` within its repair
   budget.
