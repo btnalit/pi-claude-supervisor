@@ -277,6 +277,25 @@ test("an unsupervised CLAUDE_PROJECT_DIR falls back to routing by the event cwd"
   });
 });
 
+test("CLAUDE_PROJECT_DIR takes precedence over an event cwd that another Supervisor owns", async () => {
+  await withServer(async (server, hookDir) => {
+    await withTempCwd(async (project) => {
+      await withTempCwd(async (other) => {
+        const unsubscribeProject = await server.subscribe(project, async () => ({ permissionDecision: "deny", permissionDecisionReason: "project" }));
+        const unsubscribeOther = await server.subscribe(other, async () => ({ permissionDecision: "deny", permissionDecisionReason: "cwd" }));
+        try {
+          const event = baseEvent({ hook_event_name: "PreToolUse", cwd: other, tool_name: "Bash", tool_use_id: "tool-precedence" });
+          const result = await runRelay(event, hookDir, { CLAUDE_PROJECT_DIR: project });
+          assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecisionReason, "project");
+        } finally {
+          await unsubscribeProject();
+          await unsubscribeOther();
+        }
+      });
+    });
+  });
+});
+
 test("a nested Claude in a subdirectory of a supervised cwd is not routed to that Supervisor", async () => {
   await withServer(async (server, hookDir) => {
     await withTempCwd(async (cwd) => {

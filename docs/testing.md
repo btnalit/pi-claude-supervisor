@@ -38,7 +38,8 @@ the published TypeScript source directly and there is no second runtime bundle.
   session.
 - `worker/environment.test.ts`: manual environment inheritance remains minimal, while
   automatic mode merges explicit overrides onto the complete inherited environment,
-  removes only `CLAUDECODE` so nested Claude can run, adds a safe default permission
+  removes only `CLAUDECODE` so nested Claude can run, defaults
+  `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1` unless the caller set it, adds a safe default permission
   mode when omitted, resolves settings from effective `HOME`/`CLAUDE_CONFIG_DIR`, and
   rejects Bash preauthorization in CLI/settings configuration.
 - `supervisor.test.ts`: the no-output watchdog stops a stalled worker, lifecycle event failures are retried, and output is restored when event persistence fails.

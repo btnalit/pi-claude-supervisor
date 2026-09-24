@@ -96,6 +96,6 @@ export const HOOK_TIMEOUT_SECONDS = 180;
  * supervisor and a directory with no supervisor is a no-op.
  */
 export interface HookEventSource {
-  /** Route every event whose canonical cwd matches to this handler until unsubscribed. */
+  /** Route every event whose canonical routing directory (`routeCwd`, else `event.cwd`) matches to this handler until unsubscribed. */
   subscribe(cwd: string, handler: (request: HookRelayRequest) => Promise<HookRelayReply | undefined>): Promise<() => Promise<void>>;
 }

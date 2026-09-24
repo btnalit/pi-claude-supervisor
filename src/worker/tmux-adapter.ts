@@ -1411,7 +1411,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     if (pane.dead) throw new Error("cannot adopt a dead tmux pane");
     record.handle.pid = pane.pid;
     // Compared as reported, not by inode identity: the hook relay routes events
-    // by the SHA-256 of realpath(cwd), so a pane whose cwd merely *resolves* to
+    // by the SHA-256 of realpath(project dir or cwd), so a pane whose cwd merely *resolves* to
     // the same directory under a different spelling would be adopted and then
     // never deliver a single hook event -- an unsupervised Worker that looks
     // supervised. A mismatch means the pane cannot be governed, so it is refused.
@@ -2156,7 +2156,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         requestId,
         toolUseId,
         toolName: event.tool_name ?? "unknown",
-        input: event.tool_input,
+        input: effectiveToolInput(event, record.handle.cwd),
         raw: event as unknown as Record<string, unknown>,
         phase,
         ...(writeRoots.length > 0 ? { writeRoots } : {}),
@@ -2312,6 +2312,25 @@ export function writeRootsOf(record: { scratchpadDir?: string; transcriptPath?: 
   const memory = memoryRootFor(record.transcriptPath, record.handle?.cwd ?? "", configDir);
   if (memory) roots.push(memory);
   return roots;
+}
+
+/**
+ * The permission policy resolves a Bash command's relative paths against the
+ * task directory. Hooks route by Claude's project directory, so an event can
+ * arrive from a shell that `cd`'d elsewhere (an adopted session, an explicit
+ * CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=0, or EnterWorktree). Present
+ * such a command as it actually runs, `cd <shell cwd> && <command>`, so the
+ * policy and the Decision Worker judge the real target instead of treating
+ * `echo x > hooks/pre-commit` from inside `.git` as a routine local write.
+ * The raw event is left untouched; the reply carries only a decision.
+ */
+export function effectiveToolInput(event: Pick<ClaudeHookEvent, "tool_name" | "tool_input" | "cwd">, taskCwd: string): unknown {
+  const input = event.tool_input;
+  if (event.tool_name !== "Bash" || !input || typeof input !== "object") return input;
+  const command = (input as { command?: unknown }).command;
+  if (typeof command !== "string" || typeof event.cwd !== "string" || !isAbsolute(event.cwd)) return input;
+  if (sameDirectory(event.cwd, taskCwd, "lexical")) return input;
+  return { ...(input as Record<string, unknown>), command: `cd ${shellQuote(event.cwd)} && ${command}` };
 }
 
 export function attachCommand(handle: Pick<WorkerHandle, "tmuxSocket" | "sessionName">): string {

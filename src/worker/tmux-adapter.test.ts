@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
-import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS, claudeProjectSlug, memoryRootFor, sweepDeadTmuxSockets, writeRootsOf } from "./tmux-adapter.ts";
+import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS, claudeProjectSlug, effectiveToolInput, memoryRootFor, sweepDeadTmuxSockets, writeRootsOf } from "./tmux-adapter.ts";
+import { isRoutinePermission, shellQuote } from "../policy.ts";
 import { preflightCgroupContainment } from "./process-adapter.ts";
 import type { HookEventSource, HookRelayReply, HookRelayRequest } from "../hooks/types.ts";
 import type { WorkerEvent } from "../types.ts";
@@ -1687,5 +1688,25 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   } finally {
     tmux("kill-server");
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a Bash request from a shell that left the task directory is judged where it actually runs", async () => {
+  const taskCwd = await realpath(await mkdtemp(join(tmpdir(), "pi-cs-effective-input-")));
+  try {
+    await mkdir(join(taskCwd, ".git", "hooks"), { recursive: true });
+    const command = "echo x > hooks/pre-commit";
+    const inTask = effectiveToolInput({ tool_name: "Bash", tool_input: { command }, cwd: taskCwd }, taskCwd);
+    assert.deepEqual(inTask, { command });
+    const drifted = effectiveToolInput({ tool_name: "Bash", tool_input: { command, description: "d" }, cwd: join(taskCwd, ".git") }, taskCwd);
+    assert.deepEqual(drifted, { command: `cd ${shellQuote(join(taskCwd, ".git"))} && ${command}`, description: "d" });
+    // Unprefixed, the write looks like a routine one in the task root; as it actually runs, it is not.
+    assert.equal(isRoutinePermission("Bash", { command }, taskCwd), true);
+    assert.equal(isRoutinePermission("Bash", drifted, taskCwd), false);
+    // Only Bash commands are rewritten; file tools carry absolute paths.
+    const write = { file_path: join(taskCwd, "a.txt"), content: "" };
+    assert.equal(effectiveToolInput({ tool_name: "Write", tool_input: write, cwd: join(taskCwd, ".git") }, taskCwd), write);
+  } finally {
+    await rm(taskCwd, { recursive: true, force: true });
   }
 });

@@ -138,9 +138,10 @@ An owned manual worker gets a private tmux server/socket and executes the
 validated Claude command directly in the pane. An owned automatic worker instead
 starts the Supervisor bridge through a cgroup-joining pane bootstrap, so its
 bridge identity is not a manual adoption target. The worker environment is
-passed through unchanged (apart from removing `CLAUDECODE` so nested Claude can
-start); credentials are not copied into a file, and credential-shaped command
-arguments are still rejected.
+passed through unchanged, apart from removing `CLAUDECODE` so nested Claude can
+start and defaulting `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1` (see the hook
+relay below); credentials are not copied into a file, and credential-shaped
+command arguments are still rejected.
 `load-buffer`, bracketed `paste-buffer` and `send-keys Enter` provide the input
 boundary without interpolating a task into a shell command. C0/C1 terminal
 control bytes are neutralized (escape sequences removed, a lone CR becomes a newline,
@@ -212,8 +213,12 @@ directory is Claude's `CLAUDE_PROJECT_DIR` (set on every hook command to the
 session's launch directory) when a Supervisor owns it, else the event's `cwd`:
 a Bash `cd` into a subdirectory moves `cwd` but not the project directory, so
 routing by `cwd` alone would silently drop every later event of that Worker.
-A nested Claude reports its own project directory and is not routed to its
-parent's Supervisor. Automatic Workers also get
+A nested Claude launched in a different directory reports that directory as
+its project directory and is not routed to the parent's Supervisor (one
+launched in the task directory itself is, as it always was). A Bash request
+whose shell cwd differs from the task directory is presented to the policy as
+`cd <shell cwd> && <command>`, so relative paths are judged where they actually
+resolve. Automatic Workers also get
 `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1` (unless the caller set it), which
 returns Claude's Bash to the task directory after each command, so the
 policy's relative-path resolution against the task directory stays true. A
