@@ -457,9 +457,6 @@ input.on("close", () => { try { child.kill("SIGTERM"); } catch {} });
 prompt();
 `;
 
-/** How long after a paste of its own an unmatched prompt is still taken as that paste. */
-const OWN_PROMPT_WINDOW_MS = 30_000;
-
 /** Base64 characters per bridge control line; with its prefix, well under the PTY's 4095-byte line limit. */
 const BRIDGE_FRAME_CHUNK_CHARS = 2_000;
 
@@ -1281,6 +1278,9 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       const holdsMessage = inputHoldsMessage(await this.#capture(record), message);
       if (!holdsMessage) {
         this.#logOutput(record, "[supervisor] no UserPromptSubmit hook confirmed the message, but it left the input box; the hook channel may not be reporting\n");
+        // The entry stays for a late hook with the exact text; the looser
+        // any-shape match ends with this confirmation, so someone else's
+        // prompt cannot claim it.
         return;
       }
       if (enterResends >= 2) break;
@@ -2219,10 +2219,11 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         }
         // Claude can submit a pasted message in another shape than it was
         // pasted (a long paste as a placeholder, reflowed or trimmed text).
-        // A prompt right after an unconfirmed paste of ours is that paste:
-        // reading it as a human at the keyboard would pause unattended
-        // automation for nothing.
-        if (record.pendingSentMessages.length > 0 && record.inputAt !== undefined && Date.now() - record.inputAt < OWN_PROMPT_WINDOW_MS && !isClaudeRuntimePrompt(prompt)) {
+        // A prompt while a paste of ours is still waiting for its submission
+        // is that paste: reading it as a human at the keyboard would pause
+        // unattended automation for nothing. Only inside that window: a
+        // late mismatched prompt still reads as a human, which fails safe.
+        if (record.confirmingDelivery && record.pendingSentMessages.length > 0 && !isClaudeRuntimePrompt(prompt)) {
           record.pendingSentMessages.shift();
           record.submitAcks += 1;
           this.#logOutput(record, "[supervisor] a submitted prompt did not match the pasted text exactly; counted as the Supervisor's own message\n");

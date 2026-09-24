@@ -1937,13 +1937,25 @@ test("an idle notification between paste and UserPromptSubmit does not count as 
 });
 
 test("a prompt that differs from the paste right after it is the Supervisor's own, not a human's", { skip: !tmuxAvailable, concurrency: false }, async () => {
-  await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 2_000, acknowledge: false }, async ({ adapter, handle, hook, events, output }) => {
+  await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 2_000, acknowledge: false }, async ({ adapter, handle, hook, events, output, submitted }) => {
     const sending = adapter.send(handle, "a long repair instruction that Claude shows as a placeholder", "own-1");
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    for (const deadline = Date.now() + 5_000; (await submitted()).length === 0;) {
+      if (Date.now() > deadline) throw new Error("the paste was never submitted");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
     // Claude reports the submission in another shape than the paste.
     await hook({ hook_event_name: "UserPromptSubmit", prompt: "[Pasted text #1 +12 lines]" });
     await sending;
     assert.equal(events.some((event) => event.type === "human_input"), false);
     assert.match(await output(), /counted as the Supervisor's own message/u);
+  });
+});
+
+test("a human prompt after a send whose hook never confirmed it still reads as a human", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 300, acknowledge: false }, async ({ adapter, handle, hook, events, output }) => {
+    await adapter.send(handle, "our message, never confirmed by a hook", "silent-2");
+    assert.match(await output(), /no UserPromptSubmit hook confirmed the message/u);
+    await hook({ hook_event_name: "UserPromptSubmit", prompt: "the operator's own request" });
+    assert.ok(events.some((event) => event.type === "human_input"));
   });
 });

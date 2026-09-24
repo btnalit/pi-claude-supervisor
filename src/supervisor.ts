@@ -313,7 +313,9 @@ export class Supervisor {
   #humanGate: "permission" | "worker_prompt" | "other" | undefined;
   #humanIdleResumeMs = DEFAULT_HUMAN_IDLE_RESUME_MS;
   #humanIdleTimer?: NodeJS.Timeout;
-  #lastHumanInputAt = 0;
+  /** When the session a human typed into last had activity from them or finished a turn. */
+  #humanIdleSince = 0;
+  #humanStuckNoticeSent = false;
   #candidateParked = false;
   #stopRequested?: string;
   #stopCloseReason?: DecisionSessionCloseReason;
@@ -401,6 +403,7 @@ export class Supervisor {
     this.#prUrl = undefined;
     this.#publishShortfall = undefined;
     this.#preemptiveStop = undefined;
+    this.#clearHumanIdleTimer();
     this.#automation = (options.automation ?? false) && spec.autonomy.unattended;
     this.#onDecisionSessionProgress = options.onDecisionSessionProgress;
     this.#onDecisionSessionClosed = options.onDecisionSessionClosed;
@@ -753,6 +756,9 @@ export class Supervisor {
       if (event.type === "turn_completed") {
         this.#lastWorkerResult = event.result;
         this.#lastTurnCompleted = event;
+        // The idle clock for a pause from typing into the pane starts once the
+        // human's turn has finished, not when they typed.
+        if (this.#humanRequired && this.#humanGate === "worker_prompt") this.#noteHumanActivity();
         // The grant covers the publish turn and nothing after it. Revoking here
         // rather than at the next `verify` means a Decision Worker that answers
         // `continue` cannot leave a live grant for a later, unverified push.
@@ -880,12 +886,13 @@ export class Supervisor {
       }
       if (event.type === "human_input") {
         await this.#appendEvent({ type: "human_input", taskId, workerId: handle.id, data: { text: event.text.slice(0, 512) } });
-        this.#lastHumanInputAt = Date.now();
         if (!this.#humanRequired) {
           this.#humanRequired = true;
           this.#humanGate = "worker_prompt";
           await this.#appendEvent({ type: "human_takeover", taskId, workerId: handle.id, data: { source: "worker_prompt" } });
-          this.#reportProgress("human", "a human is driving the interactive Worker; automation paused until resume-auto", true);
+          this.#reportProgress("human", this.#humanIdleResumeMs > 0
+            ? `a human is driving the interactive Worker; automation paused until resume-auto, or until the session has been idle for ${formatDurationMs(this.#humanIdleResumeMs)}`
+            : "a human is driving the interactive Worker; automation paused until resume-auto", true);
           void Promise.resolve(this.#onHumanRequired?.({
             taskId,
             workerId: handle.id,
@@ -897,7 +904,7 @@ export class Supervisor {
           })).catch(() => {});
         }
         // Every further prompt from the human restarts the idle clock.
-        if (this.#humanGate === "worker_prompt") this.#armHumanIdleResume();
+        if (this.#humanGate === "worker_prompt") this.#noteHumanActivity();
       }
       // While a human drives the interactive session, the Decision Worker must
       // not be asked to act on a completed turn; #lastTurnCompleted is still
@@ -1571,7 +1578,9 @@ export class Supervisor {
     this.#clearHumanIdleTimer();
     this.#humanRequired = false;
     this.#humanGate = undefined;
-    await this.#appendEvent({ type: eventType, taskId: this.#task?.taskId, workerId: this.#handle?.id, ...(data ? { data } : {}) });
+    // Automation is resumed whether or not the audit record could be written;
+    // a failed write must not leave the last turn undecided.
+    await this.#appendEvent({ type: eventType, taskId: this.#task?.taskId, workerId: this.#handle?.id, ...(data ? { data } : {}) }).catch(() => {});
     if (this.#decision && this.#machine.state === "waiting" && this.#lastTurnCompleted && this.#handle) {
       // Replay the last completed turn only if the Worker is really idle; if
       // it has resumed on its own, its next Stop brings a fresh turn.
@@ -1581,38 +1590,73 @@ export class Supervisor {
     }
   }
 
+  /** A prompt from the human, or the end of their turn: the idle clock starts again. */
+  #noteHumanActivity(): void {
+    this.#humanIdleSince = Date.now();
+    this.#humanStuckNoticeSent = false;
+    this.#armHumanIdleResume();
+  }
+
   /**
    * A human who typed into an unattended session and walked away would
-   * otherwise pause it until the deadline failed it. Once the session has
-   * been idle with no further human input for humanIdleResumeMs, automation
-   * resumes. Only a pause caused by typing into the pane resumes this way:
-   * an explicit takeover, and every recovered task, waits for resume-auto.
+   * otherwise pause it until the deadline failed it. Once the Worker has sat
+   * idle, with no further human input, for humanIdleResumeMs after the
+   * human's last prompt *and* the end of their last turn, automation resumes.
+   * Only a pause caused by typing into the pane resumes this way: an explicit
+   * takeover, and every recovered task, waits for resume-auto. A turn still
+   * running (often a Claude dialog the human left open) never resumes
+   * automation, but one silent for a whole period is reported once.
    */
   #armHumanIdleResume(delayMs?: number): void {
     this.#clearHumanIdleTimer();
     if (this.#humanIdleResumeMs <= 0 || !this.#automation) return;
-    const wait = delayMs ?? Math.max(1, this.#humanIdleResumeMs - (Date.now() - this.#lastHumanInputAt));
+    const period = this.#humanIdleResumeMs;
+    const recheck = Math.min(60_000, period);
+    const wait = delayMs ?? Math.max(1, period - (Date.now() - this.#humanIdleSince));
     this.#humanIdleTimer = setTimeout(() => {
       this.#humanIdleTimer = undefined;
       void this.#exclusive(async () => {
         const handle = this.#handle;
-        if (!handle || !this.#automation || !this.#humanRequired || this.#humanGate !== "worker_prompt") return;
+        const task = this.#task;
+        if (!handle || !task || !this.#automation || !this.#humanRequired || this.#humanGate !== "worker_prompt") return;
         if (["completed", "blocked", "failed", "stopped"].includes(this.#machine.state) || this.#releasing || this.#released) return;
-        const idleMs = Date.now() - this.#lastHumanInputAt;
-        if (idleMs < this.#humanIdleResumeMs) {
+        const idleMs = Date.now() - this.#humanIdleSince;
+        if (idleMs < period) {
           this.#armHumanIdleResume();
           return;
         }
-        const status = await this.#adapter.getStatus(handle).catch(() => undefined);
-        if (!status?.running) return;
-        // The human's own turn is still running: look again shortly.
+        let status: WorkerStatus;
+        try {
+          status = await this.#adapter.getStatus(handle);
+        } catch {
+          this.#armHumanIdleResume(recheck);
+          return;
+        }
+        // An exited Worker is classified and verified by the watchdog.
+        if (!status.running) return;
         if (status.activeRequests) {
-          this.#armHumanIdleResume(Math.min(60_000, this.#humanIdleResumeMs));
+          const lastOutputAt = status.lastOutputAt ? Date.parse(status.lastOutputAt) : undefined;
+          if (!this.#humanStuckNoticeSent && lastOutputAt !== undefined && Date.now() - lastOutputAt >= period) {
+            this.#humanStuckNoticeSent = true;
+            await this.#appendEvent({ type: "human_session_stalled", taskId: task.taskId, workerId: handle.id, data: { silentMs: Date.now() - lastOutputAt } }).catch(() => {});
+            void Promise.resolve(this.#onHumanRequired?.({
+              taskId: task.taskId,
+              workerId: handle.id,
+              cwd: task.cwd,
+              task: task.task,
+              reason: `the session a human was driving has been waiting mid-turn with no output for ${formatDurationMs(Date.now() - lastOutputAt)} (often a Claude dialog left open); automation stays paused until it finishes or resume-auto`,
+              ...(this.#attachHint(handle) ? { attach: this.#attachHint(handle) } : {}),
+            })).catch(() => {});
+          }
+          this.#armHumanIdleResume(recheck);
           return;
         }
         this.#reportProgress("human", "no human input for a while and the Worker is idle; automation resumed", true);
-        await this.#resumeAutomationInternal("automation_auto_resumed", { idleMs, humanIdleResumeMs: this.#humanIdleResumeMs });
-      }).catch(() => { /* the next human input or resume-auto re-arms it */ });
+        await this.#resumeAutomationInternal("automation_auto_resumed", { idleMs, humanIdleResumeMs: period });
+      }).catch(() => {
+        // Never let one failure end auto-resume for good: nobody else re-arms it.
+        if (this.#humanRequired && this.#humanGate === "worker_prompt") this.#armHumanIdleResume(recheck);
+      });
     }, wait);
     this.#humanIdleTimer.unref?.();
   }
@@ -1761,6 +1805,7 @@ export class Supervisor {
   }
 
   async #stopInternal(reason: string, flushPendingEvents = true, closeReason: DecisionSessionCloseReason = "recoverable_failure"): Promise<void> {
+    this.#clearHumanIdleTimer();
     // The preemptive adapter stop already killed the Worker; a persistently
     // failing event log must not block the state transition below.
     let flushError: unknown;
