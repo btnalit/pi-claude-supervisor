@@ -219,6 +219,21 @@ Supervisor being able to see it, or when you don't need to attach.
   `git commit -m` stores it. Everything else (`for f in …; do echo "$f"`,
   `rm -rf ./dist`, a Write to Claude's own scratchpad) follows the configured
   policy — Claude's own permission mode governs it, as when you run Claude.
+- Also always denied: the **delete floor**. A Bash `rm`/`rmdir`/`unlink`/
+  `shred`/`mv`/`rimraf`/`find -delete`/`git clean -C …`/`rsync --delete` —
+  wherever it stands in the statement, so behind any wrapper, and inside
+  quoted scripts (`sh -lc '…'`, `trap '…'`), `$(…)` and text piped into a
+  shell — may only reach paths inside the task directory, its extra write
+  roots or the temp directory. Refused: a target the policy cannot read
+  literally (`$(pwd)/..`, an unknown `$VAR`), one after an unresolvable `cd`,
+  one fed by `xargs`; the task directory itself or anything containing it; a
+  whole temp/write root; `.git`, hidden-entry globs (`.*`), globs followed by
+  `..`, an unfiltered `find .`; `git prune`, `git gc --prune`,
+  `git reflog expire`. Ordinary cleanup (`rm -rf dist node_modules .cache`,
+  `rm -f src/*.js`, `find . -name '*.pyc' -delete`, `d=$(mktemp -d); rm -rf
+  "$d"`, `rm -f .git/index.lock`) is untouched. Not covered: deletes run by an
+  interpreter or script file, overwrites (`cp`, `ln -sf`, `>`), and
+  `git reset --hard` outside protected branches.
 - `autonomy.permissionAuthority` (`policy` | `hybrid` default |
   `decision-worker`) controls who answers a permission request — every
   request in headless mode, and in interactive tmux mode only those Claude

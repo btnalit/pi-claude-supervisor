@@ -3,7 +3,7 @@ import { link, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { assertSafeWorkerCommand, evaluateCommand, evaluatePermission, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, sameDirectory, shellQuote } from "./policy.ts";
+import { assertSafeWorkerCommand, deleteFloorViolation, evaluateCommand, evaluatePermission, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, sameDirectory, shellQuote } from "./policy.ts";
 
 function bash(command: string) {
   return { command };
@@ -196,7 +196,7 @@ test("newlines separate statements and comments are ignored", () => {
   assert.equal(evaluateCommand("echo '#not a comment' # but this is\nls").decision, "allow");
 });
 
-test("the Bash tool path and direct command evaluation agree", () => {
+test("the Bash tool path is direct command evaluation plus the delete floor", () => {
   const matrix = [
     `git -C ${process.cwd()} push origin main`, "git pu{sh,} origin main", "$CMD --flag", "timeout 30 $CMD", "claude --permission-mode \"$MODE\"",
     "sh -c \"$x\"", "bash -lc 'git push origin main'", "npm publish", "gh pr create --title \"$title\"",
@@ -204,9 +204,15 @@ test("the Bash tool path and direct command evaluation agree", () => {
     "bash <<'EOF'\ngit push origin main\nEOF", "git commit -m \"$(cat <<'EOF'\nfix: merge\nEOF\n)\"", "echo hi # don't",
     "if [ -d .git ]; then git status; fi", "echo start\n$CMD", "c'l'a'u'de --print review",
   ];
+  const floorOnly = new Set(["rm -rf /tmp/*"]);
   for (const command of matrix) {
-    assert.equal(evaluatePermission("Bash", { command }).decision, evaluateCommand(command).decision, command);
+    // Only the listed commands differ, and only because the floor refuses them.
+    const expected = floorOnly.has(command) ? "deny" : evaluateCommand(command).decision;
+    assert.equal(evaluatePermission("Bash", { command }).decision, expected, command);
   }
+  // The floor is what separates the two here: a glob across the whole temp root.
+  assert.equal(evaluateCommand("rm -rf /tmp/*").decision, "allow");
+  assert.equal(evaluatePermission("Bash", { command: "rm -rf /tmp/*" }).decision, "deny");
 });
 
 test("policy allows ordinary read-only commands and literal argv values", () => {
@@ -904,4 +910,264 @@ test("a publish grant admits exactly one shape and nothing else", async () => {
   assert.equal(isRoutinePermission("Bash", { command: `${create} --title x --body y` }, process.cwd(), { remote: pr }), true);
   assert.equal(isRoutinePermission("Bash", { command: `git -C ${process.cwd()} ${hooks} push origin ${refspec}` }, process.cwd()), false);
   assert.equal(isRoutinePermission("Bash", { command: `git -C ${process.cwd()} ${hooks} push --force origin ${refspec}` }, process.cwd(), { remote: push }), false);
+});
+
+function nestShells(command: string, levels: number): string {
+  return levels === 0 ? command : nestShells(`sh -c ${shellQuote(command)}`, levels - 1);
+}
+
+async function deleteFloorFixture() {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-delete-floor-"));
+  const repo = join(root, "repo");
+  const scratch = join(root, "scratch");
+  const shared = join(root, "shared-tmp");
+  const outside = join(root, "outside");
+  await Promise.all([
+    mkdir(join(repo, ".git", "objects"), { recursive: true }),
+    mkdir(join(repo, "src"), { recursive: true }),
+    mkdir(scratch, { recursive: true }),
+    mkdir(shared, { recursive: true }),
+    mkdir(outside, { recursive: true }),
+  ]);
+  await symlink(outside, join(repo, "outside-link"));
+  // The task directory is not under the shared temp root here, so `..` is truly outside.
+  const judge = (command: string) => deleteFloorViolation(command, repo, { writeRoots: [scratch], tempRoots: [shared] });
+  return { root, repo, scratch, shared, outside, judge };
+}
+
+test("the delete floor allows ordinary cleanup inside the task, its write roots and temp", async () => {
+  const { root, scratch, shared, judge } = await deleteFloorFixture();
+  try {
+    for (const command of [
+      "rm -rf node_modules dist",
+      "rm -rf ./dist/",
+      "rm -f src/*.js",
+      "rm -rf *",
+      "rm -rf build && npm run build",
+      "cd src && rm -rf generated",
+      "find . -name '*.pyc' -delete",
+      "find . -path './build/*' -exec rm -f {} +",
+      "find dist -type f -exec rm {} +",
+      "mv src/a.ts src/b.ts",
+      "mv -t src/old a.ts b.ts",
+      "rmdir src/empty",
+      "shred -u secrets.txt",
+      "rm outside-link",
+      `rm -rf ${scratch}/cache`,
+      `rm -rf ${shared}/pi-test-cache`,
+      "git clean -fdx",
+      "git -C . clean -fdx",
+      "git -C src clean -fd",
+      "git gc",
+      "git reflog show",
+      "D=dist; rm -rf $D",
+      "for d in dist build; do rm -rf $d; done",
+      "sudo rm -rf dist",
+      "bash -c 'rm -rf dist'",
+      "grep -r 'rm -rf' .",
+      "git rm -r --cached .",
+      "npm rm lodash",
+      "git commit -m 'chore: rm -rf ../old notes'",
+      "rm -rf .cache .next __pycache__ .pytest_cache",
+      "rm -f .eslintcache",
+      "rm -f .git/index.lock",
+      "rm -rf $PWD/dist",
+      "for f in *.tmp; do rm -f \"$f\"; done",
+      "find . -name node_modules -prune -exec rm -rf {} +",
+      "rsync -a --delete src/ dist/",
+      "bash -lc 'rm -rf node_modules'",
+      "cp -r ../template ./scaffold",
+      "git commit -m \"$(cat <<'EOF'\nfix: stop calling `rm -rf ~/.cache/foo`\nEOF\n)\"",
+      "cat > NOTES.md <<'EOF'\nRun `rm -rf ~/.cache/tool`\nEOF",
+      "find . -name '*.log' -not -path './node_modules/*' -delete",
+      "find . \\( -name '*.orig' -o -name '*.rej' \\) -delete",
+      "for f in src/*.bak; do mv \"$f\" \"${f%.bak}\"; done",
+      "pushd src && rm -f a && popd && rm -f b",
+      "npm run clean",
+      "pnpm exec rimraf dist",
+      "git log -S 'rm -rf ../x'",
+      "git ls-files | xargs grep -l 'rm -rf'",
+      "cd \"$(git rev-parse --show-toplevel)\" && rm -rf dist",
+      "for f in src/*.js; do rm -f \"${f%.js}.map\"; done",
+      "grep -rln rm ../other-project",
+      "docker rm -f ../weird-name",
+      nestShells("rm -rf dist", 3),
+    ]) {
+      assert.equal(judge(command), undefined, command);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the delete floor refuses deletes and moves that could destroy what the task does not own", async () => {
+  const { root, scratch, shared, outside, judge } = await deleteFloorFixture();
+  try {
+    const cases: Array<[string, RegExp]> = [
+      ["rm -rf ~", /contains the task|outside the task/u],
+      ["rm -rf ~/other-project", /outside the task/u],
+      ['rm -rf "$HOME"', /outside the task/u],
+      ['HOME=$X; rm -rf "$HOME/x"', /only known at run time/u],
+      ["rm -rf /home", /contains the task|outside the task/u],
+      ["rm -rf /usr", /outside the task/u],
+      ["rm -rf /", /contains the task/u],
+      ["find ~ -delete", /contains the task|outside the task/u],
+      ["rm -rf $(pwd)/../x", /only known at run time/u],
+      ["rm -rf .", /task directory itself/u],
+      ["rm -rf ..", /contains the task/u],
+      ["rm -rf ../sibling", /outside the task/u],
+      [`rm -rf ${outside}`, /outside the task/u],
+      ["rm -rf outside-link/", /outside the task/u],
+      ["rm -rf outside-link/*", /outside the task/u],
+      ["rm -rf .git", /Git's own store/u],
+      ["rm -rf .git/objects", /Git's own store/u],
+      ["rm -rf src/../.git", /Git's own store/u],
+      ["mv .git /tmp/gitbak", /Git's own store/u],
+      ["rm -rf .*", /hidden entries/u],
+      ["rm -rf .[!.]*", /hidden entries/u],
+      ["find . -delete", /whole task tree/u],
+      ["find . -type f -exec rm {} +", /whole task tree/u],
+      [`cd ${shared} && rm -rf *`, /top of a shared directory/u],
+      [`rm -rf ${shared}`, /whole shared directory/u],
+      [`rm -rf ${scratch}`, /whole shared directory/u],
+      ["cd $DIR && rm -rf build", /cd the policy cannot follow/u],
+      ["mv dist ~/Desktop/", /outside the task/u],
+      ["mv --target-directory=/opt dist", /outside the task/u],
+      ["mv -t ~/elsewhere dist", /outside the task/u],
+      ["mv notes.md ~/.bashrc", /outside the task/u],
+      ["unlink /etc/hosts", /outside the task/u],
+      ["sudo rm -rf /var/lib/x", /outside the task/u],
+      ["env FOO=1 rm -rf ~/x", /outside the task/u],
+      ["timeout 5 rm -rf ../x", /outside the task/u],
+      ["nohup rm -rf /opt/x &", /outside the task/u],
+      ["true && rm -rf ../x", /outside the task/u],
+      ["ls | xargs rm", /taken from input/u],
+      ["find . -name x | xargs rm -rf", /taken from input/u],
+      ["sh -c 'rm -rf ~/x'", /outside the task/u],
+      ['bash -c "rm -rf $TARGET"', /only known at run time/u],
+      ["eval rm -rf ../x", /outside the task/u],
+      ["cat <<'EOF' | sh\nrm -rf ../x\nEOF", /outside the task/u],
+      ["git gc --prune=now", /prune Git's own store/u],
+      ["git reflog expire --expire=now --all", /prune Git's own store/u],
+      ["git -C . prune", /prune Git's own store/u],
+      ["git -C ../other clean -fdx", /outside the task/u],
+      ["bash -lc 'cd .. && rm -rf repo'", /task directory itself/u],
+      ["bash -lc 'rm -rf ../sibling'", /outside the task/u],
+      ["sh -c -- 'rm -rf ../x'", /outside the task/u],
+      ["rm -rf {src,.git}", /Git's own store/u],
+      ["rm -rf {src,.}", /task directory itself/u],
+      ["rm -rf {../sibling,x}", /outside the task/u],
+      ["rm -rf x{,/../../sibling}", /outside the task/u],
+      ["rm -rf */../../sibling", /glob followed by \.\./u],
+      ["rm -rf [.]git", /hidden entries/u],
+      ["command -p rm -rf ..", /contains the task/u],
+      ["env -i rm -rf ../sibling", /outside the task/u],
+      ["env -C .. rm -rf repo", /task directory itself/u],
+      ["flock -n /tmp/l rm -rf ../x", /outside the task/u],
+      ["busybox rm -rf ../x", /outside the task/u],
+      ["\\rm -rf ../x", /outside the task/u],
+      ["xargs -n 1 rm -rf < list", /taken from input/u],
+      ["echo $(rm -rf ../sibling)", /outside the task/u],
+      ["x=$(rm -rf ../sibling)", /outside the task/u],
+      ["echo `rm -rf ../sibling`", /outside the task/u],
+      ["cat <(rm -rf ../sibling)", /outside the task/u],
+      ["trap 'rm -rf ..' EXIT", /contains the task/u],
+      ["(cd .. && rm -rf x)", /outside the task/u],
+      ["find . -name '*' -delete", /whole task tree/u],
+      ["find . -not -name x -delete", /whole task tree/u],
+      ["find . -name x -o -delete", /whole task tree/u],
+      ["find . -name .git -exec rm -rf {} +", /whole task tree/u],
+      ["find . -regex '.*' -delete", /whole task tree/u],
+      ["bash <<EOF\nrm -rf ../x\nEOF", /outside the task/u],
+      ["echo 'rm -rf ../x' | sh", /outside the task/u],
+      ["f() { rm -rf ../x; }; f", /outside the task/u],
+      ["case x in x) rm -rf ../x;; esac", /outside the task/u],
+      ["for d in dist ../x; do rm -rf $d; done", /outside the task/u],
+      ["rsync -a --delete src/ ../mirror/", /outside the task/u],
+      ["rsync -a --delete ../src/ ./", /task directory itself/u],
+      ["git worktree remove --force ../wt", /outside the task/u],
+      ["npx rimraf ../x", /outside the task/u],
+      [nestShells("rm -rf ../x", 8), /nested this deep/u],
+      ["sudo -u node rm -rf ../x", /outside the task/u],
+      ["sudo -u git rm -rf ../x", /outside the task/u],
+      ["flock cat rm -rf ../x", /outside the task/u],
+      ["pnpm exec rimraf ../x", /outside the task/u],
+      ["npm exec -- rm -rf ../x", /outside the task/u],
+      ["npm exec -c 'rm -rf ../x'", /outside the task/u],
+      ["uv run rm -rf ../x", /outside the task/u],
+      ["git -c core.pager='rm -rf ../x' log", /outside the task/u],
+      ["git difftool -y -x 'rm -rf ../x'", /outside the task/u],
+      ["find src -exec rm -rf ../../sibling \\;", /outside the task/u],
+      ["find . -name x -exec mv {} ../sibling \\;", /outside the task/u],
+      ["find . -name x -execdir rm -rf build \\;", /relative path from find/u],
+      ["ls | xargs -I% sh -c 'rm -rf %'", /taken from input/u],
+      ['d=$(mktemp -d)/../../root/x; rm -rf "$d"', /only known at run time/u],
+      ['d=$(mktemp -d); d+=/../..; rm -rf "$d"', /only known at run time/u],
+      ['d=$(mktemp -d); printf -v d ../x; rm -rf "$d"', /only known at run time/u],
+      ['for f in *.tmp; do f=../x; rm -rf "$f"; done', /outside the task/u],
+      ["pushd .. && popd && popd && rm -rf x", /cd the policy cannot follow/u],
+      ['for f in ../repo/*; do rm -rf "${f%/*}"; done', /only known at run time/u],
+      ['d=$(mktemp -d); rm -rf "${d%/*}"', /only known at run time/u],
+      ['for f in x/*; do rm -rf "${f#x}"; done', /only known at run time/u],
+      ['for f in ../repo/*; do rm -rf "${f%s*}"; done', /only known at run time/u],
+      ['d=$(mktemp -d); rm -rf "${d%t*}"', /only known at run time/u],
+      ['d=$(mktemp -d); rm -rf "${d%??????}"', /only known at run time/u],
+      ["p='t*'; d=$(mktemp -d); rm -rf \"${d%$p}\"", /only known at run time/u],
+      ["d=$(mktemp -d); rm -rf \"${d%`echo t`}\"", /only known at run time/u],
+      ["ls | xargs -I% find % -delete", /taken from input/u],
+      ["ls | xargs -I% git -C % clean -fdx", /taken from input/u],
+      ["ls | xargs -I% rsync -a --delete src/ %", /taken from input/u],
+      ["cat <<'EOF' ; echo $(rm -rf ../sibling)\nbody\nEOF", /outside the task/u],
+      ["find . -name x -exec sudo rm -rf ../sibling \\;", /outside the task/u],
+      ["find . -name x -exec env rm -rf ../sibling \\;", /outside the task/u],
+      ["find . -name x -exec rm -rf '{}/../../../x' \\;", /built around find's \{\}/u],
+      ["yarn rimraf ../x", /outside the task/u],
+      ["pnpm rimraf ../x", /outside the task/u],
+      ["git --work-tree=/srv/app clean -fdx", /outside the task/u],
+    ];
+    for (const [command, reason] of cases) {
+      assert.match(judge(command) ?? "allowed", reason, command);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the delete floor knows mktemp results and $TMPDIR are fresh temp entries", async () => {
+  const { root, repo } = await deleteFloorFixture();
+  try {
+    for (const command of ['d=$(mktemp -d); rm -rf "$d"', "tmp=$(mktemp -d)\ntrap 'rm -rf \"$tmp\"' EXIT", 'rm -rf "$TMPDIR/x"', 'f="$(mktemp)"; rm -f "$f"']) {
+      assert.equal(deleteFloorViolation(command, repo), undefined, command);
+    }
+    assert.match(deleteFloorViolation('d=$(mktemp -d); d=..; rm -rf "$d"', repo) ?? "allowed", /contains the task/u);
+    assert.match(deleteFloorViolation('d=$(mktemp -d -p "$X"); rm -rf "$d"', repo) ?? "allowed", /only known at run time/u);
+    // The fixture lives under the temp root, so this is also the task's parent.
+    assert.match(deleteFloorViolation('rm -rf "$TMPDIR"', repo) ?? "allowed", /contains the task|whole shared directory/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a task under the shared temp root still cannot delete its own parent", async () => {
+  const { root, repo } = await deleteFloorFixture();
+  try {
+    const judge = (command: string) => deleteFloorViolation(command, repo, { tempRoots: [root] });
+    assert.match(judge("rm -rf ..") ?? "allowed", /contains the task/u);
+    assert.equal(judge("rm -rf ../scratch"), undefined, "a sibling scratch directory under temp is fair game");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the Bash permission path applies the delete floor", async () => {
+  const { root, repo } = await deleteFloorFixture();
+  try {
+    assert.equal(evaluatePermission("Bash", bash("rm -rf dist && npm test"), repo).decision, "allow");
+    const denied = evaluatePermission("Bash", bash("rm -rf ~/other-project"), repo);
+    assert.equal(denied.decision, "deny");
+    assert.match(denied.reason, /outside the task/u);
+    assert.equal(evaluatePermission("Bash", bash("rm -rf .git"), repo).decision, "deny");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

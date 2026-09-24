@@ -181,6 +181,18 @@ stream-json` 的方式运行 Claude,完全没有终端界面;一旦设置
   `git commit -m` 就是数据。除此之外的一切(`for f in …; do echo "$f"`、
   `rm -rf ./dist`、写入 Claude 自己的 scratchpad)都按配置的策略处理——由
   Claude 自己的权限模式决定,和你亲自运行 Claude 时一样。
+- 同样始终拒绝的还有**删除底线**:Bash 中的 `rm`/`rmdir`/`unlink`/`shred`/`mv`/
+  `rimraf`/`find -delete`/`git clean -C …`/`rsync --delete`——无论出现在语句的哪个
+  位置(因此任何包装器都能看穿),以及引号脚本(`sh -lc '…'`、`trap '…'`)、
+  `$(…)`、管道喂给 shell 的文本里的——只能作用于任务目录、额外写入根或临时目录
+  之内。以下会被拒绝:策略无法按字面读出的目标(`$(pwd)/..`、未知的 `$VAR`)、
+  无法解析的 `cd` 之后的相对目标、来自 `xargs` 的目标;任务目录本身或包含它的
+  目录;整个临时/写入根;`.git`、隐藏项通配(`.*`)、后跟 `..` 的通配、不带过滤的
+  `find .`;`git prune`、`git gc --prune`、`git reflog expire`。日常清理
+  (`rm -rf dist node_modules .cache`、`rm -f src/*.js`、
+  `find . -name '*.pyc' -delete`、`d=$(mktemp -d); rm -rf "$d"`、
+  `rm -f .git/index.lock`)不受影响。不覆盖:解释器或脚本文件执行的删除、覆盖写
+  (`cp`、`ln -sf`、`>`)、非受保护分支上的 `git reset --hard`。
 - `autonomy.permissionAuthority`(`policy` | `hybrid` 默认 |
   `decision-worker`)决定谁来回答权限请求——headless 模式下是每一个请求,交互式
   tmux 模式下只是那些 Claude 本来会弹窗问你的请求:`hybrid` 会让策略独自回答
