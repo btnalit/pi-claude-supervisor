@@ -1193,20 +1193,26 @@ export class Supervisor {
   /**
    * An unattended `stop` on a finished turn: models reach for it when they
    * believe the work is done, and a plain stop would end the task unverified
-   * with its work unreported. Judge the work instead — acceptance and the
-   * Reviewer only read — but send the Worker nothing more: a failure blocks
-   * the candidate rather than starting a repair round. A stop elsewhere (a
-   * pending permission, a running turn) or on a task that may publish stays
-   * a plain stop.
+   * with its work unreported. The stop still happens first — the Worker is
+   * stopped and never kept open — and then its finished work is judged
+   * (acceptance and the Reviewer only read): a failure blocks the candidate
+   * rather than starting a repair round. A stop elsewhere (a pending
+   * permission, a turn the Worker has already resumed) or on a task that may
+   * publish stays a plain stop.
    */
   async #verifyStop(handle: WorkerHandle, event: WorkerEvent, action: DecisionAction): Promise<boolean> {
     const task = this.#task;
     if (!task || !this.#automation || this.#humanRequired || event.type !== "turn_completed" || this.#machine.state !== "waiting") return false;
     if (task.spec.autonomy.remoteAuthority !== "none") return false;
-    if (await this.#decisionIsStale(event)) return true;
+    if (await this.#decisionIsStale(event)) return false;
     this.#stopVerification = action.reason;
-    await this.#appendEvent({ type: "decision_overridden", taskId: task.taskId, workerId: handle.id, data: { action: action.action, override: "verify", reason: "a stop on a finished turn is verified before the task ends; no further Worker turns", eventType: event.type } }).catch(() => {});
-    await this.#startVerification(handle, event, "Decision Worker stop");
+    await this.#appendEvent({ type: "decision_overridden", taskId: task.taskId, workerId: handle.id, data: { action: action.action, override: "verify", reason: "the Worker is stopped and its finished work verified before the task ends; no further Worker turns", decisionReason: action.reason, eventType: event.type } }).catch(() => {});
+    await this.#adapter.stop(handle, `Decision Worker: ${action.reason}`);
+    await this.#pollInternal(true);
+    // Re-read after the awaits: the poll moves the stopped Worker on.
+    const after: string = this.#machine.state;
+    if (after === "verifying") await this.#verifyInternal();
+    else await this.#parkCandidate(`Decision Worker stop left the task in state ${after} before verification`, event);
     return true;
   }
 
@@ -2316,7 +2322,7 @@ export class Supervisor {
     // A completed interactive task may keep its persistent session open for
     // the operator instead of tearing it down; a stop requested mid-verify or
     // a blocked/failed outcome always falls back to today's stop behavior.
-    const keepOpen = !stopRequested && outcome === "completed" && result.ok
+    const keepOpen = !stopRequested && this.#stopVerification === undefined && outcome === "completed" && result.ok
       && this.#keepWorkerOnCompletion && Boolean(this.#adapter.release) && Boolean(this.#handle);
     let cleanupError: unknown;
     let releasedInteractive = false;

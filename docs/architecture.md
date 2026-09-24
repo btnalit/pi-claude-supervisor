@@ -518,14 +518,16 @@ detected from the Pi `stopReason` (a provider error resolves the prompt normally
 rather than throwing); if the Decision Worker
 API/model call fails, the system records `decision_worker_failed`, applies the
 bounded retry/park policy and preserves the candidate evidence. The startup
-instructions prompt retries on the same backoff and budget, so a provider overload
-at start does not fail the task before its first turn. An abort is never
+instructions prompt retries provider errors on the same backoff and budget, so a
+provider overload at start does not fail the task before its first turn. An abort is never
 retried, and a `noop` reply on a completed turn or a permission request parks the
 candidate rather than being treated as a resolved decision, while a `noop` on a
 clean Worker exit proceeds to verification. A `stop` on a completed turn of an
-unattended task without remote authority is verified instead of discarding the
-work (`decision_overridden`); no repair round may follow it, so a failure blocks
-the candidate. A `stop` on a pending permission or running turn stays a stop. Optional alert
+unattended task without remote authority stops the Worker (never keeping it open)
+and then verifies its finished work instead of discarding it (`decision_overridden`);
+no repair round may follow, so a failure blocks the candidate. A `stop` on a
+pending permission, on a turn the Worker has already resumed, or on a task with
+remote authority stays a plain stop. Optional alert
 delivery remains independent from event-log persistence, but notification is not
 the control boundary.
 

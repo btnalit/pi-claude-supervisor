@@ -1064,26 +1064,31 @@ test(`after a failed verification, Worker turns without a new one end in a Super
 });
 }
 
-for (const passing of [true, false]) {
-  test(`a Decision Worker stop on a finished turn is verified, never repaired (${passing ? "passing" : "failing"} work)`, async () => {
+for (const variant of ["passing", "failing", "stale", "permission"] as const) {
+  const passing = variant !== "failing";
+  const verifies = variant === "passing" || variant === "failing";
+  test(`a Decision Worker stop ${verifies ? `on a finished turn is verified, never repaired (${variant} work)` : `stays a plain stop (${variant})`}`, async () => {
     const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-stop-verify-"));
     try {
       await initializeGitRepository(cwd, "worker/stop-verify");
       if (passing) await writeFile(join(cwd, "fixed"), "yes\n");
       const handle: WorkerHandle = { id: "stop-verify-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
       let running = true;
+      let activeRequests = 0;
+      // Event-log length at the first stop: acceptance must not have started.
+      let eventsAtStop: number | undefined;
       const sends: string[] = [];
       let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
       let eventListener: WorkerStartInput["eventListener"] | undefined;
       const adapter: WorkerAdapter = {
         capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
         start: async (input) => { eventListener = input.eventListener; return handle; },
-        getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+        getStatus: async () => ({ handle, running, activeRequests, processGroupCleaned: !running }),
         readOutput: async () => [],
         send: async (_handle, message) => { sends.push(message); },
         pause: async () => {},
         resume: async () => {},
-        stop: async () => { running = false; },
+        stop: async () => { eventsAtStop ??= events.events.length; running = false; },
         killProcessGroup: async () => { running = false; },
         resumeSession: async () => handle,
       };
@@ -1102,12 +1107,24 @@ for (const passing of [true, false]) {
       const event: WorkerEvent = { type: "turn_completed", handle, result: { subtype: "success", result: "Done." }, sequence: 1 };
       await eventListener?.(event);
       await supervisor.poll();
-      await onAction?.({ action: "stop", reason: "the code looks correct" }, event);
+      // stale: the Worker resumed on its own before the decision arrived.
+      if (variant === "stale") activeRequests = 1;
+      const decided: WorkerEvent = variant === "permission"
+        ? { type: "permission_request", handle, request: { requestId: "perm-1", toolUseId: "tool-1", toolName: "Bash", input: { command: "rm -rf build" }, raw: {} } }
+        : event;
+      await onAction?.({ action: "stop", reason: "containment" }, decided);
       assert.equal(sends.length, 0, "no repair or other turn follows a stop");
-      assert.ok(events.events.some((entry) => entry.type === "acceptance_started"));
-      assert.equal(supervisor.lastVerification?.ok, passing);
-      assert.equal(supervisor.state, passing ? "completed" : "blocked");
-      if (!passing) assert.equal(supervisor.candidateParked, true);
+      assert.equal(running, false, "the Worker is stopped either way");
+      if (verifies) {
+        assert.ok(!events.events.slice(0, eventsAtStop).some((entry) => entry.type === "acceptance_started"), "the Worker is stopped before its work is judged");
+        assert.ok(events.events.some((entry) => entry.type === "acceptance_started"));
+        assert.equal(supervisor.lastVerification?.ok, passing);
+        assert.equal(supervisor.state, passing ? "completed" : "blocked");
+        if (!passing) assert.equal(supervisor.candidateParked, true);
+      } else {
+        assert.ok(!events.events.some((entry) => entry.type === "acceptance_started"));
+        assert.equal(supervisor.state, "stopped");
+      }
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

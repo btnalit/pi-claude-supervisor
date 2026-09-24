@@ -180,11 +180,19 @@ export class PiDecisionWorker implements DecisionWorkerLike {
           await promptForText(session, decisionInstructions(this.#context), this.#timeoutMs, "Decision Worker startup", MAX_DECISION_RESPONSE_BYTES, { role: "decision", onUsage: this.#options.onUsage });
           break;
         } catch (error) {
-          if (this.#closed || attempt >= maxRetries || (error instanceof Error && error.name === "AbortError")) {
+          // Only a provider error is worth another attempt: a timeout already
+          // spent the whole prompt budget and would only multiply it.
+          const retryable = error instanceof Error && error.name === "DecisionWorkerApiError";
+          if (this.#closed || attempt >= maxRetries || !retryable) {
             try { await this.#options.onStartupFailure?.(error); } catch { /* preserve the original startup failure */ }
             throw error;
           }
           await new Promise<void>((resolveWait) => setTimeout(resolveWait, Math.min(MAX_DECISION_RETRY_BACKOFF_MS, this.#retryBackoffMs * 3 ** (attempt + 1))));
+          if (this.#closed) {
+            const closed = new Error("Decision Worker was closed during startup");
+            closed.name = "AbortError";
+            throw closed;
+          }
         }
       }
     }
@@ -367,8 +375,9 @@ write it as a direct instruction to Claude, not a description of what you will d
 your own read-only tools to inspect the repository before deciding).
 Use verify when a turn result indicates the task is complete, even if
 Claude says it will stop; choose stop only for an explicit stop or technical containment reason.
-A stop on a completed turn is still verified before the task ends, but no repair round can
-follow it, so a fixable problem would be lost: when the work looks done, choose verify.
+In an unattended task without remote authority, a stop on a completed turn stops the Worker
+and then still verifies its work, but no repair round can follow, so a fixable problem would
+be lost: when the work looks done, choose verify.
 Use park only when the task cannot safely produce a candidate because required evidence,
 authority, or runtime capability is unavailable. A parked candidate is asynchronous and must not
 wait for a human to be online. For an exited event choose verify, park or stop; a noop on an exited event is treated as

@@ -175,6 +175,31 @@ test("a startup provider error that outlasts the retries rejects start() and cal
   assert.match((startupError as Error).message, /rate limited/u);
 });
 
+test("closing during a startup retry backoff aborts start() without another prompt", async () => {
+  const { session, prompts } = createFakeSession([{ stopReason: "error", errorMessage: "503 overloaded" }, { stopReason: "stop", text: "ack" }]);
+  const worker = new PiDecisionWorker(baseOptions({ sessionFactory: async () => ({ session }), retryBackoffMs: 50 }));
+  const started = worker.start();
+  while (prompts.length === 0) await flush();
+  await worker.close();
+  await assert.rejects(started, (error: Error) => error.name === "AbortError");
+  assert.equal(prompts.length, 1);
+});
+
+test("a startup timeout is not retried", async () => {
+  const { session, prompts } = createFakeSession([{ holdUntilAbort: true }, { stopReason: "stop", text: "ack" }]);
+  let startupFailures = 0;
+  const worker = new PiDecisionWorker(baseOptions({ sessionFactory: async () => ({ session }), retryBackoffMs: 1, timeoutMs: 20, onStartupFailure: () => { startupFailures += 1; } }));
+  // The prompt timer is unref'd; keep the loop alive until it fires.
+  const keepAlive = setInterval(() => {}, 10);
+  try {
+    await assert.rejects(() => worker.start(), /timed out/u);
+  } finally {
+    clearInterval(keepAlive);
+  }
+  assert.equal(prompts.length, 1);
+  assert.equal(startupFailures, 1);
+});
+
 test("a transient startup provider error is retried instead of failing the task", async () => {
   const { session, prompts } = createFakeSession([
     { stopReason: "error", errorMessage: "503 model is currently experiencing high demand" },
