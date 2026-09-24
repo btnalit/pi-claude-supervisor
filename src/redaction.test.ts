@@ -44,5 +44,25 @@ test("redacts OpenAI-style and Google model API keys wherever they appear", () =
   const redacted = String(redactSensitive(`provider said: invalid key ${openaiStyle}; retry with ${googleClassic} or ${googleBound}.`));
   for (const key of [openaiStyle, googleClassic, googleBound]) assert.ok(!redacted.includes(key), key);
   assert.equal(redacted.match(/\[REDACTED\]/gu)?.length, 3);
+  const deepseekStyle = `sk-${"0123456789abcdef".repeat(2)}`;
+  const openaiProject = `sk-proj-${"Ab3_".repeat(12)}-tail`;
+  for (const key of [deepseekStyle, openaiProject]) assert.equal(redactSensitive(`key=${key}`), "key=[REDACTED]", key);
   assert.equal(redactSensitive("the task-scheduler and sk-learn stay"), "the task-scheduler and sk-learn stay");
+});
+
+test("hyphenated names that merely start with sk- are not treated as keys", () => {
+  // Session records reject a branch or path that redaction changes, so a
+  // false positive here fails the task, not just a log line.
+  for (const text of [
+    "sk-some-long-feature-branch-name",
+    "sk-1234-fix-login-redirect-loop",
+    "feature/sk-some-long-feature-branch-name",
+    "/home/user/projects/sk-learn-pipeline-experiments/src",
+    "-home-user-projects-sk-learn-pipeline-experiments",
+    "diff --git a/src/sk-utils-and-helpers-module.ts b/src/sk-utils-and-helpers-module.ts",
+    "@scope/sk-some-really-long-package-name",
+    ".sk-folding-cube-animation-delay-long { color: red }",
+    "the-sk-mask-rcnn-inference-component",
+    "AIzaSomethingInWordsNotAKeyButLongEnoughHere",
+  ]) assert.equal(redactSensitive(text), text, text);
 });

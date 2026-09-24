@@ -20,7 +20,7 @@ if (process.env.PI_CLAUDE_SUPERVISOR_REAL_DECISION !== "1") {
   console.error("Set PI_CLAUDE_SUPERVISOR_REAL_DECISION=1 to run this spike against a live model.");
   process.exit(2);
 }
-const modelSpec = process.env.SPIKE_DECISION_MODEL ?? "google/gemini-3.5-flash-lite";
+const modelSpec = process.env.SPIKE_DECISION_MODEL || "google/gemini-3.5-flash-lite";
 const scenarios = (process.env.SPIKE_DECISION_SCENARIOS ?? "review,question,stuck").split(",").map((name) => name.trim()).filter(Boolean);
 const deadlineMs = Number(process.env.SPIKE_TIMEOUT_MS ?? 600_000);
 const keep = process.env.SPIKE_KEEP === "1";
@@ -39,9 +39,9 @@ const testFull = `${testBase}\ntest("rejects min > max", () => {\n  assert.throw
  *           task must end blocked within its repair budget, not loop.
  */
 const expected = {
-  // The fix must actually have been asked for and made: a Reviewer that
-  // waves the incomplete first turn through does not pass this scenario.
-  review: (r) => r.state === "completed" && r.verified && r.workerFixed,
+  // The missing RangeError must have been asked for and then made: a
+  // Reviewer that waves the incomplete first turn through fails this.
+  review: (r) => r.state === "completed" && r.verified && r.fixRequested && r.workerFixed,
   question: (r) => r.state === "completed" && r.verified && r.humanRequired.length === 0,
   stuck: (r) => r.state === "blocked" && !r.verified,
 };
@@ -66,6 +66,7 @@ async function runScenario(scenario, model) {
   let listener;
   let sequence = 0;
   let fixed = false;
+  let fixRequested = false;
   const transcript = [];
   const reply = (text) => setTimeout(() => {
     sequence += 1;
@@ -87,6 +88,7 @@ async function runScenario(scenario, model) {
     readOutput: async () => [],
     send: async (_handle, message) => {
       transcript.push(`SUPERVISOR> ${message.slice(0, 400)}`);
+      if (/RangeError|min\s*>\s*max/iu.test(message)) fixRequested = true;
       if (scenario !== "stuck" && !fixed) {
         fixed = true;
         await writeImpl(true);
@@ -152,6 +154,7 @@ async function runScenario(scenario, model) {
     state: supervisor.state,
     verified: supervisor.lastVerification?.ok ?? false,
     repairRound: supervisor.repairRound,
+    fixRequested,
     workerFixed: fixed,
     humanRequired: human,
     decisions: events.filter((event) => event.type === "decision_made").map((event) => `${event.data?.action}: ${String(event.data?.reason ?? "").slice(0, 160)}`),

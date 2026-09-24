@@ -131,9 +131,10 @@ PI_CLAUDE_SUPERVISOR_REAL_DECISION=1 npm run spike:decision
 Credentials come only from Pi's own sources (for example `GEMINI_API_KEY` in
 the environment, or `~/.pi/agent/auth.json`); the script never reads, prints or
 stores a key, and redacts what it prints. The scenarios cover:
-- `review`: an incomplete first turn is caught and repaired (a model that
-  answers the "task is complete" turn with `stop` ends it blocked, with no
-  repair, so the scenario fails; that is model behavior, not a regression);
+- `review`: an incomplete first turn is caught and repaired. Two model
+  behaviors fail it without being regressions: a Reviewer that passes the
+  incomplete turn, and a Decision Worker that answers the "task is complete"
+  turn with `stop`, which ends the task blocked with no repair;
 - `question`: a mid-task question is answered from the spec without a human;
 - `stuck`: a Worker that only claims success ends `blocked` within its repair
   budget.

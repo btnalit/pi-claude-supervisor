@@ -198,3 +198,34 @@ test("Decision Worker session registry ignores corrupt and misnamed records duri
   const records = await store.list({ activeOnly: true });
   assert.deepEqual(records.map((record) => record.taskId), [taskId]);
 });
+
+test("a task on an sk- branch in an sk- directory keeps its Decision session", async () => {
+  // Redaction must not mistake these names for API keys: the store rejects a
+  // cwd or branch that redaction would change.
+  const directory = await mkdtemp(join(tmpdir(), "pi-claude-decision-store-sk-"));
+  try {
+    const store = new DecisionSessionStore(directory);
+    await mkdir(store.sessionDirectory(taskId), { recursive: true });
+    await store.save({
+      taskId,
+      task: "sk- names fixture",
+      cwd: "/home/user/src/sk-learn-pipeline-experiments",
+      command: "claude",
+      args: [],
+      decisionSessionFile: join(store.sessionDirectory(taskId), "session.jsonl"),
+      maxTurns: 100,
+      deadlineMs: 60_000,
+      noOutputTimeoutMs: 60_000,
+      startedAt: new Date().toISOString(),
+      baseBranch: "sk-1234-fix-login-redirect-loop",
+      turn: 0,
+      repairRound: 0,
+      state: "active",
+    });
+    const restored = await new DecisionSessionStore(directory).load(taskId);
+    assert.equal(restored?.cwd, "/home/user/src/sk-learn-pipeline-experiments");
+    assert.equal(restored?.baseBranch, "sk-1234-fix-login-redirect-loop");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
