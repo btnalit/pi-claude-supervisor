@@ -1131,6 +1131,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   }
 
   async #send(record: TmuxRecord, message: string, idempotencyKey: string): Promise<void> {
+    // The Worker's state as the message was decided, before queueing for the
+    // input gate and the pane checks: a turn someone else starts from here on
+    // makes the message stale, however long those take.
+    const decidedAt = { turnSequence: record.turnSequence, humanInputs: record.humanInputs };
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const previous = record.inputTail;
@@ -1149,7 +1153,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       // This is the final reservation check immediately before paste. A
       // human typing after this point is inherently outside tmux's control;
       // takeover mode is the explicit exclusion mechanism for automation.
-      await this.#awaitInputReady(record);
+      await this.#awaitInputReady(record, decidedAt);
       record.activeRequests = 1;
       record.readyStreak = 0;
       record.turnObservedOutput = false;
@@ -1223,10 +1227,9 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
    * refusing on the first look turned each of those into a parked task.
    * Refused only as retryable, since nothing has been typed yet.
    */
-  async #awaitInputReady(record: TmuxRecord): Promise<void> {
+  async #awaitInputReady(record: TmuxRecord, decidedAt: { turnSequence: number; humanInputs: number }): Promise<void> {
     const deadline = Date.now() + this.#inputReadyTimeoutMs;
-    const turnSequence = record.turnSequence;
-    const humanInputs = record.humanInputs;
+    const { turnSequence, humanInputs } = decidedAt;
     for (let first = true; ; first = false) {
       if (record.stopping || record.released) throw new WorkerInputError("tmux worker is stopping or released", { retryable: false });
       // Someone else started a turn while this send waited (a human at the

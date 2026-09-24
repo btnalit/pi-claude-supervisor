@@ -1895,8 +1895,8 @@ test("a send waiting for the prompt yields to a turn someone else started, witho
     await setConfig({ busy: true, dropEnters: 0 });
     const sending = adapter.send(handle, "stale automated decision", "yield-1");
     const outcome = sending.then(() => "sent", (error) => error);
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    // An operator at the attached pane submits their own prompt, and that turn ends.
+    // An operator at the attached pane submits their own prompt, and that turn
+    // ends, right away: before the send has even queued for the input gate.
     await hook({ hook_event_name: "UserPromptSubmit", prompt: "operator's own request" });
     await hook({ hook_event_name: "Stop", last_assistant_message: "operator turn done" });
     await setConfig({ busy: false, dropEnters: 0 });
