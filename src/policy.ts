@@ -307,7 +307,9 @@ function floorScript(command: string, start: string | undefined, roots: FloorRoo
       if (name === "xargs" || name === "parallel") {
         const later = words.slice(cursor + 1);
         const shell = later.some((word) => SHELL_NAMES.has(floorCommandName(word) ?? "") || floorCommandName(word) === "eval");
-        const inner = later.find((word) => DELETE_COMMANDS.has(floorCommandName(word) ?? "") || (shell && DELETE_WORD.test(word.value)));
+        const deletingOption = (word: ShellToken): boolean => /^(?:-delete|--delete\S*|--remove-source-files)$/u.test(word.value)
+          || (word.value === "clean" && later.some((other) => floorCommandName(other) === "git"));
+        const inner = later.find((word) => DELETE_COMMANDS.has(floorCommandName(word) ?? "") || deletingOption(word) || (shell && DELETE_WORD.test(word.value)));
         if (inner) return `Worker cannot delete targets taken from input (${name} ${inner.value}); name the paths, or use find -delete inside the task directory`;
         break;
       }
@@ -467,8 +469,9 @@ function applyFloorBindings(tokens: readonly ShellToken[], bindings: ReadonlyMap
   return tokens.map((token) => {
     if (token.operator || token.data || !token.dynamic) return token;
     // `${f%.bak}` keeps the directory part, so it reads as the bound value; a
-    // `#` prefix strip or a `%` pattern with `/` can drop directories and stays unknown.
-    const value = token.value.replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?::?[-?=+][^}]*|%{1,2}[^}/]*)?\}|([A-Za-z_][A-Za-z0-9_]*))/gu,
+    // `#` prefix strip, or a `%` pattern with `/` or a wildcard (which matches
+    // `/` in parameter expansion), can drop directories and stays unknown.
+    const value = token.value.replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?::?[-?=+][^}]*|%{1,2}[^}/*?[\]\\]*)?\}|([A-Za-z_][A-Za-z0-9_]*))/gu,
       (match, braced: string | undefined, bare: string | undefined) => bindings.get(braced ?? bare ?? "") ?? match);
     if (value === token.value) return token;
     return { ...token, value, dynamic: /[$`*?[\]{}~]/u.test(value) };
