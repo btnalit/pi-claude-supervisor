@@ -137,15 +137,15 @@ test("repository evidence names an untracked symlink without following it, and s
   }
 });
 
-test("repository evidence omits the content of untracked hard-link aliases, and stays complete", async () => {
+test("repository evidence omits untracked hard-link aliases and stays incomplete: a second link must not hide text from the Reviewer", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-evidence-hard-link-"));
   try {
     await initWithCommit(cwd);
     await writeFile(join(cwd, "secret.txt"), "sensitive metadata\n");
     await link(join(cwd, "secret.txt"), join(cwd, "alias.txt"));
     const evidence = await collectRepositoryEvidence(cwd);
-    assert.equal(evidence.complete, true);
-    assert.match(evidence.untracked ?? "", /hard-linked file, \d+ bytes; content omitted/u);
+    assert.equal(evidence.complete, false);
+    assert.match(evidence.untracked ?? "", /hard-link file omitted/u);
     assert.doesNotMatch(evidence.untracked ?? "", /sensitive metadata/u);
   } finally {
     await rm(cwd, { recursive: true, force: true });

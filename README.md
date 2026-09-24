@@ -418,7 +418,7 @@ unparsable keeps the default and is reported once as a
 | `HUMAN_WEBHOOK_SECRET` | unset | HMAC signing secret; sent as the `x-pi-supervisor-signature` header |
 | `UNATTENDED` | `true` | Task runs without a synchronous human callback |
 | `REQUIRE_LOCAL_COMMIT` | `true` | Require a local commit on the candidate's branch before completion |
-| `MAX_DECISION_RETRIES` | `4` (0–10) | Retries of a Decision Worker call that times out or fails (429/529, network, auth); waits 15s, 45s, then 60s between attempts |
+| `MAX_DECISION_RETRIES` | `4` (0–10) | Retries of a Decision Worker call that times out or fails for a reason waiting does not fix (a prompt that is too long, a corrupted session); waits 15s, 45s, then 60s. A transient provider or network outage (429/529, 5xx, resets) on a completed turn is waited out instead, one attempt a minute; rejected credentials, billing and a missing model park at once |
 | `PERMISSION_AUTHORITY` | `hybrid` | `policy` \| `hybrid` \| `decision-worker` |
 | `REMOTE_AUTHORITY` | `none` | `none` \| `push` \| `pr`; grants the publish phase after verification passes. `--remote` overrides it per task |
 | `REMOTE_NAME` | `origin` | The single remote a publish grant may name |

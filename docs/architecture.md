@@ -562,16 +562,22 @@ approval for ordinary actions; a task that cannot safely produce a candidate is
 parked or failed without granting remote/main authority. Model/API failures are
 detected from the Pi `stopReason` (a provider error resolves the prompt normally
 rather than throwing); if the Decision Worker
-API/model call fails, the system classifies the error. Rejected credentials,
-billing and a missing model are configuration errors and park at once
-("Decision Worker configuration failed"); everything else (429/529 overloads,
-a quota that resets, 5xx, timeouts, network resets) is transient. An
-unattended task waits a transient outage out, backing off to one attempt a
-minute and recording each `decision_retry`, instead of parking after
-`maxDecisionRetries` (which still bounds an attended task); if no decision
-lands, the idle watchdog verifies the Worker's finished work. An error thrown
-while applying a decided action is recorded as `decision_action_failed`, not as
-a model failure. The startup
+API/model call fails, the system classifies the error. Rejected, missing or
+expired credentials, billing and a missing model are configuration errors and
+park at once ("Decision Worker configuration failed"). An explicitly listed
+transient provider or network failure (429/529 overloads and rate limits,
+including a quota that resets, 5xx, gateway and connection errors) on a
+completed turn or an exit is waited out, backing off to one attempt a minute
+and recording each `decision_retry`: the task has no human to resume it, and if
+no decision lands the idle watchdog verifies the Worker's finished work — the
+close-out verifies at once rather than wait on a decision that is backing off.
+Everything else (a prompt that is too long, a corrupted session, the Decision
+Worker's own request timeout), and a permission request, which blocks the
+Worker mid-turn, stays bounded by `maxDecisionRetries` and then parks. A
+decision that lands for a turn a later turn, message or verification has since
+superseded is recorded as `decision_ignored` rather than applied. An error
+thrown while applying a decided action is recorded as `decision_action_failed`,
+not as a model failure. The startup
 instructions prompt retries transient provider errors on the same backoff within `maxDecisionRetries`, so a
 provider overload at start does not fail the task before its first turn. An abort is never
 retried, and a `noop` reply on a completed turn or a permission request parks the
@@ -674,9 +680,10 @@ park it without requiring a human to be online. The Reviewer retries provider
 errors with a fresh session within a total review budget
 (`PI_CLAUDE_SUPERVISOR_REVIEW_TIMEOUT_MS`, default 10 minutes). Truncated
 (oversize) evidence requests a bounded repair before parking, while incomplete
-evidence (an unsafe path, a read or git failure) still parks. An untracked
-binary, symlink, hard link or special file is named in the evidence with its
-size or link target but no content; that is complete evidence, not a park.
+evidence (an unsafe path, a read or git failure, an untracked hard link, which
+could hide text from the Reviewer) still parks. An untracked binary (with its
+size), a symlink (with its target, not followed) or a special file is named in
+the evidence without its content; that is complete evidence, not a park.
 
 A `revise` result produces an audited repair round and sends a bounded corrective
 instruction to a still-live `repairableSession` Worker. Checks and review then run again.

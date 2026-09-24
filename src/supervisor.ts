@@ -235,6 +235,10 @@ export class Supervisor {
   #lastTurnCompleted?: WorkerEvent;
   /** Key of the completed turn whose decision is still in flight; the deadline must not verify underneath it. */
   #pendingDecisionKey?: string;
+  /** The pending decision's request has failed at least once and is backing off. */
+  #pendingDecisionRetrying = false;
+  /** The Supervisor turn a completed-turn event was handed to the Decision Worker at; a later turn supersedes it. */
+  readonly #decisionTurnAtNotify = new WeakMap<WorkerEvent, number>();
   /** When the pending decision was requested; bounds how long an idle timeout defers to it. */
   #pendingDecisionSince = 0;
   /**
@@ -559,6 +563,7 @@ export class Supervisor {
           } : {}),
           onAction: (action, event) => this.#applyDecision(action, event),
           onRetry: (event, info) => {
+            if (this.#pendingDecisionKey === workerEventKey(event)) this.#pendingDecisionRetrying = true;
             void this.#appendEvent({ type: "decision_retry", taskId: this.#task?.taskId, workerId: event.handle.id, data: { eventType: event.type, attempt: info.attempt, delayMs: info.delayMs, error: safeMessage(info.error) } }).catch(() => {});
           },
           onFailure: (event, error) => this.#decisionFailure(event, error),
@@ -1056,6 +1061,16 @@ export class Supervisor {
         return;
       }
       if (!task || !handle || !this.#automation || ["completed", "blocked", "failed", "stopped"].includes(this.#machine.state)) return;
+      // A decision for a completed turn that has since been overtaken (a later
+      // turn, a message sent after it, a verification the watchdog or the
+      // close-out started while it was backing off a provider outage) would
+      // act on a state that no longer exists.
+      const notifiedTurn = this.#decisionTurnAtNotify.get(event);
+      if (event.type === "turn_completed" && ((this.#lastTurnCompleted && event !== this.#lastTurnCompleted) || (notifiedTurn !== undefined && notifiedTurn !== this.#turn) || this.#verificationAbortController)) {
+        this.#settlePendingDecision(event);
+        await this.#appendEvent({ type: "decision_ignored", taskId: task.taskId, workerId: handle.id, data: { action: action.action, reason: "superseded by a later turn, message or verification", eventType: event.type } }).catch(() => {});
+        return;
+      }
       if (this.#humanRequired) {
         await this.#appendEvent({ type: "decision_deferred", taskId: task.taskId, workerId: handle.id, data: { action: action.action, reason: action.reason, eventType: event.type } }).catch(() => {});
         return;
@@ -1325,6 +1340,8 @@ export class Supervisor {
     if (event.type === "turn_completed") {
       this.#pendingDecisionKey = workerEventKey(event);
       this.#pendingDecisionSince = Date.now();
+      this.#pendingDecisionRetrying = false;
+      this.#decisionTurnAtNotify.set(event, this.#turn);
     }
     if (replay) this.#decision.replay!(event);
     else this.#decision.notify(event);
@@ -2798,8 +2815,11 @@ export class Supervisor {
     // which nothing else calls while the Worker is alive.
     if (this.#machine.state === "running" && !status.activeRequests) await this.#pollInternal();
     // A decision still in flight for the last turn owns the next step: it is
-    // applied under close-out (a `wait` becomes verify) once it arrives.
-    if (this.#pendingDecisionKey || this.#machine.state !== "waiting" || this.#verificationAbortController || status.activeRequests) return;
+    // applied under close-out (a `wait` becomes verify) once it arrives. One
+    // that is backing off a provider outage may not land before the grace
+    // runs out, so the idle Worker is verified now; the late decision is
+    // then ignored as superseded.
+    if ((this.#pendingDecisionKey && !this.#pendingDecisionRetrying) || this.#machine.state !== "waiting" || this.#verificationAbortController || status.activeRequests) return;
     this.#clearWaitTimer();
     await this.#appendEvent({ type: "deadline_close_out", taskId: task.taskId, workerId: handle.id, data: { action: "verify", reason: "task deadline reached with an idle Worker" } });
     try {

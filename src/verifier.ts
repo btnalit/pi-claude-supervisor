@@ -528,13 +528,14 @@ async function collectUntrackedEvidence(cwd: string, signal?: AbortSignal): Prom
     try {
       // Directory components must be real; the leaf itself may be a link, reported below.
       await assertNoSymlinkComponents(root, dirname(relativePath));
-      // A symlink, an FD-less special file, a hard link or a binary is named
-      // with what can be said about it, but its content is not read. Its
-      // presence is complete evidence in itself: parking a task because the
-      // Worker added a PNG, a fixture database or a symlink helps nobody.
+      // A symlink, a special file or a binary is named with what can be said
+      // about it, but its content is not read. Its presence is complete
+      // evidence in itself: parking a task because the Worker added a PNG, a
+      // fixture database or a symlink helps nobody.
       const info = await lstat(fullPath);
       if (info.isSymbolicLink()) {
-        const target = await readlink(fullPath).catch(() => "?");
+        // Unreadable means it changed after lstat: nothing true can be said about it.
+        const target = await readlink(fullPath);
         sections.push(`--- ${JSON.stringify(path)} [symbolic link to ${JSON.stringify(target)}; not followed]`);
         continue;
       }
@@ -550,7 +551,10 @@ async function collectUntrackedEvidence(cwd: string, signal?: AbortSignal): Prom
         continue;
       }
       if (opened.nlink > 1) {
-        sections.push(`--- ${JSON.stringify(path)} [hard-linked file, ${opened.size} bytes; content omitted]`);
+        // Unlike a binary or a symlink, a second link would hide ordinary text
+        // from the Reviewer just by existing, so it keeps the evidence incomplete.
+        complete = false;
+        sections.push(`--- ${JSON.stringify(path)} [hard-link file omitted]`);
         continue;
       }
       await assertOpenedEvidencePath(root, handle.fd);

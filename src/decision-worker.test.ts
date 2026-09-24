@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { isDecisionActionError, isDecisionConfigurationError, PiDecisionWorker, type DecisionAction, type DecisionWorkerOptions, type PiModel } from "./decision-worker.ts";
+import { classifyDecisionError, isDecisionActionError, isDecisionConfigurationError, PiDecisionWorker, type DecisionErrorClass, type DecisionAction, type DecisionWorkerOptions, type PiModel } from "./decision-worker.ts";
 import type { PiUsageSample, WorkerEvent, WorkerHandle } from "./types.ts";
 
 /** One model call's token usage, matching a `message_end` record's `usage` field. */
@@ -692,7 +692,7 @@ test("unattended, a transient provider outage is waited out past maxDecisionRetr
   }));
   await worker.start();
   worker.notify(turnCompletedEvent());
-  while (failures.length === 0 && actions.length === 0) await flush();
+  await until(() => failures.length > 0 || actions.length > 0);
   assert.deepEqual(failures, []);
   assert.deepEqual(actions, ["verify"]);
   assert.deepEqual(retries, [1, 2, 3]);
@@ -718,7 +718,7 @@ test("a configuration error (credentials, billing, missing model) fails at once,
     }));
     await worker.start();
     worker.notify(turnCompletedEvent());
-    while (failures.length === 0) await flush();
+    await until(() => failures.length > 0);
     assert.equal(prompts.length, 2, errorMessage);
     assert.deepEqual(retries, [], errorMessage);
     assert.ok(isDecisionConfigurationError(failures[0]), errorMessage);
@@ -726,12 +726,36 @@ test("a configuration error (credentials, billing, missing model) fails at once,
   }
 });
 
-test("transient provider errors are not mistaken for configuration errors", () => {
-  const transient = (message: string) => Object.assign(new Error(`Decision Worker request model request failed: ${message}`), { name: "DecisionWorkerApiError" });
-  for (const message of ["429 RESOURCE_EXHAUSTED: You exceeded your current quota", "529 overloaded_error", "500 Internal Server Error", "fetch failed: getaddrinfo ENOTFOUND api.example.com", "socket hang up"]) {
-    assert.equal(isDecisionConfigurationError(transient(message)), false, message);
-  }
-  assert.equal(isDecisionConfigurationError(new Error("Decision Worker request timed out after 1000ms")), false);
+test("provider errors are classified by what waiting can fix, from the real message shapes", () => {
+  const api = (message: string) => Object.assign(new Error(`Decision Worker request model request failed: ${message}`), { name: "DecisionWorkerApiError" });
+  const cases: Array<[DecisionErrorClass, Error]> = [
+    ["configuration", api('401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}')],
+    ["configuration", api("400 API key not valid. Please pass a valid API key.")],
+    ["configuration", api("400 API key expired. Please renew the API key.")],
+    ["configuration", api("404 models/gemini-9 is not found for API version v1beta")],
+    ["configuration", api("400 Your credit balance is too low to access the Anthropic API")],
+    ["configuration", api("429 You exceeded your current quota, please check your plan and billing details. insufficient_quota")],
+    ["configuration", api("AccessDeniedException: You don't have access to the model with the specified model ID.")],
+    ["configuration", api("UnrecognizedClientException: The security token included in the request is invalid.")],
+    ["configuration", api("ExpiredTokenException: The security token included in the request is expired")],
+    ["configuration", api("ValidationException: Validation error: The provided model identifier is invalid.")],
+    ["configuration", new Error("No API key found for anthropic")],
+    ["configuration", new Error('Authentication failed for "google"')],
+    // Gemini's per-minute limit mentions billing but passes by itself.
+    ["transient", api("429 You exceeded your current quota, please check your plan and billing details. Quota exceeded for metric: generate_content_free_tier_requests. Please retry in 32.2s.")],
+    ["transient", api("529 overloaded_error")],
+    ["transient", api("503 Service Unavailable")],
+    ["transient", api('Provider returned error {"code":403,"message":"temporarily unavailable"}')],
+    ["transient", api("502 <html>bad gateway, trace id-403</html>")],
+    ["transient", new Error("fetch failed")],
+    ["transient", new Error("socket hang up")],
+    // Deterministic: the same request fails the same way every time.
+    ["other", api("400 prompt is too long: 213462 tokens > 200000 maximum")],
+    ["other", api("400 context_length_exceeded")],
+    ["other", api("400 messages.3: tool_use ids were found without tool_result blocks immediately after")],
+    ["other", new Error("Decision Worker request timed out after 120000ms")],
+  ];
+  for (const [expected, error] of cases) assert.equal(classifyDecisionError(error), expected, error.message);
 });
 
 test("an error thrown while applying an action is marked as an action failure, not a model failure", async () => {
@@ -747,7 +771,7 @@ test("an error thrown while applying an action is marked as an action failure, n
   }));
   await worker.start();
   worker.notify(turnCompletedEvent());
-  while (failures.length === 0) await flush();
+  await until(() => failures.length > 0);
   assert.equal(isDecisionActionError(failures[0]), true);
   assert.equal(isDecisionConfigurationError(failures[0]), false);
   await worker.close();
@@ -768,11 +792,84 @@ test("close() wakes a decision retry backoff instead of sitting it out", async (
   }));
   await worker.start();
   worker.notify(turnCompletedEvent());
-  while (retries.length === 0) await flush();
-  const timers = () => process.getActiveResourcesInfo().filter((resource) => resource === "Timeout").length;
-  const before = timers();
+  await until(() => retries.length > 0);
   await worker.close();
-  await flush();
-  // The minute-long backoff timer is cleared, not left to keep the process alive.
-  assert.equal(timers(), before - 1);
+  // The queued decision gives up at once rather than sitting out a minute-long backoff.
+  const settled = await Promise.race([worker.settled().then(() => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000))]);
+  assert.equal(settled, true);
+});
+
+/** Flush until the condition holds, failing instead of hanging on a regression. */
+async function until(condition: () => boolean, maxFlushes = 20_000): Promise<void> {
+  for (let flushes = 0; !condition(); flushes += 1) {
+    if (flushes >= maxFlushes) throw new Error("condition not reached");
+    await flush();
+  }
+}
+
+test("an error that fails the same way every time stays bounded by maxDecisionRetries even unattended", async () => {
+  const { session, prompts } = createFakeSession([
+    { stopReason: "stop", text: "ack" },
+    ...Array.from({ length: 10 }, () => ({ stopReason: "error" as const, errorMessage: "400 prompt is too long: 213462 tokens > 200000 maximum" })),
+  ]);
+  const failures: unknown[] = [];
+  const worker = new PiDecisionWorker(baseOptions({
+    onAction: () => { throw new Error("must not act"); },
+    onFailure: (_event, error) => { failures.push(error); },
+    sessionFactory: async () => ({ session }),
+    retryBackoffMs: 1,
+    context: unattendedContext(2),
+  }));
+  await worker.start();
+  worker.notify(turnCompletedEvent());
+  await until(() => failures.length > 0);
+  // The startup prompt, then the first attempt and two retries.
+  assert.equal(prompts.length, 4);
+  assert.equal(classifyDecisionError(failures[0]), "other");
+  await worker.close();
+});
+
+test("a permission request is not waited out through an outage: the Worker is blocked on it", async () => {
+  const { session, prompts } = createFakeSession([
+    { stopReason: "stop", text: "ack" },
+    ...Array.from({ length: 10 }, () => ({ stopReason: "error" as const, errorMessage: "529 overloaded_error" })),
+  ]);
+  const failures: unknown[] = [];
+  const worker = new PiDecisionWorker(baseOptions({
+    onFailure: (_event, error) => { failures.push(error); },
+    sessionFactory: async () => ({ session }),
+    retryBackoffMs: 1,
+    context: unattendedContext(1),
+  }));
+  await worker.start();
+  worker.notify(permissionRequestEvent("Bash", { command: "npm test" }));
+  await until(() => failures.length > 0);
+  assert.equal(prompts.length, 3);
+  await worker.close();
+});
+
+test("the Decision Worker's own request timeout stays bounded: the model ran its whole budget", async () => {
+  const { session, prompts } = createFakeSession([
+    { stopReason: "stop", text: "ack" },
+    { holdUntilAbort: true },
+    { holdUntilAbort: true },
+    { holdUntilAbort: true },
+  ]);
+  const failures: unknown[] = [];
+  const worker = new PiDecisionWorker(baseOptions({
+    onFailure: (_event, error) => { failures.push(error); },
+    sessionFactory: async () => ({ session }),
+    retryBackoffMs: 1,
+    timeoutMs: 20,
+    context: unattendedContext(1),
+  }));
+  await worker.start();
+  worker.notify(turnCompletedEvent());
+  for (let waited = 0; failures.length === 0; waited += 10) {
+    if (waited > 5_000) throw new Error("condition not reached");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(prompts.length, 3);
+  assert.match(String((failures[0] as Error).message), /timed out/u);
+  await worker.close();
 });

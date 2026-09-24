@@ -2909,7 +2909,7 @@ test("a completed interactive task with keepWorkerOnCompletion releases instead 
  */
 function closeOutFixture(cwd: string) {
   const handle: WorkerHandle = { id: "close-out-worker", startedAt: new Date().toISOString(), cwd, ownership: "adopted" };
-  const state = { activeRequests: 0, released: false, stopReasons: [] as string[], sent: [] as string[], replays: [] as WorkerEvent[], contexts: [] as Array<Record<string, unknown>>, listener: undefined as WorkerStartInput["eventListener"], onAction: undefined as Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined };
+  const state = { activeRequests: 0, released: false, stopReasons: [] as string[], sent: [] as string[], replays: [] as WorkerEvent[], contexts: [] as Array<Record<string, unknown>>, listener: undefined as WorkerStartInput["eventListener"], onAction: undefined as Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined, onRetry: undefined as Parameters<DecisionWorkerFactory>[0]["onRetry"] | undefined };
   const adapter: WorkerAdapter = {
     capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true, repairableSession: true }),
     start: async (input) => { state.listener = input.eventListener; return handle; },
@@ -2927,6 +2927,7 @@ function closeOutFixture(cwd: string) {
   };
   const decisionWorkerFactory: DecisionWorkerFactory = (options) => {
     state.onAction = options.onAction;
+    state.onRetry = options.onRetry;
     return {
       start: async () => {},
       updateContext: (patch) => { state.contexts.push(patch as Record<string, unknown>); },
@@ -3037,6 +3038,42 @@ test("a wait decision during close-out is overridden into verification, and neve
     assert.equal(overridden?.data?.action, "wait");
     assert.equal(overridden?.data?.override, "verify");
     assert.ok(events.events.some((event) => event.type === "verification_passed"));
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("close-out does not wait on a decision that is backing off a provider outage, and ignores it when it lands", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-close-out-retrying-"));
+  try {
+    await initializeGitRepository(cwd, "worker/close-out-retrying");
+    const fixture = closeOutFixture(cwd);
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(fixture.adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "close out past a retrying decision",
+      cwd,
+      command: "claude",
+      automation: true,
+      spec: automaticSpec(),
+      startedAt: new Date(Date.now() - 3_000).toISOString(),
+      deadlineMs: 2_000,
+      deadlineGraceMs: 60_000,
+      deadlineWarningMs: 0,
+      noOutputTimeoutMs: 0,
+      decisionWorkerFactory: fixture.decisionWorkerFactory,
+    });
+    const turn = fixture.turn(1);
+    fixture.state.listener?.(turn);
+    await supervisor.poll();
+    // The decision for this turn hit a provider outage and is backing off.
+    fixture.state.onRetry?.(turn, { attempt: 1, delayMs: 60_000, error: new Error("529 overloaded_error") });
+    await waitFor(() => supervisor.state === "completed");
+    assert.ok(events.events.some((event) => event.type === "deadline_close_out"));
+    // The decision lands after the outage: the verification already superseded it.
+    await fixture.state.onAction?.({ action: "continue", message: "keep going", reason: "late" }, turn);
+    assert.deepEqual(fixture.state.sent, []);
+    assert.equal(supervisor.state, "completed");
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -4432,5 +4469,21 @@ test("a Decision configuration error and an action failure are parked under thei
     assert.equal(supervisor.candidateParked, true);
     assert.ok(events.events.some((event) => event.type === "decision_action_failed"));
     assert.doesNotMatch(JSON.stringify(events.events.map((event) => event.data)), /Decision Worker API failed/u);
+  });
+});
+
+test("a decision that lands after a later turn superseded its own is ignored, not applied", async () => {
+  const sent: string[] = [];
+  await withScriptedSend(async (message) => { sent.push(message); }, async ({ handle, events, decide, emit }) => {
+    const first: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 1 };
+    const second: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 2 };
+    emit(first);
+    emit(second);
+    await decide({ action: "continue", message: "Stale guidance for turn one.", reason: "late" }, first);
+    assert.deepEqual(sent, []);
+    const ignored = events.events.find((event) => event.type === "decision_ignored");
+    assert.match(String(ignored?.data?.reason), /superseded/u);
+    await decide({ action: "continue", message: "Guidance for turn two.", reason: "current" }, second);
+    assert.deepEqual(sent, ["Guidance for turn two."]);
   });
 });

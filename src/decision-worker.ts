@@ -108,16 +108,44 @@ const DEFAULT_DECISION_RETRY_BACKOFF_MS = 5_000;
 const MAX_DECISION_RETRY_BACKOFF_MS = 60_000;
 
 /**
- * Provider errors that no amount of waiting fixes: rejected credentials,
- * billing, a model that does not exist. Everything else a provider or the
- * network produces (429/529 overloads, a daily quota that resets, 5xx,
- * timeouts, resets) is transient.
+ * Errors no amount of waiting fixes: rejected, missing or expired
+ * credentials, an exhausted account, a model that does not exist. Matched on
+ * words, not bare status codes, which also turn up inside request ids, URLs
+ * and wrapped upstream errors.
  */
-const CONFIGURATION_ERROR = /\b(?:401|403|404)\b|authenticat|unauthori[sz]ed|invalid[_ ]api[_ ]key|api[_ ]key[_ ]not[_ ]valid|permission[_ ]denied|forbidden|billing|payment[_ ]required|credit[_ ]balance|insufficient[_ ]quota|not[_ ]found[_ ]error|model\b[^\n]{0,80}\bnot[_ ]found|does not exist|unsupported[_ ]model|invalid[_ ]model/iu;
+const CONFIGURATION_ERROR = /authentication|unauthori[sz]ed|invalid[_ ]?x?-?api[_ -]?key|api[_ ]key[_ ](?:not[_ ]valid|expired|invalid)|no api key found|security token[^\n]{0,40}invalid|UnrecognizedClient|ExpiredToken|AccessDenied|permission[_ ]denied|permission_error|payment[_ ]required|credit[_ ]balance|insufficient[_ ]quota|billing_error|not_found_error|models?\b[^\n]{0,80}\b(?:not[_ ]found|does not exist|is invalid)|model identifier is invalid|unsupported[_ ]model|invalid[_ ]model/iu;
+
+/**
+ * Errors that pass by themselves: provider load and rate limits (including a
+ * quota that resets, whose Gemini message also mentions "billing"), 5xx,
+ * gateway and network failures. Based on pi-ai's own retryable list. Anything
+ * matching neither list, such as a prompt that is too long, a corrupted
+ * session or this worker's own request timeout, fails the same way every time
+ * and stays bounded by maxDecisionRetries.
+ */
+const TRANSIENT_ERROR = /overloaded|rate.?limit|too many requests|resource.?exhausted|retry in \d|quota exceeded for metric|exceeded your current quota|\b(?:429|500|502|503|504|524|529)\b|service.?unavailable|temporarily unavailable|server.?error|internal.?error|provider.?returned.?error|network.?error|connection.?(?:error|refused|lost|reset)|other side closed|fetch failed|getaddrinfo|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|upstream.?connect|reset before headers|socket hang up|socket connection was closed|gateway.?time.?out|websocket.?(?:closed|error)|ended without|stream ended before|http2 request did not get a response|you can retry your request|try your request again|please retry your request/iu;
+
+/** The Decision Worker's own per-request timeout: the model ran the whole budget. */
+const OWN_TIMEOUT = /^Decision Worker [^\n]* timed out after \d+ms$/u;
+
+export type DecisionErrorClass = "configuration" | "transient" | "other";
+
+export function classifyDecisionError(error: unknown): DecisionErrorClass {
+  if (!(error instanceof Error)) return "other";
+  if (error.name === "DecisionWorkerConfigError") return "configuration";
+  if (OWN_TIMEOUT.test(error.message)) return "other";
+  // Judge the provider's own text, not this worker's "… model request failed:" wrapper.
+  const text = error.message.replace(/^[^\n:]*model request failed: /u, "");
+  if (CONFIGURATION_ERROR.test(text)) return "configuration";
+  // A provider's error turn (pi-ai reports it as a stop reason, not a throw).
+  if (error.name === "DecisionWorkerApiError" && TRANSIENT_ERROR.test(text)) return "transient";
+  // A thrown transport failure before any provider answered.
+  if (/fetch failed|getaddrinfo|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|socket hang up|network.?error/iu.test(text)) return "transient";
+  return "other";
+}
 
 export function isDecisionConfigurationError(error: unknown): boolean {
-  return error instanceof Error && (error.name === "DecisionWorkerConfigError"
-    || (error.name === "DecisionWorkerApiError" && CONFIGURATION_ERROR.test(error.message)));
+  return classifyDecisionError(error) === "configuration";
 }
 
 function configurationError(error: Error): Error {
@@ -214,7 +242,7 @@ export class PiDecisionWorker implements DecisionWorkerLike {
           if (this.#closed) throw closedDuringStartup();
           // Only a provider error is worth another attempt: a timeout already
           // spent the whole prompt budget and would only multiply it.
-          const retryable = error instanceof Error && error.name === "DecisionWorkerApiError" && !isDecisionConfigurationError(error);
+          const retryable = error instanceof Error && error.name === "DecisionWorkerApiError" && classifyDecisionError(error) !== "configuration";
           if (attempt >= maxRetries || !retryable) {
             try { await this.#options.onStartupFailure?.(error); } catch { /* preserve the original startup failure */ }
             throw error;
@@ -286,16 +314,21 @@ export class PiDecisionWorker implements DecisionWorkerLike {
       } catch (error) {
         if (this.#closed) return;
         if (error instanceof Error && error.name === "AbortError") throw error;
+        const kind = classifyDecisionError(error);
         // Waiting does not fix credentials, billing or a missing model: park now, with that reason.
-        if (isDecisionConfigurationError(error)) throw configurationError(error as Error);
-        // Unattended, a transient outage is waited out rather than parking the
-        // task: nobody is there to resume it. The Supervisor's idle watchdog
-        // still verifies the Worker's finished work if no decision ever lands.
-        const unattended = this.#context.spec?.autonomy.unattended === true;
-        if (!unattended && attempt >= maxRetries) throw error;
+        if (kind === "configuration") throw configurationError(error as Error);
+        // A transient provider or network outage on a completed turn or an
+        // exit is waited out rather than parking the task: nobody is there to
+        // resume it, and the Supervisor's idle watchdog verifies the Worker's
+        // finished work if no decision ever lands. A permission request is
+        // not waited out: the Worker is blocked mid-turn on it, and on some
+        // transports nothing else would ever answer it. Anything else fails
+        // the same way on every attempt and stays bounded.
+        const waitOut = kind === "transient" && event.type !== "permission_request";
+        if (!waitOut && attempt >= maxRetries) throw error;
         attempt += 1;
         // 429/529 overloads last minutes, not seconds: 15s, 45s, then 60s.
-        const delayMs = Math.min(MAX_DECISION_RETRY_BACKOFF_MS, this.#retryBackoffMs * 3 ** attempt);
+        const delayMs = Math.min(MAX_DECISION_RETRY_BACKOFF_MS, this.#retryBackoffMs * 3 ** Math.min(attempt, 10));
         try { this.#options.onRetry?.(event, { attempt, delayMs, error }); } catch { /* observability only */ }
         await new Promise<void>((resolveWait) => {
           const timer = setTimeout(() => { this.#wakeRetryBackoff = undefined; resolveWait(); }, delayMs);
@@ -370,6 +403,11 @@ export class PiDecisionWorker implements DecisionWorkerLike {
 
   get restored(): boolean {
     return Boolean(this.#options.sessionFile && this.#sessionFile === this.#options.sessionFile);
+  }
+
+  /** Resolves once every queued decision has finished or given up (shutdown and tests). */
+  async settled(): Promise<void> {
+    await this.#tail.catch(() => {});
   }
 
   async close(): Promise<void> {
