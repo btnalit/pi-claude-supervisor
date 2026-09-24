@@ -1164,12 +1164,13 @@ test("P0 and P1 Reviewer findings enter automatic repair, and a pass carrying on
   const handle: WorkerHandle = { id: "blocking-finding-worker", startedAt: new Date().toISOString(), cwd: "/tmp", ownership: "owned" };
   let running = true;
   let sends = 0;
+  let sent = "";
   const adapter: WorkerAdapter = {
     capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
     start: async () => handle,
     getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
     readOutput: async () => [],
-    send: async () => { sends += 1; },
+    send: async (_handle, text) => { sends += 1; sent = text; },
     pause: async () => {},
     resume: async () => {},
     stop: async () => { running = false; },
@@ -1178,8 +1179,12 @@ test("P0 and P1 Reviewer findings enter automatic repair, and a pass carrying on
   };
   const supervisor = new Supervisor(adapter, undefined, {
     // The Reviewer contradicts itself: `pass` with a P1 finding. The finding
-    // must still be repaired rather than waved through or parked.
-    reviewer: { review: async () => ({ verdict: "pass", summary: "looks fine", findings: [{ id: "F001", severity: "P1", message: "crash on empty input", requiredFix: "guard the empty case" }], round: 0, checkedAt: new Date().toISOString() }) },
+    // must still be repaired rather than waved through or parked — and lead
+    // the repair instruction, so long lesser findings cannot crowd it out.
+    reviewer: { review: async () => ({ verdict: "pass", summary: "looks fine", findings: [
+      ...[1, 2, 3, 4, 5].map((n) => ({ id: `F00${n}`, severity: "P3" as const, message: `cosmetic ${n} ${"x".repeat(3_900)}` })),
+      { id: "F006", severity: "P1" as const, message: "crash on empty input", requiredFix: "guard the empty case" },
+    ], round: 0, checkedAt: new Date().toISOString() }) },
   });
   await supervisor.start({
     task: "blocking finding fixture",
@@ -1199,6 +1204,7 @@ test("P0 and P1 Reviewer findings enter automatic repair, and a pass carrying on
   assert.equal(supervisor.candidateParked, false);
   assert.equal(supervisor.state, "running");
   assert.equal(sends, 1);
+  assert.match(sent, /Reviewer findings:\nF006 \[P1\]: crash on empty input; required fix: guard the empty case\nF001 \[P3\]/u);
 });
 
 test("Reviewer API failure parks a candidate without human review", async () => {
