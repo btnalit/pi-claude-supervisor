@@ -216,6 +216,8 @@ export class Supervisor {
   #lastVerification?: AcceptanceReport;
   /** The Worker turn the last verification judged; later turns are not reflected in it. */
   #lastVerificationTurn?: number;
+  /** Set when a Decision Worker `stop` became a verification: no repair turn may follow it. */
+  #stopVerification?: string;
   #workerOutput = "";
   #lastWorkerResult?: Record<string, unknown>;
   #lastTurnCompleted?: WorkerEvent;
@@ -355,6 +357,7 @@ export class Supervisor {
     this.#lastObservedBranch = undefined;
     this.#lastVerification = undefined;
     this.#lastVerificationTurn = undefined;
+    this.#stopVerification = undefined;
     this.#workerOutput = "";
     this.#lastWorkerResult = undefined;
     this.#lastTurnCompleted = undefined;
@@ -1140,6 +1143,7 @@ export class Supervisor {
         return;
       }
       if (action.action === "stop") {
+        if (await this.#verifyStop(handle, event, action)) return;
         await this.#stopInternal(`Decision Worker: ${action.reason}`);
         return;
       }
@@ -1176,10 +1180,33 @@ export class Supervisor {
    */
   async #verifyStaleFailure(handle: WorkerHandle, event: WorkerEvent, action: DecisionAction): Promise<boolean> {
     if (event.type !== "turn_completed" || !this.#lastVerification || this.#lastVerification.ok || this.#lastVerificationTurn === undefined) return false;
+    // A turn cut short by the Worker's own API error is half-done work: let
+    // the Decision Worker resume it rather than judging it.
+    if (event.result.is_error === true || event.result.subtype === "error") return false;
     const turnsSince = this.#turn - this.#lastVerificationTurn;
     if (turnsSince < STALE_VERIFICATION_TURNS) return false;
     await this.#appendEvent({ type: "decision_overridden", taskId: this.#task?.taskId, workerId: handle.id, data: { action: action.action, override: "verify", reason: `${turnsSince} Worker turns since the last failed verification`, eventType: event.type } }).catch(() => {});
     await this.#startVerification(handle, event, "stale failed verification");
+    return true;
+  }
+
+  /**
+   * An unattended `stop` on a finished turn: models reach for it when they
+   * believe the work is done, and a plain stop would end the task unverified
+   * with its work unreported. Judge the work instead — acceptance and the
+   * Reviewer only read — but send the Worker nothing more: a failure blocks
+   * the candidate rather than starting a repair round. A stop elsewhere (a
+   * pending permission, a running turn) or on a task that may publish stays
+   * a plain stop.
+   */
+  async #verifyStop(handle: WorkerHandle, event: WorkerEvent, action: DecisionAction): Promise<boolean> {
+    const task = this.#task;
+    if (!task || !this.#automation || this.#humanRequired || event.type !== "turn_completed" || this.#machine.state !== "waiting") return false;
+    if (task.spec.autonomy.remoteAuthority !== "none") return false;
+    if (await this.#decisionIsStale(event)) return true;
+    this.#stopVerification = action.reason;
+    await this.#appendEvent({ type: "decision_overridden", taskId: task.taskId, workerId: handle.id, data: { action: action.action, override: "verify", reason: "a stop on a finished turn is verified before the task ends; no further Worker turns", eventType: event.type } }).catch(() => {});
+    await this.#startVerification(handle, event, "Decision Worker stop");
     return true;
   }
 
@@ -2216,6 +2243,10 @@ export class Supervisor {
     const task = this.#task;
     const handle = this.#handle;
     if (!task || !this.#automation || this.#humanRequired) return false;
+    if (this.#stopVerification !== undefined) {
+      await this.#appendEvent({ type: "candidate_blocked", taskId: task.taskId, workerId: handle?.id, data: { reason: `${reason}; the Decision Worker chose stop, so no repair round is sent` } });
+      return false;
+    }
     if (this.#repairRound >= task.spec.maxRepairRounds) {
       await this.#appendEvent({ type: "repair_round_exhausted", taskId: task.taskId, workerId: handle?.id, data: { maxRepairRounds: task.spec.maxRepairRounds, reason } });
       await this.#appendEvent({ type: "candidate_blocked", taskId: task.taskId, workerId: handle?.id, data: { reason: `${reason}; automatic repair budget is exhausted` } });

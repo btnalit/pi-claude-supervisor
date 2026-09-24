@@ -996,7 +996,8 @@ test("automatic acceptance review requests a bounded repair before completing", 
   assert.equal(supervisor.state, "completed");
 });
 
-test("after a failed verification, Worker turns without a new one end in a Supervisor verify", async () => {
+for (const errorTurn of [false, true]) {
+test(`after a failed verification, Worker turns without a new one end in a Supervisor verify${errorTurn ? " (not on a Worker error turn)" : ""}`, async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-stale-verification-"));
   try {
     await initializeGitRepository(cwd, "worker/stale-verification");
@@ -1036,21 +1037,82 @@ test("after a failed verification, Worker turns without a new one end in a Super
     assert.match(sends[0] ?? "", /Automatic repair round 1/u);
     // The Decision Worker keeps judging by the old failure and only continues.
     for (let sequence = 1; sequence <= 3; sequence += 1) {
-      const event: WorkerEvent = { type: "turn_completed", handle, result: { subtype: "success", result: "Fixed; all checks pass." }, sequence };
+      // Optionally the third turn is cut short by the Worker's own API error.
+      const failedTurn = errorTurn && sequence === 3;
+      const event: WorkerEvent = { type: "turn_completed", handle, result: failedTurn ? { subtype: "error", is_error: true, result: "API error" } : { subtype: "success", result: "Fixed; all checks pass." }, sequence };
       await eventListener?.(event);
       await supervisor.poll();
-      await onAction?.({ action: "continue", message: "Verification still fails; look again.", reason: "last verification failed" }, event);
+      await onAction?.(failedTurn ? { action: "retry", reason: "Worker API error" } : { action: "continue", message: "Verification still fails; look again.", reason: "last verification failed" }, event);
     }
-    // Two of those continues reached Claude; the third became a verify.
-    assert.equal(sends.length, 3);
-    const override = events.events.find((event) => event.type === "decision_overridden");
-    assert.equal((override?.data as { override?: string } | undefined)?.override, "verify");
-    assert.equal(supervisor.lastVerification?.ok, true);
-    assert.equal(supervisor.state, "completed");
+    if (errorTurn) {
+      // The retry of a half-done turn is sent, not judged.
+      assert.equal(sends.length, 4);
+      assert.ok(!events.events.some((event) => event.type === "decision_overridden"));
+      assert.equal(supervisor.state, "running");
+      await supervisor.stop("test complete");
+    } else {
+      // Two of those continues reached Claude; the third became a verify.
+      assert.equal(sends.length, 3);
+      const override = events.events.find((event) => event.type === "decision_overridden");
+      assert.equal((override?.data as { override?: string } | undefined)?.override, "verify");
+      assert.equal(supervisor.lastVerification?.ok, true);
+      assert.equal(supervisor.state, "completed");
+    }
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
 });
+}
+
+for (const passing of [true, false]) {
+  test(`a Decision Worker stop on a finished turn is verified, never repaired (${passing ? "passing" : "failing"} work)`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-stop-verify-"));
+    try {
+      await initializeGitRepository(cwd, "worker/stop-verify");
+      if (passing) await writeFile(join(cwd, "fixed"), "yes\n");
+      const handle: WorkerHandle = { id: "stop-verify-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+      let running = true;
+      const sends: string[] = [];
+      let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+      let eventListener: WorkerStartInput["eventListener"] | undefined;
+      const adapter: WorkerAdapter = {
+        capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+        start: async (input) => { eventListener = input.eventListener; return handle; },
+        getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+        readOutput: async () => [],
+        send: async (_handle, message) => { sends.push(message); },
+        pause: async () => {},
+        resume: async () => {},
+        stop: async () => { running = false; },
+        killProcessGroup: async () => { running = false; },
+        resumeSession: async () => handle,
+      };
+      const events = new FlakyEventLog("never-fail");
+      const supervisor = new Supervisor(adapter, events as never, { reviewer: automaticReviewer() });
+      await supervisor.start({
+        task: "stop verify fixture",
+        cwd,
+        command: "claude",
+        automation: true,
+        deadlineMs: 0,
+        noOutputTimeoutMs: 0,
+        spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "fixed", name: "fixed", command: process.execPath, args: ["-e", "process.exit(require('node:fs').existsSync('fixed') ? 0 : 1)"], required: true, timeoutMs: 5_000 }] },
+        decisionWorkerFactory: (options) => { onAction = options.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+      });
+      const event: WorkerEvent = { type: "turn_completed", handle, result: { subtype: "success", result: "Done." }, sequence: 1 };
+      await eventListener?.(event);
+      await supervisor.poll();
+      await onAction?.({ action: "stop", reason: "the code looks correct" }, event);
+      assert.equal(sends.length, 0, "no repair or other turn follows a stop");
+      assert.ok(events.events.some((entry) => entry.type === "acceptance_started"));
+      assert.equal(supervisor.lastVerification?.ok, passing);
+      assert.equal(supervisor.state, passing ? "completed" : "blocked");
+      if (!passing) assert.equal(supervisor.candidateParked, true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
 
 test("automatic candidates require and review a local commit", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-local-commit-"));
