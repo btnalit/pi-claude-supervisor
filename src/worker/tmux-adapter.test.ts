@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, rmdir, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
@@ -1760,8 +1760,8 @@ setInterval(() => {
   let next;
   try { next = fs.readFileSync(${JSON.stringify(configPath)}, "utf8"); } catch { return; }
   if (next === raw) return;
+  try { config = JSON.parse(next); } catch { return; }
   raw = next;
-  config = JSON.parse(next);
   render();
 }, 30);
 process.stdin.setRawMode(true);
@@ -1803,7 +1803,8 @@ render();
       await run({
         adapter,
         handle,
-        setConfig: async (config) => { await writeFile(configPath, JSON.stringify(config)); await new Promise((resolve) => setTimeout(resolve, 150)); },
+        // Atomic, so the fake never reads a half-written config.
+        setConfig: async (config) => { await writeFile(`${configPath}.tmp`, JSON.stringify(config)); await rename(`${configPath}.tmp`, configPath); await new Promise((resolve) => setTimeout(resolve, 150)); },
         submitted,
         socketPath,
         sessionName,
