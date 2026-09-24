@@ -470,8 +470,9 @@ function applyFloorBindings(tokens: readonly ShellToken[], bindings: ReadonlyMap
     if (token.operator || token.data || !token.dynamic) return token;
     // `${f%.bak}` keeps the directory part, so it reads as the bound value; a
     // `#` prefix strip, or a `%` pattern with `/` or a wildcard (which matches
-    // `/` in parameter expansion), can drop directories and stays unknown.
-    const value = token.value.replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?::?[-?=+][^}]*|%{1,2}[^}/*?[\]\\]*)?\}|([A-Za-z_][A-Za-z0-9_]*))/gu,
+    // `/` in parameter expansion, as can one arriving through `$p`), can drop
+    // directories and stays unknown.
+    const value = token.value.replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?::?[-?=+][^}]*|%{1,2}[^}/*?[\]\\$`]*)?\}|([A-Za-z_][A-Za-z0-9_]*))/gu,
       (match, braced: string | undefined, bare: string | undefined) => bindings.get(braced ?? bare ?? "") ?? match);
     if (value === token.value) return token;
     return { ...token, value, dynamic: /[$`*?[\]{}~]/u.test(value) };

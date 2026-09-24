@@ -1112,6 +1112,8 @@ test("the delete floor refuses deletes and moves that could destroy what the tas
       ['for f in ../repo/*; do rm -rf "${f%s*}"; done', /only known at run time/u],
       ['d=$(mktemp -d); rm -rf "${d%t*}"', /only known at run time/u],
       ['d=$(mktemp -d); rm -rf "${d%??????}"', /only known at run time/u],
+      ["p='t*'; d=$(mktemp -d); rm -rf \"${d%$p}\"", /only known at run time/u],
+      ["d=$(mktemp -d); rm -rf \"${d%`echo t`}\"", /only known at run time/u],
       ["ls | xargs -I% find % -delete", /taken from input/u],
       ["ls | xargs -I% git -C % clean -fdx", /taken from input/u],
       ["ls | xargs -I% rsync -a --delete src/ %", /taken from input/u],
