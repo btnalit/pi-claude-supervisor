@@ -2647,12 +2647,7 @@ export class Supervisor {
       // re-entrancy with #verificationAbortController, so this cannot race an
       // already-running verification.
       if (this.#automation && this.#machine.state === "verifying" && !this.#verificationAbortController) {
-        try {
-          await this.#verifyInternal();
-        } catch (error) {
-          // automation failures are parked inside #verifyInternal; audit the rest
-          await this.#appendEvent({ type: "worker_event_error", taskId, workerId, data: { error: safeMessage(error), eventType: "watchdog_verify" } }).catch(() => {});
-        }
+        await this.#guardOwnVerification(this.#handle, undefined, "watchdog_verify", () => this.#verifyInternal());
       }
       return;
     }
@@ -2697,11 +2692,7 @@ export class Supervisor {
       const polled: string = this.#machine.state;
       if (polled !== "running" && polled !== "waiting") {
         if (polled === "verifying" && !this.#verificationAbortController) {
-          try {
-            await this.#verifyInternal();
-          } catch (error) {
-            await this.#appendEvent({ type: "worker_event_error", taskId, workerId, data: { error: safeMessage(error), eventType: "watchdog_verify" } }).catch(() => {});
-          }
+          await this.#guardOwnVerification(this.#handle, undefined, "watchdog_verify", () => this.#verifyInternal());
         }
         return;
       }
@@ -2867,10 +2858,16 @@ export class Supervisor {
    * notice. Park it instead, keeping the candidate and the real reason.
    */
   async #startOwnVerification(handle: WorkerHandle, event: WorkerEvent | undefined, origin: string): Promise<void> {
+    await this.#guardOwnVerification(handle, event, origin, () => this.#startVerification(handle, event, origin));
+  }
+
+  async #guardOwnVerification(handle: WorkerHandle | undefined, event: WorkerEvent | undefined, origin: string, verify: () => Promise<unknown>): Promise<void> {
     try {
-      await this.#startVerification(handle, event, origin);
+      await verify();
     } catch (error) {
-      await this.#appendEvent({ type: "worker_event_error", taskId: this.#task?.taskId, workerId: handle.id, data: { error: safeMessage(error), eventType: origin } }).catch(() => {});
+      await this.#appendEvent({ type: "worker_event_error", taskId: this.#task?.taskId, workerId: handle?.id, data: { error: safeMessage(error), eventType: origin } }).catch(() => {});
+      // A release in progress finishes the task its own way.
+      if (this.#releasing || this.#released) return;
       if (this.#machine.state === "verifying" && !this.#verificationAbortController) {
         await this.#parkCandidate(`${origin} verification failed part-way: ${safeMessage(error)}`, event).catch(() => {});
       }
