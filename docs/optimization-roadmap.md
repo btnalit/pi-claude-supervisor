@@ -41,7 +41,8 @@
 | 子生命周期 | 现有字段（节选） |
 |---|---|
 | 验证 / 修复 | `#lastVerification` `#lastVerificationTurn` `#verificationAbortController` `#repairRound` `#lastFindingSignature` `#repairSendInProgress` |
-| 终止 | `#stopRequested` `#stopCloseReason` `#stopVerification` `#preemptiveStop` `#releasing` `#released` `#terminalNoticeSent` |
+| 终止 | `#stopRequested` `#stopCloseReason` `#stopVerification` `#preemptiveStop` |
+| 释放 / 交接（非终止） | `#releasing` `#released`（交互任务完成后保留会话时也会置位）；`#terminalNoticeSent` 仅防重复通知 |
 | 截止 / 收尾 | `#deadlineNotices` `#deadlineMs` `#deadlineGraceMs`（收尾与终止 **相互独立**，见 §3.2） |
 | 发布 | `#publishState` `#publishTarget` `#publishRemote` `#remoteGrant` `#verifiedHead` `#prUrl` `#publishShortfall` |
 | 人工闸门 | `#humanRequired` `#humanGate` `#candidateParked` |
@@ -65,6 +66,7 @@
 - 事件日志约 55 种事件类型；日志按 64 MB 轮转并保留多份。**没有单一的“任务终态”事件**，
   终态需由 `verification_passed` / `candidate_parked` / `verification_failed` / `worker_stopped` / 启动失败等推导；
   `decision_overridden` 只有自由文本 `reason`，没有结构化的 guard 标识。
+- 已有重放测试：`src/automation-replay.test.ts` 中 `ReplayAdapter` 负责重放，`ReplayEventLog` 负责记录事件。
 - 真实链路（Claude TUI / hooks / cgroup v2 / 限流 / 长 idle）无自动化覆盖。
   部分单测依赖 `process.cwd()` 为干净 git 仓库（有未跟踪文件时约 5 个 supervisor 测试失败）；
   在世界可写 `/tmp` 下 `environment.test.ts` 误报（`assertSecureExecutablePath` 逐级检查父目录，`/tmp` 的 1777 权限必然不通过）。
@@ -86,21 +88,36 @@
 | Candidate | 产物 | 通过或被搁置（blocked/parked）的候选结果 |
 | Progress Fingerprint | 派生 | 某轮次的仓库状态摘要（提案，见阶段 1） |
 
-### 3.2 必须恒成立的不变量（与现有行为一致）
+### 3.2 现有行为（重构必须保持）与目标不变量（需显式行为变更）
 
-1. **停止意图唯一所有者**：同一时刻至多一个停止意图。操作员停止（含 `release`、硬截止、无输出超时）
-   取代 Decision 停止；Decision 停止不能取代操作员停止。
-2. **收尾与停止正交**：deadline 收尾 **不是** 停止意图；收尾期间仍允许修复轮（剩余时间 ≥ `MIN_CLOSE_OUT_REPAIR_MS`），
-   也允许 Decision 停止生效。
-3. **修复前置条件**：最近验证失败 ∧ 不存在 Decision 停止（verify-first）或操作员停止 ∧ 修复预算未耗尽 ∧
-   Worker 可就地修复 ∧ 收尾剩余时间足够。
-4. **验证时效**：基于验证结果的判断必须知道其 `atTurn`；`atTurn < 当前轮次` 的结果只能作为历史证据。
-5. **发布前置条件**：存在对 `verifiedHead` 的通过验证 ∧ 远端授权有效 ∧ 远端基线未变化。
-6. **人工闸门**：闸门打开时，Decision 只能被延迟（`decision_deferred`），不能被执行或丢弃。
-7. **终态无挂起资源**：进入终态后不得存在计时器、中止控制器或待决决策。
-8. **裁决可审计**：每次覆盖都产生带结构化 guard 标识与理由的事件。
+**A. 现有行为**——阶段 2 的提取 PR 必须逐条保持；这里如实描述代码，包括不理想之处：
 
-阶段 2 的每个提取 PR 必须 **逐条保持** 上述不变量对应的现有行为；不变量本身若需调整，另开行为变更 PR。
+1. **Decision verify-first 停止让位于操作员停止**：`#verifyStop` 与 `#finalizeVerification` 检查操作员停止，
+   已存在操作员停止时以其为准。其余路径（Decision 普通 stop、`park` / `ask_human` / `noop` → park）**不检查**
+   操作员停止（见 B1）。再次调用 `stop()` 会覆盖原因与关闭原因。
+2. **收尾与停止正交**：deadline 收尾不是停止；收尾期间允许修复轮（剩余 ≥ `MIN_CLOSE_OUT_REPAIR_MS`），
+   Decision 停止照常经 `#verifyStop`。deadline + grace 到期由 watchdog **停止** Worker（`worker_watchdog_timeout`）。
+3. **修复前置条件**（`#requestRepair`）：自动化模式 ∧ 人工闸门关闭 ∧ 无 verify-first 停止 ∧ 修复预算未耗尽 ∧
+   有存活 handle 且 Worker 仍在运行 ∧ 状态为 running/waiting/verifying ∧ 可就地修复 ∧ 收尾剩余时间足够。
+   触发来源：验收失败、截断证据、本地 commit 缺失、Reviewer revise，**以及通过验证后发布预检发现未提交改动**。
+4. **验证时效**：基于验证结果的 Decision 判断以 `atTurn` 标注其时效；例外——发布轮返回后，若 HEAD 与工作树未变，
+   复用发布前的通过验证（`#settlePublish`），不重新验证。
+5. **发布前置条件**：存在对 `verifiedHead` 的通过验证 ∧ 远端授权有效 ∧ 远端基线未变化；用户拒绝发布时仍以
+   completed 结束并记录 shortfall。
+6. **人工闸门**：闸门打开时 Decision 被记录为 `decision_deferred` 并 **丢弃**；`resumeAutomation` 只重新询问最后一个
+   `turn_completed`（见 B2）。闸门检查位于已释放/终态检查之后。
+7. **无输出**：自动化下空闲 Worker 的无输出超时触发 **验证**（`worker_idle_timeout`）；轮次中途静默才 **停止**。
+8. **成本预算**：超出 `maxWorkerCostUsd`（或 Claude `error_max_budget_usd`）**立即 park**，不验证、不停止意图。
+
+**B. 目标不变量**——当前不成立，须以 **独立的行为变更 PR** 实现（建议作为阶段 0.3，见 §5）：
+
+1. **操作员停止唯一优先**：任何 Decision 终止类动作（普通 stop、park、ask_human、noop→park）在操作员停止
+   已请求时都让位；任务以 `stopped` / `human_stop` 结束。（复审已用临时测试复现：Decision `park` 与操作员 stop
+   竞态时任务以 `blocked` 结束；Decision 普通 stop 竞态时关闭原因为 `recoverable_failure` 而非 `human_stop`。）
+2. **延迟而不丢失**：人工闸门期间的权限回应在闸门关闭后重放，或权限请求被重新交给 Decision Worker。
+3. **终态无挂起资源**：进入终态后清除计时器、中止控制器与 `#pendingDecisionKey`（当前 stop/park/finalize 不清除后者）。
+4. **裁决可审计**：每次覆盖带结构化 guard 标识（阶段 2.3 引入；当前 stale 丢弃记 `decision_ignored`，
+   权限覆盖记 `permission_decision`，`decision_overridden` 仅有文本 `reason`）。
 
 ### 3.3 子生命周期（目标形态，覆盖现有真实路径）
 
@@ -113,14 +130,21 @@ Verification（每轮）：
        ▼ ok
   local commit check ── missing ▶ repair? / blocked
        ▼ ok
-  review ── pass ▶ publish? ─┬─ none ▶ completed
-       │                     └─ requested ▶ (publish turn) ▶ settled ▶ completed | abandoned ▶ 重新验证 | publish-only blocked
+  review ── pass ▶ publish? ─┬─ none / 用户拒绝 ▶ completed（拒绝时记 shortfall）
+       │                     ├─ 预检：未提交/未跟踪改动 ▶ repair?（同上）
+       │                     └─ requested ▶ (publish turn) ▶ HEAD/树未变 ▶ settled（复用通过验证）▶ completed
+       │                                                   └ 变化 ▶ abandoned ▶ 重新验证 | publish-only blocked
        ├─ revise ▶ repair?（同上）；重复发现 ▶ human ▶ parked
        └─ human / Reviewer 失败 ▶ parked
-  任一阶段：操作员停止 ▶ cancelled（stopped）
-StopIntent：none → decision_stop{verifyFirst | plain} → operator_stop{human | release | watchdog | no_output | abort_start | recoverable_failure}
-            （只允许 none→任意、decision_stop→operator_stop）
-Budget（独立）：turns / cost / deadline+close-out —— 触发的是验证或 park，而不是 StopIntent
+  任一阶段：操作员停止 ▶ cancelled（stopped）；证据采集失败 / 验证中 takeover 或 release ▶ parked
+  （注：所有 blocked 的验证结果都会置 #candidateParked，“blocked”与“parked”在状态上相同）
+StopIntent（终止意图，现状）：
+  none → decision_stop{verifyFirst | plain} | operator_stop{human | watchdog(deadline+grace) | mid-turn no_output | abort_start | recoverable_failure}
+  decision_stop{verifyFirst} → operator_stop（操作员取代，现状只在此路径成立）
+  operator_stop → operator_stop（再次 stop 覆盖原因，现状）
+Park（终止但非停止意图）：成本预算、Decision park/ask_human/noop、验证 blocked —— 经 #stopInternal(…, "blocked") 结束
+Release（非终止）：断开 Supervisor；交互 Worker 移出 cgroup 交还操作员，任务状态与恢复记录不变
+Budget：turns 耗尽 → 验证；deadline 收尾 → 验证空闲 Worker；deadline+grace → watchdog 停止；cost → 立即 park
 ```
 
 ## 4. 目标架构（Target）
@@ -152,10 +176,15 @@ interface DecisionGuard {
   actions: ReadonlyArray<DecisionAction["action"]>;   // 按动作适用，staleness 语义随动作不同
   decide(action, event, ctx): Promise<GuardVerdict>;
 }
-// 顺序（与现状一致）：terminal/released → human-gate(defer) → dedupe → 按动作：
-//   stop:     verify-stop(handled | pass→plain stop)
-//   continue/redirect/answer/retry: stale-event(drop) → turn-budget → no-progress → stale-failure
-//   wait:     close-out-wait→verify、deadline-warning-replay
+// 顺序（现状；标 * 者为提案新增）：
+//   已释放 → 终态 → 人工闸门（defer，现状为丢弃，见 §3.2 B2）→ 去重（wait 不去重）→ 记录 decision_made → 按动作：
+//   allow/deny_permission: 策略 deny 覆盖 Decision 的 allow；无法回应权限 → park
+//   continue/redirect/answer 且待决 AskUserQuestion: 以权限 deny 携带答案（先于过期检查）
+//   continue/redirect/answer/retry: stale-event(drop) → turn-budget → *no-progress → stale-failure
+//   verify:   stale-event(drop, decision_ignored) → 验证
+//   stop:     verify-stop(handled；过期或有远端授权 → pass→普通 stop)
+//   park/ask_human/noop: → park（noop 在 clean exit 上 → 验证）
+//   wait:     收尾期 wait→verify、deadline 预警重放
 ```
 
 ## 5. 分阶段实施
@@ -172,8 +201,11 @@ interface DecisionGuard {
 **0.2 拆分校验与脱敏**（**有意的行为变更**：合法路径的判定改为显式规则）：新增 `src/validation.ts`
 （`assertSafeAbsolutePath`、`assertSafeBranchName`、`assertSafeExecutablePath`、`looksLikeCredential`），
 替换 `assertNoCredentialPath`、`assertResolvedExecutable`、`isSafeAbsolutePath` 中的“脱敏前后相等”判定；
-分支跟踪改用原始分支名做比较，仅在输出时脱敏。
+分支跟踪、detached HEAD 判断与发布授权的分支/受保护分支检查改用原始分支名，仅在输出时脱敏。
 **验收**：现有测试全绿；新增“脱敏规则变化不影响路径/分支合法性”的测试；列出被新规则放行或拒绝的差异样例。
+
+**0.3 已知行为缺口修复**（显式行为变更，单独 PR）：实现 §3.2 B1（操作员停止唯一优先）与 B3（终态清除待决决策），
+各带竞态回归测试；B2（延迟而不丢失）需先确认权限请求重放的交互，单独评估。
 
 ### 阶段 1：通用无进展兜底（1 个 PR，先观察后覆盖）
 
@@ -199,11 +231,11 @@ continue/redirect/answer/retry → 覆盖为 verify；Worker 自身 API 错误�
 
 | PR | 内容 | 必做 |
 |---|---|---|
-| 2.0 | **行为基线**：可控时钟（`node:test` 的 `mock.timers` 或注入 clock）+ 在 `automation-replay.test.ts` 的 `ReplayEventLog` 基础上录制 12–15 个场景的 **归一化事件序列**（事件类型 + 关键字段；剔除 `at`、临时路径、耗时、成本） | ✅ |
-| 2.1 | 抽出 `StopIntent`（不变量 1、2），替换 `#stopRequested` `#stopVerification` `#stopCloseReason` `#preemptiveStop`，纳入 `release`/watchdog/abortStart 来源 | ✅ |
-| 2.2 | 抽出 `VerificationCycle`（不变量 3、4，§3.3 全部路径） | ✅ |
+| 2.0 | **行为基线**：可控时钟（`node:test` 的 `mock.timers` 或注入 clock）+ 在 `automation-replay.test.ts` 的 `ReplayEventLog` 基础上录制 12–15 个场景的 **归一化事件序列**（事件类型 + 关键字段；剔除 `at` 与 `data` 内的时间戳如 `checkedAt`/`startedAt`、临时路径、耗时、成本） | ✅ |
+| 2.1 | 抽出 `StopIntent`（保持 §3.2 A1、A2、A7），替换 `#stopRequested` `#stopVerification` `#stopCloseReason` `#preemptiveStop`，纳入 watchdog / 无输出 / abortStart 来源 | ✅ |
+| 2.2 | 抽出 `VerificationCycle`（保持 §3.2 A3、A4、A5，§3.3 全部路径） | ✅ |
 | 2.3 | 抽出 Decision 裁决管线，保持现有顺序与语义；事件增加结构化 guard 字段 | ✅ |
-| 2.4 | 抽出 `PublishCycle`（不变量 5） | 可选 |
+| 2.4 | 抽出 `PublishCycle`（保持 §3.2 A5） | 可选 |
 | 2.5 | 抽出 watchdog / usage；进一步缩减 `supervisor.ts` | 可选 |
 
 **场景清单**（2.0）：正常完成；验收失败→修复→通过；Reviewer revise→修复；截断证据→修复；本地 commit 缺失→修复；
@@ -212,16 +244,20 @@ continue/redirect/answer/retry → 覆盖为 verify；Worker 自身 API 错误�
 发布成功/中止后重新验证；启动中止。
 
 **每个 PR 的验收**：归一化事件序列一致；全量单测通过；`spike:decision` 在两个模型上通过；独立 review 通过。
-**完成标准**：`StopIntent` 与 `VerificationCycle` 有转换表与表驱动测试；§3.2 每条不变量至少一个违反即失败的测试。
+**完成标准**：`StopIntent` 与 `VerificationCycle` 有转换表与表驱动测试；§3.2 A 的每条现有行为有特征测试，
+B 的每条目标不变量在对应的行为变更 PR 中有违反即失败的测试。
 
 ### 阶段 3：恢复路径补齐（1–2 个 PR）
 
 - 恢复后的 Worker 是新进程，因此 **不恢复进行中的验证**，而是恢复“它的结论”：
   `DecisionSessionRecord` 升级 schema（`version` +1，旧记录按保守默认迁移），持久化
   `lastVerification{ok, atTurn, findingSignature}` 与 guard 计数（含进度指纹基线）。
-- 恢复后：若最近验证失败，stale-failure / no-progress guard 从持久化计数继续；
-  若进行中的是 Decision 停止（verify-first），恢复后直接进入一次验证而不再发送 Worker 轮次。
-  操作员停止会关闭记录，不需要持久化。
+- 恢复后的任务先处于 `takeover()` 空闲状态，直到 resume-auto 或 `--extend` 才恢复自动化（`index.ts`）；
+  自动化恢复时：若最近验证失败，stale-failure / no-progress guard 从持久化计数继续；若中断时处于 Decision
+  verify-first 停止，恢复自动化后的第一个动作是一次验证而不是发送 Worker 轮次。
+- 哪些终止会关闭恢复记录：只有清理已确认的 `human_stop`。关机停止（`preserveDecisionSession` →
+  `recoverable_failure`）、watchdog / 无输出停止、清理未确认的 `human_stop` 都会标记为可恢复中断；
+  `release` 不改动记录。正是这些任务需要完整的恢复状态。
 - 同时消除 `index.ts` 中两处重复的进度持久化逻辑（启动与恢复路径共用一个函数）。
 - 测试：修复中途 recover、stop→verify 中途 recover；`spike:decision` 新增 `recover` 场景。
 
@@ -256,6 +292,7 @@ automatic 模式强制 cgroup v2，容器、macOS、部分 NAS/WSL 无法使用�
 
 ## 7. 可观测性与审计
 
+- `#humanGate` 的 `"permission"` 取值当前从未被赋值，可在阶段 2 清理。
 - 新事件/字段（提案）：`no_progress_detected`；`decision_overridden.guard`；`stop_intent_changed`；
   `verification_stage_changed`；一个推导性的任务终态事件（如 `task_finished{outcome, reason}`）便于统计。
 - 阶段 0 的报告命令作为唯一质量看板入口；不引入外部监控组件。
@@ -265,7 +302,7 @@ automatic 模式强制 cgroup v2，容器、macOS、部分 NAS/WSL 无法使用�
 | 风险 | 对策 |
 |---|---|
 | 重构引入行为回归 | 可控时钟 + 归一化事件序列 + 每 PR 只搬一个生命周期 + 独立 review |
-| 规格与现状不符导致“重构即改行为” | §3.2 不变量以现有行为为准；调整不变量须单独的行为变更 PR |
+| 规格与现状不符导致“重构即改行为” | §3.2 区分“现有行为（保持）”与“目标不变量（显式变更）”；前者以代码为准 |
 | 范围膨胀 | 阶段 2 只有 2.0–2.3 必做；可选项在指标证明必要时再做 |
 | LLM 行为随模型变化 | 以 guard 兜底而非 prompt；spike 多模型回归 |
 | 无进展检测误伤合法的连续排查 | 先观察模式；阈值可配置；只看仓库指纹 |
@@ -273,7 +310,7 @@ automatic 模式强制 cgroup v2，容器、macOS、部分 NAS/WSL 无法使用�
 
 ## 9. 成功标准
 
-- `StopIntent` 与 `VerificationCycle` 独立成模块，有转换表与表驱动测试；§3.2 每条不变量有违反即失败的测试。
+- `StopIntent` 与 `VerificationCycle` 独立成模块，有转换表与表驱动测试；§3.2 A 有特征测试，B 已实现并有违反即失败的测试。
 - 报告命令可给出无人值守完成率、park 原因分布、覆盖次数；阶段 1 启用覆盖后，“无验证运行到 deadline/配额耗尽”归零。
 - recover 后所有确定性兜底仍然生效（阶段 3 测试）。
 - 连续两个版本发版清单全部通过，且无因生命周期交互导致的回归。
@@ -281,8 +318,8 @@ automatic 模式强制 cgroup v2，容器、macOS、部分 NAS/WSL 无法使用�
 ## 10. 建议顺序与当前最小版本
 
 ```text
-阶段0（度量 + 校验拆分） → 阶段1（无进展，先观察） → 阶段2 核心（2.0→2.1→2.2→2.3） → 阶段3（恢复补齐）
+阶段0（度量 + 校验拆分 + 已知缺口） → 阶段1（无进展，先观察） → 阶段2 核心（2.0→2.1→2.2→2.3） → 阶段3（恢复补齐）
                              阶段4（测试卫生/发版清单）并行；阶段2 可选项与阶段5 视指标与决策再定
 ```
 
-**最小下一步**：阶段 0.1 报告命令（无运行时变更）与 0.2 校验拆分（小而明确的行为变更），各一个 PR。
+**最小下一步**：阶段 0.1 报告命令（无运行时变更）、0.2 校验拆分与 0.3 已知缺口修复（小而明确的行为变更），各一个 PR。
