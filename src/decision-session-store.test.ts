@@ -209,7 +209,7 @@ test("a task on an sk- branch in an sk- directory keeps its Decision session", a
     await store.save({
       taskId,
       task: "sk- names fixture",
-      cwd: "/home/user/src/sk-learn-pipeline-experiments",
+      cwd: "/srv/sk-dataset_2024_v2_experiments",
       command: "claude",
       args: [],
       decisionSessionFile: join(store.sessionDirectory(taskId), "session.jsonl"),
@@ -217,14 +217,14 @@ test("a task on an sk- branch in an sk- directory keeps its Decision session", a
       deadlineMs: 60_000,
       noOutputTimeoutMs: 60_000,
       startedAt: new Date().toISOString(),
-      baseBranch: "sk-1234-fix-login-redirect-loop",
+      baseBranch: "sk-1234_fix_login_redirect_loop",
       turn: 0,
       repairRound: 0,
       state: "active",
     });
     const restored = await new DecisionSessionStore(directory).load(taskId);
-    assert.equal(restored?.cwd, "/home/user/src/sk-learn-pipeline-experiments");
-    assert.equal(restored?.baseBranch, "sk-1234-fix-login-redirect-loop");
+    assert.equal(restored?.cwd, "/srv/sk-dataset_2024_v2_experiments");
+    assert.equal(restored?.baseBranch, "sk-1234_fix_login_redirect_loop");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

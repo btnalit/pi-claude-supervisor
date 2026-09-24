@@ -88,8 +88,9 @@ async function runScenario(scenario, model) {
     readOutput: async () => [],
     send: async (_handle, message) => {
       transcript.push(`SUPERVISOR> ${message.slice(0, 400)}`);
+      // The fix follows only a message that asks for it.
       if (/RangeError|min\s*>\s*max/iu.test(message)) fixRequested = true;
-      if (scenario !== "stuck" && !fixed) {
+      if (scenario !== "stuck" && fixRequested && !fixed) {
         fixed = true;
         await writeImpl(true);
         reply("Done. clamp now throws RangeError when min > max, with a test for it; all tests pass.");

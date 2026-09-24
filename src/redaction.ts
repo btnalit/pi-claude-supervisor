@@ -8,12 +8,15 @@ export function redactSensitive(value: unknown, key?: string): unknown {
   if (typeof value === "string") {
     return value
       .replace(/\b(sk-ant-[A-Za-z0-9_-]+)\b/gu, "[REDACTED]")
-      // OpenAI-style (OpenAI, DeepSeek, …) and Google (classic and bound) API
-      // keys. The sk- shape needs a long unbroken run with a digit right after
-      // the prefix, so hyphenated names (a branch sk-1234-fix-login, a path
-      // .../sk-learn-pipeline, a CSS class) are left alone: session records
-      // and transcript paths are rejected when redaction changes them.
-      .replace(/(?<![A-Za-z0-9_-])sk-(?:proj-|svcacct-|admin-)?(?=[A-Za-z0-9_]{20})(?=[A-Za-z_]*[0-9])[A-Za-z0-9_-]{20,}/gu, "[REDACTED]")
+      // sk- and Google API keys, matched by their real shapes so that names
+      // merely starting with "sk-" (a branch sk-1234_fix_login, a path
+      // .../sk-dataset_2024_v2, a CSS class) stay intact: session records and
+      // transcript paths are rejected when redaction changes them.
+      // OpenAI keys (legacy, proj, svcacct, admin) all carry T3BlbkFJ, base64
+      // for "OpenAI"; their base64url bodies may contain - and _.
+      .replace(/(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]*T3BlbkFJ[A-Za-z0-9_-]*/gu, "[REDACTED]")
+      // Other sk- providers (DeepSeek, Moonshot, …): 32+ letters and digits.
+      .replace(/(?<![A-Za-z0-9_-])sk-(?=[A-Za-z]*[0-9])(?=[0-9]*[A-Za-z])[A-Za-z0-9]{32,}(?![A-Za-z0-9_-])/gu, "[REDACTED]")
       .replace(/(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/gu, "[REDACTED]")
       .replace(/(?<![A-Za-z0-9_-])AQ\.[A-Za-z0-9_-]{40,}/gu, "[REDACTED]")
       .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|npm_[A-Za-z0-9]{20,})\b/gu, "[REDACTED]")

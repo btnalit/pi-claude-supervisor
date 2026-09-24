@@ -38,15 +38,20 @@ test("token counts under a sensitive-looking key are numbers, not secrets", () =
 
 test("redacts OpenAI-style and Google model API keys wherever they appear", () => {
   // Placeholders with the real shapes; none of these is a key.
-  const openaiStyle = `sk-${"0123456789abcdef".repeat(2)}`;
+  const deepseekStyle = `sk-${"0123456789abcdef".repeat(2)}`;
+  const legacyOpenai = `sk-${"aB3dE5fG7hJ9kL1mN".repeat(1)}T3BlbkFJ${"pQ2rS4tU6vW8xY0z2a4c"}`;
+  // Project keys are base64url: a hyphen or underscore can come first.
+  const projectOpenai = `sk-proj-a-B_${"x9".repeat(34)}T3BlbkFJ${"-Yz_8".repeat(15)}`;
+  const serviceOpenai = `sk-svcacct-${"-q_1".repeat(18)}T3BlbkFJ${"w2-E".repeat(18)}`;
   const googleClassic = `AIza${"X".repeat(35)}`;
   const googleBound = `AQ.${"Ab8_example-placeholder".repeat(2)}`;
-  const redacted = String(redactSensitive(`provider said: invalid key ${openaiStyle}; retry with ${googleClassic} or ${googleBound}.`));
-  for (const key of [openaiStyle, googleClassic, googleBound]) assert.ok(!redacted.includes(key), key);
-  assert.equal(redacted.match(/\[REDACTED\]/gu)?.length, 3);
-  const deepseekStyle = `sk-${"0123456789abcdef".repeat(2)}`;
-  const openaiProject = `sk-proj-${"Ab3_".repeat(12)}-tail`;
-  for (const key of [deepseekStyle, openaiProject]) assert.equal(redactSensitive(`key=${key}`), "key=[REDACTED]", key);
+  const keys = [deepseekStyle, legacyOpenai, projectOpenai, serviceOpenai, googleClassic, googleBound];
+  for (const [before, after] of [[" ", " "], ["\"", "\""], ["=", "&"], ["{\"apiKey\":\"", "\"}"], ["?key=", ""]]) {
+    for (const key of keys) {
+      const redacted = String(redactSensitive(`provider said${before}${key}${after}`));
+      assert.ok(!redacted.includes(key.slice(-16)), `${before}${key}`);
+    }
+  }
   assert.equal(redactSensitive("the task-scheduler and sk-learn stay"), "the task-scheduler and sk-learn stay");
 });
 
@@ -63,6 +68,12 @@ test("hyphenated names that merely start with sk- are not treated as keys", () =
     "@scope/sk-some-really-long-package-name",
     ".sk-folding-cube-animation-delay-long { color: red }",
     "the-sk-mask-rcnn-inference-component",
+    "/srv/sk-dataset_2024_v2_experiments",
+    "/home/u/code/sk-image_segmentation_v2",
+    "sk-1234_fix_login_redirect_loop",
+    "feature/sk-JIRA1234abcdefghijklmnop",
+    "sk-proj-some-long-feature-branch-name-here-and-more",
+    "sk-2024Q3experimentsRepo",
     "AIzaSomethingInWordsNotAKeyButLongEnoughHere",
   ]) assert.equal(redactSensitive(text), text, text);
 });
