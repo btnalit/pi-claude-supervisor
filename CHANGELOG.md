@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented here.
 
+## [0.9.2](https://github.com/btnalit/pi-claude-supervisor/compare/v0.9.1...v0.9.2) (2026-09-24)
+
+
+### Bug Fixes
+
+* **supervisor:** finish stop and startup races; add gated live Decision spike ([#67](https://github.com/btnalit/pi-claude-supervisor/issues/67)) ([648b269](https://github.com/btnalit/pi-claude-supervisor/commit/648b269f185fbeb5ab39fe22ce855cc8d4342747))
+* **supervisor:** stability fixes found by end-to-end runs with a real Decision Worker ([#65](https://github.com/btnalit/pi-claude-supervisor/issues/65)) ([cd0b8ef](https://github.com/btnalit/pi-claude-supervisor/commit/cd0b8efdd0898833036b14acab5ca7b29ca70d04))
+
 ## [0.9.1](https://github.com/btnalit/pi-claude-supervisor/compare/v0.9.0...v0.9.1) (2026-09-24)
 
 
