@@ -66,9 +66,9 @@
     "build": "node scripts/build-package.mjs"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
     "@types/node": "22.20.1",
-    "typebox": "1.3.32",
+    "typebox": "1.3.34",
     "typescript": "7.0.2",
     "yaml": "2.9.1"
   }
