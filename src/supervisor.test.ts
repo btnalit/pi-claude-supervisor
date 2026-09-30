@@ -4693,6 +4693,59 @@ async function withPendingInputFixture(mode: "decision" | "repair" | "publish", 
   }
 }
 
+for (const failAudit of [false, true]) {
+  test(`duplicate native ingress during ${failAudit ? "a failing" : "a pending"} audit cannot gate operator input or resumed automation`, { timeout: 10_000 }, async () => {
+    await withPendingInputFixture("decision", async ({ supervisor, adapter, events, event, emit, decision, replays, stopCalls }) => {
+      let entered!: () => void;
+      const paused = new Promise<void>((resolve) => { entered = resolve; });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const append = events.append.bind(events);
+      let first = true;
+      events.append = async (entry) => {
+        if (entry.type === "human_input" && first) {
+          first = false;
+          entered();
+          await gate;
+          if (failAudit) throw new Error("injected native audit failure");
+        }
+        return append(entry);
+      };
+      const human: WorkerEvent = { type: "human_input", handle: event.handle, text: "operator is driving", sequence: 1 };
+      emit(human);
+      await paused;
+      assert.equal(supervisor.humanRequired, true);
+      emit({ ...human }); // Same ingress key, before the first event is handled.
+      release();
+      await supervisor.poll();
+      if (failAudit) await waitFor(() => events.events.some((entry) => entry.type === "worker_event_error"));
+      let sends = 0;
+      adapter.send = async () => { sends += 1; };
+      await supervisor.send("explicit operator message");
+      assert.equal(sends, 1);
+      assert.equal(supervisor.humanRequired, true);
+      emit({ type: "turn_completed", handle: event.handle, result: {}, sequence: 2, source: "human" });
+      await supervisor.poll();
+      await supervisor.resumeAutomation();
+      assert.ok(replays.at(-1));
+      await decision.onAction({ action: "continue", message: "fresh post-resume action", reason: "test" }, replays.at(-1)!);
+      assert.equal(sends, 2);
+      assert.equal(supervisor.humanRequired, false);
+      assert.equal(supervisor.candidateParked, false);
+      assert.equal(stopCalls(), 0);
+      if (failAudit) {
+        // Failed audit entries remain queued for retry, independently of input
+        // ingress deduplication; do not assert exactly-once journal delivery.
+        assert.ok(events.events.some((entry) => entry.type === "human_input"));
+        assert.ok(events.events.some((entry) => entry.type === "worker_event_error" && entry.data?.error === "injected native audit failure"));
+      } else {
+        assert.equal(events.events.filter((entry) => entry.type === "human_input").length, 1);
+        assert.equal(events.events.filter((entry) => entry.type === "human_takeover").length, 1);
+      }
+    });
+  });
+}
+
 for (const mode of ["decision", "repair", "publish"] as const) {
   test(`takeover cancels a pending ${mode} input without parking or stopping the Worker`, { timeout: 10_000 }, async () => {
     await withPendingInputFixture(mode, async ({ supervisor, adapter, events, decision, event, stopCalls }) => {
