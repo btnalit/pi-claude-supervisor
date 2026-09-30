@@ -1202,9 +1202,9 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
           const index = record.pendingSentMessages.lastIndexOf(safeTmuxMessage(message));
           if (index >= 0) record.pendingSentMessages.splice(index, 1);
         }
-        record.activeRequests = 0;
         const reserved = record.turnSources.indexOf(turnSource);
         if (reserved >= 0) record.turnSources.splice(reserved, 1);
+        record.activeRequests = record.turnSources.length > 0 ? 1 : 0;
         record.readyStreak = 0;
         throw error;
       }
