@@ -217,7 +217,9 @@ test("recover --extend hands the task back to automation with a continuation of 
     maxTurns: 2,
     deadlineMs: 60_000,
     noOutputTimeoutMs: 60_000,
-    startedAt: new Date().toISOString(),
+    // Expired recovery grants 30m from now; an unexpired 1m budget plus
+    // 30m would correctly leave 31m instead.
+    startedAt: new Date(Date.now() - 120_000).toISOString(),
     baseCommit,
     baseBranch: "worker/recovery",
     turn: 0,
@@ -251,7 +253,11 @@ test("recover --extend hands the task back to automation with a continuation of 
     assert.ok(shutdownHandler);
 
     await command.handler(`recover --extend 30m ${taskId}`, context);
-    assert.match(messages.at(-1) ?? "", new RegExp(`Worker recovered: task=${taskId} worker=[^;]+; automation resumed with a continuation of the original task; 30m of budget from now`, "u"));
+    assert.match(messages.at(-1) ?? "", new RegExp(`Worker recovered: task=${taskId} worker=[^;]+; automation resumed with a continuation of the original task; [^;]+ of budget from now`, "u"));
+    const recovered = await decisionStore.load(taskId);
+    assert.ok(recovered);
+    const remaining = recovered.deadlineMs - (Date.now() - Date.parse(recovered.startedAt));
+    assert.ok(remaining > 29 * 60_000 && remaining <= 30 * 60_000, `remaining budget: ${remaining}`);
     // The fresh Worker is told what the task was and to look at earlier work
     // first, without anyone having to send it by hand.
     for (let attempt = 0; attempt < 40; attempt += 1) {
