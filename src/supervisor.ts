@@ -750,6 +750,7 @@ export class Supervisor {
   #receiveWorkerEvent(event: WorkerEvent): void {
     if (event.type === "output" || event.type === "jsonl") return;
     if (event.type === "human_input" && this.#automation && event.handle.id === this.#handle?.id && !this.#handledEvents.has(workerEventKey(event))) {
+      this.#takeoverRequested = true;
       this.#automationEpoch += 1;
       this.#inputAbortController?.abort(this.#takeoverInputError);
     }
@@ -901,26 +902,35 @@ export class Supervisor {
         }
       }
       if (event.type === "human_input") {
-        await this.#appendEvent({ type: "human_input", taskId, workerId: handle.id, data: { text: event.text.slice(0, 512) } });
-        if (!this.#humanRequired) {
+        const takingOver = !this.#humanRequired;
+        // Ownership is not conditional on an audit write succeeding. Once the
+        // serialized handoff begins, the ingress flag has done its job.
+        if (takingOver) {
           this.#humanRequired = true;
           this.#humanGate = "worker_prompt";
-          await this.#appendEvent({ type: "human_takeover", taskId, workerId: handle.id, data: { source: "worker_prompt" } });
-          this.#reportProgress("human", this.#humanIdleResumeMs > 0
-            ? `a human is driving the interactive Worker; automation paused until resume-auto, or until the session has been idle for ${formatDurationMs(this.#humanIdleResumeMs)}`
-            : "a human is driving the interactive Worker; automation paused until resume-auto", true);
-          void Promise.resolve(this.#onHumanRequired?.({
-            taskId,
-            workerId: handle.id,
-            cwd: task.cwd,
-            task: task.task,
-            reason: "human typed into the supervised session; automation paused",
-            source: "worker_prompt",
-            ...(this.#attachHint(handle) ? { attach: this.#attachHint(handle) } : {}),
-          })).catch(() => {});
         }
-        // Every further prompt from the human restarts the idle clock.
-        if (this.#humanGate === "worker_prompt") this.#noteHumanActivity();
+        this.#takeoverRequested = false;
+        try {
+          await this.#appendEvent({ type: "human_input", taskId, workerId: handle.id, data: { text: event.text.slice(0, 512) } });
+          if (takingOver) await this.#appendEvent({ type: "human_takeover", taskId, workerId: handle.id, data: { source: "worker_prompt" } });
+        } finally {
+          if (takingOver) {
+            this.#reportProgress("human", this.#humanIdleResumeMs > 0
+              ? `a human is driving the interactive Worker; automation paused until resume-auto, or until the session has been idle for ${formatDurationMs(this.#humanIdleResumeMs)}`
+              : "a human is driving the interactive Worker; automation paused until resume-auto", true);
+            void Promise.resolve(this.#onHumanRequired?.({
+              taskId,
+              workerId: handle.id,
+              cwd: task.cwd,
+              task: task.task,
+              reason: "human typed into the supervised session; automation paused",
+              source: "worker_prompt",
+              ...(this.#attachHint(handle) ? { attach: this.#attachHint(handle) } : {}),
+            })).catch(() => {});
+          }
+          // Every further prompt from the human restarts the idle clock.
+          if (this.#humanGate === "worker_prompt") this.#noteHumanActivity();
+        }
       }
       // While a human drives the interactive session, the Decision Worker must
       // not be asked to act on a completed turn; #lastTurnCompleted is still
@@ -1722,6 +1732,7 @@ export class Supervisor {
   }
 
   async #sendInternal(message: string): Promise<void> {
+    const inputEpoch = this.#automationEpoch;
     if (this.#takeoverRequested) throw this.#takeoverInputError;
     await this.#flushPendingEvents();
     const taskId = this.#task?.taskId;
@@ -1740,7 +1751,7 @@ export class Supervisor {
     }
     const nextTurn = this.#turn + 1;
     if (nextTurn > (this.#task?.maxTurns ?? 100)) throw new Error("supervisor turn budget exhausted");
-    if (this.#takeoverRequested) throw this.#takeoverInputError;
+    if (this.#takeoverRequested || inputEpoch !== this.#automationEpoch) throw this.#takeoverInputError;
     const inputAbortController = new AbortController();
     this.#inputAbortController = inputAbortController;
     try {
