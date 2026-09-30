@@ -204,6 +204,8 @@ export interface HumanInterventionNotice {
   cwd: string;
   task: string;
   reason: string;
+  /** Readable category; the original reason remains the detailed evidence. */
+  reasonLabel?: string;
   question?: string;
   permission?: { requestId: string; toolUseId: string; toolName: string; input: unknown };
   /** Shell command to attach to the tmux session this notice concerns, when it refers to one. */
@@ -322,6 +324,7 @@ export class Supervisor {
   #humanIdleSince = 0;
   #humanStuckNoticeSent = false;
   #candidateParked = false;
+  #parkReasonLabel?: string;
   #stopRequested?: string;
   #stopCloseReason?: DecisionSessionCloseReason;
   #onDecisionSessionProgress?: (info: { taskId: string; turn: number; repairRound: number; lastFindingSignature?: string; workerCostUsd: number }) => Promise<void> | void;
@@ -366,6 +369,7 @@ export class Supervisor {
   /** True only after an explicit takeover, never for ordinary uncertainty. */
   get humanRequired() { return this.#humanRequired; }
   get candidateParked() { return this.#candidateParked; }
+  get parkReasonLabel() { return this.#parkReasonLabel; }
   /** True after the persistent worker was detached from this Supervisor. */
   get released() { return this.#released; }
   /** Wall-clock budget of the active task, or undefined when no deadline is configured. */
@@ -421,6 +425,7 @@ export class Supervisor {
     this.#takeoverRequested = false;
     this.#automationEpoch += 1;
     this.#candidateParked = false;
+    this.#parkReasonLabel = undefined;
     this.#released = false;
     this.#releasing = false;
     this.#terminalNoticeSent = false;
@@ -788,7 +793,7 @@ export class Supervisor {
         await this.#persistProgress();
         if (this.#automation && budgetReason) {
           skipDecisionNotify = true;
-          await this.#parkCandidate(budgetReason, event);
+          await this.#parkCandidate(budgetReason, event, undefined, "Worker budget");
         }
       }
       if (event.type === "permission_request") {
@@ -948,6 +953,7 @@ export class Supervisor {
     if (!task) return;
     const reason = `Decision Worker API failed during initialization: ${safeMessage(error)}`;
     this.#candidateParked = true;
+    this.#parkReasonLabel = "Decision startup failed";
     if (this.#machine.state === "starting") this.#machine.transition("blocked");
     await this.#appendEvent({ type: "decision_worker_failed", taskId: task.taskId, data: { eventType: "startup", error: safeMessage(error) } }).catch((auditError) => {
       console.error(`pi-claude-supervisor decision startup audit failed: ${safeMessage(auditError)}`);
@@ -955,12 +961,12 @@ export class Supervisor {
     await this.#appendEvent({
       type: "candidate_parked",
       taskId: task.taskId,
-      data: { status: "failed", deliverable: false, reason },
+      data: { status: "failed", deliverable: false, reason, reasonLabel: this.#parkReasonLabel },
     }).catch((auditError) => {
       console.error(`pi-claude-supervisor candidate audit failed: ${safeMessage(auditError)}`);
     });
     this.#terminalNoticeSent = true;
-    void Promise.resolve(this.#onCandidate?.({ taskId: task.taskId, cwd: task.cwd, task: task.task, reason, status: "failed", deliverable: false, usage: this.usage })).catch(() => {});
+    void Promise.resolve(this.#onCandidate?.({ taskId: task.taskId, cwd: task.cwd, task: task.task, reason, reasonLabel: this.#parkReasonLabel, status: "failed", deliverable: false, usage: this.usage })).catch(() => {});
   }
 
   /**
@@ -1084,7 +1090,7 @@ export class Supervisor {
         workerId: event.handle.id,
         data: { eventType: event.type, error: safeMessage(error) },
       });
-      await this.#parkCandidate(`${kind}: ${safeMessage(error)}`, event);
+      await this.#parkCandidate(`${kind}: ${safeMessage(error)}`, event, undefined, kind);
     });
   }
 
@@ -1227,7 +1233,7 @@ export class Supervisor {
         return;
       }
       if (action.action === "park" || action.action === "ask_human") {
-        await this.#parkCandidate(action.reason, event, action.question);
+        await this.#parkCandidate(action.reason, event, action.question, "Human requested");
         return;
       }
       if (action.action === "stop") {
@@ -1273,7 +1279,7 @@ export class Supervisor {
     const attempts = (this.#inputRetry?.event === event ? this.#inputRetry.attempts : 0) + 1;
     if (attempts > MAX_INPUT_RETRIES) {
       this.#inputRetry = undefined;
-      await this.#parkCandidate(`the Worker did not accept input after ${MAX_INPUT_RETRIES} deferred attempts: ${safeMessage(error)}`, event);
+      await this.#parkCandidate(`the Worker did not accept input after ${MAX_INPUT_RETRIES} deferred attempts: ${safeMessage(error)}`, event, undefined, "Worker input");
       return;
     }
     this.#inputRetry = { event, attempts, turn: this.#turn };
@@ -1492,7 +1498,7 @@ export class Supervisor {
    * The Worker is stopped and its evidence is retained. A caller may later
    * recover the Decision Worker session or inspect the local candidate.
    */
-  async #parkCandidate(reason: string, event?: WorkerEvent, question?: string): Promise<void> {
+  async #parkCandidate(reason: string, event?: WorkerEvent, question?: string, reasonLabel = "Candidate blocked"): Promise<void> {
     const task = this.#task;
     if (!task || this.#candidateParked || ["completed", "blocked", "failed", "stopped"].includes(this.#machine.state)) return;
     const handle = this.#handle;
@@ -1511,10 +1517,11 @@ export class Supervisor {
       checks: [],
     } satisfies AcceptanceReport;
     if (this.#machine.state === "verifying") {
-      await this.#finalizeVerification(verification, "blocked", reason);
+      await this.#finalizeVerification(verification, "blocked", reason, { reasonLabel });
       return;
     }
     this.#candidateParked = true;
+    this.#parkReasonLabel = reasonLabel;
     this.#reportProgress("candidate", reason, true);
     let cleanupError: unknown;
     if (handle && ["running", "waiting", "paused", "starting"].includes(this.#machine.state)) {
@@ -1532,6 +1539,7 @@ export class Supervisor {
       cwd: task.cwd,
       task: task.task,
       reason,
+      reasonLabel,
       question,
       permission,
       status: cleanupError ? "failed" : "blocked",
@@ -1555,6 +1563,7 @@ export class Supervisor {
         cwd: task.cwd,
         task: task.task,
         reason,
+        reasonLabel,
         question,
         permission,
         ...(this.#attachHint(handle) ? { attach: this.#attachHint(handle) } : {}),
@@ -2074,7 +2083,7 @@ export class Supervisor {
         repositoryEvidence = redactRepositoryEvidence(await collectRepositoryEvidence(this.#task.cwd, { signal: verificationAbortController.signal, baseRef: this.#task.baseCommit }));
       } catch (error) {
         this.#lastVerification = result;
-        await this.#parkCandidate(`local repository evidence could not be collected: ${safeMessage(error)}`, undefined);
+        await this.#parkCandidate(`local repository evidence could not be collected: ${safeMessage(error)}`, undefined, undefined, "Repository evidence");
         return result;
       }
       await this.#trackBranchChange(repositoryEvidence.branch);
@@ -2102,13 +2111,13 @@ export class Supervisor {
           this.#verificationAbortController = undefined;
           return result;
         }
-        await this.#parkCandidate(`${reason}; candidate cannot be published`, undefined);
+        await this.#parkCandidate(`${reason}; candidate cannot be published`, undefined, undefined, "Review limits");
         return result;
       }
       if (this.#automation && (this.#task.baseCommit || this.#task.spec.autonomy.requireLocalCommit)
         && repositoryEvidence.complete === false) {
         this.#lastVerification = result;
-        await this.#parkCandidate("repository evidence is incomplete or truncated; candidate cannot be published", undefined);
+        await this.#parkCandidate("repository evidence is incomplete or truncated; candidate cannot be published", undefined, undefined, "Repository evidence");
         return result;
       }
       if (this.#automation && this.#task.baseCommit && !repositoryEvidence.branch) {
@@ -2197,7 +2206,7 @@ export class Supervisor {
       }
       if (review.verdict === "human") {
         this.#lastVerification = result;
-        await this.#parkCandidate(review.summary, undefined);
+        await this.#parkCandidate(review.summary, undefined, undefined, "Reviewer blocked");
         return result;
       }
     }
@@ -2620,7 +2629,7 @@ export class Supervisor {
    * later block with a passing report (an uncommitted tree after a voided
    * publish turn) is not the same thing.
    */
-  async #finalizeVerification(result: AcceptanceReport, outcome: "completed" | "blocked" = result.ok ? "completed" : "blocked", outcomeReason?: string, options: { publishOnly?: boolean } = {}): Promise<AcceptanceReport> {
+  async #finalizeVerification(result: AcceptanceReport, outcome: "completed" | "blocked" = result.ok ? "completed" : "blocked", outcomeReason?: string, options: { publishOnly?: boolean; reasonLabel?: string } = {}): Promise<AcceptanceReport> {
     this.#clearWatchdog();
     // Whatever happens from here the task is terminal: the grant must not
     // outlive the publish turn it was issued for.
@@ -2629,6 +2638,7 @@ export class Supervisor {
     const stopCloseReason = this.#stopCloseReason ?? "human_stop";
     if (outcome === "blocked") {
       this.#candidateParked = true;
+      this.#parkReasonLabel = options.reasonLabel ?? (options.publishOnly ? "Publish unconfirmed" : "Verification blocked");
     }
     // A completed interactive task may keep its persistent session open for
     // the operator instead of tearing it down; a stop requested mid-verify or
@@ -2674,7 +2684,7 @@ export class Supervisor {
     if (this.#machine.state === "verifying") this.#machine.transition(terminalState);
     const candidateReason = outcomeReason ?? (result.ok ? "candidate is ready after independent acceptance" : "candidate did not satisfy acceptance/review");
     this.#reportProgress(stopRequested ? "stopping" : verificationSucceeded ? "completed" : terminalState === "blocked" ? "candidate" : "failed", stopRequested ? "verification stopped by operator" : verificationSucceeded ? "verification and independent review passed" : candidateReason, true);
-    const eventData = { ...result, ...(stopRequested ? { cancelled: true, stopReason: this.#stopRequested } : {}), ...(terminalState === "blocked" ? { candidateReason } : {}), ...(cleanupError ? { cleanupError: safeMessage(cleanupError) } : {}), ...(this.#lastObservedBranch ? { branch: this.#lastObservedBranch, protectedBranch: isProtectedBranch(this.#lastObservedBranch) } : {}) };
+    const eventData = { ...result, ...(stopRequested ? { cancelled: true, stopReason: this.#stopRequested } : {}), ...(terminalState === "blocked" ? { candidateReason, reasonLabel: this.#parkReasonLabel } : {}), ...(cleanupError ? { cleanupError: safeMessage(cleanupError) } : {}), ...(this.#lastObservedBranch ? { branch: this.#lastObservedBranch, protectedBranch: isProtectedBranch(this.#lastObservedBranch) } : {}) };
     let eventError: unknown;
     try {
       await this.#appendEvent({ type: verificationSucceeded ? "verification_passed" : terminalState === "blocked" ? "candidate_parked" : "verification_failed", taskId: this.#task?.taskId, workerId: this.#handle?.id, data: eventData });
@@ -2721,6 +2731,7 @@ export class Supervisor {
         reason: verificationSucceeded
           ? `${releasedInteractive ? "candidate is ready; the interactive session stays open (/supervise stop closes it)" : "candidate is ready"}${this.#prUrl ? `; pull request ${this.#prUrl}` : ""}${this.#publishShortfall ? `; not published: ${this.#publishShortfall}` : ""}`
           : candidateReason,
+        ...(verificationSucceeded ? {} : { reasonLabel: this.#parkReasonLabel }),
         status: verificationSucceeded ? "ready" : "blocked",
         deliverable: verificationSucceeded || publishOnlyBlock,
         usage: this.usage,
@@ -3046,7 +3057,7 @@ export class Supervisor {
       // A release in progress finishes the task its own way.
       if (this.#releasing || this.#released) return;
       if (this.#machine.state === "verifying" && !this.#verificationAbortController) {
-        await this.#parkCandidate(`${origin} verification failed part-way: ${safeMessage(error)}`, event).catch(() => {});
+        await this.#parkCandidate(`${origin} verification failed part-way: ${safeMessage(error)}`, event, undefined, "Verification failed").catch(() => {});
       }
     }
   }

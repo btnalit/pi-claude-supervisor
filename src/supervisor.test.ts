@@ -4807,7 +4807,8 @@ test("takeover cancellation does not hide an actual input failure", { timeout: 1
     await supervisor.takeover();
     await action;
     assert.equal(supervisor.candidateParked, true);
-    assert.ok(events.events.some((entry) => entry.type === "candidate_parked" && String(entry.data?.reason).includes("transport failed independently")));
+    assert.equal(supervisor.parkReasonLabel, "Worker input failed");
+    assert.ok(events.events.some((entry) => entry.type === "candidate_parked" && entry.data?.reasonLabel === "Worker input failed" && String(entry.data.reason).includes("transport failed independently")));
     assert.ok(events.events.some((entry) => entry.type === "worker_input_failed" && entry.data?.error === "transport failed independently"));
   });
 });

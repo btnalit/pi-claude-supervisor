@@ -96,6 +96,7 @@ function toGeneric(notice: HumanInterventionNotice | CandidateNotice): Record<st
     task: { id: sanitize(notice.taskId), goal: sanitize(notice.task), cwd: sanitize(notice.cwd) },
     worker: { id: sanitize(notice.workerId) },
     reason: sanitize(notice.reason),
+    ...(notice.reasonLabel ? { reasonLabel: sanitize(notice.reasonLabel) } : {}),
     question: sanitize(notice.question),
     permission: notice.permission ? sanitize(notice.permission) : undefined,
     ...(notice.attach ? { attach: sanitize(notice.attach) } : {}),
@@ -115,6 +116,7 @@ function toWeCom(notice: HumanInterventionNotice | CandidateNotice): Record<stri
   // repository name into `\_` and break the link. The URL is already sanitized.
   const pullRequest = "status" in notice && notice.prUrl ? `\nPR: ${safeText(notice.prUrl)}` : "";
   const title = candidate ? "Claude Supervisor 候选状态" : "Claude Supervisor 需要人工介入";
+  const category = notice.reasonLabel ? `\n> 类别: ${safeText(notice.reasonLabel)}` : "";
   const usage = candidate && notice.usage ? `\n> Worker 费用: $${notice.usage.workerCostUsd.toFixed(2)} (${notice.usage.workerTurns} turns)\n> Pi tokens: ${usageSummary(notice.usage).piTokens}` : "";
   const suffix = candidate
     ? `\n> 状态: ${safeText(notice.status)}\n> 可交付: ${notice.deliverable ? "yes" : "no"}${usage}\n\n该通知不授予远程 push 或 main/integration merge 权限。`
@@ -122,7 +124,7 @@ function toWeCom(notice: HumanInterventionNotice | CandidateNotice): Record<stri
   return {
     msgtype: "markdown",
     markdown: {
-      content: `### ${title}\n> 任务: ${safeText(notice.task)}\n> Task ID: ${safeText(notice.taskId)}\n> 原因: ${safeText(notice.reason)}${escapeMarkdown(question)}${escapeMarkdown(permission)}${escapeMarkdown(attach)}${pullRequest}${suffix}`,
+      content: `### ${title}\n> 任务: ${safeText(notice.task)}\n> Task ID: ${safeText(notice.taskId)}${category}\n> 原因: ${safeText(notice.reason)}${escapeMarkdown(question)}${escapeMarkdown(permission)}${escapeMarkdown(attach)}${pullRequest}${suffix}`,
     },
   };
 }
