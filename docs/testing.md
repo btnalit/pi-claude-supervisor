@@ -60,8 +60,10 @@ trusted parent such as a 0700 directory under `$HOME/.cache`, not world-writable
   submission boundary, after Enter, and pending decision/repair/publish sends.
   Cancelled waits do not consume a turn; submitted input is never replayed, and
   a genuine transport error is not swallowed as cancellation. Old responses stay
-  stale even after resume-auto replays the same completed turn. Native input,
-  duplicate hook events, stale handles and failed takeover audit writes are covered.
+  stale even after resume-auto replays the same completed turn. Native input is
+  injected at both decision and send status preflights, before a send controller
+  exists. Duplicate hook events, stale handles and failed explicit/native takeover
+  audit writes are covered; a failed audit does not restore automation ownership.
 - Overlapping tmux monitor/stop/status cleanup is paused deterministically at the
   cgroup read boundary to assert one cleanup execution, shared failure evidence,
   and a successful later retry; unexpected filesystem errors are not suppressed.

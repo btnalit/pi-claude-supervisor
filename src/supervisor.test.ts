@@ -4764,6 +4764,63 @@ test("native input cancels pending automation, but stale handles and duplicate e
   });
 });
 
+for (const preflight of ["decision", "send"] as const) {
+  test(`native input cancels automation during the ${preflight} status preflight before a send controller exists`, { timeout: 10_000 }, async () => {
+    await withPendingInputFixture("decision", async ({ supervisor, adapter, decision, event, emit, events, stopCalls }) => {
+      const getStatus = adapter.getStatus.bind(adapter);
+      let entered!: () => void;
+      const checking = new Promise<void>((resolve) => { entered = resolve; });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let checks = 0;
+      adapter.getStatus = async (handle) => {
+        const status = await getStatus(handle);
+        checks += 1;
+        if (checks === (preflight === "decision" ? 1 : 2)) {
+          entered();
+          await gate;
+        }
+        return status;
+      };
+      let sends = 0;
+      adapter.send = async () => { sends += 1; };
+      const action = Promise.resolve(decision.onAction({ action: "continue", message: "obsolete input", reason: "test" }, event));
+      await checking;
+      emit({ type: "human_input", handle: event.handle, text: "operator is driving", sequence: 1 });
+      release();
+      await action;
+      await supervisor.poll();
+      assert.equal(sends, 0);
+      assert.equal(supervisor.turn, 0);
+      assert.equal(supervisor.humanRequired, true);
+      assert.equal(supervisor.candidateParked, false);
+      assert.equal(stopCalls(), 0);
+      assert.equal(events.events.filter((entry) => entry.type === "worker_input_cancelled").length, 1);
+    });
+  });
+}
+
+test("native input retains human ownership when its first audit write fails", { timeout: 10_000 }, async () => {
+  await withPendingInputFixture("decision", async ({ supervisor, adapter, event, emit, events }) => {
+    const append = events.append.bind(events);
+    let failOnce = true;
+    events.append = async (entry) => {
+      if (entry.type === "human_input" && failOnce) { failOnce = false; throw new Error("native input audit failed"); }
+      return append(entry);
+    };
+    let sends = 0;
+    adapter.send = async () => { sends += 1; };
+    emit({ type: "human_input", handle: event.handle, text: "operator is driving", sequence: 1 });
+    await waitFor(() => events.events.some((entry) => entry.type === "worker_event_error"));
+    assert.ok(events.events.some((entry) => entry.type === "worker_event_error" && entry.data?.error === "native input audit failed"));
+    assert.equal(supervisor.humanRequired, true);
+    await supervisor.send("explicit operator message");
+    assert.equal(sends, 1);
+    assert.equal(supervisor.turn, 1);
+    assert.equal(supervisor.humanRequired, true);
+  });
+});
+
 test("takeover waits for an already submitted input boundary and rejects its late decision after resume", { timeout: 10_000 }, async () => {
   await withPendingInputFixture("decision", async ({ supervisor, adapter, decision, event, events, replays, stopCalls }) => {
     let entered!: () => void;
