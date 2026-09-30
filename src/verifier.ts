@@ -482,16 +482,29 @@ async function readTrackedDiff(cwd: string, ref: string, signal?: AbortSignal): 
   const paths: string[] = [];
   let complete = hidden.length <= maxUntrackedFiles();
   try {
+    const changes = await readGitEvidence(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-status", "-z", ref, "--"], signal);
+    if (!changes.complete) {
+      const bounded = boundEvidence(`${normal.text}\n${changes.text}`);
+      return { ...bounded, complete: false, truncated: changes.truncated || bounded.truncated };
+    }
+    const fields = changes.text.split("\0");
+    const statuses = new Map<string, string>();
+    for (let i = 0; i + 1 < fields.length; i += 2) statuses.set(fields[i + 1]!, fields[i]!);
     const root = await realpath(cwd);
     for (const path of hidden.slice(0, maxUntrackedFiles())) {
       throwIfAborted(signal);
-      if (!await trackedFileIsBinary(root, path) && !await baselineBlobIsBinary(cwd, ref, path, signal)) paths.push(path);
+      const status = statuses.get(path);
+      if (!status) throw new Error("tracked diff changed during evidence collection");
+      // A deleted side is a Git blob, not the possibly replaced worktree path.
+      // An added side has no baseline blob, even if that name was a tree.
+      if ((status === "D" || !await trackedFileIsBinary(root, path))
+        && (status === "A" || !await baselineBlobIsBinary(cwd, ref, path, signal))) paths.push(path);
     }
   } catch (error) {
     throwIfAborted(signal);
     return { text: `${normal.text}\n[ATTRIBUTE-HIDDEN DIFF UNAVAILABLE] ${error instanceof Error ? error.message : String(error)}`, complete: false, truncated: false };
   }
-  const forced = paths.length ? await readGitEvidence(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--text", "--unified=3", "--no-renames", ref, "--", ...paths], signal) : undefined;
+  const forced = paths.length ? await readGitEvidence(cwd, ["--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--text", "--unified=3", "--no-renames", ref, "--", ...paths], signal) : undefined;
   const text = `${normal.text}${forced ? `\n[Text diff for attribute-hidden files]\n${forced.text}` : ""}${complete ? "" : "\n[TRUNCATED: too many attribute-hidden paths]"}`;
   const bounded = boundEvidence(text);
   return { ...bounded, complete: complete && bounded.complete && (forced?.complete ?? true), truncated: !complete || bounded.truncated || (forced?.truncated ?? false) };

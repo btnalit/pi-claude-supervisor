@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, link, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { access, link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
@@ -205,6 +205,63 @@ test("Reviewer evidence reveals attribute-hidden text without textconv, external
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+for (const filename of ["*", "star*.txt", ":(glob)*"]) {
+  test(`attribute-hidden filename ${JSON.stringify(filename)} is a literal path, not a binary-expanding pathspec`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-evidence-literal-"));
+    try {
+      await initWithCommit(cwd);
+      await writeFile(join(cwd, ".gitattributes"), "* -diff\n");
+      await writeFile(join(cwd, filename), "ordinary text before\n");
+      await writeFile(join(cwd, "star-image.txt"), Buffer.from("\0binary before"));
+      await execFileAsync("git", ["add", "."], { cwd });
+      await execFileAsync("git", ["-c", "user.email=test@example.invalid", "-c", "user.name=Test", "commit", "-qm", "literal baseline"], { cwd });
+      const baseRef = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim();
+      await writeFile(join(cwd, filename), "ordinary text after\n");
+      await writeFile(join(cwd, "star-image.txt"), Buffer.from("\0BINARY_SENTINEL"));
+      const evidence = await collectRepositoryEvidence(cwd, { baseRef });
+      assert.equal(evidence.complete, true);
+      assert.equal(evidence.truncated, false);
+      assert.match(evidence.diff, /\+ordinary text after/u);
+      assert.match(evidence.diff, /Binary files .*star-image\.txt/u);
+      assert.doesNotMatch(evidence.diff, /BINARY_SENTINEL/u);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const replacement of ["symlink", "file"] as const) {
+  for (const staged of [false, true]) {
+    test(`attribute-hidden directory deletion remains complete with a ${staged ? "staged" : "unstaged"} replacement ${replacement}`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), "pi-evidence-deleted-tree-"));
+      const outside = await mkdtemp(join(tmpdir(), "pi-evidence-outside-"));
+      try {
+        await initWithCommit(cwd);
+        await mkdir(join(cwd, "d"));
+        await writeFile(join(cwd, ".gitattributes"), "* -diff\n");
+        await writeFile(join(cwd, "d", "hidden.txt"), "baseline deletion text\n");
+        await writeFile(join(outside, "hidden.txt"), "OUTSIDE_MUST_NOT_BE_READ\n");
+        await execFileAsync("git", ["add", "."], { cwd });
+        await execFileAsync("git", ["-c", "user.email=test@example.invalid", "-c", "user.name=Test", "commit", "-qm", "tree baseline"], { cwd });
+        const baseRef = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim();
+        await rm(join(cwd, "d"), { recursive: true });
+        if (replacement === "symlink") await symlink(outside, join(cwd, "d"));
+        else await writeFile(join(cwd, "d"), "replacement ordinary text\n");
+        if (staged) await execFileAsync("git", ["add", "-A"], { cwd });
+        const evidence = await collectRepositoryEvidence(cwd, { baseRef });
+        assert.equal(evidence.complete, true);
+        assert.equal(evidence.truncated, false);
+        assert.match(evidence.diff, /-baseline deletion text/u);
+        if (replacement === "file" && staged) assert.match(evidence.diff, /\+replacement ordinary text/u);
+        assert.doesNotMatch(evidence.diff, /OUTSIDE_MUST_NOT_BE_READ/u);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+  }
+}
 
 test("attribute-hidden text remains subject to evidence limits", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "pi-evidence-attributes-large-"));

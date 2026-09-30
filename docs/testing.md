@@ -62,8 +62,9 @@ trusted parent such as a 0700 directory under `$HOME/.cache`, not world-writable
   a genuine transport error is not swallowed as cancellation. Old responses stay
   stale even after resume-auto replays the same completed turn. Native input is
   injected at both decision and send status preflights, before a send controller
-  exists. Duplicate hook events, stale handles and failed explicit/native takeover
-  audit writes are covered; a failed audit does not restore automation ownership.
+  exists. Duplicate hook events during pending/failed audit writes cannot gate
+  operator input or fresh resumed actions; stale handles and failed explicit/native
+  takeover audit writes are covered without restoring automation ownership.
 - Idle-notification delivery tests pause at the completed paste instead of
   assuming a fixed sleep places the hook inside submission on a loaded runner.
   Unacknowledged idle during paste/initial Enter cannot finish the reserved turn
@@ -77,8 +78,11 @@ trusted parent such as a 0700 directory under `$HOME/.cache`, not world-writable
 - Git read retries are bounded and exclude aborts, evidence overflow, definitive
   negatives and credentials failures. Acceptance commands are not retried.
 - Attribute-hidden tracked text, including additions/deletions, remains visible to
-  the Reviewer without executing textconv/external diff; binary contents stay omitted
-  and forced text remains bounded. Park labels retain the original detailed reason.
+  the Reviewer without executing textconv/external diff; literal wildcard/magic
+  filenames cannot pull binaries into forced text. Deleted sides use baseline blobs
+  even when a parent directory becomes a symlink/file, without following the new
+  symlink. Binary contents stay omitted and text remains bounded. Park labels retain
+  the original detailed reason.
 
 The tmux regressions use a real local tmux server with scripted fake Claude TUIs.
 `test:pi` is registration/command smoke, not a real Pi model run. Neither these tests
