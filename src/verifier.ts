@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, type ExecFileOptions } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { lstat, open, readlink, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -7,8 +7,10 @@ import type { AcceptanceCheck, AcceptanceCheckResult, AcceptanceReport, Verifica
 import { evidenceMaxBytes, evidenceMaxUntrackedFiles } from "./config.ts";
 import { assertSafeWorkerCommand, isCommitId } from "./policy.ts";
 import { workerEnvironment } from "./worker/environment.ts";
+import { retryGitRead } from "./git-read.ts";
 
 const execFileAsync = promisify(execFile);
+const execGitRead = (args: string[], options: ExecFileOptions & { encoding?: "utf8" }) => retryGitRead(() => execFileAsync("git", args, options), options.signal);
 const MAX_UNTRACKED_FILE_BYTES = 256 * 1024;
 
 /** The bounded evidence/output size; configurable via PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES. */
@@ -67,7 +69,7 @@ export interface RepositoryEvidence {
 /** Read the repository HEAD without invoking a shell. */
 export async function repositoryHead(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
   try {
-    const result = await execFileAsync("git", ["rev-parse", "--verify", "HEAD"], {
+    const result = await execGitRead(["rev-parse", "--verify", "HEAD"], {
       cwd,
       timeout: 30_000,
       maxBuffer: 1024,
@@ -110,13 +112,14 @@ const REPOSITORY_RELOCATING_GIT_VARIABLE = /^(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON
  * Worker published. Never used for anything that mutates.
  */
 export async function runReadOnly(command: string, args: readonly string[], cwd: string, signal?: AbortSignal): Promise<{ stdout: string }> {
-  const result = await execFileAsync(command, [...args], {
+  const read = () => execFileAsync(command, [...args], {
     cwd,
     timeout: 60_000,
     maxBuffer: 256 * 1024,
     signal,
     env: remoteReadEnvironment(),
   });
+  const result = await (command === "git" ? retryGitRead(read, signal) : read());
   return { stdout: String(result.stdout) };
 }
 
@@ -229,7 +232,7 @@ async function resolveSshHostname(alias: string, signal?: AbortSignal): Promise<
 export async function repositoryCommitExists(cwd: string, commit: string, signal?: AbortSignal): Promise<boolean> {
   if (!isCommitId(commit)) return false;
   try {
-    const result = await execFileAsync("git", ["cat-file", "-e", `${commit}^{commit}`], {
+    const result = await execGitRead(["cat-file", "-e", `${commit}^{commit}`], {
       cwd,
       timeout: 30_000,
       maxBuffer: 1024,
@@ -245,7 +248,7 @@ export async function repositoryCommitExists(cwd: string, commit: string, signal
 /** Verify that `ancestor` is reachable from `descendant` (or is `descendant` itself) without invoking a shell. */
 export async function repositoryIsAncestor(cwd: string, ancestor: string, descendant: string, signal?: AbortSignal): Promise<boolean> {
   try {
-    await execFileAsync("git", ["merge-base", "--is-ancestor", ancestor, descendant], {
+    await execGitRead(["merge-base", "--is-ancestor", ancestor, descendant], {
       cwd,
       timeout: 30_000,
       maxBuffer: 1024,
@@ -265,7 +268,7 @@ export async function repositoryIsAncestor(cwd: string, ancestor: string, descen
  */
 export async function repositoryClean(cwd: string, signal?: AbortSignal): Promise<boolean | undefined> {
   try {
-    const result = await execFileAsync("git", ["status", "--porcelain", "--untracked-files=all"], {
+    const result = await execGitRead(["status", "--porcelain", "--untracked-files=all"], {
       cwd,
       timeout: 30_000,
       maxBuffer: 1024 * 1024,
@@ -290,7 +293,7 @@ export async function repositoryClean(cwd: string, signal?: AbortSignal): Promis
 export async function repositoryGitDirectoryIsLocal(cwd: string, signal?: AbortSignal): Promise<boolean> {
   try {
     const read = async (args: string[]): Promise<string> => {
-      const result = await execFileAsync("git", args, { cwd, timeout: 30_000, maxBuffer: 4096, signal, env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }) });
+      const result = await execGitRead(args, { cwd, timeout: 30_000, maxBuffer: 4096, signal, env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }) });
       return String(result.stdout).trim();
     };
     const [gitDir, commonDir] = await Promise.all([read(["rev-parse", "--git-dir"]), read(["rev-parse", "--git-common-dir"])]);
@@ -311,7 +314,7 @@ export async function repositoryGitDirectoryIsLocal(cwd: string, signal?: AbortS
 /** Determine whether cwd is a non-bare Git worktree without invoking a shell. */
 export async function repositoryWorkTree(cwd: string, signal?: AbortSignal): Promise<boolean | undefined> {
   try {
-    const result = await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], {
+    const result = await execGitRead(["rev-parse", "--is-inside-work-tree"], {
       cwd,
       timeout: 30_000,
       maxBuffer: 1024,
@@ -328,7 +331,7 @@ export async function repositoryWorkTree(cwd: string, signal?: AbortSignal): Pro
 /** Read the current symbolic branch without invoking a shell. */
 export async function repositoryBranch(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
   try {
-    const result = await execFileAsync("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], {
+    const result = await execGitRead(["symbolic-ref", "--quiet", "--short", "HEAD"], {
       cwd,
       timeout: 30_000,
       maxBuffer: 1024,
@@ -398,7 +401,7 @@ export async function collectRepositoryEvidence(cwd: string, options: Pick<Verif
   const [statusResult, diffResult, commitsResult, branchResult, untrackedResult, head] = await Promise.all([
     readGitEvidence(cwd, ["status", "--short", "--untracked-files=all"], options.signal),
     // A baseline-relative diff includes committed, staged, and unstaged changes.
-    readGitEvidence(cwd, ["diff", "--no-ext-diff", "--unified=3", diffRef, "--"], options.signal),
+    readTrackedDiff(cwd, diffRef, options.signal),
     readGitEvidence(cwd, commitArgs, options.signal),
     readGitEvidence(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"], options.signal),
     collectUntrackedEvidence(cwd, options.signal),
@@ -465,10 +468,103 @@ interface EvidencePart {
   truncated: boolean;
 }
 
+async function readTrackedDiff(cwd: string, ref: string, signal?: AbortSignal): Promise<EvidencePart> {
+  const args = ["diff", "--no-ext-diff", "--no-textconv", "--unified=3", "--no-renames", ref, "--"];
+  const normal = await readGitEvidence(cwd, args, signal);
+  if (!normal.complete) return normal;
+  // -diff/custom binary attributes hide ordinary source too. Inspect only
+  // Git's binary-classified paths, then force text for actual text files.
+  // Genuine binaries keep the normal name-only notice, without huge patches.
+  const stats = await readGitEvidence(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--numstat", "-z", ref, "--"], signal);
+  if (!stats.complete) return { text: `${normal.text}\n${stats.text}`, complete: false, truncated: stats.truncated };
+  const hidden = stats.text.split("\0").filter((entry) => entry.startsWith("-\t-\t")).map((entry) => entry.slice(4));
+  if (hidden.length === 0) return normal;
+  const groups = new Map<string, string[]>();
+  const pathsTruncated = hidden.length > maxUntrackedFiles();
+  let complete = !pathsTruncated;
+  let truncated = pathsTruncated;
+  try {
+    const changes = await readGitEvidence(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-status", "-z", ref, "--"], signal);
+    if (!changes.complete) {
+      const bounded = boundEvidence(`${normal.text}\n${changes.text}`);
+      return { ...bounded, complete: false, truncated: changes.truncated || bounded.truncated };
+    }
+    const fields = changes.text.split("\0");
+    const statuses = new Map<string, string>();
+    for (let i = 0; i + 1 < fields.length; i += 2) statuses.set(fields[i + 1]!, fields[i]!);
+    const root = await realpath(cwd);
+    for (const path of hidden.slice(0, maxUntrackedFiles())) {
+      throwIfAborted(signal);
+      const status = statuses.get(path);
+      if (!status || !["A", "D", "M", "T"].includes(status)) throw new Error("tracked diff has missing or unsupported change status");
+      // A deleted side is a Git blob, not the possibly replaced worktree path.
+      // An added side has no baseline blob, even if that name was a tree.
+      if ((status === "D" || !await trackedFileIsBinary(root, path))
+        && (status === "A" || !await baselineBlobIsBinary(cwd, ref, path, signal))) {
+        const paths = groups.get(status) ?? [];
+        paths.push(path);
+        groups.set(status, paths);
+      }
+    }
+  } catch (error) {
+    throwIfAborted(signal);
+    return { text: `${normal.text}\n[ATTRIBUTE-HIDDEN DIFF UNAVAILABLE] ${error instanceof Error ? error.message : String(error)}`, complete: false, truncated: false };
+  }
+  const forcedTexts: string[] = [];
+  for (const [status, paths] of groups) {
+    // Literal pathspecs still recurse into an old/new tree. Exact status groups
+    // separate its opposite-side leaves (A versus D) from the selected file.
+    const forced = await readGitEvidence(cwd, ["--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--text", "--unified=3", "--no-renames", `--diff-filter=${status}`, ref, "--", ...paths], signal);
+    forcedTexts.push(forced.text);
+    complete &&= forced.complete;
+    truncated ||= forced.truncated;
+  }
+  const text = `${normal.text}${forcedTexts.length ? `\n[Text diff for attribute-hidden files]\n${forcedTexts.join("\n")}` : ""}${pathsTruncated ? "\n[TRUNCATED: too many attribute-hidden paths]" : ""}`;
+  const bounded = boundEvidence(text);
+  return { ...bounded, complete: complete && bounded.complete, truncated: truncated || bounded.truncated };
+}
+
+async function trackedFileIsBinary(root: string, path: string): Promise<boolean> {
+  const fullPath = resolve(root, path);
+  const within = relative(root, fullPath);
+  if (isAbsolute(within) || within === ".." || within.startsWith(`..${sep}`)) throw new Error("tracked evidence path escaped the repository");
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    await assertNoSymlinkComponents(root, dirname(within));
+    const info = await lstat(fullPath);
+    if (info.isSymbolicLink()) return false; // Git diffs the link itself.
+    if (!info.isFile()) throw new Error("tracked evidence is not a regular file");
+    handle = await open(fullPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    await assertOpenedEvidencePath(root, handle.fd);
+    const prefix = Buffer.alloc(8_000);
+    const { bytesRead } = await handle.read(prefix, 0, prefix.length, 0);
+    return prefix.subarray(0, bytesRead).includes(0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; // Deleted tracked file.
+    throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function baselineBlobIsBinary(cwd: string, ref: string, path: string, signal?: AbortSignal): Promise<boolean> {
+  let prefix: string | Buffer;
+  try {
+    const result = await execGitRead(["cat-file", "blob", `${ref}:${path}`], { cwd, timeout: 30_000, maxBuffer: 8_000, signal, env: workerEnvironment(process.env) });
+    prefix = result.stdout;
+  } catch (error) {
+    const failure = error as { code?: number | string; stdout?: string; stderr?: string };
+    if (failure.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") prefix = failure.stdout ?? "";
+    else if (failure.code === 128 && /does not exist in|exists on disk, but not in/u.test(failure.stderr ?? "")) return false; // Added file.
+    else throw error;
+  }
+  return Buffer.from(prefix).includes(0);
+}
+
 async function readGitEvidence(cwd: string, args: string[], signal?: AbortSignal): Promise<EvidencePart> {
   throwIfAborted(signal);
   try {
-    const result = await execFileAsync("git", args, {
+    const result = await execGitRead(args, {
       cwd,
       timeout: 30_000,
       maxBuffer: maxExecBufferBytes(),
@@ -497,7 +593,7 @@ async function collectUntrackedEvidence(cwd: string, signal?: AbortSignal): Prom
     return { text: `[UNTRACKED EVIDENCE UNAVAILABLE] ${error instanceof Error ? error.message : String(error)}`, complete: false, truncated: false };
   }
   try {
-    const result = await execFileAsync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+    const result = await execGitRead(["ls-files", "--others", "--exclude-standard", "-z"], {
       cwd,
       timeout: 30_000,
       maxBuffer: maxOutputBytes(),

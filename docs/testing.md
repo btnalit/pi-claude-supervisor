@@ -46,6 +46,50 @@ the published TypeScript source directly and there is no second runtime bundle.
 - `scripts/check-package.mjs`: verifies the Pi manifest, peer dependency policy,
   required files and forbidden secret paths.
 
+### Unattended interactive reliability regressions
+
+Use Node 22/24 to match CI. Keep fake `claude` executables under an operator-owned
+trusted parent such as a 0700 directory under `$HOME/.cache`, not world-writable
+`/tmp`, and prepend them to `PATH` so normal tests cannot call a real provider.
+
+- Policy nesting runs in an isolated child with a hard timeout; nested denied
+  commands remain denied and evaluation caches never cross calls.
+- Provider classification covers explicit statuses versus context/token/request-id
+  numbers and generic provider errors.
+- Takeover races cover waiting before paste, during the paste-to-initial-Enter
+  submission boundary, after Enter, and pending decision/repair/publish sends.
+  Cancelled waits do not consume a turn; submitted input is never replayed, and
+  a genuine transport error is not swallowed as cancellation. Old responses stay
+  stale even after resume-auto replays the same completed turn. Native input is
+  injected at both decision and send status preflights, before a send controller
+  exists. Duplicate hook events during pending/failed audit writes cannot gate
+  operator input or fresh resumed actions; stale handles and failed explicit/native
+  takeover audit writes are covered without restoring automation ownership.
+- Idle-notification delivery tests pause at the completed paste instead of
+  assuming a fixed sleep places the hook inside submission on a loaded runner.
+  Unacknowledged idle during paste/initial Enter cannot finish the reserved turn
+  or mask native input. A real submit acknowledgement allows fast idle completion
+  even before Enter returns; legitimate idle also works after cancellation/failure.
+- Overlapping tmux monitor/stop/status cleanup is paused deterministically at the
+  cgroup read boundary to assert one cleanup execution, shared failure evidence,
+  and a successful later retry; unexpected filesystem errors are not suppressed.
+- Automatic completions and idle notices cannot reset human idleness. Queued human
+  turns retain their source and busy state even when an automatic submission fails.
+- Git read retries are bounded and exclude aborts, evidence overflow, definitive
+  negatives and credentials failures. Acceptance commands are not retried.
+- Attribute-hidden tracked text, including additions/deletions, remains visible to
+  the Reviewer without executing textconv/external diff; literal wildcard/magic
+  filenames cannot pull binaries into forced text. Deleted sides use baseline blobs
+  even when a parent directory becomes a symlink/file, without following the new
+  symlink. Exact A/D status groups prevent literal ancestor paths from including
+  binary descendants on the opposite side, in both file/tree directions, and share
+  the aggregate evidence bound. Binary contents stay omitted. Park labels retain
+  the original detailed reason.
+
+The tmux regressions use a real local tmux server with scripted fake Claude TUIs.
+`test:pi` is registration/command smoke, not a real Pi model run. Neither these tests
+nor `test:install` prove an authenticated Claude unattended run.
+
 ## Transport spike acceptance
 
 Run `npm run spike:transport` only in an isolated test workspace after the test

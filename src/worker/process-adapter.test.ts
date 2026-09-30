@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, chmod, constants, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import fsPromises, { access, chmod, constants, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -373,6 +374,51 @@ test("blocked stdin writes time out and do not strand the worker", async () => {
   }
   assert.equal((await adapter.getStatus(handle)).running, false);
 });
+
+for (const code of ["ESRCH", "EIO", "changed"] as const) {
+  test(`process identity ${code} ${code === "ESRCH" ? "allows verified cleanup during exit" : "preserves failure and permits retry"}`, { skip: process.platform !== "linux", concurrency: false, timeout: 10_000 }, async (t) => {
+    const adapter = new ProcessWorkerAdapter({ cgroupMode: "off", terminationGraceMs: 50, killGraceMs: 500 });
+    const handle = await adapter.start({ task: "", cwd: process.cwd(), command: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"] });
+    const failure = Object.assign(new Error(`injected proc identity ${code}`), { code });
+    const originalRead = fsPromises.readFile;
+    let reads = 0;
+    const mock = t.mock.method(fsPromises, "readFile", async (...args: Parameters<typeof originalRead>) => {
+      if (String(args[0]) === `/proc/${handle.pid}/stat`) {
+        reads += 1;
+        if (code !== "changed") throw failure;
+        const stat = String(await originalRead(...args));
+        const close = stat.lastIndexOf(")");
+        const fields = stat.slice(close + 2).trim().split(/\s+/u);
+        fields[19] = String(BigInt(fields[19]!) + 1n);
+        return stat.slice(0, close + 2) + fields.join(" ");
+      }
+      return originalRead(...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      if (code === "ESRCH") {
+        await adapter.stop(handle, "exit identity race");
+        assert.equal((await adapter.getStatus(handle)).processGroupCleaned, true);
+        assert.equal(await processGroupHasLiveMember(handle.pid!), false);
+      } else {
+        if (code === "changed") {
+          await assert.rejects(adapter.killProcessGroup(handle, "changed identity"), /process-group identity changed/u);
+          assert.equal((await adapter.getStatus(handle)).running, true);
+        } else {
+          await assert.rejects(adapter.stop(handle, "genuine identity read failure"), (error) => error === failure);
+        }
+        assert.equal((await adapter.getStatus(handle)).processGroupCleaned, false);
+      }
+      assert.ok(reads > 0);
+    } finally {
+      mock.mock.restore();
+      syncBuiltinESMExports();
+      await adapter.stop(handle, "retry after restoring proc reads");
+    }
+    assert.equal((await adapter.getStatus(handle)).processGroupCleaned, true);
+    assert.equal(await processGroupHasLiveMember(handle.pid!), false);
+  });
+}
 
 test("stop escalates when the worker refuses SIGTERM", async () => {
   const adapter = new ProcessWorkerAdapter({ terminationGraceMs: 25, killGraceMs: 25 });

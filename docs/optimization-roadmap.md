@@ -6,6 +6,22 @@
 > [`automation-hardening-plan.md`](automation-hardening-plan.md) 记录自动化加固；本文只覆盖 0.9.2 之后的
 > **收敛与稳定性** 工作，不改变它们确立的边界与目标。
 
+## 本地后续可靠性修复（基于 v0.10.0，尚未发布）
+
+此轮不搬回已关闭、未合并的 PR #61 安全硬化，也不扩大静态删除解析或 structured bridge 功能。
+
+- ✅ 嵌套 shell 策略检查使用每次调用独立、包含递归深度的缓存，避免重复解析；新增独立子进程硬超时回归。
+- ✅ provider 错误只从明确 HTTP/status 字段识别状态码，不再把 token 数量、request-id 或泛化 provider 错误判为瞬时故障。
+- ✅ interactive 轮次带人工/自动来源；自动轮次与 idle 通知不重置人工空闲时钟，排队人工轮次保留忙状态。
+- ✅ `takeover` 在生命周期锁外取消等待输入，并使旧决策失效；粘贴到首次 Enter 是提交边界，接管确认须等它结束。
+  取消后不盲发 Ctrl-C、不再重试 Enter、不重放已提交但未确认的文本；修复/发布待发送取消不误 park 或终止 Worker。
+- ✅ 恢复提示读取当前剩余预算；不改变 `extendedDeadlineMs` 的累计期限语义。structured bridge 仅修手工输入快速结果丢失和退出清理竞态。
+- ✅ Reviewer 为 attributes 隐藏的实际文本补充强制文本 diff，禁用 textconv/external diff，保持证据上限；真实二进制只记名。
+- ✅ 只对白名单瞬态 Git 读取错误有限重试（最多 3 次）；abort、输出超限、明确否定和配置错误不重试，验收命令绝不因此重跑。
+- ✅ park 状态、事件与通知透传可读 `reasonLabel`，保留原始 `reason`。
+
+确定性夹具不能代替 authenticated Claude interactive spike；真实 Claude/hook 长任务与其余路线图工作仍需后续验证。
+
 ## 1. 背景与目标
 
 0.9.0 → 0.9.2 的独立审查与真实模型端到端测试（`npm run spike:decision`）暴露出一个共同根因：
@@ -253,7 +269,7 @@ copy-mode、Stop-hook block、后台任务、AskUserQuestion、限流模拟；�
 |---|---|---|---|---|
 | D1 ✅ | Decision 失败即 park：约 3 分钟重试后 park；应用动作时抛出的任何错误也被当作 API 失败 | 429/529 常持续更久；发送失败被误标为 API 失败 | 无人值守下对 **可重试的** provider 错误（限流、过载、5xx、超时）按上限退避持续重试直到 deadline；认证、计费、模型不存在等配置错误立即 park 并告警；权限请求回退到策略答案；动作应用错误单独分类（配合 T3）。**已实现**：配置错误立即 park；已完成轮次（未被后续事件取代）上 **明确列出的** 瞬时错误（参照 pi-ai 可重试清单）退避（≤60 s）持续重试并记 `decision_retry`，由空闲 watchdog 兜底验证、close-out 不再等待重试中的决策；其余错误（prompt 过长、会话损坏、自身超时）、权限请求与退出事件仍受 `maxDecisionRetries` 约束；被后续轮次取代的迟到决策、以及取代时仍在失败重试的旧轮次均记 `decision_ignored` 丢弃（不 park）；动作错误记 `decision_action_failed`。**未做**：权限请求回退到策略答案——须在删除底线上线后再做 | 低 |
 | D2 | Reviewer 回复解析：前后散文、额外键、字段顺序、嵌套值、缺 reviewId 均判格式失败；二次失败 → human → park；Provider 失败 4 次即 park | 真实模型的正常输出被判失败 | 保留 reviewId 与重复键检查；取回复中第一个带匹配 reviewId 的对象；忽略未知键；**取消字段顺序与扁平值规则**；格式失败换新会话重试；Provider 耗尽后稍后重验而非 park | 低–中 |
-| D3 ✅ | 未跟踪的二进制、符号链接、硬链接、不可读文件使证据“不完整” → **无修复直接 park**（Reviewer 也拒绝） | Worker 加一张 PNG / fixture DB / symlink 就 park | 这类文件记为“omitted”，证据仍视为完整；git 读取失败重试一次；截断仍走修复。**已实现**：二进制（不论大小，记大小）、符号链接（记目标、不跟随）、特殊文件记名，证据完整；硬链接仍视为不完整（第二个链接可向 Reviewer 隐藏普通文本）。**未做**：git 读取失败重试 | 低 |
+| D3 ✅ | 未跟踪的二进制、符号链接、硬链接、不可读文件使证据“不完整” → **无修复直接 park**（Reviewer 也拒绝） | Worker 加一张 PNG / fixture DB / symlink 就 park | 这类文件记为“omitted”，证据仍视为完整；git 读取失败重试一次；截断仍走修复。**已实现**：二进制（不论大小，记大小）、符号链接（记目标、不跟随）、特殊文件记名，证据完整；硬链接仍视为不完整（第二个链接可向 Reviewer 隐藏普通文本）。**后续本地修复**：白名单瞬态 Git 读取错误最多尝试 3 次（含首次）；abort、输出超限与明确否定不重试 | 低 |
 | D4 | 远端边界正则对整条命令匹配：误拒 `git commit -m "fix: push handler"`、`git stash push`、`git merge --abort`、`git log --grep=merge`、`grep -rn shutdown src/` 等；同一拒绝表也用于验收命令 | 常规开发命令被拒，Worker 反复绕路 | 按语句、在 git 子命令位置匹配（已有 `gitSubcommandIndex`）；只拒 push/send-pack/受保护 ref 的 update-ref，merge 仅在当前或目标为受保护分支时拒；shutdown/reboot 锚定到命令位置 | 低–中 |
 | D5 | 含动态参数（`$VAR`、`$(…)`）的命令一律拒绝：`git show $SHA`、`npx vitest run $TEST_FILE` 等 | 频繁无谓拒绝 | 仅在 push/remote/config/改写分支语句中，或会被 shell/eval/xargs 执行时拒绝 | 低–中 |
 | D6 | 可信 Claude 可执行文件要求每级父目录都无组写/全局写；恢复时钉死旧 realpath | umask 002 的发行版直接启动失败；Claude 自动更新后恢复失败 | 只拒全局可写或他人所有的路径；恢复时重新解析并记 `worker_executable_changed` 事件 | 低 |

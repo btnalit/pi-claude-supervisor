@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, symlink, writeFile } from "node:fs/promises";
+import fsPromises, { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { spawn, spawnSync } from "node:child_process";
+import { homedir, tmpdir } from "node:os";
+import childProcess, { spawn, spawnSync } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import test from "node:test";
 import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS, claudeProjectSlug, effectiveToolInput, inputHoldsMessage, memoryRootFor, sweepDeadTmuxSockets, writeRootsOf } from "./tmux-adapter.ts";
 import { isWorkerInputError } from "./input-error.ts";
@@ -626,6 +627,92 @@ setInterval(() => {}, 10000);
     await rm(stateDir, { recursive: true, force: true });
   }
 });
+
+for (const injectFailure of [false, true]) {
+  test(`overlapping tmux cleanup is coalesced${injectFailure ? ", preserves failure, and can retry" : ""}`, { skip: !automaticTmuxAvailable, concurrency: false, timeout: 20_000 }, async (t) => {
+    const cache = join(homedir(), ".cache");
+    await mkdir(cache, { recursive: true, mode: 0o700 });
+    const stateDir = await mkdtemp(join(cache, "pi-supervisor-cleanup-race-"));
+    const fakeClaude = join(stateDir, "claude");
+    await writeFile(fakeClaude, '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({ type: "system", subtype: "ready" }) + "\\n"); process.stdin.resume();\n', { mode: 0o700 });
+    const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 20, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+    let handle: Awaited<ReturnType<TmuxWorkerAdapter["start"]>> | undefined;
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    let paused = false;
+    let readCalls = 0;
+    let cleanupExecutions = 0;
+    let observeNextPaneStatus = false;
+    let paneProbeClosed!: () => void;
+    const probeClosed = new Promise<void>((resolve) => { paneProbeClosed = resolve; });
+    let stopping: Promise<unknown> | undefined;
+    let inspecting: ReturnType<TmuxWorkerAdapter["getStatus"]> | undefined;
+    let restore = () => {};
+    try {
+      handle = await adapter.start({ task: "cleanup race", cwd: stateDir, command: fakeClaude, args: [], automatic: true, sendInitialInput: false,
+        env: { HOME: join(stateDir, "home"), CLAUDE_CONFIG_DIR: join(stateDir, "config") } });
+      assert.ok(handle.cgroupPath);
+      const cgroupPath = handle.cgroupPath;
+      const originalRead = fsPromises.readFile;
+      const readMock = t.mock.method(fsPromises, "readFile", async (...args: Parameters<typeof originalRead>) => {
+        if (String(args[0]) === `${cgroupPath}/cgroup.events`) {
+          readCalls += 1;
+          if (readCalls === 1) {
+            paused = true;
+            await readGate;
+            if (injectFailure) throw Object.assign(new Error("injected cgroup read failure"), { code: "EIO" });
+          }
+        }
+        return originalRead(...args);
+      });
+      const originalSpawn = childProcess.spawn;
+      const spawnMock = t.mock.method(childProcess, "spawn", (...args: unknown[]) => {
+        const child = Reflect.apply(originalSpawn, childProcess, args) as ReturnType<typeof originalSpawn>;
+        if (Array.isArray(args[1]) && args[1].includes(handle!.tmuxSocket)) {
+          if (args[1].includes("kill-server")) cleanupExecutions += 1;
+          if (observeNextPaneStatus && args[1].includes("display-message")) {
+            observeNextPaneStatus = false;
+            child.once("close", paneProbeClosed);
+          }
+        }
+        return child;
+      });
+      syncBuiltinESMExports();
+      restore = () => { readMock.mock.restore(); spawnMock.mock.restore(); syncBuiltinESMExports(); };
+      stopping = adapter.stop(handle, "overlap cleanup").then(() => undefined, (error: unknown) => error);
+      await waitFor(() => paused);
+      observeNextPaneStatus = true;
+      inspecting = adapter.getStatus(handle);
+      await probeClosed;
+      await new Promise<void>((resolve) => setImmediate(resolve)); // The pane probe has joined cleanup while its read is paused.
+      releaseRead();
+      const [stopError, status] = await Promise.all([stopping, inspecting]);
+      assert.equal(cleanupExecutions, 1, "monitor, stop and status must share one cleanup body");
+      assert.equal(readCalls, 1);
+      if (injectFailure) {
+        assert.match(String(stopError), /injected cgroup read failure/u);
+        assert.match(status.cleanupError ?? "", /injected cgroup read failure/u);
+        assert.equal(status.processGroupCleaned, false);
+        await adapter.stop(handle, "retry failed cleanup");
+        const retried = await adapter.getStatus(handle);
+        assert.equal(retried.cleanupError, undefined);
+        assert.equal(retried.cgroupError, undefined);
+        assert.equal(retried.processGroupCleaned, true);
+        assert.equal(cleanupExecutions, 2);
+      } else {
+        assert.equal(stopError, undefined);
+        assert.equal(status.cleanupError, undefined);
+        assert.equal(status.processGroupCleaned, true);
+      }
+    } finally {
+      releaseRead();
+      restore();
+      await Promise.allSettled([stopping, inspecting].filter(Boolean));
+      if (handle) await adapter.stop(handle, "cleanup race fixture").catch(() => {});
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("automatic tmux allows a Claude child and cgroup cleanup reaps it", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-nested-test-"));
@@ -1485,7 +1572,9 @@ async function startInteractiveOwnedFixture(options: { retainCgroupUntilLeaseRel
   events: WorkerEvent[];
   fakePid: number;
 }> {
-  const stateDir = await realpath(await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-interactive-")));
+  const cache = join(homedir(), ".cache");
+  await mkdir(cache, { recursive: true, mode: 0o700 });
+  const stateDir = await realpath(await mkdtemp(join(cache, "pi-claude-supervisor-tmux-interactive-")));
   const fakeClaude = join(stateDir, "claude");
   const pidFile = join(stateDir, "claude.pid");
   const hookSettingsPath = join(stateDir, "hook-settings.json");
@@ -1731,10 +1820,11 @@ interface FakeTuiConfig { busy: boolean; dropEnters: number }
  * The test flips the config file to change its state.
  */
 async function withFakeTui(
-  options: { inputReadyTimeoutMs: number; inputConfirmTimeoutMs: number; acknowledge: boolean },
+  options: { inputReadyTimeoutMs: number; inputConfirmTimeoutMs: number; acknowledge: boolean; tmuxBinary?: string },
   run: (context: { adapter: TmuxWorkerAdapter; handle: Awaited<ReturnType<TmuxWorkerAdapter["start"]>>; setConfig: (config: FakeTuiConfig) => Promise<void>; submitted: () => Promise<string[]>; socketPath: string; sessionName: string; output: () => Promise<string>; events: WorkerEvent[]; hook: (event: Omit<HookRelayRequest["event"], "session_id" | "cwd">) => Promise<unknown> }) => Promise<void>,
 ): Promise<void> {
-  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-fake-tui-"));
+  await mkdir(join(homedir(), ".cache"), { recursive: true });
+  const stateDir = await mkdtemp(join(homedir(), ".cache", "pi-claude-supervisor-tmux-fake-tui-"));
   const socketPath = join(stateDir, "tmux.sock");
   const sessionName = `pi-fake-tui-${process.pid}-${Date.now()}`;
   const configPath = join(stateDir, "config.json");
@@ -1782,7 +1872,7 @@ render();
   const created = spawnSync("tmux", ["-S", socketPath, "new-session", "-d", "-s", sessionName, "-x", "200", "-c", stateDir, claudeScript], { encoding: "utf8" });
   assert.equal(created.status, 0, created.stderr);
   const hookSource = createFakeHookSource();
-  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000, terminationGraceMs: 200, inputReadyTimeoutMs: options.inputReadyTimeoutMs, inputConfirmTimeoutMs: options.inputConfirmTimeoutMs });
+  const adapter = new TmuxWorkerAdapter({ stateDir, tmuxBinary: options.tmuxBinary, pollIntervalMs: 40, startupTimeoutMs: 5_000, terminationGraceMs: 200, inputReadyTimeoutMs: options.inputReadyTimeoutMs, inputConfirmTimeoutMs: options.inputConfirmTimeoutMs });
   let stopAcks = false;
   let collected = "";
   const events: WorkerEvent[] = [];
@@ -1854,6 +1944,93 @@ test("a send that never finds an idle prompt is refused as retryable", { skip: !
   });
 });
 
+test("cancelling a send waiting for an idle prompt delivers no input", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 5_000, inputConfirmTimeoutMs: 5_000, acknowledge: false }, async ({ adapter, handle, setConfig, submitted }) => {
+    await setConfig({ busy: true, dropEnters: 0 });
+    const controller = new AbortController();
+    const reason = new Error("takeover before paste");
+    const sending = adapter.send(handle, "must not be pasted", "cancel-busy", controller.signal);
+    const rejected = assert.rejects(sending, (error) => error === reason);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    controller.abort(reason);
+    await rejected;
+    assert.deepEqual(await submitted(), []);
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+    await setConfig({ busy: false, dropEnters: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(await submitted(), []);
+  });
+});
+
+test("cancelling after paste settles the initial Enter once without confirmation retries", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-tmux-paste-boundary-"));
+  const binary = join(root, "tmux-boundary");
+  const pasted = join(root, "pasted");
+  const release = join(root, "release");
+  await writeFile(binary, `#!/usr/bin/env node
+const fs = require("node:fs");
+const result = require("node:child_process").spawnSync("tmux", process.argv.slice(2), { stdio: "inherit" });
+(async () => {
+  if (process.argv.includes("paste-buffer") && result.status === 0 && !fs.existsSync(${JSON.stringify(pasted)})) {
+    fs.writeFileSync(${JSON.stringify(pasted)}, "pasted");
+    for (let i = 0; i < 250 && !fs.existsSync(${JSON.stringify(release)}); i++) await new Promise(r => setTimeout(r, 20));
+  }
+  process.exit(result.status ?? 1);
+})();
+`);
+  await chmod(binary, 0o700);
+  try {
+    await withFakeTui({ inputReadyTimeoutMs: 5_000, inputConfirmTimeoutMs: 5_000, acknowledge: false, tmuxBinary: binary }, async ({ adapter, handle, submitted, output, hook, events }) => {
+      const controller = new AbortController();
+      let settled = false;
+      const sending = adapter.send(handle, "pasted boundary", "cancel-paste", controller.signal).finally(() => { settled = true; });
+      await waitForFile(pasted);
+      controller.abort(new Error("takeover during paste"));
+      assert.equal(settled, false, "submission boundary must settle before takeover is acknowledged");
+      await writeFile(release, "continue");
+      await sending;
+      assert.deepEqual(await submitted(), ["pasted boundary"]);
+      await adapter.send(handle, "pasted boundary", "cancel-paste");
+      assert.deepEqual(await submitted(), ["pasted boundary"]);
+      assert.doesNotMatch(await output(), /sent Enter again/u);
+      await hook({ hook_event_name: "Notification", notification_type: "idle_prompt" });
+      assert.equal(events.filter((event) => event.type === "turn_completed").length, 1);
+      assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cancelling after Enter never replays delivered-but-unconfirmed input", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 5_000, inputConfirmTimeoutMs: 5_000, acknowledge: false }, async ({ adapter, handle, submitted, output }) => {
+    const controller = new AbortController();
+    const sending = adapter.send(handle, "entered once", "cancel-confirm", controller.signal);
+    for (let i = 0; i < 100 && (await submitted()).length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(await submitted(), ["entered once"]);
+    controller.abort(new Error("takeover after Enter"));
+    await sending;
+    await adapter.send(handle, "entered once", "cancel-confirm");
+    assert.deepEqual(await submitted(), ["entered once"]);
+    assert.doesNotMatch(await output(), /sent Enter again/u);
+  });
+});
+
+test("queued human completion is distinguished from the automatic turn before it", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 1_000, acknowledge: true }, async ({ adapter, handle, hook, events }) => {
+    await adapter.send(handle, "automatic request", "source-1");
+    await hook({ hook_event_name: "UserPromptSubmit", prompt: "queued human request" });
+    await hook({ hook_event_name: "Stop", last_assistant_message: "automatic done" });
+    const first = events.find((event) => event.type === "turn_completed");
+    assert.equal(first?.source, "automatic");
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 1);
+    await hook({ hook_event_name: "Stop", last_assistant_message: "human done" });
+    const completions = events.filter((event) => event.type === "turn_completed");
+    assert.equal(completions[1]?.source, "human");
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+  });
+});
+
 test("a lost Enter is resent while the input box still holds the message", { skip: !tmuxAvailable, concurrency: false }, async () => {
   await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 400, acknowledge: true }, async ({ adapter, handle, setConfig, submitted, output }) => {
     await setConfig({ busy: false, dropEnters: 1 });
@@ -1918,22 +2095,126 @@ test("an interactive send leaves every stacked tmux mode, not only a single copy
   });
 });
 
-test("an idle notification between paste and UserPromptSubmit does not count as delivery", { skip: !tmuxAvailable, concurrency: false }, async () => {
-  await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 400, acknowledge: false }, async ({ adapter, handle, setConfig, hook, events, output }) => {
-    await setConfig({ busy: false, dropEnters: 1 });
-    const sending = adapter.send(handle, "wait for the real submit", "idle-1");
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    await hook({ hook_event_name: "Notification", notification_type: "idle_prompt", message: "Claude is waiting for your input" });
-    await sending;
-    // The dropped Enter was resent: the idle notification did not short-circuit the check.
-    assert.match(await output(), /sent Enter again/u);
-    // The idle notice did not close the turn that was only starting.
-    assert.equal(events.some((event) => event.type === "turn_completed"), false);
-    assert.equal((await adapter.getStatus(handle)).activeRequests, 1);
-    // The real submission still matches the pasted message rather than reading as a human prompt.
-    await hook({ hook_event_name: "UserPromptSubmit", prompt: "wait for the real submit" });
-    assert.equal(events.some((event) => event.type === "human_input"), false);
+for (const scenario of ["idle", "native", "acknowledged"] as const) {
+  const nativeInput = scenario === "native";
+  test(scenario === "acknowledged"
+    ? "an acknowledged turn can finish while initial Enter is still settling"
+    : nativeInput
+      ? "native input during paste is not masked by the submission idle guard"
+      : "an idle notification between paste and UserPromptSubmit does not count as delivery", { skip: !tmuxAvailable, concurrency: false, timeout: 15_000 }, async () => {
+    await mkdir(join(homedir(), ".cache"), { recursive: true });
+    const root = await mkdtemp(join(homedir(), ".cache", "pi-tmux-idle-boundary-"));
+    const binary = join(root, "tmux-boundary");
+    const pasted = join(root, "pasted");
+    const release = join(root, "release");
+    await writeFile(binary, `#!/usr/bin/env node
+const fs = require("node:fs");
+const result = require("node:child_process").spawnSync("tmux", process.argv.slice(2), { stdio: "inherit" });
+(async () => {
+  if (process.argv.includes("paste-buffer") && result.status === 0 && !fs.existsSync(${JSON.stringify(pasted)})) {
+    fs.writeFileSync(${JSON.stringify(pasted)}, "pasted");
+    for (let i = 0; i < 250 && !fs.existsSync(${JSON.stringify(release)}); i++) await new Promise(r => setTimeout(r, 20));
+  }
+  process.exit(result.status ?? 1);
+})();
+`);
+    await chmod(binary, 0o700);
+    try {
+      await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 400, acknowledge: false, tmuxBinary: binary }, async ({ adapter, handle, setConfig, hook, events, output, socketPath, sessionName, submitted }) => {
+        await setConfig({ busy: false, dropEnters: scenario === "acknowledged" ? 0 : 1 });
+        const sending = adapter.send(handle, "wait for the real submit", "idle-1");
+        await waitForFile(pasted);
+        await hook({ hook_event_name: "Notification", notification_type: "idle_prompt", message: "Claude is waiting for your input" });
+        assert.equal(events.some((event) => event.type === "turn_completed"), false);
+        if (scenario === "acknowledged") {
+          // A human presses Enter on the already-pasted automatic message.
+          // Its real submit hook proves delivery even while our initial Enter
+          // operation is still pending; a fast idle must not then be lost.
+          assert.equal(spawnSync("tmux", ["-S", socketPath, "send-keys", "-t", sessionName, "Enter"]).status, 0);
+          for (const deadline = Date.now() + 5_000; (await submitted()).length === 0;) {
+            if (Date.now() > deadline) throw new Error("the pasted message was never submitted");
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          await hook({ hook_event_name: "UserPromptSubmit", prompt: "wait for the real submit" });
+          await hook({ hook_event_name: "Notification", notification_type: "idle_prompt" });
+          assert.equal(events.filter((event) => event.type === "turn_completed").length, 1);
+          await writeFile(release, "continue");
+          await sending;
+          assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+          assert.doesNotMatch(await output(), /sent Enter again/u);
+          return;
+        }
+        if (nativeInput) {
+          await hook({ hook_event_name: "UserPromptSubmit", prompt: "human typing during paste" });
+          assert.ok(events.some((event) => event.type === "human_input" && event.text === "human typing during paste"));
+        }
+        await writeFile(release, "continue");
+        await sending;
+        // The dropped Enter was resent: the idle notification did not short-circuit the check.
+        assert.match(await output(), /sent Enter again/u);
+        // The idle notice did not close the turn that was only starting.
+        assert.equal(events.some((event) => event.type === "turn_completed"), false);
+        assert.equal((await adapter.getStatus(handle)).activeRequests, 1);
+        // The real submission still matches the pasted message rather than reading as a human prompt.
+        await hook({ hook_event_name: "UserPromptSubmit", prompt: "wait for the real submit" });
+        assert.equal(events.some((event) => event.type === "human_input"), nativeInput);
+        // Once submission has settled, a real idle notification still completes
+        // its turn; neither success nor a queued human turn leaves the guard stuck.
+        await hook({ hook_event_name: "Notification", notification_type: "idle_prompt" });
+        const completions = events.filter((event) => event.type === "turn_completed");
+        assert.equal(completions.length, 1);
+        assert.equal(completions[0]?.source, "automatic");
+        assert.equal((await adapter.getStatus(handle)).activeRequests, nativeInput ? 1 : 0);
+        if (nativeInput) {
+          await hook({ hook_event_name: "Notification", notification_type: "idle_prompt" });
+          assert.equal(events.filter((event) => event.type === "turn_completed")[1]?.source, "human");
+          assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
+}
+
+test("failed submission preserves a queued human turn and restores idle notifications", { skip: !tmuxAvailable, concurrency: false, timeout: 15_000 }, async () => {
+  await mkdir(join(homedir(), ".cache"), { recursive: true });
+  const root = await mkdtemp(join(homedir(), ".cache", "pi-tmux-failed-submission-"));
+  const binary = join(root, "tmux-failure");
+  const failing = join(root, "failing");
+  const release = join(root, "release");
+  await writeFile(binary, `#!/usr/bin/env node
+const fs = require("node:fs");
+(async () => {
+  if (process.argv.includes("paste-buffer")) {
+    fs.writeFileSync(${JSON.stringify(failing)}, "failing");
+    for (let i = 0; i < 250 && !fs.existsSync(${JSON.stringify(release)}); i++) await new Promise(r => setTimeout(r, 20));
+    process.stderr.write("injected paste failure\\n");
+    process.exit(42);
+  }
+  const result = require("node:child_process").spawnSync("tmux", process.argv.slice(2), { stdio: "inherit" });
+  process.exit(result.status ?? 1);
+})();
+`);
+  await chmod(binary, 0o700);
+  try {
+    await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 400, acknowledge: false, tmuxBinary: binary }, async ({ adapter, handle, submitted, hook, events }) => {
+      const rejected = assert.rejects(adapter.send(handle, "failed automated submission", "failed-paste"), /injected paste failure/u);
+      await waitForFile(failing);
+      await hook({ hook_event_name: "UserPromptSubmit", prompt: "human during the failed submission" });
+      await writeFile(release, "continue");
+      await rejected;
+      assert.deepEqual(await submitted(), []);
+      assert.equal((await adapter.getStatus(handle)).activeRequests, 1, "the failed automatic reservation cannot clear a queued human turn");
+      await hook({ hook_event_name: "Notification", notification_type: "idle_prompt" });
+      const completions = events.filter((event) => event.type === "turn_completed");
+      assert.equal(completions.length, 1);
+      assert.equal(completions[0]?.source, "human");
+      assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("a prompt that differs from the paste right after it is the Supervisor's own, not a human's", { skip: !tmuxAvailable, concurrency: false }, async () => {
