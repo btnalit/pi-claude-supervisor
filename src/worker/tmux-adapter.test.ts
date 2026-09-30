@@ -2095,10 +2095,13 @@ test("an interactive send leaves every stacked tmux mode, not only a single copy
   });
 });
 
-for (const nativeInput of [false, true]) {
-  test(nativeInput
-    ? "native input during paste is not masked by the submission idle guard"
-    : "an idle notification between paste and UserPromptSubmit does not count as delivery", { skip: !tmuxAvailable, concurrency: false, timeout: 15_000 }, async () => {
+for (const scenario of ["idle", "native", "acknowledged"] as const) {
+  const nativeInput = scenario === "native";
+  test(scenario === "acknowledged"
+    ? "an acknowledged turn can finish while initial Enter is still settling"
+    : nativeInput
+      ? "native input during paste is not masked by the submission idle guard"
+      : "an idle notification between paste and UserPromptSubmit does not count as delivery", { skip: !tmuxAvailable, concurrency: false, timeout: 15_000 }, async () => {
     await mkdir(join(homedir(), ".cache"), { recursive: true });
     const root = await mkdtemp(join(homedir(), ".cache", "pi-tmux-idle-boundary-"));
     const binary = join(root, "tmux-boundary");
@@ -2117,12 +2120,30 @@ const result = require("node:child_process").spawnSync("tmux", process.argv.slic
 `);
     await chmod(binary, 0o700);
     try {
-      await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 400, acknowledge: false, tmuxBinary: binary }, async ({ adapter, handle, setConfig, hook, events, output }) => {
-        await setConfig({ busy: false, dropEnters: 1 });
+      await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 400, acknowledge: false, tmuxBinary: binary }, async ({ adapter, handle, setConfig, hook, events, output, socketPath, sessionName, submitted }) => {
+        await setConfig({ busy: false, dropEnters: scenario === "acknowledged" ? 0 : 1 });
         const sending = adapter.send(handle, "wait for the real submit", "idle-1");
         await waitForFile(pasted);
         await hook({ hook_event_name: "Notification", notification_type: "idle_prompt", message: "Claude is waiting for your input" });
         assert.equal(events.some((event) => event.type === "turn_completed"), false);
+        if (scenario === "acknowledged") {
+          // A human presses Enter on the already-pasted automatic message.
+          // Its real submit hook proves delivery even while our initial Enter
+          // operation is still pending; a fast idle must not then be lost.
+          assert.equal(spawnSync("tmux", ["-S", socketPath, "send-keys", "-t", sessionName, "Enter"]).status, 0);
+          for (const deadline = Date.now() + 5_000; (await submitted()).length === 0;) {
+            if (Date.now() > deadline) throw new Error("the pasted message was never submitted");
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          await hook({ hook_event_name: "UserPromptSubmit", prompt: "wait for the real submit" });
+          await hook({ hook_event_name: "Notification", notification_type: "idle_prompt" });
+          assert.equal(events.filter((event) => event.type === "turn_completed").length, 1);
+          await writeFile(release, "continue");
+          await sending;
+          assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+          assert.doesNotMatch(await output(), /sent Enter again/u);
+          return;
+        }
         if (nativeInput) {
           await hook({ hook_event_name: "UserPromptSubmit", prompt: "human typing during paste" });
           assert.ok(events.some((event) => event.type === "human_input" && event.text === "human typing during paste"));

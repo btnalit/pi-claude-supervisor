@@ -2330,11 +2330,12 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         if (event.notification_type === "permission_prompt") {
           const hasPendingPrompt = [...record.pendingPermissionRequests.values()].some((pending) => pending.phase === "prompt");
           if (!hasPendingPrompt) this.#logOutput(record, "[supervisor] Claude is waiting at a permission prompt the hook did not intercept\n");
-        } else if (event.notification_type === "idle_prompt" && record.activeRequests > 0 && !record.submittingInput && !record.confirmingDelivery) {
-          // Skipped while a send is confirming its delivery: an idle notice in
-          // the gap between the paste and its UserPromptSubmit would close a
-          // turn that is only just starting, and the Supervisor would decide
-          // (even verify) on an empty result while Claude works.
+        } else if (event.notification_type === "idle_prompt" && record.activeRequests > 0
+          && ((!record.submittingInput && !record.confirmingDelivery) || record.pendingSentMessages.length === 0)) {
+          // Before acknowledgement, idle during paste/Enter does not prove the
+          // reserved turn was consumed. A real submit acknowledgement can
+          // precede our Enter's return: do not lose that fast completed turn
+          // merely because the submission operation is still settling.
           // Claude has been idle at its prompt for a minute with no Stop
           // delivered (interrupted turn, lost hook): close the turn so the
           // Supervisor is not left waiting for a completion that will not come.
