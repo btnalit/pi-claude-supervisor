@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, type ExecFileOptions } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { lstat, open, readlink, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -7,8 +7,10 @@ import type { AcceptanceCheck, AcceptanceCheckResult, AcceptanceReport, Verifica
 import { evidenceMaxBytes, evidenceMaxUntrackedFiles } from "./config.ts";
 import { assertSafeWorkerCommand, isCommitId } from "./policy.ts";
 import { workerEnvironment } from "./worker/environment.ts";
+import { retryGitRead } from "./git-read.ts";
 
 const execFileAsync = promisify(execFile);
+const execGitRead = (args: string[], options: ExecFileOptions & { encoding?: "utf8" }) => retryGitRead(() => execFileAsync("git", args, options), options.signal);
 const MAX_UNTRACKED_FILE_BYTES = 256 * 1024;
 
 /** The bounded evidence/output size; configurable via PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES. */
@@ -67,7 +69,7 @@ export interface RepositoryEvidence {
 /** Read the repository HEAD without invoking a shell. */
 export async function repositoryHead(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
   try {
-    const result = await execFileAsync("git", ["rev-parse", "--verify", "HEAD"], {
+    const result = await execGitRead(["rev-parse", "--verify", "HEAD"], {
       cwd,
       timeout: 30_000,
       maxBuffer: 1024,
@@ -110,13 +112,14 @@ const REPOSITORY_RELOCATING_GIT_VARIABLE = /^(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON
  * Worker published. Never used for anything that mutates.
  */
 export async function runReadOnly(command: string, args: readonly string[], cwd: string, signal?: AbortSignal): Promise<{ stdout: string }> {
-  const result = await execFileAsync(command, [...args], {
+  const read = () => execFileAsync(command, [...args], {
     cwd,
     timeout: 60_000,
     maxBuffer: 256 * 1024,
     signal,
     env: remoteReadEnvironment(),
   });
+  const result = await (command === "git" ? retryGitRead(read, signal) : read());
   return { stdout: String(result.stdout) };
 }
 
@@ -229,7 +232,7 @@ async function resolveSshHostname(alias: string, signal?: AbortSignal): Promise<
 export async function repositoryCommitExists(cwd: string, commit: string, signal?: AbortSignal): Promise<boolean> {
   if (!isCommitId(commit)) return false;
   try {
-    const result = await execFileAsync("git", ["cat-file", "-e", `${commit}^{commit}`], {
+    const result = await execGitRead(["cat-file", "-e", `${commit}^{commit}`], {
       cwd,
       timeout: 30_000,
       maxBuffer: 1024,
@@ -245,7 +248,7 @@ export async function repositoryCommitExists(cwd: string, commit: string, signal
 /** Verify that `ancestor` is reachable from `descendant` (or is `descendant` itself) without invoking a shell. */
 export async function repositoryIsAncestor(cwd: string, ancestor: string, descendant: string, signal?: AbortSignal): Promise<boolean> {
   try {
-    await execFileAsync("git", ["merge-base", "--is-ancestor", ancestor, descendant], {
+    await execGitRead(["merge-base", "--is-ancestor", ancestor, descendant], {
       cwd,
       timeout: 30_000,
       maxBuffer: 1024,
@@ -265,7 +268,7 @@ export async function repositoryIsAncestor(cwd: string, ancestor: string, descen
  */
 export async function repositoryClean(cwd: string, signal?: AbortSignal): Promise<boolean | undefined> {
   try {
-    const result = await execFileAsync("git", ["status", "--porcelain", "--untracked-files=all"], {
+    const result = await execGitRead(["status", "--porcelain", "--untracked-files=all"], {
       cwd,
       timeout: 30_000,
       maxBuffer: 1024 * 1024,
@@ -290,7 +293,7 @@ export async function repositoryClean(cwd: string, signal?: AbortSignal): Promis
 export async function repositoryGitDirectoryIsLocal(cwd: string, signal?: AbortSignal): Promise<boolean> {
   try {
     const read = async (args: string[]): Promise<string> => {
-      const result = await execFileAsync("git", args, { cwd, timeout: 30_000, maxBuffer: 4096, signal, env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }) });
+      const result = await execGitRead(args, { cwd, timeout: 30_000, maxBuffer: 4096, signal, env: workerEnvironment(process.env, { GIT_TERMINAL_PROMPT: "0" }) });
       return String(result.stdout).trim();
     };
     const [gitDir, commonDir] = await Promise.all([read(["rev-parse", "--git-dir"]), read(["rev-parse", "--git-common-dir"])]);
@@ -311,7 +314,7 @@ export async function repositoryGitDirectoryIsLocal(cwd: string, signal?: AbortS
 /** Determine whether cwd is a non-bare Git worktree without invoking a shell. */
 export async function repositoryWorkTree(cwd: string, signal?: AbortSignal): Promise<boolean | undefined> {
   try {
-    const result = await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], {
+    const result = await execGitRead(["rev-parse", "--is-inside-work-tree"], {
       cwd,
       timeout: 30_000,
       maxBuffer: 1024,
@@ -328,7 +331,7 @@ export async function repositoryWorkTree(cwd: string, signal?: AbortSignal): Pro
 /** Read the current symbolic branch without invoking a shell. */
 export async function repositoryBranch(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
   try {
-    const result = await execFileAsync("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], {
+    const result = await execGitRead(["symbolic-ref", "--quiet", "--short", "HEAD"], {
       cwd,
       timeout: 30_000,
       maxBuffer: 1024,
@@ -468,7 +471,7 @@ interface EvidencePart {
 async function readGitEvidence(cwd: string, args: string[], signal?: AbortSignal): Promise<EvidencePart> {
   throwIfAborted(signal);
   try {
-    const result = await execFileAsync("git", args, {
+    const result = await execGitRead(args, {
       cwd,
       timeout: 30_000,
       maxBuffer: maxExecBufferBytes(),
@@ -497,7 +500,7 @@ async function collectUntrackedEvidence(cwd: string, signal?: AbortSignal): Prom
     return { text: `[UNTRACKED EVIDENCE UNAVAILABLE] ${error instanceof Error ? error.message : String(error)}`, complete: false, truncated: false };
   }
   try {
-    const result = await execFileAsync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+    const result = await execGitRead(["ls-files", "--others", "--exclude-standard", "-z"], {
       cwd,
       timeout: 30_000,
       maxBuffer: maxOutputBytes(),
