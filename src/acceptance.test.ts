@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { link, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { access, link, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
@@ -164,6 +164,65 @@ test("an untracked binary file, even a large one, is omitted without making the 
     assert.match(evidence.untracked ?? "", /"logo\.png" \[binary file, \d+ bytes; content omitted\]/u);
     assert.match(evidence.untracked ?? "", /plain text/u);
   } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("Reviewer evidence reveals attribute-hidden text without textconv, external diff or binary contents", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-evidence-attributes-"));
+  const marker = join(cwd, "converter-ran");
+  try {
+    await initWithCommit(cwd);
+    await writeFile(join(cwd, ".gitattributes"), "* -diff\nconverted.txt diff=unsafe\n");
+    await writeFile(join(cwd, "hidden.txt"), "original source\n");
+    await writeFile(join(cwd, "deleted.txt"), "deleted source evidence\n");
+    await writeFile(join(cwd, "converted.txt"), "before converter\n");
+    await writeFile(join(cwd, "image.bin"), Buffer.concat([Buffer.from([0, 1]), Buffer.alloc(1024 * 1024, 2)]));
+    await execFileAsync("git", ["add", "."], { cwd });
+    await execFileAsync("git", ["-c", "user.email=test@example.invalid", "-c", "user.name=Test", "commit", "-qm", "attribute baseline"], { cwd });
+    const baseRef = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim();
+    const converter = join(cwd, "converter.sh");
+    await writeFile(converter, `#!/bin/sh\nprintf ran > '${marker}'\n`, { mode: 0o700 });
+    await execFileAsync("git", ["config", "diff.unsafe.textconv", converter], { cwd });
+    await execFileAsync("git", ["config", "diff.unsafe.command", converter], { cwd });
+    await writeFile(join(cwd, "hidden.txt"), "source the Reviewer must see\n");
+    await writeFile(join(cwd, "converted.txt"), "raw text, not converter output\n");
+    await rm(join(cwd, "deleted.txt"));
+    await writeFile(join(cwd, "new\tfile.txt"), "staged hidden addition\n");
+    await execFileAsync("git", ["add", "new\tfile.txt"], { cwd });
+    await writeFile(join(cwd, "image.bin"), Buffer.concat([Buffer.from("\0BINARY_SENTINEL"), Buffer.alloc(3 * 1024 * 1024, 3)]));
+    const evidence = await collectRepositoryEvidence(cwd, { baseRef });
+    assert.equal(evidence.complete, true);
+    assert.equal(evidence.truncated, false);
+    assert.match(evidence.diff, /\+source the Reviewer must see/u);
+    assert.match(evidence.diff, /-deleted source evidence/u);
+    assert.match(evidence.diff, /\+staged hidden addition/u);
+    assert.match(evidence.diff, /\+raw text, not converter output/u);
+    assert.match(evidence.diff, /Binary files .*image\.bin/u);
+    assert.doesNotMatch(evidence.diff, /BINARY_SENTINEL/u);
+    await assert.rejects(access(marker), { code: "ENOENT" });
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("attribute-hidden text remains subject to evidence limits", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-evidence-attributes-large-"));
+  const previous = process.env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES;
+  try {
+    await initWithCommit(cwd);
+    await writeFile(join(cwd, ".gitattributes"), "tracked.txt -diff\n");
+    await execFileAsync("git", ["add", ".gitattributes"], { cwd });
+    await execFileAsync("git", ["-c", "user.email=test@example.invalid", "-c", "user.name=Test", "commit", "-qm", "attributes"], { cwd });
+    await writeFile(join(cwd, "tracked.txt"), "x".repeat(2_000_000));
+    process.env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES = String(64 * 1024);
+    const evidence = await collectRepositoryEvidence(cwd);
+    assert.equal(evidence.complete, false);
+    assert.equal(evidence.truncated, true);
+    assert.ok(Buffer.byteLength(evidence.diff) <= 64 * 1024);
+  } finally {
+    if (previous === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES;
+    else process.env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES = previous;
     await rm(cwd, { recursive: true, force: true });
   }
 });
