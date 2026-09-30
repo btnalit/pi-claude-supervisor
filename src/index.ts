@@ -1214,6 +1214,7 @@ function formatSessionDetail(taskId: string, session: Supervisor, tmuxModeLabel?
   if (tmuxModeLabel) parts.push(`mode=${tmuxModeLabel}`);
   if (session.humanRequired) parts.push("automation=paused(resume-auto)");
   if (session.candidateParked) parts.push("candidate=parked");
+  if (session.parkReasonLabel) parts.push(`parkReason=${JSON.stringify(session.parkReasonLabel)}`);
   if (task) {
     parts.push(`turn=${session.turn}/${task.maxTurns}`);
     if (session.repairRound > 0) parts.push(`repair=${session.repairRound}`);

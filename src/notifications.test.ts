@@ -53,6 +53,26 @@ test("candidate webhook is an optional status notification, not an approval requ
   assert.doesNotMatch(body, /approve_or_deny_permission/u);
 });
 
+test("park labels reach both notification formats without replacing the original reason", async () => {
+  const originalFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = (async (_input, init) => {
+    bodies.push(String(init?.body ?? ""));
+    return new Response("ok", { status: 200 });
+  }) as typeof fetch;
+  const candidate: CandidateNotice = { taskId: "parked", cwd: "/tmp/work", task: "test", status: "blocked", deliverable: false, reason: "original input evidence", reasonLabel: "Worker input" };
+  try {
+    await new HumanWebhookNotifier({ url: "https://example.test/hook" }).notifyCandidate(candidate);
+    await new HumanWebhookNotifier({ url: "https://example.test/hook", format: "wecom" }).notifyCandidate(candidate);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.equal(JSON.parse(bodies[0]!).reason, "original input evidence");
+  assert.equal(JSON.parse(bodies[0]!).reasonLabel, "Worker input");
+  assert.match(bodies[1]!, /Worker input/u);
+  assert.match(bodies[1]!, /original input evidence/u);
+});
+
 test("a pull request URL survives both notice formats unescaped", async () => {
   const originalFetch = globalThis.fetch;
   let genericBody = "";
