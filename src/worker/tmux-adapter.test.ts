@@ -2177,25 +2177,35 @@ const result = require("node:child_process").spawnSync("tmux", process.argv.slic
   });
 }
 
-test("failed submission restores idle notifications for a subsequent human turn", { skip: !tmuxAvailable, concurrency: false, timeout: 15_000 }, async () => {
+test("failed submission preserves a queued human turn and restores idle notifications", { skip: !tmuxAvailable, concurrency: false, timeout: 15_000 }, async () => {
   await mkdir(join(homedir(), ".cache"), { recursive: true });
   const root = await mkdtemp(join(homedir(), ".cache", "pi-tmux-failed-submission-"));
   const binary = join(root, "tmux-failure");
+  const failing = join(root, "failing");
+  const release = join(root, "release");
   await writeFile(binary, `#!/usr/bin/env node
-if (process.argv.includes("paste-buffer")) {
-  process.stderr.write("injected paste failure\\n");
-  process.exit(42);
-}
-const result = require("node:child_process").spawnSync("tmux", process.argv.slice(2), { stdio: "inherit" });
-process.exit(result.status ?? 1);
+const fs = require("node:fs");
+(async () => {
+  if (process.argv.includes("paste-buffer")) {
+    fs.writeFileSync(${JSON.stringify(failing)}, "failing");
+    for (let i = 0; i < 250 && !fs.existsSync(${JSON.stringify(release)}); i++) await new Promise(r => setTimeout(r, 20));
+    process.stderr.write("injected paste failure\\n");
+    process.exit(42);
+  }
+  const result = require("node:child_process").spawnSync("tmux", process.argv.slice(2), { stdio: "inherit" });
+  process.exit(result.status ?? 1);
+})();
 `);
   await chmod(binary, 0o700);
   try {
     await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 400, acknowledge: false, tmuxBinary: binary }, async ({ adapter, handle, submitted, hook, events }) => {
-      await assert.rejects(adapter.send(handle, "failed automated submission", "failed-paste"), /injected paste failure/u);
+      const rejected = assert.rejects(adapter.send(handle, "failed automated submission", "failed-paste"), /injected paste failure/u);
+      await waitForFile(failing);
+      await hook({ hook_event_name: "UserPromptSubmit", prompt: "human during the failed submission" });
+      await writeFile(release, "continue");
+      await rejected;
       assert.deepEqual(await submitted(), []);
-      assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
-      await hook({ hook_event_name: "UserPromptSubmit", prompt: "human after the failed submission" });
+      assert.equal((await adapter.getStatus(handle)).activeRequests, 1, "the failed automatic reservation cannot clear a queued human turn");
       await hook({ hook_event_name: "Notification", notification_type: "idle_prompt" });
       const completions = events.filter((event) => event.type === "turn_completed");
       assert.equal(completions.length, 1);

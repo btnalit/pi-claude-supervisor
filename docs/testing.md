@@ -73,7 +73,7 @@ trusted parent such as a 0700 directory under `$HOME/.cache`, not world-writable
   cgroup read boundary to assert one cleanup execution, shared failure evidence,
   and a successful later retry; unexpected filesystem errors are not suppressed.
 - Automatic completions and idle notices cannot reset human idleness. Queued human
-  completions retain their source and active-turn state.
+  turns retain their source and busy state even when an automatic submission fails.
 - Git read retries are bounded and exclude aborts, evidence overflow, definitive
   negatives and credentials failures. Acceptance commands are not retried.
 - Attribute-hidden tracked text, including additions/deletions, remains visible to
