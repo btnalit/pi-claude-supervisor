@@ -241,6 +241,7 @@ for (const replacement of ["symlink", "file"] as const) {
         await mkdir(join(cwd, "d"));
         await writeFile(join(cwd, ".gitattributes"), "* -diff\n");
         await writeFile(join(cwd, "d", "hidden.txt"), "baseline deletion text\n");
+        await writeFile(join(cwd, "d", "image.bin"), Buffer.from("\0DELETED_BINARY_SENTINEL\n"));
         await writeFile(join(outside, "hidden.txt"), "OUTSIDE_MUST_NOT_BE_READ\n");
         await execFileAsync("git", ["add", "."], { cwd });
         await execFileAsync("git", ["-c", "user.email=test@example.invalid", "-c", "user.name=Test", "commit", "-qm", "tree baseline"], { cwd });
@@ -254,13 +255,41 @@ for (const replacement of ["symlink", "file"] as const) {
         assert.equal(evidence.truncated, false);
         assert.match(evidence.diff, /-baseline deletion text/u);
         if (replacement === "file" && staged) assert.match(evidence.diff, /\+replacement ordinary text/u);
-        assert.doesNotMatch(evidence.diff, /OUTSIDE_MUST_NOT_BE_READ/u);
+        assert.doesNotMatch(evidence.diff, /OUTSIDE_MUST_NOT_BE_READ|DELETED_BINARY_SENTINEL|\0/u);
       } finally {
         await rm(cwd, { recursive: true, force: true });
         await rm(outside, { recursive: true, force: true });
       }
     });
   }
+}
+
+for (const staged of [false, true]) {
+  test(`attribute-hidden file replacement with ${staged ? "a staged" : "an unstaged"} mixed text/binary tree omits binary descendants`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "pi-evidence-new-tree-"));
+    try {
+      await initWithCommit(cwd);
+      await writeFile(join(cwd, ".gitattributes"), "* -diff\n");
+      await writeFile(join(cwd, "d"), "baseline former file\n");
+      await execFileAsync("git", ["add", "."], { cwd });
+      await execFileAsync("git", ["-c", "user.email=test@example.invalid", "-c", "user.name=Test", "commit", "-qm", "file baseline"], { cwd });
+      const baseRef = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim();
+      await rm(join(cwd, "d"));
+      await mkdir(join(cwd, "d"));
+      await writeFile(join(cwd, "d", "hidden.txt"), "new descendant text\n");
+      await writeFile(join(cwd, "d", "image.bin"), Buffer.from("\0ADDED_BINARY_SENTINEL\n"));
+      if (staged) await execFileAsync("git", ["add", "-A"], { cwd });
+      const evidence = await collectRepositoryEvidence(cwd, { baseRef });
+      assert.equal(evidence.complete, true);
+      assert.equal(evidence.truncated, false);
+      assert.match(evidence.diff, /-baseline former file/u);
+      const text = `${evidence.diff}\n${evidence.untracked ?? ""}`;
+      assert.match(text, /new descendant text/u);
+      assert.doesNotMatch(text, /ADDED_BINARY_SENTINEL|\0/u);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 }
 
 test("attribute-hidden text remains subject to evidence limits", async () => {
@@ -274,6 +303,32 @@ test("attribute-hidden text remains subject to evidence limits", async () => {
     await writeFile(join(cwd, "tracked.txt"), "x".repeat(2_000_000));
     process.env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES = String(64 * 1024);
     const evidence = await collectRepositoryEvidence(cwd);
+    assert.equal(evidence.complete, false);
+    assert.equal(evidence.truncated, true);
+    assert.ok(Buffer.byteLength(evidence.diff) <= 64 * 1024);
+  } finally {
+    if (previous === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES;
+    else process.env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES = previous;
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("attribute-hidden A/D groups share the aggregate evidence bound", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-evidence-group-bound-"));
+  const previous = process.env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES;
+  try {
+    await initWithCommit(cwd);
+    await mkdir(join(cwd, "d"));
+    await writeFile(join(cwd, ".gitattributes"), "* -diff\n");
+    await writeFile(join(cwd, "d", "hidden.txt"), "baseline deletion text\n".repeat(2_000));
+    await execFileAsync("git", ["add", "."], { cwd });
+    await execFileAsync("git", ["-c", "user.email=test@example.invalid", "-c", "user.name=Test", "commit", "-qm", "bounded tree baseline"], { cwd });
+    const baseRef = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd })).stdout.trim();
+    await rm(join(cwd, "d"), { recursive: true });
+    await writeFile(join(cwd, "d"), "replacement ordinary text\n".repeat(2_000));
+    await execFileAsync("git", ["add", "-A"], { cwd });
+    process.env.PI_CLAUDE_SUPERVISOR_EVIDENCE_MAX_BYTES = String(64 * 1024);
+    const evidence = await collectRepositoryEvidence(cwd, { baseRef });
     assert.equal(evidence.complete, false);
     assert.equal(evidence.truncated, true);
     assert.ok(Buffer.byteLength(evidence.diff) <= 64 * 1024);

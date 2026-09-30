@@ -479,8 +479,10 @@ async function readTrackedDiff(cwd: string, ref: string, signal?: AbortSignal): 
   if (!stats.complete) return { text: `${normal.text}\n${stats.text}`, complete: false, truncated: stats.truncated };
   const hidden = stats.text.split("\0").filter((entry) => entry.startsWith("-\t-\t")).map((entry) => entry.slice(4));
   if (hidden.length === 0) return normal;
-  const paths: string[] = [];
-  let complete = hidden.length <= maxUntrackedFiles();
+  const groups = new Map<string, string[]>();
+  const pathsTruncated = hidden.length > maxUntrackedFiles();
+  let complete = !pathsTruncated;
+  let truncated = pathsTruncated;
   try {
     const changes = await readGitEvidence(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-status", "-z", ref, "--"], signal);
     if (!changes.complete) {
@@ -494,20 +496,32 @@ async function readTrackedDiff(cwd: string, ref: string, signal?: AbortSignal): 
     for (const path of hidden.slice(0, maxUntrackedFiles())) {
       throwIfAborted(signal);
       const status = statuses.get(path);
-      if (!status) throw new Error("tracked diff changed during evidence collection");
+      if (!status || !["A", "D", "M", "T"].includes(status)) throw new Error("tracked diff has missing or unsupported change status");
       // A deleted side is a Git blob, not the possibly replaced worktree path.
       // An added side has no baseline blob, even if that name was a tree.
       if ((status === "D" || !await trackedFileIsBinary(root, path))
-        && (status === "A" || !await baselineBlobIsBinary(cwd, ref, path, signal))) paths.push(path);
+        && (status === "A" || !await baselineBlobIsBinary(cwd, ref, path, signal))) {
+        const paths = groups.get(status) ?? [];
+        paths.push(path);
+        groups.set(status, paths);
+      }
     }
   } catch (error) {
     throwIfAborted(signal);
     return { text: `${normal.text}\n[ATTRIBUTE-HIDDEN DIFF UNAVAILABLE] ${error instanceof Error ? error.message : String(error)}`, complete: false, truncated: false };
   }
-  const forced = paths.length ? await readGitEvidence(cwd, ["--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--text", "--unified=3", "--no-renames", ref, "--", ...paths], signal) : undefined;
-  const text = `${normal.text}${forced ? `\n[Text diff for attribute-hidden files]\n${forced.text}` : ""}${complete ? "" : "\n[TRUNCATED: too many attribute-hidden paths]"}`;
+  const forcedTexts: string[] = [];
+  for (const [status, paths] of groups) {
+    // Literal pathspecs still recurse into an old/new tree. Exact status groups
+    // separate its opposite-side leaves (A versus D) from the selected file.
+    const forced = await readGitEvidence(cwd, ["--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--text", "--unified=3", "--no-renames", `--diff-filter=${status}`, ref, "--", ...paths], signal);
+    forcedTexts.push(forced.text);
+    complete &&= forced.complete;
+    truncated ||= forced.truncated;
+  }
+  const text = `${normal.text}${forcedTexts.length ? `\n[Text diff for attribute-hidden files]\n${forcedTexts.join("\n")}` : ""}${pathsTruncated ? "\n[TRUNCATED: too many attribute-hidden paths]" : ""}`;
   const bounded = boundEvidence(text);
-  return { ...bounded, complete: complete && bounded.complete && (forced?.complete ?? true), truncated: !complete || bounded.truncated || (forced?.truncated ?? false) };
+  return { ...bounded, complete: complete && bounded.complete, truncated: truncated || bounded.truncated };
 }
 
 async function trackedFileIsBinary(root: string, path: string): Promise<boolean> {
