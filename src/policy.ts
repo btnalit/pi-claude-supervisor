@@ -1079,10 +1079,15 @@ export function evaluateCommand(command: string, args: readonly string[] = [], g
   const lexical = lexShell(normalized);
   if (lexical.error) return { decision: "deny", reason: `command could not be safely parsed: ${lexical.error}` };
   const literalArgs = args.map((value) => ({ value, operator: false, dynamic: false }));
-  return evaluateTokens([...lexical.tokens, ...literalArgs], 0, grant);
+  return evaluateTokens([...lexical.tokens, ...literalArgs], 0, new Map(), grant);
 }
 
-function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: string, depth: number, grant?: RemoteGrant): PolicyResult | undefined {
+// Scoped to one permission check. The conservative shell scan encounters the
+// same suffix at many nesting levels; re-evaluating it makes a short command
+// take seconds. Depth remains part of the key because it bounds recursion.
+type NestedCommandCache = Map<string, PolicyResult>;
+
+function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: string, depth: number, cache: NestedCommandCache, grant?: RemoteGrant): PolicyResult | undefined {
   // A publish grant admits exactly one shape; everything else still falls
   // through to the ordinary boundary denials below.
   if (grant) {
@@ -1099,7 +1104,7 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   const hasGitAliasConfiguration = hasGit && lower.some((value) => /^alias\.[^=]*(?:=|$)/u.test(value));
   if (depth < 4) {
     for (const nested of nestedShellCommands(lower, values)) {
-      const nestedResult = evaluateCommandInternal(nested, depth + 1);
+      const nestedResult = evaluateCommandInternal(nested, depth + 1, cache);
       if (nestedResult.decision === "deny") return nestedResult;
     }
   }
@@ -1402,15 +1407,20 @@ function nestedShellCommands(lower: readonly string[], values: readonly string[]
   return nested;
 }
 
-function evaluateCommandInternal(command: string, depth: number, grant?: RemoteGrant): PolicyResult {
+function evaluateCommandInternal(command: string, depth: number, cache: NestedCommandCache): PolicyResult {
   const normalized = command.trim();
-  if (!normalized) return { decision: "deny", reason: "empty command" };
+  const key = `${depth}:${normalized}`;
+  const cached = cache.get(key);
+  if (cached) return cached;
   const lexical = lexShell(normalized);
-  if (lexical.error) return { decision: "deny", reason: `command could not be safely parsed: ${lexical.error}` };
-  return evaluateTokens(lexical.tokens, depth, grant);
+  const result: PolicyResult = lexical.error
+    ? { decision: "deny", reason: `command could not be safely parsed: ${lexical.error}` }
+    : evaluateTokens(lexical.tokens, depth, cache);
+  cache.set(key, result);
+  return result;
 }
 
-function evaluateTokens(rawTokens: readonly ShellToken[], depth: number, grant?: RemoteGrant): PolicyResult {
+function evaluateTokens(rawTokens: readonly ShellToken[], depth: number, cache: NestedCommandCache, grant?: RemoteGrant): PolicyResult {
   const { tokens: dataResolved, embedded } = resolveDataTokens(rawTokens);
   const tokens = resolveLiteralBindings(dataResolved);
   if (depth < 4) {
@@ -1418,13 +1428,13 @@ function evaluateTokens(rawTokens: readonly ShellToken[], depth: number, grant?:
       // Never with the grant: a nested result is consulted only when it denies,
       // so a grant here could only suppress a denial -- a heredoc-wrapped push
       // would pass while the direct form is the only shape that was reviewed.
-      const nestedResult = evaluateCommandInternal(body, depth + 1);
+      const nestedResult = evaluateCommandInternal(body, depth + 1, cache);
       if (nestedResult.decision === "deny") return nestedResult;
     }
   }
   const canonical = tokens.map((token) => token.value).join(" ").trim();
   if (!canonical) return { decision: "deny", reason: "empty command" };
-  const boundary = evaluateRepositoryBoundary(tokens, canonical, depth, grant);
+  const boundary = evaluateRepositoryBoundary(tokens, canonical, depth, cache, grant);
   if (boundary) return boundary;
   if (containsRemoteHttpMutation(canonical)) {
     return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
