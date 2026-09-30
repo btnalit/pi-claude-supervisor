@@ -46,6 +46,33 @@ the published TypeScript source directly and there is no second runtime bundle.
 - `scripts/check-package.mjs`: verifies the Pi manifest, peer dependency policy,
   required files and forbidden secret paths.
 
+### Unattended interactive reliability regressions
+
+Use Node 22/24 to match CI. Keep fake `claude` executables under an operator-owned
+trusted parent such as a 0700 directory under `$HOME/.cache`, not world-writable
+`/tmp`, and prepend them to `PATH` so normal tests cannot call a real provider.
+
+- Policy nesting runs in an isolated child with a hard timeout; nested denied
+  commands remain denied and evaluation caches never cross calls.
+- Provider classification covers explicit statuses versus context/token/request-id
+  numbers and generic provider errors.
+- Takeover races cover waiting before paste, during the paste-to-initial-Enter
+  submission boundary, after Enter, and pending decision/repair/publish sends.
+  Cancelled waits do not consume a turn; submitted input is never replayed, and
+  a genuine transport error is not swallowed as cancellation. Old responses stay
+  stale even after resume-auto replays the same completed turn.
+- Automatic completions and idle notices cannot reset human idleness. Queued human
+  completions retain their source and active-turn state.
+- Git read retries are bounded and exclude aborts, evidence overflow, definitive
+  negatives and credentials failures. Acceptance commands are not retried.
+- Attribute-hidden tracked text, including additions/deletions, remains visible to
+  the Reviewer without executing textconv/external diff; binary contents stay omitted
+  and forced text remains bounded. Park labels retain the original detailed reason.
+
+The tmux regressions use a real local tmux server with scripted fake Claude TUIs.
+`test:pi` is registration/command smoke, not a real Pi model run. Neither these tests
+nor `test:install` prove an authenticated Claude unattended run.
+
 ## Transport spike acceptance
 
 Run `npm run spike:transport` only in an isolated test workspace after the test
