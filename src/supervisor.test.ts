@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2187,7 +2187,7 @@ test("resume-auto replays the last completed turn", async () => {
   assert.ok(!events.events.some((event) => event.type === "worker_message_sent"));
   await supervisor.resumeAutomation();
   assert.equal(replays.length, 1);
-  assert.equal(replays[0], turnEvent);
+  assert.deepEqual(replays[0], turnEvent);
   // The replayed action must not have been deduped by the earlier, deferred
   // delivery: #applyDecision returned before recording its actionKey.
   await onAction?.({ action: "continue", message: "should not be sent", reason: "r" }, turnEvent);
@@ -2315,7 +2315,7 @@ test("hybrid permission authority answers routine requests from policy", async (
   await supervisor.poll();
   assert.equal(responded.length, 1);
   assert.equal(notified.length, 1);
-  assert.equal(notified[0], nonRoutineEvent);
+  assert.deepEqual(notified[0], nonRoutineEvent);
 });
 
 test("policy permission authority never consults the Decision Worker", async () => {
@@ -2720,7 +2720,7 @@ test("interactive pre-phase AskUserQuestion is forwarded to the Decision Worker 
   capturedListener?.(questionEvent);
   await supervisor.poll();
   assert.equal(notified.length, 1);
-  assert.equal(notified[0], questionEvent);
+  assert.deepEqual(notified[0], questionEvent);
   assert.equal(responded.length, 0);
   await onAction?.({ action: "deny_permission", requestId: "req-ask", toolUseId: "tool-ask", reason: "Option B because it matches the existing pattern" }, questionEvent);
   assert.equal(responded.length, 1);
@@ -2851,7 +2851,7 @@ test("human_input pauses automation, is withheld from the Decision Worker's next
 
   await supervisor.resumeAutomation();
   assert.equal(replays.length, 1);
-  assert.equal(replays[0], turnEvent);
+  assert.deepEqual(replays[0], turnEvent);
 });
 
 test("a completed interactive task with keepWorkerOnCompletion releases instead of stopping the Worker", async () => {
@@ -4640,6 +4640,178 @@ test("a verification the watchdog starts for an exited Worker that throws part-w
   }
 });
 
+async function withPendingInputFixture(mode: "decision" | "repair" | "publish", run: (context: { supervisor: Supervisor; adapter: WorkerAdapter; events: FlakyEventLog; decision: Parameters<DecisionWorkerFactory>[0]; event: WorkerEvent; replays: WorkerEvent[]; stopCalls: () => number; emit: (event: WorkerEvent) => void }) => Promise<void>): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), "pi-supervisor-input-race-"));
+  const cwd = join(root, "work");
+  await mkdir(cwd);
+  await initializeGitRepository(cwd);
+  if (mode === "publish") {
+    const remote = join(root, "remote.git");
+    await execFileAsync("git", ["init", "-q", "--bare", remote]);
+    await execFileAsync("git", ["remote", "add", "origin", remote], { cwd });
+  }
+  const handle: WorkerHandle = { id: "pending-input", cwd, ownership: "owned", startedAt: new Date().toISOString() };
+  let listener: WorkerStartInput["eventListener"];
+  let running = true;
+  let stopped = 0;
+  let decision!: Parameters<DecisionWorkerFactory>[0];
+  const notified: WorkerEvent[] = [];
+  const replays: WorkerEvent[] = [];
+  const events = new FlakyEventLog("never-fail");
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true }),
+    start: async (input) => { listener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { stopped += 1; running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+  };
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+    reviewer: { review: async () => ({ verdict: mode === "repair" ? "revise" : "pass", summary: "fixture review", findings: mode === "repair" ? [{ id: "F001", severity: "P1", message: "fixture needs a repair" }] : [], round: 0, checkedAt: new Date().toISOString() }) },
+  });
+  try {
+    await supervisor.start({
+      task: "input ownership race", cwd, command: "claude", automation: true, interactive: true,
+      deadlineMs: 0, noOutputTimeoutMs: 0,
+      spec: { autonomy: { ...automaticSpec().autonomy, remoteAuthority: mode === "publish" ? "push" : "none" } },
+      decisionWorkerFactory: (options) => {
+        decision = options;
+        return { start: async () => {}, updateContext: () => {}, notify: (event) => { notified.push(event); }, replay: (event) => { replays.push(event); }, close: async () => {} };
+      },
+    });
+    void listener?.({ type: "turn_completed", handle, result: {}, sequence: 1 });
+    await supervisor.poll();
+    assert.ok(notified[0]);
+    await run({ supervisor, adapter, events, decision, event: notified[0], replays, stopCalls: () => stopped, emit: (event) => { void listener?.(event); } });
+  } finally {
+    await supervisor.stop("test cleanup").catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+for (const mode of ["decision", "repair", "publish"] as const) {
+  test(`takeover cancels a pending ${mode} input without parking or stopping the Worker`, { timeout: 10_000 }, async () => {
+    await withPendingInputFixture(mode, async ({ supervisor, adapter, events, decision, event, stopCalls }) => {
+      let entered!: () => void;
+      const sending = new Promise<void>((resolve) => { entered = resolve; });
+      adapter.send = async (_handle, _message, _key, signal) => {
+        assert.ok(signal);
+        entered();
+        await new Promise<void>((_resolve, reject) => {
+          if (signal.aborted) reject(signal.reason);
+          else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      };
+      const action = Promise.resolve(decision.onAction(mode === "decision"
+        ? { action: "continue", message: "not yet submitted", reason: "test" }
+        : { action: "verify", reason: "test" }, event)).catch((error) => decision.onFailure?.(event, error));
+      await Promise.race([sending, action.then(() => { throw new Error(`input never started: ${supervisor.state}`); })]);
+      await supervisor.takeover();
+      await action;
+      assert.equal(supervisor.humanRequired, true);
+      assert.equal(supervisor.candidateParked, false);
+      assert.equal(supervisor.state, "waiting");
+      assert.equal(supervisor.turn, 0);
+      assert.equal(supervisor.repairRound, 0);
+      assert.equal(stopCalls(), 0);
+      assert.equal(events.events.filter((entry) => entry.type === "worker_input_cancelled").length, 1);
+      assert.equal(events.events.some((entry) => /failed|candidate_parked|worker_input_deferred/u.test(entry.type)), false);
+    });
+  });
+}
+
+test("native input cancels pending automation, but stale handles and duplicate events do not", { timeout: 10_000 }, async () => {
+  await withPendingInputFixture("decision", async ({ supervisor, adapter, decision, event, emit, replays, events, stopCalls }) => {
+    let entered!: () => void;
+    let inputSignal!: AbortSignal;
+    let sending = new Promise<void>((resolve) => { entered = resolve; });
+    adapter.send = async (_handle, _message, _key, signal) => {
+      assert.ok(signal);
+      inputSignal = signal;
+      entered();
+      await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    };
+    const action = Promise.resolve(decision.onAction({ action: "continue", message: "obsolete input", reason: "test" }, event));
+    await sending;
+    emit({ type: "human_input", handle: { ...event.handle, id: "old worker" }, text: "stale", sequence: 99 });
+    assert.equal(inputSignal.aborted, false);
+    const human: WorkerEvent = { type: "human_input", handle: event.handle, text: "operator is driving", sequence: 1 };
+    emit(human);
+    await action;
+    await supervisor.poll();
+    assert.equal(supervisor.humanRequired, true);
+    assert.equal(supervisor.candidateParked, false);
+    assert.equal(supervisor.turn, 0);
+    assert.equal(stopCalls(), 0);
+
+    await supervisor.resumeAutomation();
+    assert.ok(replays[0]);
+    sending = new Promise<void>((resolve) => { entered = resolve; });
+    const resumed = Promise.resolve(decision.onAction({ action: "continue", message: "fresh decision", reason: "test" }, replays[0]));
+    await sending; // A cancelled action must not dedupe the fresh epoch away.
+    emit(human);
+    assert.equal(inputSignal.aborted, false, "a replayed native event is not a new takeover");
+    emit({ ...human, sequence: 2 }); // Identical text, but genuinely new input.
+    await resumed;
+    await supervisor.poll();
+    assert.equal(supervisor.humanRequired, true);
+    assert.equal(stopCalls(), 0);
+    assert.equal(events.events.filter((entry) => entry.type === "worker_input_cancelled").length, 2);
+  });
+});
+
+test("takeover waits for an already submitted input boundary and rejects its late decision after resume", { timeout: 10_000 }, async () => {
+  await withPendingInputFixture("decision", async ({ supervisor, adapter, decision, event, events, replays, stopCalls }) => {
+    let entered!: () => void;
+    const sending = new Promise<void>((resolve) => { entered = resolve; });
+    let sends = 0;
+    adapter.send = async (_handle, _message, _key, signal) => {
+      sends += 1;
+      assert.ok(signal);
+      entered();
+      // Already submitted: cancellation ends confirmation, not delivery.
+      await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+    };
+    const action = Promise.resolve(decision.onAction({ action: "continue", message: "submitted once", reason: "test" }, event));
+    await sending;
+    await supervisor.takeover();
+    await action;
+    assert.equal(supervisor.turn, 1);
+    assert.equal(stopCalls(), 0);
+    assert.equal(supervisor.humanRequired, true);
+    assert.equal(events.events.some((entry) => entry.type === "worker_input_cancelled"), false);
+    await supervisor.poll();
+    await supervisor.resumeAutomation();
+    assert.equal(replays.length, 1);
+    await decision.onAction({ action: "continue", message: "stale reply", reason: "test" }, event);
+    assert.equal(sends, 1);
+    assert.ok(events.events.some((entry) => entry.type === "decision_ignored"));
+  });
+});
+
+test("takeover cancellation does not hide an actual input failure", { timeout: 10_000 }, async () => {
+  await withPendingInputFixture("decision", async ({ supervisor, adapter, decision, event, events }) => {
+    let entered!: () => void;
+    const sending = new Promise<void>((resolve) => { entered = resolve; });
+    adapter.send = async (_handle, _message, _key, signal) => {
+      assert.ok(signal);
+      entered();
+      await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(new WorkerInputError("transport failed independently", { retryable: false })), { once: true }));
+    };
+    const action = Promise.resolve(decision.onAction({ action: "continue", message: "test", reason: "test" }, event)).catch((error) => decision.onFailure?.(event, error));
+    await sending;
+    await supervisor.takeover();
+    await action;
+    assert.equal(supervisor.candidateParked, true);
+    assert.ok(events.events.some((entry) => entry.type === "candidate_parked" && String(entry.data?.reason).includes("transport failed independently")));
+    assert.ok(events.events.some((entry) => entry.type === "worker_input_failed" && entry.data?.error === "transport failed independently"));
+  });
+});
+
 /** An interactive automatic task whose Worker idleness and human input the test drives. */
 async function withHumanGateFixture(humanIdleResumeMs: number, run: (context: { supervisor: Supervisor; handle: WorkerHandle; events: FlakyEventLog; emit: (event: WorkerEvent) => void; replays: WorkerEvent[]; setActive: (active: number) => void; failStatus: (times: number) => void; setLastOutputAt: (at: string | undefined) => void; notices: HumanInterventionNotice[] }) => Promise<void>): Promise<void> {
   const handle: WorkerHandle = { id: "human-gate-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
@@ -4704,6 +4876,23 @@ test("a pause from typing into the session resumes automation once the human has
   });
 });
 
+test("automatic turns and idle notifications do not reset the human idle clock", async () => {
+  await withHumanGateFixture(300, async ({ supervisor, handle, emit }) => {
+    emit({ type: "human_input", handle, text: "human has left the keyboard" });
+    await supervisor.poll();
+    let sequence = 0;
+    const automatic = setInterval(() => {
+      sequence += 1;
+      emit({ type: "turn_completed", handle, result: { subtype: sequence % 2 ? "stop" : "idle" }, sequence, source: "automatic" });
+    }, 50);
+    try {
+      await waitFor(() => !supervisor.humanRequired, 1_500);
+    } finally {
+      clearInterval(automatic);
+    }
+  });
+});
+
 test("each further human prompt restarts the idle clock", async () => {
   await withHumanGateFixture(1_500, async ({ supervisor, handle, emit }) => {
     emit({ type: "turn_completed", handle, result: {}, sequence: 1 });
@@ -4718,6 +4907,22 @@ test("each further human prompt restarts the idle clock", async () => {
   });
 });
 
+
+test("a failed takeover audit leaves human ownership but no stale send-cancellation flag", async () => {
+  await withHumanGateFixture(0, async ({ supervisor, events }) => {
+    const append = events.append.bind(events);
+    let failOnce = true;
+    events.append = async (event) => {
+      if (event.type === "human_takeover" && failOnce) { failOnce = false; throw new Error("takeover audit failed"); }
+      return append(event);
+    };
+    await assert.rejects(supervisor.takeover(), /takeover audit failed/u);
+    assert.equal(supervisor.humanRequired, true);
+    await supervisor.send("explicit operator message");
+    assert.equal(supervisor.turn, 1);
+    assert.equal(supervisor.humanRequired, true);
+  });
+});
 
 test("an explicit takeover never resumes on its own, however long the session idles", async () => {
   await withHumanGateFixture(200, async ({ supervisor, handle, events, emit }) => {

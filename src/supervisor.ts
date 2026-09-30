@@ -246,6 +246,8 @@ export class Supervisor {
   #pendingDecisionRetrying = false;
   /** The Supervisor turn a completed-turn event was handed to the Decision Worker at; a later turn supersedes it. */
   readonly #decisionTurnAtNotify = new WeakMap<WorkerEvent, number>();
+  readonly #decisionEpochAtNotify = new WeakMap<WorkerEvent, number>();
+  #automationEpoch = 0;
   /** When the pending decision was requested; bounds how long an idle timeout defers to it. */
   #pendingDecisionSince = 0;
   /**
@@ -308,6 +310,9 @@ export class Supervisor {
   #usageRecordedEvents = new Set<string>();
   #pendingPermissions = new Map<string, WorkerPermissionRequest>();
   #humanRequired = false;
+  #takeoverRequested = false;
+  #inputAbortController?: AbortController;
+  readonly #takeoverInputError = Object.assign(new Error("pending input cancelled by human takeover"), { name: "AbortError" });
   #watchdogTickPending = false;
   /** "worker_prompt": a human typed into the pane; "other": an explicit takeover or a recovered task. */
   #humanGate: "permission" | "worker_prompt" | "other" | undefined;
@@ -413,6 +418,8 @@ export class Supervisor {
     this.#usageRecordedEvents.clear();
     this.#pendingPermissions.clear();
     this.#humanRequired = false;
+    this.#takeoverRequested = false;
+    this.#automationEpoch += 1;
     this.#candidateParked = false;
     this.#released = false;
     this.#releasing = false;
@@ -583,7 +590,7 @@ export class Supervisor {
             void this.#appendEvent({ type: "decision_ignored", taskId: this.#task?.taskId, workerId: event.handle.id, data: { reason: "superseded while its decision was failing", eventType: event.type, error: safeMessage(error) } }).catch(() => {});
           },
           onRetry: (event, info) => {
-            if (this.#pendingDecisionKey === workerEventKey(event)) this.#pendingDecisionRetrying = true;
+            if (!this.#decisionSuperseded(event) && this.#pendingDecisionKey === workerEventKey(event)) this.#pendingDecisionRetrying = true;
             void this.#appendEvent({ type: "decision_retry", taskId: this.#task?.taskId, workerId: event.handle.id, data: { eventType: event.type, attempt: info.attempt, delayMs: info.delayMs, error: safeMessage(info.error) } }).catch(() => {});
           },
           onFailure: (event, error) => this.#decisionFailure(event, error),
@@ -737,6 +744,10 @@ export class Supervisor {
 
   #receiveWorkerEvent(event: WorkerEvent): void {
     if (event.type === "output" || event.type === "jsonl") return;
+    if (event.type === "human_input" && this.#automation && event.handle.id === this.#handle?.id && !this.#handledEvents.has(workerEventKey(event))) {
+      this.#automationEpoch += 1;
+      this.#inputAbortController?.abort(this.#takeoverInputError);
+    }
     void this.#exclusive(() => this.#processWorkerEvent(event)).catch((error) => {
       void this.#appendEvent({ type: "worker_event_error", taskId: this.#task?.taskId, workerId: event.handle.id, data: { error: safeMessage(error), eventType: event.type } }).catch(() => {});
     });
@@ -758,7 +769,7 @@ export class Supervisor {
         this.#lastTurnCompleted = event;
         // The idle clock for a pause from typing into the pane starts once the
         // human's turn has finished, not when they typed.
-        if (this.#humanRequired && this.#humanGate === "worker_prompt") this.#noteHumanActivity();
+        if (this.#humanRequired && this.#humanGate === "worker_prompt" && event.source !== "automatic" && event.result.subtype !== "idle") this.#noteHumanActivity();
         // The grant covers the publish turn and nothing after it. Revoking here
         // rather than at the next `verify` means a Decision Worker that answers
         // `continue` cannot leave a live grant for a later, unverified push.
@@ -1103,14 +1114,14 @@ export class Supervisor {
         await this.#appendEvent({ type: "decision_ignored", taskId: task.taskId, workerId: handle.id, data: { action: action.action, reason: "superseded by a later turn, message or verification", eventType: event.type } }).catch(() => {});
         return;
       }
-      if (this.#humanRequired) {
+      if (this.#humanRequired || this.#takeoverRequested) {
         await this.#appendEvent({ type: "decision_deferred", taskId: task.taskId, workerId: handle.id, data: { action: action.action, reason: action.reason, eventType: event.type } }).catch(() => {});
         return;
       }
       // A repeated `wait` for the same event (the wait timer's re-ask, or a
       // deadline-phase replay) must re-arm the timer, so it is never deduped;
       // every other action is applied once per event.
-      const actionKey = `${workerEventKey(event)}:${action.action}`;
+      const actionKey = `${workerEventKey(event)}:${this.#automationEpoch}:${action.action}`;
       if (action.action !== "wait") {
         if (this.#handledEvents.has(actionKey)) return;
         this.#handledEvents.add(actionKey);
@@ -1247,6 +1258,10 @@ export class Supervisor {
     try {
       await this.#sendInternal(message);
     } catch (error) {
+      if (error === this.#takeoverInputError) {
+        await this.#noteInputCancelled();
+        return;
+      }
       if (!isWorkerInputError(error) || !error.retryable) throw error;
       await this.#deferDecisionInput(action, event, error);
       return;
@@ -1265,7 +1280,7 @@ export class Supervisor {
     const delayMs = Math.min(MAX_INPUT_RETRY_DELAY_MS, this.#inputRetryBaseMs * 2 ** (attempts - 1));
     await this.#appendEvent({ type: "worker_input_deferred", taskId: this.#task?.taskId, workerId: event.handle.id, data: { action: action.action, attempt: attempts, delayMs, error: safeMessage(error), eventType: event.type } }).catch(() => {});
     // The same decision is applied again, so it must not be deduplicated away.
-    this.#handledEvents.delete(`${workerEventKey(event)}:${action.action}`);
+    this.#handledEvents.delete(`${workerEventKey(event)}:${this.#automationEpoch}:${action.action}`);
     this.#clearWaitTimer();
     this.#inputRetryTimer = setTimeout(() => {
       this.#inputRetryTimer = undefined;
@@ -1273,7 +1288,7 @@ export class Supervisor {
       // message or a state change means this decision no longer applies.
       const pending = this.#inputRetry;
       if (!pending || pending.event !== event || pending.turn !== this.#turn || this.#machine.state !== "waiting"
-        || (event.type === "turn_completed" && this.#lastTurnCompleted !== event)) return;
+        || (event.type === "turn_completed" && !this.#isLastCompletedTurn(event))) return;
       // #decisionFailure can itself reject (event log, Worker cleanup); nothing
       // above this timer would catch it, and an unhandled rejection ends Pi.
       void this.#applyDecision(action, event, true)
@@ -1367,10 +1382,16 @@ export class Supervisor {
    * turn, a message sent after it, a verification already running) would act
    * on a state that no longer exists.
    */
+  #isLastCompletedTurn(event: WorkerEvent): boolean {
+    return Boolean(this.#lastTurnCompleted && workerEventKey(event) === workerEventKey(this.#lastTurnCompleted));
+  }
+
   #decisionSuperseded(event: WorkerEvent): boolean {
+    const epoch = this.#decisionEpochAtNotify.get(event);
+    if (epoch !== undefined && epoch !== this.#automationEpoch) return true;
     if (event.type !== "turn_completed") return false;
     const notifiedTurn = this.#decisionTurnAtNotify.get(event);
-    return Boolean((this.#lastTurnCompleted && event !== this.#lastTurnCompleted) || (notifiedTurn !== undefined && notifiedTurn !== this.#turn) || this.#verificationAbortController);
+    return Boolean((this.#lastTurnCompleted && !this.#isLastCompletedTurn(event)) || (notifiedTurn !== undefined && notifiedTurn !== this.#turn) || this.#verificationAbortController);
   }
 
   /** Refresh the Decision Worker's context and deliver (or re-deliver) an event; a completed turn is then pending a decision. */
@@ -1380,18 +1401,23 @@ export class Supervisor {
     // nothing must be marked as pending on its account.
     if (replay && !this.#decision.replay) return;
     this.#decision.updateContext(this.#decisionContextPatch());
+    // Each delivery owns its epoch, even when resume-auto replays the same
+    // underlying turn while an older model response is still arriving.
+    const deliveredEvent = { ...event };
+    this.#decisionEpochAtNotify.set(deliveredEvent, this.#automationEpoch);
     if (event.type === "turn_completed") {
       this.#pendingDecisionKey = workerEventKey(event);
       this.#pendingDecisionSince = Date.now();
       this.#pendingDecisionRetrying = false;
-      this.#decisionTurnAtNotify.set(event, this.#turn);
+      this.#decisionTurnAtNotify.set(deliveredEvent, this.#turn);
     }
-    if (replay) this.#decision.replay!(event);
-    else this.#decision.notify(event);
+    if (replay) this.#decision.replay!(deliveredEvent);
+    else this.#decision.notify(deliveredEvent);
   }
 
   #settlePendingDecision(event: WorkerEvent): void {
-    if (this.#pendingDecisionKey && this.#pendingDecisionKey === workerEventKey(event)) this.#pendingDecisionKey = undefined;
+    const epoch = this.#decisionEpochAtNotify.get(event);
+    if ((epoch === undefined || epoch === this.#automationEpoch) && this.#pendingDecisionKey === workerEventKey(event)) this.#pendingDecisionKey = undefined;
   }
 
   /** True when the adapter reports no active Worker turn; a status failure counts as busy. */
@@ -1426,7 +1452,7 @@ export class Supervisor {
     this.#waitTimer = setTimeout(() => {
       this.#waitTimer = undefined;
       void this.#exclusive(async () => {
-        if (!this.#decision || !this.#automation || this.#humanRequired || this.#machine.state !== "waiting" || this.#lastTurnCompleted !== event) return;
+        if (!this.#decision || !this.#automation || this.#humanRequired || this.#machine.state !== "waiting" || !this.#isLastCompletedTurn(event)) return;
         const handle = this.#handle;
         if (!handle) return;
         const status = await this.#adapter.getStatus(handle).catch(() => undefined);
@@ -1558,13 +1584,29 @@ export class Supervisor {
   }
 
   async takeover(): Promise<void> {
+    // A send waiting for a tmux prompt holds #exclusive. Request cancellation
+    // now; acknowledge ownership only after its submission boundary settles.
+    this.#takeoverRequested = true;
+    this.#automationEpoch += 1;
+    this.#inputAbortController?.abort(this.#takeoverInputError);
     return this.#exclusive(async () => {
-      this.#verificationAbortController?.abort("human takeover");
-      this.#clearHumanIdleTimer();
-      this.#humanRequired = true;
-      this.#humanGate = "other";
-      await this.#appendEvent({ type: "human_takeover", taskId: this.#task?.taskId, workerId: this.#handle?.id });
+      try {
+        this.#verificationAbortController?.abort("human takeover");
+        this.#clearWaitTimer();
+        this.#pendingDecisionKey = undefined;
+        this.#clearHumanIdleTimer();
+        this.#humanRequired = true;
+        this.#humanGate = "other";
+        this.#remoteGrant = undefined;
+        await this.#appendEvent({ type: "human_takeover", taskId: this.#task?.taskId, workerId: this.#handle?.id });
+      } finally {
+        this.#takeoverRequested = false;
+      }
     });
+  }
+
+  async #noteInputCancelled(): Promise<void> {
+    await this.#appendEvent({ type: "worker_input_cancelled", taskId: this.#task?.taskId, workerId: this.#handle?.id, data: { reason: "human takeover; no input was submitted" } }).catch(() => {});
   }
 
   async resumeAutomation(): Promise<void> {
@@ -1671,6 +1713,7 @@ export class Supervisor {
   }
 
   async #sendInternal(message: string): Promise<void> {
+    if (this.#takeoverRequested) throw this.#takeoverInputError;
     await this.#flushPendingEvents();
     const taskId = this.#task?.taskId;
     const handle = this.#handle;
@@ -1688,7 +1731,14 @@ export class Supervisor {
     }
     const nextTurn = this.#turn + 1;
     if (nextTurn > (this.#task?.maxTurns ?? 100)) throw new Error("supervisor turn budget exhausted");
-    await this.#adapter.send(handle, message, `${taskId}:turn:${nextTurn}`);
+    if (this.#takeoverRequested) throw this.#takeoverInputError;
+    const inputAbortController = new AbortController();
+    this.#inputAbortController = inputAbortController;
+    try {
+      await this.#adapter.send(handle, message, `${taskId}:turn:${nextTurn}`, inputAbortController.signal);
+    } finally {
+      if (this.#inputAbortController === inputAbortController) this.#inputAbortController = undefined;
+    }
     // The silence being timed starts now, not at the Worker's last output: a
     // repair or publish turn follows an acceptance/Review run that can easily
     // outlast the no-output timeout on its own.
@@ -2024,7 +2074,7 @@ export class Supervisor {
         repositoryEvidence = redactRepositoryEvidence(await collectRepositoryEvidence(this.#task.cwd, { signal: verificationAbortController.signal, baseRef: this.#task.baseCommit }));
       } catch (error) {
         this.#lastVerification = result;
-        await this.#parkCandidate(`local repository evidence could not be collected: ${safeMessage(error)}`);
+        await this.#parkCandidate(`local repository evidence could not be collected: ${safeMessage(error)}`, undefined);
         return result;
       }
       await this.#trackBranchChange(repositoryEvidence.branch);
@@ -2052,13 +2102,13 @@ export class Supervisor {
           this.#verificationAbortController = undefined;
           return result;
         }
-        await this.#parkCandidate(`${reason}; candidate cannot be published`);
+        await this.#parkCandidate(`${reason}; candidate cannot be published`, undefined);
         return result;
       }
       if (this.#automation && (this.#task.baseCommit || this.#task.spec.autonomy.requireLocalCommit)
         && repositoryEvidence.complete === false) {
         this.#lastVerification = result;
-        await this.#parkCandidate("repository evidence is incomplete or truncated; candidate cannot be published");
+        await this.#parkCandidate("repository evidence is incomplete or truncated; candidate cannot be published", undefined);
         return result;
       }
       if (this.#automation && this.#task.baseCommit && !repositoryEvidence.branch) {
@@ -2147,7 +2197,7 @@ export class Supervisor {
       }
       if (review.verdict === "human") {
         this.#lastVerification = result;
-        await this.#parkCandidate(review.summary);
+        await this.#parkCandidate(review.summary, undefined);
         return result;
       }
     }
@@ -2321,6 +2371,13 @@ export class Supervisor {
       this.#publishTarget = undefined;
       this.#publishRemote = undefined;
       this.#verifiedHead = undefined;
+      if (error === this.#takeoverInputError) {
+        this.#publishState = "none";
+        const current: string = this.#machine.state;
+        if (current === "running") this.#machine.transition("waiting");
+        await this.#noteInputCancelled();
+        return true; // Relinquished to the operator, not a terminal candidate.
+      }
       await this.#notePublishShortfall(handle.id, { reason: `the publish instruction could not be sent: ${safeMessage(error)}` });
       // The transition above already moved the machine; read it without the
       // narrowing the guard at the top of this method introduced.
@@ -2537,6 +2594,17 @@ export class Supervisor {
       await this.#sendInternal(instruction);
       return true;
     } catch (error) {
+      if (error === this.#takeoverInputError) {
+        if (this.#machine.state === "running") this.#machine.transition("waiting");
+        this.#repairRound -= 1;
+        task.repairRound = this.#repairRound;
+        // No repair turn ran: a repeated review after the operator resumes
+        // cannot be evidence that an automatic repair failed twice.
+        this.#lastFindingSignature = undefined;
+        delete task.lastFindingSignature;
+        await this.#noteInputCancelled();
+        return true; // The takeover owns the next step; do not finalize/stop it.
+      }
       if (this.#machine.state === "running") this.#machine.transition("verifying");
       await this.#appendEvent({ type: "candidate_blocked", taskId: task.taskId, workerId: handle.id, data: { reason: `automatic repair could not be sent: ${safeMessage(error)}` } });
       return false;
@@ -2559,7 +2627,9 @@ export class Supervisor {
     this.#remoteGrant = undefined;
     const stopRequested = this.#stopRequested !== undefined;
     const stopCloseReason = this.#stopCloseReason ?? "human_stop";
-    if (outcome === "blocked") this.#candidateParked = true;
+    if (outcome === "blocked") {
+      this.#candidateParked = true;
+    }
     // A completed interactive task may keep its persistent session open for
     // the operator instead of tearing it down; a stop requested mid-verify or
     // a blocked/failed outcome always falls back to today's stop behavior.
@@ -3251,7 +3321,7 @@ function workerEventKey(event: WorkerEvent): string {
   if (event.type === "turn_completed") return `${event.handle.id}:result:${event.sequence}`;
   if (event.type === "exited") return `${event.handle.id}:exit`;
   if (event.type === "jsonl") return `${event.handle.id}:jsonl:${String(event.record.uuid ?? event.record.request_id ?? JSON.stringify(event.record))}`;
-  if (event.type === "human_input") return `${event.handle.id}:human:${event.text.slice(0, 80)}`;
+  if (event.type === "human_input") return `${event.handle.id}:human:${event.sequence ?? event.text.slice(0, 80)}`;
   return `${event.handle.id}:output:${event.chunk.at}:${event.chunk.text.slice(0, 80)}`;
 }
 

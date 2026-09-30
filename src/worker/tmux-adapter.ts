@@ -71,6 +71,8 @@ interface TmuxRecord {
   lastOutputAt?: string;
   lastInputAt?: string;
   activeRequests: number;
+  /** Submission order, including human prompts queued behind an automatic turn. */
+  turnSources: Array<{ source: "human" | "automatic" }>;
   turnSequence: number;
   /** Monotonic counter for prompt-phase permission request ids. */
   promptSequence: number;
@@ -451,6 +453,9 @@ input.on("line", (line) => {
   }
   if (!line.trim()) return;
   inputActive = true;
+  // A manual prompt can finish before the next screen poll. Reserve its turn
+  // in the same ordered stream as the result, rather than losing that result.
+  writeEvent({ type: "bridge_input" });
   child.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: line } }) + "\\n");
 });
 input.on("close", () => { try { child.kill("SIGTERM"); } catch {} });
@@ -683,6 +688,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       seenPermissionRequestIds: new Set(),
       permissionResponses: new Set(),
       activeRequests: 0,
+      turnSources: [],
       turnSequence: 0,
       promptSequence: 0,
       readyStreak: 0,
@@ -946,12 +952,13 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     });
   }
 
-  async send(handle: WorkerHandle, message: string, idempotencyKey: string): Promise<void> {
+  async send(handle: WorkerHandle, message: string, idempotencyKey: string, signal?: AbortSignal): Promise<void> {
     const record = this.#record(handle);
     if (record.sentKeys.has(idempotencyKey)) return;
+    signal?.throwIfAborted();
     if (record.released) throw new WorkerInputError("tmux worker is no longer supervised", { retryable: false });
     if (record.activeRequests > 0) throw new WorkerInputError("tmux worker has an active turn; wait for its prompt before sending another turn", { retryable: true });
-    await this.#send(record, message, idempotencyKey);
+    await this.#send(record, message, idempotencyKey, signal);
   }
 
   async respondPermission(handle: WorkerHandle, requestId: string, toolUseId: string, decision: PermissionDecision, updatedInput?: unknown): Promise<void> {
@@ -1126,11 +1133,18 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       return;
     }
     try { await this.#run(record, ["pipe-pane", "-t", record.target], undefined, undefined, true); }
-    catch (error) { if (!isMissingSession(error)) record.cleanupError = asError(error); }
+    catch (error) {
+      // Exit can win the race with pipe-pane. Ignore only this expected
+      // teardown error, with independent confirmation that the pane is dead.
+      const exited = error instanceof Error && /target pane has exited/iu.test(error.message)
+        && (await this.#paneStatus(record).catch(() => undefined))?.dead;
+      if (exited) record.paneDead = true;
+      else if (!isMissingSession(error)) record.cleanupError = asError(error);
+    }
     record.pipeAttached = false;
   }
 
-  async #send(record: TmuxRecord, message: string, idempotencyKey: string): Promise<void> {
+  async #send(record: TmuxRecord, message: string, idempotencyKey: string, signal?: AbortSignal): Promise<void> {
     // The Worker's state when the send was requested, before queueing for the
     // input gate and the pane checks: a turn someone else starts from here on
     // makes the message stale, however long those take. (Input that arrived
@@ -1142,6 +1156,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     record.inputTail = previous.then(() => gate);
     await previous;
     try {
+      signal?.throwIfAborted();
       if (record.stopping || record.released) throw new WorkerInputError("tmux worker is stopping or released", { retryable: false });
       const pane = await this.#paneStatus(record);
       if (pane.dead) throw new WorkerInputError("tmux worker is not running", { retryable: false });
@@ -1154,8 +1169,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       // This is the final reservation check immediately before paste. A
       // human typing after this point is inherently outside tmux's control;
       // takeover mode is the explicit exclusion mechanism for automation.
-      await this.#awaitInputReady(record, decidedAt);
+      await this.#awaitInputReady(record, decidedAt, signal);
       record.activeRequests = 1;
+      const turnSource = { source: "automatic" as const };
+      record.turnSources.push(turnSource);
       record.readyStreak = 0;
       record.turnObservedOutput = false;
       record.inputAt = Date.now();
@@ -1168,8 +1185,8 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       }
       const acks = record.submitAcks;
       try {
-        await this.#sendRaw(record, message);
-        if (record.interactive) await this.#confirmDelivery(record, safeTmuxMessage(message), acks);
+        await this.#sendRaw(record, message, signal);
+        if (record.interactive) await this.#confirmDelivery(record, safeTmuxMessage(message), acks, signal);
         record.sentKeys.add(idempotencyKey);
         record.lastInputAt = new Date().toISOString();
       } catch (error) {
@@ -1178,6 +1195,8 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
           if (index >= 0) record.pendingSentMessages.splice(index, 1);
         }
         record.activeRequests = 0;
+        const reserved = record.turnSources.indexOf(turnSource);
+        if (reserved >= 0) record.turnSources.splice(reserved, 1);
         record.readyStreak = 0;
         throw error;
       }
@@ -1186,7 +1205,8 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     }
   }
 
-  async #sendRaw(record: TmuxRecord, message: string): Promise<void> {
+  async #sendRaw(record: TmuxRecord, message: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     if (record.structured) {
       const encoded = Buffer.from(safeTmuxMessage(message), "utf8").toString("base64");
       await this.#sendFramed(record, "@pi:user", encoded);
@@ -1198,8 +1218,12 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     // in the buffer makes Claude's TUI render them literally instead of
     // entering paste mode.
     await this.#run(record, ["load-buffer", "-b", bufferName, "-"], safeMessage);
+    signal?.throwIfAborted();
     await this.#leaveCopyMode(record);
+    signal?.throwIfAborted();
     await this.#run(record, ["paste-buffer", "-p", "-d", "-b", bufferName, "-t", record.target]);
+    // Finish this already-pasted submission, but cancellation stops waiting
+    // for its hook and prevents every later Enter retry. Never resend the text.
     // In copy mode Enter is a copy-mode key, not input for Claude.
     await this.#leaveCopyMode(record);
     await this.#run(record, ["send-keys", "-t", record.target, "Enter"]);
@@ -1228,10 +1252,11 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
    * refusing on the first look turned each of those into a parked task.
    * Refused only as retryable, since nothing has been typed yet.
    */
-  async #awaitInputReady(record: TmuxRecord, decidedAt: { turnSequence: number; humanInputs: number }): Promise<void> {
+  async #awaitInputReady(record: TmuxRecord, decidedAt: { turnSequence: number; humanInputs: number }, signal?: AbortSignal): Promise<void> {
     const deadline = Date.now() + this.#inputReadyTimeoutMs;
     const { turnSequence, humanInputs } = decidedAt;
     for (let first = true; ; first = false) {
+      signal?.throwIfAborted();
       if (record.stopping || record.released) throw new WorkerInputError("tmux worker is stopping or released", { retryable: false });
       // Someone else started a turn while this send waited (a human at the
       // attached pane, Claude's own background completion): the message was
@@ -1263,18 +1288,18 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
    * duplicate it); an empty box without the hook means delivery happened but
    * the hook channel did not report it, which the no-output watchdog covers.
    */
-  async #confirmDelivery(record: TmuxRecord, message: string, acksBefore: number): Promise<void> {
+  async #confirmDelivery(record: TmuxRecord, message: string, acksBefore: number, signal?: AbortSignal): Promise<void> {
     record.confirmingDelivery = true;
     try {
-      await this.#confirmDeliveryAttempts(record, message, acksBefore);
+      await this.#confirmDeliveryAttempts(record, message, acksBefore, signal);
     } finally {
       record.confirmingDelivery = false;
     }
   }
 
-  async #confirmDeliveryAttempts(record: TmuxRecord, message: string, acksBefore: number): Promise<void> {
+  async #confirmDeliveryAttempts(record: TmuxRecord, message: string, acksBefore: number, signal?: AbortSignal): Promise<void> {
     for (let enterResends = 0; ; enterResends += 1) {
-      if (await this.#awaitSubmitAck(record, acksBefore)) return;
+      if (await this.#awaitSubmitAck(record, acksBefore, signal)) return;
       const holdsMessage = inputHoldsMessage(await this.#capture(record), message);
       if (!holdsMessage) {
         this.#logOutput(record, "[supervisor] no UserPromptSubmit hook confirmed the message, but it left the input box; the hook channel may not be reporting\n");
@@ -1284,16 +1309,24 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         return;
       }
       if (enterResends >= 2) break;
+      if (signal?.aborted) return;
       await this.#leaveCopyMode(record);
+      if (signal?.aborted) return;
       await this.#run(record, ["send-keys", "-t", record.target, "Enter"]);
       this.#logOutput(record, "[supervisor] message still in the input box; sent Enter again\n");
     }
     throw new WorkerInputError(`the message is still in Claude's input box after Enter was sent three times; attach with ${attachCommand(record.handle)}`, { retryable: false });
   }
 
-  async #awaitSubmitAck(record: TmuxRecord, acksBefore: number): Promise<boolean> {
+  async #awaitSubmitAck(record: TmuxRecord, acksBefore: number, signal?: AbortSignal): Promise<boolean> {
     const deadline = Date.now() + this.#inputConfirmTimeoutMs;
     while (record.submitAcks === acksBefore) {
+      // The paste/Enter already happened: ownership is handed over without
+      // claiming non-delivery or retrying an uncertain submission.
+      if (signal?.aborted) {
+        this.#logOutput(record, "[supervisor] input confirmation cancelled after submission; delivery unconfirmed, text will not be resent\n");
+        return true;
+      }
       if (record.stopping || record.released) return true;
       if (Date.now() >= deadline) return false;
       await delay(Math.min(100, this.#pollIntervalMs, Math.max(1, deadline - Date.now())));
@@ -2076,6 +2109,13 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       }
       return;
     }
+    if (event.type === "bridge_input") {
+      record.turnSources.push({ source: "human" });
+      record.activeRequests = 1;
+      record.readyStreak = 0;
+      record.inputAt = Date.now();
+      return;
+    }
     this.#emit(record, { type: "jsonl", handle: record.handle, record: event });
     const request = event.request;
     if (isPermissionRequest(event, request)) {
@@ -2099,9 +2139,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       const resultId = jsonlRecordId(event, record.turnSequence + 1);
       if (!record.seenResultIds.has(resultId)) {
         rememberBounded(record.seenResultIds, resultId);
-        record.activeRequests = Math.max(0, record.activeRequests - 1);
         record.turnSequence += 1;
-        this.#emit(record, { type: "turn_completed", handle: record.handle, result: event, sequence: record.turnSequence });
+        const source = record.turnSources.shift()?.source;
+        record.activeRequests = record.turnSources.length > 0 ? 1 : 0;
+        this.#emit(record, { type: "turn_completed", handle: record.handle, result: event, sequence: record.turnSequence, source });
       }
     }
     if (event.type === "bridge_exit") record.activeRequests = 0;
@@ -2182,7 +2223,9 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       if (record.pendingSentMessages.length > 0) record.submitAcks += 1;
       record.pendingSentMessages.length = 0;
     }
-    this.#emit(record, { type: "turn_completed", handle: record.handle, sequence: record.turnSequence, result });
+    const source = record.turnSources.shift()?.source;
+    record.activeRequests = record.turnSources.length > 0 ? 1 : 0;
+    this.#emit(record, { type: "turn_completed", handle: record.handle, sequence: record.turnSequence, result, source });
   }
 
   async #handleHookRequest(record: TmuxRecord, request: HookRelayRequest): Promise<HookRelayReply | undefined> {
@@ -2232,8 +2275,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         // Claude Code delivers its own background-task, monitor and agent
         // completions through this hook as a user-role message; nobody typed it.
         record.humanInputs += 1;
-        if (!isClaudeRuntimePrompt(prompt)) {
-          this.#emit(record, { type: "human_input", handle: record.handle, text: boundTextHead(prompt, 4_096) });
+        const runtimePrompt = isClaudeRuntimePrompt(prompt);
+        record.turnSources.push({ source: runtimePrompt ? "automatic" : "human" });
+        if (!runtimePrompt) {
+          this.#emit(record, { type: "human_input", handle: record.handle, text: boundTextHead(prompt, 4_096), sequence: record.humanInputs });
         }
         record.activeRequests = 1;
         record.inputAt = Date.now();
