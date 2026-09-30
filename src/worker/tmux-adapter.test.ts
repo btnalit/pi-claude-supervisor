@@ -1731,7 +1731,7 @@ interface FakeTuiConfig { busy: boolean; dropEnters: number }
  * The test flips the config file to change its state.
  */
 async function withFakeTui(
-  options: { inputReadyTimeoutMs: number; inputConfirmTimeoutMs: number; acknowledge: boolean },
+  options: { inputReadyTimeoutMs: number; inputConfirmTimeoutMs: number; acknowledge: boolean; tmuxBinary?: string },
   run: (context: { adapter: TmuxWorkerAdapter; handle: Awaited<ReturnType<TmuxWorkerAdapter["start"]>>; setConfig: (config: FakeTuiConfig) => Promise<void>; submitted: () => Promise<string[]>; socketPath: string; sessionName: string; output: () => Promise<string>; events: WorkerEvent[]; hook: (event: Omit<HookRelayRequest["event"], "session_id" | "cwd">) => Promise<unknown> }) => Promise<void>,
 ): Promise<void> {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-fake-tui-"));
@@ -1782,7 +1782,7 @@ render();
   const created = spawnSync("tmux", ["-S", socketPath, "new-session", "-d", "-s", sessionName, "-x", "200", "-c", stateDir, claudeScript], { encoding: "utf8" });
   assert.equal(created.status, 0, created.stderr);
   const hookSource = createFakeHookSource();
-  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 40, startupTimeoutMs: 5_000, terminationGraceMs: 200, inputReadyTimeoutMs: options.inputReadyTimeoutMs, inputConfirmTimeoutMs: options.inputConfirmTimeoutMs });
+  const adapter = new TmuxWorkerAdapter({ stateDir, tmuxBinary: options.tmuxBinary, pollIntervalMs: 40, startupTimeoutMs: 5_000, terminationGraceMs: 200, inputReadyTimeoutMs: options.inputReadyTimeoutMs, inputConfirmTimeoutMs: options.inputConfirmTimeoutMs });
   let stopAcks = false;
   let collected = "";
   const events: WorkerEvent[] = [];
@@ -1850,6 +1850,90 @@ test("a send that never finds an idle prompt is refused as retryable", { skip: !
     await setConfig({ busy: true, dropEnters: 0 });
     await assert.rejects(adapter.send(handle, "never delivered", "busy-2"), (error) => isWorkerInputError(error) && error.retryable);
     assert.deepEqual(await submitted(), []);
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+  });
+});
+
+test("cancelling a send waiting for an idle prompt delivers no input", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 5_000, inputConfirmTimeoutMs: 5_000, acknowledge: false }, async ({ adapter, handle, setConfig, submitted }) => {
+    await setConfig({ busy: true, dropEnters: 0 });
+    const controller = new AbortController();
+    const reason = new Error("takeover before paste");
+    const sending = adapter.send(handle, "must not be pasted", "cancel-busy", controller.signal);
+    const rejected = assert.rejects(sending, (error) => error === reason);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    controller.abort(reason);
+    await rejected;
+    assert.deepEqual(await submitted(), []);
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+    await setConfig({ busy: false, dropEnters: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(await submitted(), []);
+  });
+});
+
+test("cancelling after paste settles the initial Enter once without confirmation retries", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-tmux-paste-boundary-"));
+  const binary = join(root, "tmux-boundary");
+  const pasted = join(root, "pasted");
+  const release = join(root, "release");
+  await writeFile(binary, `#!/usr/bin/env node
+const fs = require("node:fs");
+const result = require("node:child_process").spawnSync("tmux", process.argv.slice(2), { stdio: "inherit" });
+(async () => {
+  if (process.argv.includes("paste-buffer") && result.status === 0 && !fs.existsSync(${JSON.stringify(pasted)})) {
+    fs.writeFileSync(${JSON.stringify(pasted)}, "pasted");
+    for (let i = 0; i < 250 && !fs.existsSync(${JSON.stringify(release)}); i++) await new Promise(r => setTimeout(r, 20));
+  }
+  process.exit(result.status ?? 1);
+})();
+`);
+  await chmod(binary, 0o700);
+  try {
+    await withFakeTui({ inputReadyTimeoutMs: 5_000, inputConfirmTimeoutMs: 5_000, acknowledge: false, tmuxBinary: binary }, async ({ adapter, handle, submitted, output }) => {
+      const controller = new AbortController();
+      let settled = false;
+      const sending = adapter.send(handle, "pasted boundary", "cancel-paste", controller.signal).finally(() => { settled = true; });
+      await waitForFile(pasted);
+      controller.abort(new Error("takeover during paste"));
+      assert.equal(settled, false, "submission boundary must settle before takeover is acknowledged");
+      await writeFile(release, "continue");
+      await sending;
+      assert.deepEqual(await submitted(), ["pasted boundary"]);
+      await adapter.send(handle, "pasted boundary", "cancel-paste");
+      assert.deepEqual(await submitted(), ["pasted boundary"]);
+      assert.doesNotMatch(await output(), /sent Enter again/u);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cancelling after Enter never replays delivered-but-unconfirmed input", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 5_000, inputConfirmTimeoutMs: 5_000, acknowledge: false }, async ({ adapter, handle, submitted, output }) => {
+    const controller = new AbortController();
+    const sending = adapter.send(handle, "entered once", "cancel-confirm", controller.signal);
+    for (let i = 0; i < 100 && (await submitted()).length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(await submitted(), ["entered once"]);
+    controller.abort(new Error("takeover after Enter"));
+    await sending;
+    await adapter.send(handle, "entered once", "cancel-confirm");
+    assert.deepEqual(await submitted(), ["entered once"]);
+    assert.doesNotMatch(await output(), /sent Enter again/u);
+  });
+});
+
+test("queued human completion is distinguished from the automatic turn before it", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 1_000, acknowledge: true }, async ({ adapter, handle, hook, events }) => {
+    await adapter.send(handle, "automatic request", "source-1");
+    await hook({ hook_event_name: "UserPromptSubmit", prompt: "queued human request" });
+    await hook({ hook_event_name: "Stop", last_assistant_message: "automatic done" });
+    const first = events.find((event) => event.type === "turn_completed");
+    assert.equal(first?.source, "automatic");
+    assert.equal((await adapter.getStatus(handle)).activeRequests, 1);
+    await hook({ hook_event_name: "Stop", last_assistant_message: "human done" });
+    const completions = events.filter((event) => event.type === "turn_completed");
+    assert.equal(completions[1]?.source, "human");
     assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
   });
 });

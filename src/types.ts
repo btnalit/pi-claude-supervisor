@@ -36,11 +36,11 @@ export interface WorkerPermissionRequest {
 export type WorkerEvent =
   | { type: "output"; handle: WorkerHandle; chunk: WorkerOutputChunk }
   | { type: "jsonl"; handle: WorkerHandle; record: Record<string, unknown> }
-  | { type: "turn_completed"; handle: WorkerHandle; result: Record<string, unknown>; sequence: number }
+  | { type: "turn_completed"; handle: WorkerHandle; result: Record<string, unknown>; sequence: number; source?: "human" | "automatic" }
   | { type: "permission_request"; handle: WorkerHandle; request: WorkerPermissionRequest }
   | { type: "exited"; handle: WorkerHandle; exitCode?: number | null; signal?: NodeJS.Signals }
   /** A prompt the Supervisor did not send reached an interactive Worker: a human is driving. */
-  | { type: "human_input"; handle: WorkerHandle; text: string };
+  | { type: "human_input"; handle: WorkerHandle; text: string; sequence?: number };
 
 export type WorkerEventListener = (event: WorkerEvent) => void | Promise<void>;
 
@@ -170,7 +170,8 @@ export interface WorkerAdapter {
   subscribe?(handle: WorkerHandle, listener: WorkerEventListener): () => void;
   /** Respond to Claude Code's stdio permission request. */
   respondPermission?(handle: WorkerHandle, requestId: string, toolUseId: string, decision: PermissionDecision, updatedInput?: unknown): Promise<void>;
-  send(handle: WorkerHandle, message: string, idempotencyKey: string): Promise<void>;
+  /** Cooperatively cancel waiting for input; a message already submitted is not retracted. */
+  send(handle: WorkerHandle, message: string, idempotencyKey: string, signal?: AbortSignal): Promise<void>;
   pause(handle: WorkerHandle): Promise<void>;
   resume(handle: WorkerHandle): Promise<void>;
   stop(handle: WorkerHandle, reason: string): Promise<void>;
