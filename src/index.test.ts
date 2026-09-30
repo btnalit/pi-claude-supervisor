@@ -459,8 +459,20 @@ test("index releases a confirmed-clean failed worker cwd reservation", async () 
     const originalAcquire = CwdLeaseStore.prototype.acquire;
     CwdLeaseStore.prototype.acquire = async function(this: CwdLeaseStore, ...args: Parameters<CwdLeaseStore["acquire"]>) {
       const handle = await originalAcquire.apply(this, args);
-      handle.updateWorker = async () => {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+      handle.updateWorker = async (worker) => {
+        const deadline = Date.now() + 5_000;
+        for (;;) {
+          try { await readFile(join(cwd, ".registration-failure-pid"), "utf8"); break; }
+          catch (error) {
+            if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+          }
+          if (worker.pid) {
+            try { process.kill(worker.pid, 0); }
+            catch { throw new Error("registration fixture exited before writing its PID"); }
+          }
+          if (Date.now() > deadline) throw new Error("registration fixture timed out before writing its PID");
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
         throw new Error("injected lease registration failure");
       };
       return handle;
