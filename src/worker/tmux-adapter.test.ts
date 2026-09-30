@@ -1823,7 +1823,8 @@ async function withFakeTui(
   options: { inputReadyTimeoutMs: number; inputConfirmTimeoutMs: number; acknowledge: boolean; tmuxBinary?: string },
   run: (context: { adapter: TmuxWorkerAdapter; handle: Awaited<ReturnType<TmuxWorkerAdapter["start"]>>; setConfig: (config: FakeTuiConfig) => Promise<void>; submitted: () => Promise<string[]>; socketPath: string; sessionName: string; output: () => Promise<string>; events: WorkerEvent[]; hook: (event: Omit<HookRelayRequest["event"], "session_id" | "cwd">) => Promise<unknown> }) => Promise<void>,
 ): Promise<void> {
-  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-fake-tui-"));
+  await mkdir(join(homedir(), ".cache"), { recursive: true });
+  const stateDir = await mkdtemp(join(homedir(), ".cache", "pi-claude-supervisor-tmux-fake-tui-"));
   const socketPath = join(stateDir, "tmux.sock");
   const sessionName = `pi-fake-tui-${process.pid}-${Date.now()}`;
   const configPath = join(stateDir, "config.json");
@@ -1979,7 +1980,7 @@ const result = require("node:child_process").spawnSync("tmux", process.argv.slic
 `);
   await chmod(binary, 0o700);
   try {
-    await withFakeTui({ inputReadyTimeoutMs: 5_000, inputConfirmTimeoutMs: 5_000, acknowledge: false, tmuxBinary: binary }, async ({ adapter, handle, submitted, output }) => {
+    await withFakeTui({ inputReadyTimeoutMs: 5_000, inputConfirmTimeoutMs: 5_000, acknowledge: false, tmuxBinary: binary }, async ({ adapter, handle, submitted, output, hook, events }) => {
       const controller = new AbortController();
       let settled = false;
       const sending = adapter.send(handle, "pasted boundary", "cancel-paste", controller.signal).finally(() => { settled = true; });
@@ -1992,6 +1993,9 @@ const result = require("node:child_process").spawnSync("tmux", process.argv.slic
       await adapter.send(handle, "pasted boundary", "cancel-paste");
       assert.deepEqual(await submitted(), ["pasted boundary"]);
       assert.doesNotMatch(await output(), /sent Enter again/u);
+      await hook({ hook_event_name: "Notification", notification_type: "idle_prompt" });
+      assert.equal(events.filter((event) => event.type === "turn_completed").length, 1);
+      assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
     });
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -2091,22 +2095,95 @@ test("an interactive send leaves every stacked tmux mode, not only a single copy
   });
 });
 
-test("an idle notification between paste and UserPromptSubmit does not count as delivery", { skip: !tmuxAvailable, concurrency: false }, async () => {
-  await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 400, acknowledge: false }, async ({ adapter, handle, setConfig, hook, events, output }) => {
-    await setConfig({ busy: false, dropEnters: 1 });
-    const sending = adapter.send(handle, "wait for the real submit", "idle-1");
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    await hook({ hook_event_name: "Notification", notification_type: "idle_prompt", message: "Claude is waiting for your input" });
-    await sending;
-    // The dropped Enter was resent: the idle notification did not short-circuit the check.
-    assert.match(await output(), /sent Enter again/u);
-    // The idle notice did not close the turn that was only starting.
-    assert.equal(events.some((event) => event.type === "turn_completed"), false);
-    assert.equal((await adapter.getStatus(handle)).activeRequests, 1);
-    // The real submission still matches the pasted message rather than reading as a human prompt.
-    await hook({ hook_event_name: "UserPromptSubmit", prompt: "wait for the real submit" });
-    assert.equal(events.some((event) => event.type === "human_input"), false);
+for (const nativeInput of [false, true]) {
+  test(nativeInput
+    ? "native input during paste is not masked by the submission idle guard"
+    : "an idle notification between paste and UserPromptSubmit does not count as delivery", { skip: !tmuxAvailable, concurrency: false, timeout: 15_000 }, async () => {
+    await mkdir(join(homedir(), ".cache"), { recursive: true });
+    const root = await mkdtemp(join(homedir(), ".cache", "pi-tmux-idle-boundary-"));
+    const binary = join(root, "tmux-boundary");
+    const pasted = join(root, "pasted");
+    const release = join(root, "release");
+    await writeFile(binary, `#!/usr/bin/env node
+const fs = require("node:fs");
+const result = require("node:child_process").spawnSync("tmux", process.argv.slice(2), { stdio: "inherit" });
+(async () => {
+  if (process.argv.includes("paste-buffer") && result.status === 0 && !fs.existsSync(${JSON.stringify(pasted)})) {
+    fs.writeFileSync(${JSON.stringify(pasted)}, "pasted");
+    for (let i = 0; i < 250 && !fs.existsSync(${JSON.stringify(release)}); i++) await new Promise(r => setTimeout(r, 20));
+  }
+  process.exit(result.status ?? 1);
+})();
+`);
+    await chmod(binary, 0o700);
+    try {
+      await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 400, acknowledge: false, tmuxBinary: binary }, async ({ adapter, handle, setConfig, hook, events, output }) => {
+        await setConfig({ busy: false, dropEnters: 1 });
+        const sending = adapter.send(handle, "wait for the real submit", "idle-1");
+        await waitForFile(pasted);
+        await hook({ hook_event_name: "Notification", notification_type: "idle_prompt", message: "Claude is waiting for your input" });
+        assert.equal(events.some((event) => event.type === "turn_completed"), false);
+        if (nativeInput) {
+          await hook({ hook_event_name: "UserPromptSubmit", prompt: "human typing during paste" });
+          assert.ok(events.some((event) => event.type === "human_input" && event.text === "human typing during paste"));
+        }
+        await writeFile(release, "continue");
+        await sending;
+        // The dropped Enter was resent: the idle notification did not short-circuit the check.
+        assert.match(await output(), /sent Enter again/u);
+        // The idle notice did not close the turn that was only starting.
+        assert.equal(events.some((event) => event.type === "turn_completed"), false);
+        assert.equal((await adapter.getStatus(handle)).activeRequests, 1);
+        // The real submission still matches the pasted message rather than reading as a human prompt.
+        await hook({ hook_event_name: "UserPromptSubmit", prompt: "wait for the real submit" });
+        assert.equal(events.some((event) => event.type === "human_input"), nativeInput);
+        // Once submission has settled, a real idle notification still completes
+        // its turn; neither success nor a queued human turn leaves the guard stuck.
+        await hook({ hook_event_name: "Notification", notification_type: "idle_prompt" });
+        const completions = events.filter((event) => event.type === "turn_completed");
+        assert.equal(completions.length, 1);
+        assert.equal(completions[0]?.source, "automatic");
+        assert.equal((await adapter.getStatus(handle)).activeRequests, nativeInput ? 1 : 0);
+        if (nativeInput) {
+          await hook({ hook_event_name: "Notification", notification_type: "idle_prompt" });
+          assert.equal(events.filter((event) => event.type === "turn_completed")[1]?.source, "human");
+          assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
+}
+
+test("failed submission restores idle notifications for a subsequent human turn", { skip: !tmuxAvailable, concurrency: false, timeout: 15_000 }, async () => {
+  await mkdir(join(homedir(), ".cache"), { recursive: true });
+  const root = await mkdtemp(join(homedir(), ".cache", "pi-tmux-failed-submission-"));
+  const binary = join(root, "tmux-failure");
+  await writeFile(binary, `#!/usr/bin/env node
+if (process.argv.includes("paste-buffer")) {
+  process.stderr.write("injected paste failure\\n");
+  process.exit(42);
+}
+const result = require("node:child_process").spawnSync("tmux", process.argv.slice(2), { stdio: "inherit" });
+process.exit(result.status ?? 1);
+`);
+  await chmod(binary, 0o700);
+  try {
+    await withFakeTui({ inputReadyTimeoutMs: 2_000, inputConfirmTimeoutMs: 400, acknowledge: false, tmuxBinary: binary }, async ({ adapter, handle, submitted, hook, events }) => {
+      await assert.rejects(adapter.send(handle, "failed automated submission", "failed-paste"), /injected paste failure/u);
+      assert.deepEqual(await submitted(), []);
+      assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+      await hook({ hook_event_name: "UserPromptSubmit", prompt: "human after the failed submission" });
+      await hook({ hook_event_name: "Notification", notification_type: "idle_prompt" });
+      const completions = events.filter((event) => event.type === "turn_completed");
+      assert.equal(completions.length, 1);
+      assert.equal(completions[0]?.source, "human");
+      assert.equal((await adapter.getStatus(handle)).activeRequests, 0);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("a prompt that differs from the paste right after it is the Supervisor's own, not a human's", { skip: !tmuxAvailable, concurrency: false }, async () => {

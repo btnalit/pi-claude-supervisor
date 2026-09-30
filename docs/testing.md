@@ -64,6 +64,10 @@ trusted parent such as a 0700 directory under `$HOME/.cache`, not world-writable
   injected at both decision and send status preflights, before a send controller
   exists. Duplicate hook events, stale handles and failed explicit/native takeover
   audit writes are covered; a failed audit does not restore automation ownership.
+- Idle-notification delivery tests pause at the completed paste instead of
+  assuming a fixed sleep places the hook inside submission on a loaded runner.
+  Idle during paste/initial Enter cannot finish the reserved turn or mask native
+  input; legitimate idle still completes after success, cancellation or failure.
 - Overlapping tmux monitor/stop/status cleanup is paused deterministically at the
   cgroup read boundary to assert one cleanup execution, shared failure evidence,
   and a successful later retry; unexpected filesystem errors are not suppressed.

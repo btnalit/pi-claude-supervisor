@@ -152,6 +152,8 @@ interface TmuxRecord {
   submitAcks: number;
   /** Counts prompts nobody here sent (human or Claude runtime), so a waiting send can tell the Worker moved on. */
   humanInputs: number;
+  /** Paste/initial Enter is still in flight, before delivery confirmation starts. */
+  submittingInput: boolean;
   /** A send is waiting for its UserPromptSubmit; an idle notice in that window is not a finished turn. */
   confirmingDelivery?: boolean;
   pendingPermissionRequests: Map<string, { phase: "pre" | "prompt"; resolve: (reply: HookRelayReply) => void }>;
@@ -710,6 +712,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       pendingSentMessages: [],
       submitAcks: 0,
       humanInputs: 0,
+      submittingInput: false,
       pendingPermissionRequests: new Map(),
       ignoredHookRequests: 0,
     };
@@ -1188,7 +1191,9 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       }
       const acks = record.submitAcks;
       try {
-        await this.#sendRaw(record, message, signal);
+        record.submittingInput = true;
+        try { await this.#sendRaw(record, message, signal); }
+        finally { record.submittingInput = false; }
         if (record.interactive) await this.#confirmDelivery(record, safeTmuxMessage(message), acks, signal);
         record.sentKeys.add(idempotencyKey);
         record.lastInputAt = new Date().toISOString();
@@ -2325,7 +2330,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         if (event.notification_type === "permission_prompt") {
           const hasPendingPrompt = [...record.pendingPermissionRequests.values()].some((pending) => pending.phase === "prompt");
           if (!hasPendingPrompt) this.#logOutput(record, "[supervisor] Claude is waiting at a permission prompt the hook did not intercept\n");
-        } else if (event.notification_type === "idle_prompt" && record.activeRequests > 0 && !record.confirmingDelivery) {
+        } else if (event.notification_type === "idle_prompt" && record.activeRequests > 0 && !record.submittingInput && !record.confirmingDelivery) {
           // Skipped while a send is confirming its delivery: an idle notice in
           // the gap between the paste and its UserPromptSubmit would close a
           // turn that is only just starting, and the Supervisor would decide
