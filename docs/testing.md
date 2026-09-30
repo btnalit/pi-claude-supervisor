@@ -81,7 +81,9 @@ trusted parent such as a 0700 directory under `$HOME/.cache`, not world-writable
   the Reviewer without executing textconv/external diff; literal wildcard/magic
   filenames cannot pull binaries into forced text. Deleted sides use baseline blobs
   even when a parent directory becomes a symlink/file, without following the new
-  symlink. Binary contents stay omitted and text remains bounded. Park labels retain
+  symlink. Exact A/D status groups prevent literal ancestor paths from including
+  binary descendants on the opposite side, in both file/tree directions, and share
+  the aggregate evidence bound. Binary contents stay omitted. Park labels retain
   the original detailed reason.
 
 The tmux regressions use a real local tmux server with scripted fake Claude TUIs.
