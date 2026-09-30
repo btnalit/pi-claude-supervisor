@@ -307,6 +307,8 @@ export class Supervisor {
   /** Interactive tasks may keep their persistent session open after completion instead of stopping it. */
   #keepWorkerOnCompletion = false;
   #handledEvents = new Set<string>();
+  /** Deduplicate native cancellation at ingress, before its audit can settle. */
+  #pendingHumanInputs = new Set<string>();
   #deferredWorkerEvents = new Map<string, WorkerEvent>();
   /** Turn events whose usage was already accounted; a deferred replay must not double-count tokens. */
   #usageRecordedEvents = new Set<string>();
@@ -418,6 +420,7 @@ export class Supervisor {
     this.#onDecisionSessionClosed = options.onDecisionSessionClosed;
     this.#onProgress = options.onProgress;
     this.#handledEvents.clear();
+    this.#pendingHumanInputs.clear();
     this.#deferredWorkerEvents.clear();
     this.#usageRecordedEvents.clear();
     this.#pendingPermissions.clear();
@@ -749,10 +752,14 @@ export class Supervisor {
 
   #receiveWorkerEvent(event: WorkerEvent): void {
     if (event.type === "output" || event.type === "jsonl") return;
-    if (event.type === "human_input" && this.#automation && event.handle.id === this.#handle?.id && !this.#handledEvents.has(workerEventKey(event))) {
-      this.#takeoverRequested = true;
-      this.#automationEpoch += 1;
-      this.#inputAbortController?.abort(this.#takeoverInputError);
+    if (event.type === "human_input" && this.#automation && event.handle.id === this.#handle?.id) {
+      const key = workerEventKey(event);
+      if (!this.#handledEvents.has(key) && !this.#pendingHumanInputs.has(key)) {
+        this.#pendingHumanInputs.add(key);
+        this.#takeoverRequested = true;
+        this.#automationEpoch += 1;
+        this.#inputAbortController?.abort(this.#takeoverInputError);
+      }
     }
     void this.#exclusive(() => this.#processWorkerEvent(event)).catch((error) => {
       void this.#appendEvent({ type: "worker_event_error", taskId: this.#task?.taskId, workerId: event.handle.id, data: { error: safeMessage(error), eventType: event.type } }).catch(() => {});
@@ -940,6 +947,7 @@ export class Supervisor {
         this.#notifyDecision(event);
       }
       this.#handledEvents.add(key);
+      this.#pendingHumanInputs.delete(key);
       this.#deferredWorkerEvents.delete(key);
     } catch (error) {
       this.#deferredWorkerEvents.set(key, event);
