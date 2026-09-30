@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, symlink, writeFile } from "node:fs/promises";
+import fsPromises, { access, chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rename, rm, rmdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { spawn, spawnSync } from "node:child_process";
+import { homedir, tmpdir } from "node:os";
+import childProcess, { spawn, spawnSync } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import test from "node:test";
 import { TmuxWorkerAdapter, TMUX_EMBEDDED_SCRIPTS, claudeProjectSlug, effectiveToolInput, inputHoldsMessage, memoryRootFor, sweepDeadTmuxSockets, writeRootsOf } from "./tmux-adapter.ts";
 import { isWorkerInputError } from "./input-error.ts";
@@ -626,6 +627,92 @@ setInterval(() => {}, 10000);
     await rm(stateDir, { recursive: true, force: true });
   }
 });
+
+for (const injectFailure of [false, true]) {
+  test(`overlapping tmux cleanup is coalesced${injectFailure ? ", preserves failure, and can retry" : ""}`, { skip: !automaticTmuxAvailable, concurrency: false, timeout: 20_000 }, async (t) => {
+    const cache = join(homedir(), ".cache");
+    await mkdir(cache, { recursive: true, mode: 0o700 });
+    const stateDir = await mkdtemp(join(cache, "pi-supervisor-cleanup-race-"));
+    const fakeClaude = join(stateDir, "claude");
+    await writeFile(fakeClaude, '#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({ type: "system", subtype: "ready" }) + "\\n"); process.stdin.resume();\n', { mode: 0o700 });
+    const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 20, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+    let handle: Awaited<ReturnType<TmuxWorkerAdapter["start"]>> | undefined;
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    let paused = false;
+    let readCalls = 0;
+    let cleanupExecutions = 0;
+    let observeNextPaneStatus = false;
+    let paneProbeClosed!: () => void;
+    const probeClosed = new Promise<void>((resolve) => { paneProbeClosed = resolve; });
+    let stopping: Promise<unknown> | undefined;
+    let inspecting: ReturnType<TmuxWorkerAdapter["getStatus"]> | undefined;
+    let restore = () => {};
+    try {
+      handle = await adapter.start({ task: "cleanup race", cwd: stateDir, command: fakeClaude, args: [], automatic: true, sendInitialInput: false,
+        env: { HOME: join(stateDir, "home"), CLAUDE_CONFIG_DIR: join(stateDir, "config") } });
+      assert.ok(handle.cgroupPath);
+      const cgroupPath = handle.cgroupPath;
+      const originalRead = fsPromises.readFile;
+      const readMock = t.mock.method(fsPromises, "readFile", async (...args: Parameters<typeof originalRead>) => {
+        if (String(args[0]) === `${cgroupPath}/cgroup.events`) {
+          readCalls += 1;
+          if (readCalls === 1) {
+            paused = true;
+            await readGate;
+            if (injectFailure) throw Object.assign(new Error("injected cgroup read failure"), { code: "EIO" });
+          }
+        }
+        return originalRead(...args);
+      });
+      const originalSpawn = childProcess.spawn;
+      const spawnMock = t.mock.method(childProcess, "spawn", (...args: unknown[]) => {
+        const child = Reflect.apply(originalSpawn, childProcess, args) as ReturnType<typeof originalSpawn>;
+        if (Array.isArray(args[1]) && args[1].includes(handle!.tmuxSocket)) {
+          if (args[1].includes("kill-server")) cleanupExecutions += 1;
+          if (observeNextPaneStatus && args[1].includes("display-message")) {
+            observeNextPaneStatus = false;
+            child.once("close", paneProbeClosed);
+          }
+        }
+        return child;
+      });
+      syncBuiltinESMExports();
+      restore = () => { readMock.mock.restore(); spawnMock.mock.restore(); syncBuiltinESMExports(); };
+      stopping = adapter.stop(handle, "overlap cleanup").then(() => undefined, (error: unknown) => error);
+      await waitFor(() => paused);
+      observeNextPaneStatus = true;
+      inspecting = adapter.getStatus(handle);
+      await probeClosed;
+      await new Promise<void>((resolve) => setImmediate(resolve)); // The pane probe has joined cleanup while its read is paused.
+      releaseRead();
+      const [stopError, status] = await Promise.all([stopping, inspecting]);
+      assert.equal(cleanupExecutions, 1, "monitor, stop and status must share one cleanup body");
+      assert.equal(readCalls, 1);
+      if (injectFailure) {
+        assert.match(String(stopError), /injected cgroup read failure/u);
+        assert.match(status.cleanupError ?? "", /injected cgroup read failure/u);
+        assert.equal(status.processGroupCleaned, false);
+        await adapter.stop(handle, "retry failed cleanup");
+        const retried = await adapter.getStatus(handle);
+        assert.equal(retried.cleanupError, undefined);
+        assert.equal(retried.cgroupError, undefined);
+        assert.equal(retried.processGroupCleaned, true);
+        assert.equal(cleanupExecutions, 2);
+      } else {
+        assert.equal(stopError, undefined);
+        assert.equal(status.cleanupError, undefined);
+        assert.equal(status.processGroupCleaned, true);
+      }
+    } finally {
+      releaseRead();
+      restore();
+      await Promise.allSettled([stopping, inspecting].filter(Boolean));
+      if (handle) await adapter.stop(handle, "cleanup race fixture").catch(() => {});
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("automatic tmux allows a Claude child and cgroup cleanup reaps it", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-nested-test-"));
@@ -1485,7 +1572,9 @@ async function startInteractiveOwnedFixture(options: { retainCgroupUntilLeaseRel
   events: WorkerEvent[];
   fakePid: number;
 }> {
-  const stateDir = await realpath(await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-interactive-")));
+  const cache = join(homedir(), ".cache");
+  await mkdir(cache, { recursive: true, mode: 0o700 });
+  const stateDir = await realpath(await mkdtemp(join(cache, "pi-claude-supervisor-tmux-interactive-")));
   const fakeClaude = join(stateDir, "claude");
   const pidFile = join(stateDir, "claude.pid");
   const hookSettingsPath = join(stateDir, "hook-settings.json");

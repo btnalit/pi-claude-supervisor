@@ -60,7 +60,11 @@ trusted parent such as a 0700 directory under `$HOME/.cache`, not world-writable
   submission boundary, after Enter, and pending decision/repair/publish sends.
   Cancelled waits do not consume a turn; submitted input is never replayed, and
   a genuine transport error is not swallowed as cancellation. Old responses stay
-  stale even after resume-auto replays the same completed turn.
+  stale even after resume-auto replays the same completed turn. Native input,
+  duplicate hook events, stale handles and failed takeover audit writes are covered.
+- Overlapping tmux monitor/stop/status cleanup is paused deterministically at the
+  cgroup read boundary to assert one cleanup execution, shared failure evidence,
+  and a successful later retry; unexpected filesystem errors are not suppressed.
 - Automatic completions and idle notices cannot reset human idleness. Queued human
   completions retain their source and active-turn state.
 - Git read retries are bounded and exclude aborts, evidence overflow, definitive

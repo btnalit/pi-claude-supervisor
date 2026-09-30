@@ -94,6 +94,7 @@ interface TmuxRecord {
   abortListener?: () => void;
   released: boolean;
   cleanupComplete: boolean;
+  cleanupPromise?: Promise<void>;
   /**
    * Set once an owned interactive `release()` has migrated every process out
    * of the Worker cgroup and handed the tmux session back to the operator.
@@ -918,8 +919,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
     } catch (error) {
       if (isMissingSession(error)) {
         record.paneDead = true;
-        record.cleanupError = undefined;
-        if (!record.cleanupComplete && record.owned) await this.#cleanup(record, false);
+        if (!record.cleanupComplete && record.owned) {
+          try { await this.#cleanup(record, false); }
+          catch (cleanupError) { record.cleanupError ??= asError(cleanupError); }
+        }
       } else {
         record.cleanupError = asError(error);
         if (isPaneIdentityError(error)) record.paneDead = false;
@@ -1870,6 +1873,16 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
   }
 
   async #cleanup(record: TmuxRecord, _force: boolean): Promise<void> {
+    // Both callers' force values have always used the same verified cleanup.
+    // A monitor/status/stop overlap must not remove a cgroup under another read.
+    if (record.cleanupPromise) return record.cleanupPromise;
+    const cleanup = this.#cleanupOnce(record);
+    record.cleanupPromise = cleanup;
+    try { await cleanup; }
+    finally { if (record.cleanupPromise === cleanup) record.cleanupPromise = undefined; }
+  }
+
+  async #cleanupOnce(record: TmuxRecord): Promise<void> {
     if (record.cleanupComplete) return;
     // A later cleanup call is a retry, so do not let a transient prior error
     // permanently poison a successful retry. The caller preserves errors from
@@ -1885,6 +1898,7 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       try { await rm(record.runtimeDir, { recursive: true, force: true }); }
       catch (error) { record.cleanupError ??= asError(error); }
       record.cleanupComplete = !record.cleanupError;
+      if (record.cleanupError) throw record.cleanupError;
       return;
     }
     if (record.monitor) clearInterval(record.monitor);
@@ -1908,14 +1922,16 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       try {
         await cleanupCgroup(record.cgroupPath, this.#terminationGraceMs, Boolean((record.structured || record.interactive) && record.handle.retainCgroupUntilLeaseRelease));
         record.cgroupCleaned = true;
+        record.cgroupError = undefined;
       } catch (error) {
-        record.cgroupError ??= asError(error);
+        record.cgroupError = asError(error);
         record.cleanupError ??= record.cgroupError;
       }
     }
     try { await rm(record.runtimeDir, { recursive: true, force: true }); }
     catch (error) { record.cleanupError ??= asError(error); }
     record.cleanupComplete = !record.cleanupError && (record.serverKilled || !record.sessionCreated) && (!record.cgroupPath || record.cgroupCleaned === true);
+    if (record.cleanupError) throw record.cleanupError;
   }
 
   async #unsubscribeHooks(record: TmuxRecord): Promise<void> {
