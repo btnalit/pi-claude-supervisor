@@ -401,7 +401,7 @@ export async function collectRepositoryEvidence(cwd: string, options: Pick<Verif
   const [statusResult, diffResult, commitsResult, branchResult, untrackedResult, head] = await Promise.all([
     readGitEvidence(cwd, ["status", "--short", "--untracked-files=all"], options.signal),
     // A baseline-relative diff includes committed, staged, and unstaged changes.
-    readGitEvidence(cwd, ["diff", "--no-ext-diff", "--unified=3", diffRef, "--"], options.signal),
+    readTrackedDiff(cwd, diffRef, options.signal),
     readGitEvidence(cwd, commitArgs, options.signal),
     readGitEvidence(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"], options.signal),
     collectUntrackedEvidence(cwd, options.signal),
@@ -466,6 +466,72 @@ interface EvidencePart {
   text: string;
   complete: boolean;
   truncated: boolean;
+}
+
+async function readTrackedDiff(cwd: string, ref: string, signal?: AbortSignal): Promise<EvidencePart> {
+  const args = ["diff", "--no-ext-diff", "--no-textconv", "--unified=3", "--no-renames", ref, "--"];
+  const normal = await readGitEvidence(cwd, args, signal);
+  if (!normal.complete) return normal;
+  // -diff/custom binary attributes hide ordinary source too. Inspect only
+  // Git's binary-classified paths, then force text for actual text files.
+  // Genuine binaries keep the normal name-only notice, without huge patches.
+  const stats = await readGitEvidence(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--numstat", "-z", ref, "--"], signal);
+  if (!stats.complete) return { text: `${normal.text}\n${stats.text}`, complete: false, truncated: stats.truncated };
+  const hidden = stats.text.split("\0").filter((entry) => entry.startsWith("-\t-\t")).map((entry) => entry.slice(4));
+  if (hidden.length === 0) return normal;
+  const paths: string[] = [];
+  let complete = hidden.length <= maxUntrackedFiles();
+  try {
+    const root = await realpath(cwd);
+    for (const path of hidden.slice(0, maxUntrackedFiles())) {
+      throwIfAborted(signal);
+      if (!await trackedFileIsBinary(root, path) && !await baselineBlobIsBinary(cwd, ref, path, signal)) paths.push(path);
+    }
+  } catch (error) {
+    throwIfAborted(signal);
+    return { text: `${normal.text}\n[ATTRIBUTE-HIDDEN DIFF UNAVAILABLE] ${error instanceof Error ? error.message : String(error)}`, complete: false, truncated: false };
+  }
+  const forced = paths.length ? await readGitEvidence(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--text", "--unified=3", "--no-renames", ref, "--", ...paths], signal) : undefined;
+  const text = `${normal.text}${forced ? `\n[Text diff for attribute-hidden files]\n${forced.text}` : ""}${complete ? "" : "\n[TRUNCATED: too many attribute-hidden paths]"}`;
+  const bounded = boundEvidence(text);
+  return { ...bounded, complete: complete && bounded.complete && (forced?.complete ?? true), truncated: !complete || bounded.truncated || (forced?.truncated ?? false) };
+}
+
+async function trackedFileIsBinary(root: string, path: string): Promise<boolean> {
+  const fullPath = resolve(root, path);
+  const within = relative(root, fullPath);
+  if (isAbsolute(within) || within === ".." || within.startsWith(`..${sep}`)) throw new Error("tracked evidence path escaped the repository");
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    await assertNoSymlinkComponents(root, dirname(within));
+    const info = await lstat(fullPath);
+    if (info.isSymbolicLink()) return false; // Git diffs the link itself.
+    if (!info.isFile()) throw new Error("tracked evidence is not a regular file");
+    handle = await open(fullPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    await assertOpenedEvidencePath(root, handle.fd);
+    const prefix = Buffer.alloc(8_000);
+    const { bytesRead } = await handle.read(prefix, 0, prefix.length, 0);
+    return prefix.subarray(0, bytesRead).includes(0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; // Deleted tracked file.
+    throw error;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+async function baselineBlobIsBinary(cwd: string, ref: string, path: string, signal?: AbortSignal): Promise<boolean> {
+  let prefix: string | Buffer;
+  try {
+    const result = await execGitRead(["cat-file", "blob", `${ref}:${path}`], { cwd, timeout: 30_000, maxBuffer: 8_000, signal, env: workerEnvironment(process.env) });
+    prefix = result.stdout;
+  } catch (error) {
+    const failure = error as { code?: number | string; stdout?: string; stderr?: string };
+    if (failure.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") prefix = failure.stdout ?? "";
+    else if (failure.code === 128 && /does not exist in|exists on disk, but not in/u.test(failure.stderr ?? "")) return false; // Added file.
+    else throw error;
+  }
+  return Buffer.from(prefix).includes(0);
 }
 
 async function readGitEvidence(cwd: string, args: string[], signal?: AbortSignal): Promise<EvidencePart> {
