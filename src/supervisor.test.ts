@@ -5469,4 +5469,55 @@ test("release after verification has already passed completes cleanly without a 
   }
 });
 
+test("release failure during verification surfaces cleanupError and cleanupConfirmed=false", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-release-fail-"));
+  try {
+    await initializeGitRepository(cwd, "worker/release-fail");
+    const handle: WorkerHandle = { id: "release-fail-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned", sessionName: "pi-cs-release-fail" };
+    let stopCalls = 0;
+    let closure: { cleanupConfirmed: boolean; reason: string } | undefined;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true, repairableSession: true }),
+      start: async () => handle,
+      getStatus: async () => ({ handle, running: true, activeRequests: 0, processGroupCleaned: false }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { stopCalls += 1; },
+      release: async () => { throw new Error("injected release failure"); },
+      killProcessGroup: async () => { stopCalls += 1; },
+      resumeSession: async () => handle,
+    };
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(adapter, events as never, { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "release failure during verification",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      onDecisionSessionClosed: (_taskId, info) => { closure = info; },
+      spec: {
+        maxRepairRounds: 2,
+        autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 },
+        acceptance: [{ id: "slow", name: "slow", command: process.execPath, args: ["-e", "setTimeout(() => process.exit(1), 10000)"], required: true, timeoutMs: 15_000 }],
+      },
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    });
+    await supervisor.poll();
+    const verifying = supervisor.verify();
+    await waitFor(() => events.events.some((entry) => entry.type === "acceptance_started"), 3_000);
+    const [verifyResult, releaseResult] = await Promise.allSettled([verifying, supervisor.release("detach fails")]);
+    assert.equal(verifyResult.status, "rejected");
+    assert.equal(releaseResult.status, "rejected");
+    assert.equal(stopCalls, 0);
+    assert.equal(supervisor.state, "failed");
+    assert.deepEqual(closure, { cleanupConfirmed: false, reason: "recoverable_failure" });
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 

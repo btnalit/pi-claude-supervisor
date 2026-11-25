@@ -1095,6 +1095,7 @@ export class Supervisor {
         await this.#appendEvent({ type: "decision_ignored", taskId: this.#task?.taskId, workerId: event.handle.id, data: { reason: "operator stop requested", eventType: event.type, error: safeMessage(error) } }).catch(() => {});
         return;
       }
+      if (!this.#task || !this.#handle || ["completed", "blocked", "failed", "stopped"].includes(this.#machine.state)) return;
       // A *model* failure for an event overtaken while it failed decides
       // nothing (the Pi Decision Worker already drops those itself; this
       // covers other factories). A failure applying an action or delivering
