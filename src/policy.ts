@@ -1088,41 +1088,41 @@ export function evaluateCommand(command: string, args: readonly string[] = [], g
 type NestedCommandCache = Map<string, PolicyResult>;
 
 /**
- * Strictly non-executing text/inspection commands whose literal arguments can
- * safely be stripped from broad remote/destructive regex scans (when the
- * statement has no dynamic/subshell/brace tokens and does not pipe into a
- * non-text command). Explicitly excludes pagers/editors (`view`, `less`, `more`,
- * `bat`), `sort` (`--compress-program`), `diff`, `tee` and `jq`.
+ * Strict allowlist of non-executing inspection commands permitted in an
+ * all-allowlisted command for subtractive boundary scanning. Excludes `echo`,
+ * `printf`, pagers/editors (`view`, `less`, `more`, `bat`), `sort`, `diff`,
+ * `tee` and `jq`.
  */
-const HARMLESS_TEXT_COMMANDS = new Set([
-  "echo", "printf", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg",
-  "cut", "tr", "uniq", "nl", "tac", "rev", "base64", "md5sum", "sha1sum", "sha256sum",
-  "column", "fold", "paste", "comm", "cmp", "od", "hexdump", "xxd", "ls", "stat", "file",
+const STRICT_INSPECTION_COMMANDS = new Set([
+  "grep", "egrep", "fgrep", "rg", "head", "tail", "wc", "cat", "cut", "tr", "uniq", "nl", "ls", "stat",
 ]);
-/** Git subcommands that only read repository state; their non-dynamic literal args cannot push, merge or mutate remotes. */
+/** Known non-executing `rg` flags (allowlist; excludes `--pre`, `--hostname-bin`, `-z`, `--search-zip`, etc.). */
+const RG_SAFE_LONG_FLAGS = new Set([
+  "--line-number", "--no-line-number", "--ignore-case", "--case-sensitive", "--smart-case",
+  "--files-with-matches", "--files-without-match", "--count", "--count-matches",
+  "--word-regexp", "--fixed-strings", "--invert-match", "--only-matching",
+  "--hidden", "--no-ignore", "--no-heading", "--with-filename", "--no-filename",
+  "--quiet", "--no-messages", "--glob", "--iglob", "--type", "--type-not",
+  "--max-count", "--regexp", "--after-context", "--before-context", "--context",
+  "--color", "--multiline", "--files",
+]);
+const RG_SAFE_SHORT_CHARS = new Set([..."nilcwFSUvHovqsrmgeABCtT"]);
+/** Git subcommands that only read repository state; their literal args cannot push, merge or mutate remotes. */
 const GIT_READ_ONLY_SUBCOMMANDS = new Set([
   "status", "diff", "log", "show", "rev-parse", "rev-list", "ls-files", "blame", "describe",
   "cat-file", "merge-base", "merge-tree", "shortlog", "whatchanged", "name-rev",
   "check-ignore", "check-attr", "ls-tree", "diff-tree", "diff-index", "diff-files",
   "for-each-ref", "show-ref",
 ]);
-/** Git subcommands where `-m` / `--message` genuinely accepts free-form message text (excludes `rebase -m`, which is `--merge`). */
-const GIT_MESSAGE_SUBCOMMANDS = new Set(["commit", "tag", "stash", "notes"]);
 const GIT_MERGE_CONTROL_FLAGS = new Set(["--abort", "--continue", "--quit"]);
 const GIT_MERGE_VALUE_OPTIONS = new Set(["-m", "--message", "-s", "--strategy", "-X", "--strategy-option", "--cleanup"]);
 const GIT_MERGE_SAFE_FLAGS = new Set([
   "--no-ff", "--ff", "--ff-only", "--squash", "--no-squash", "--commit", "--no-commit",
-  "--edit", "--no-edit", "-q", "--quiet", "-v", "--verbose", "--stat", "-n", "--no-stat",
+  "--no-edit", "-q", "--quiet", "-v", "--verbose", "--stat", "-n", "--no-stat",
   "--log", "--no-log", "--rerere-autoupdate", "--no-rerere-autoupdate",
   "--allow-unrelated-histories", "--no-verify",
 ]);
 const SHELL_META_CHARS = /[()`${}]/u;
-/** Commands that can rebind command names, create symlinks/binaries, or export env hooks; if present anywhere in a command, disable all subtractive stripping. */
-const STRIP_DISABLING_COMMANDS = new Set([
-  "hash", "alias", "enable", "ln", "cp", "install", "mv",
-  "export", "declare", "typeset", "readonly", "local", "set", "shopt",
-  "eval", "source", ".", "function",
-]);
 
 interface ScanSegment {
   tokens: ShellToken[];
@@ -1144,30 +1144,52 @@ function scanSegmentsOf(tokens: readonly ShellToken[]): ScanSegment[] {
   return segments;
 }
 
-function segmentCommandWords(segment: readonly ShellToken[]): { words: ShellToken[]; start: number } {
-  const words: ShellToken[] = [];
-  let afterRedirect = false;
-  for (const token of segment) {
-    if (token.operator) { afterRedirect = REDIRECT_OPERATORS.has(token.value) || token.value === "<<<"; continue; }
-    if (!afterRedirect) words.push(token);
-    afterRedirect = false;
-  }
-  let start = 0;
-  while (start < words.length && !words[start]!.dynamic && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[start]!.value)) start += 1;
-  return { words, start };
-}
-
-function segmentHasUnsafeShellTokens(segment: readonly ShellToken[]): boolean {
-  let afterRedirect = false;
-  for (const token of segment) {
+function hasDisallowedGlobalScanToken(tokens: readonly ShellToken[]): boolean {
+  for (const token of tokens) {
     if (token.operator) {
-      afterRedirect = REDIRECT_OPERATORS.has(token.value) || token.value === "<<<";
+      // Any redirection operator (`>`, `>>`, `<`, `<<`, `<<<`, `>|`, `&>`, `>&`) disables stripping for the whole command.
+      if (!SEGMENT_SPLIT_OPERATORS.has(token.value)) return true;
       continue;
     }
     if (token.dynamic || token.data) return true;
-    if (afterRedirect && token.value.startsWith("(")) return true;
-    afterRedirect = false;
     if (SHELL_META_CHARS.test(token.value)) return true;
+  }
+  return false;
+}
+
+function isSafeRgArgs(args: readonly ShellToken[]): boolean {
+  for (const token of args) {
+    const value = token.value;
+    if (value === "--" || value === "-" || !value.startsWith("-")) continue;
+    if (value.startsWith("--")) {
+      const flag = value.includes("=") ? value.slice(0, value.indexOf("=")) : value;
+      if (!RG_SAFE_LONG_FLAGS.has(flag)) return false;
+      continue;
+    }
+    // Short option cluster (e.g. `-rn`, `-in`, `-C3`).
+    const chars = value.slice(1);
+    if (!chars) return false;
+    for (let i = 0; i < chars.length; i += 1) {
+      const ch = chars[i]!;
+      if (!RG_SAFE_SHORT_CHARS.has(ch)) return false;
+      // Short flags that take an inline numeric/string value (`-m5`, `-A2`, `-ePAT`, `-g*.ts`).
+      if ("ABCmgteT".includes(ch)) break;
+    }
+  }
+  return true;
+}
+
+function hasEditFlag(args: readonly ShellToken[]): boolean {
+  for (const token of args) {
+    const value = token.value;
+    if (value === "--") break;
+    if (value === "-e" || value === "--edit" || value === "-c" || value === "--reedit-message" || value.startsWith("--reedit-message=")) return true;
+    // Combined short option cluster containing `e` (e.g. `-ae`, `-am` is fine, `-e` is not).
+    if (value.startsWith("-") && !value.startsWith("--") && value.length > 2) {
+      // Stop before `-m` payload in `-amfoo`.
+      const beforeMsg = value.includes("m") ? value.slice(1, value.indexOf("m")) : value.slice(1);
+      if (beforeMsg.includes("e") || beforeMsg.includes("c")) return true;
+    }
   }
   return false;
 }
@@ -1215,7 +1237,7 @@ function hasRemoteNamed(name: string, commonDir: string): boolean {
   const packed = join(commonDir, "packed-refs");
   try {
     if (existsSync(packed)) {
-      if (statSync(packed).size > 2 * 1024 * 1024) return true;
+      if (lstatSync(packed).isSymbolicLink() || statSync(packed).size > 2 * 1024 * 1024) return true;
       const content = readFileSync(packed, "utf8");
       const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
       if (new RegExp(` refs/remotes/${escaped}/`, "u").test(content)) return true;
@@ -1235,7 +1257,7 @@ function isRemoteTrackingRef(ref: string, commonDir: string): boolean {
 
 function isSafeMergeControl(words: readonly ShellToken[], subIndex: number): boolean {
   const args = words.slice(subIndex + 1);
-  if (args.length === 0 || args.some((token) => token.dynamic || token.data)) return false;
+  if (args.length === 0) return false;
   let sawControl = false;
   for (const token of args) {
     if (GIT_MERGE_CONTROL_FLAGS.has(token.value)) { sawControl = true; continue; }
@@ -1249,31 +1271,28 @@ function isSafeMergeControl(words: readonly ShellToken[], subIndex: number): boo
  * #55-2: allow a local non-protected branch merge ONLY under strict, TOCTOU-free
  * conditions:
  * - `cwd` is provided;
- * - the merge is the sole statement in the command (no prior checkout/cd/subshell/script);
- * - no leading environment assignments (e.g. `GIT_DIR=...`);
- * - no git global options before `merge` (`subIndex === 1`: no `-C`, `--git-dir`, `-c`);
- * - no redirections or dynamic/subshell tokens;
+ * - the merge is the sole statement in the command;
+ * - no leading environment assignments, redirections, dynamic/meta tokens or git global options (`subIndex === 1`);
+ * - no `--edit`/`-e` flag;
  * - HEAD is an attached non-protected branch, and every source is a literal
  *   local non-protected branch (not `-`, not a remote or remote-tracking ref,
- *   no rev syntax `^`/`~`/`..`/`:`/`@{`).
+ *   no rev syntax `^`/`~`/`..`/`:`/`@{`, stripping `refs/heads/` and `heads/`).
  */
-function isAllowedLocalMerge(segment: readonly ShellToken[], words: readonly ShellToken[], start: number, subIndex: number, totalSegments: number, cwd: string | undefined): boolean {
-  if (cwd === undefined || totalSegments !== 1 || start !== 0 || subIndex !== 1) return false;
-  if (segment.some((token) => token.operator)) return false;
-  if (segmentHasUnsafeShellTokens(segment)) return false;
+function isAllowedLocalMerge(words: readonly ShellToken[], totalSegments: number, cwd: string | undefined): boolean {
+  if (cwd === undefined || totalSegments !== 1) return false;
   const dirs = readGitDirs(cwd);
   if (!dirs) return false;
   const targetBranch = readCurrentGitBranch(cwd);
   if (!targetBranch || isProtectedBranch(targetBranch)) return false;
 
-  const args = words.slice(subIndex + 1);
+  const args = words.slice(2);
   const sources: string[] = [];
   let options = true;
   for (let i = 0; i < args.length; i += 1) {
     const value = args[i]!.value;
     if (options && value === "--") { options = false; continue; }
     if (options && value.startsWith("-")) {
-      if (value === "-") return false; // `git merge -` merges the previous branch.
+      if (value === "-") return false;
       if (GIT_MERGE_VALUE_OPTIONS.has(value)) {
         if (i + 1 >= args.length) return false;
         i += 1;
@@ -1291,127 +1310,121 @@ function isAllowedLocalMerge(segment: readonly ShellToken[], words: readonly She
     if (!source || source === "-" || /[:^~]|@\{|\.\./u.test(source)) return false;
     if (["HEAD", "FETCH_HEAD", "ORIG_HEAD", "MERGE_HEAD"].includes(source)) return false;
     if (isRemoteTrackingRef(source, dirs.commonDir)) return false;
-    const normalized = source.replace(/^refs\/heads\//u, "");
+    const normalized = source.replace(/^(?:refs\/)?heads\//u, "");
     if (!normalized || isProtectedBranch(normalized)) return false;
   }
   return true;
 }
 
-function isHarmlessTextInvocation(head: ShellToken | undefined, args: readonly ShellToken[]): boolean {
-  if (!head || head.dynamic || head.data || /[\\/]/u.test(head.value)) return false;
-  const name = head.value.toLowerCase();
-  if (!HARMLESS_TEXT_COMMANDS.has(name)) return false;
-  if (name === "rg" && args.some((token) => /^--pre(?:=|$)|^--pre-glob(?:=|$)|^--search-zip$|^-.*z/u.test(token.value))) return false;
-  if (name === "printf" && args.some((token) => token.value === "-v" || /^-v/u.test(token.value))) return false;
-  return true;
-}
-
-/** True when every command in the `|` pipeline starting at `segIdx` is a clean harmless text command. */
-function pipelineIsHarmlessText(segments: readonly ScanSegment[], segIdx: number): boolean {
-  for (let i = segIdx; i < segments.length; i += 1) {
-    const seg = segments[i]!;
-    if (segmentHasUnsafeShellTokens(seg.tokens)) return false;
-    const { words, start } = segmentCommandWords(seg.tokens);
-    if (!isHarmlessTextInvocation(words[start], words.slice(start + 1))) return false;
-    if (seg.nextOperator !== "|") return true;
+function collectMessageDropTokens(args: readonly ShellToken[], dropSet: Set<ShellToken>): void {
+  for (let i = 0; i < args.length; i += 1) {
+    const token = args[i]!;
+    if (token.value === "--") break;
+    if (token.value === "-m" || token.value === "--message") {
+      const next = args[i + 1];
+      if (next) { dropSet.add(next); i += 1; }
+      continue;
+    }
+    if (token.value.startsWith("--message=") || /^-m./u.test(token.value)) {
+      dropSet.add(token);
+    }
   }
-  return true;
-}
-
-/** True when any statement in the command could rebind command names, mutate env hooks or define shell functions. */
-function commandDisablesStripping(segments: readonly ScanSegment[]): boolean {
-  for (const segment of segments) {
-    const { words, start } = segmentCommandWords(segment.tokens);
-    let idx = start;
-    while (idx < words.length && COMMAND_POSITION_KEYWORDS.has(words[idx]!.value.toLowerCase())) idx += 1;
-    const head = words[idx];
-    const headName = head ? head.value.split(/[\\/]/u).at(-1)?.toLowerCase() : undefined;
-    if (headName && STRIP_DISABLING_COMMANDS.has(headName)) return true;
-    if (words.slice(0, start).some((token) => /^(?:PATH|GIT_|LD_|BASH_ENV|ENV)=/u.test(token.value))) return true;
-    if (segment.tokens.some((token) => !token.operator && (token.value === "()" || token.value === "{" || token.value === "}"))) return true;
-  }
-  return false;
 }
 
 /**
- * Subtractive scan: preserve every existing wrapper, nested-shell, dynamic-arg,
- * remote-config and protected-branch denial, and remove ONLY proven-harmless
- * non-dynamic literal words before running the broad remote/destructive checks.
- * Dynamic tokens, subshells, path-qualified binaries, name-rebinding chains,
- * and pipelines feeding non-text commands are never stripped.
+ * Strict fail-closed allowlist check for a single segment. Returns the exact
+ * set of harmless literal tokens to drop from this segment, or `undefined` if
+ * the segment is NOT an allowlisted shape (which disables stripping for the
+ * ENTIRE command).
+ */
+function allowlistedSegmentDrops(segment: readonly ShellToken[], totalSegments: number, cwd: string | undefined): Set<ShellToken> | undefined {
+  if (segment.length === 0) return undefined;
+  const head = segment[0]!;
+  // Reject leading env assignments (`NAME=val`), path-qualified binaries (`./cat`, `/bin/cat`), and shell keywords.
+  if (/[\\/=]/u.test(head.value)) return undefined;
+  const name = head.value.toLowerCase();
+  const args = segment.slice(1);
+  const dropSet = new Set<ShellToken>();
+
+  // Shape A: strictly non-executing inspection command (with flag allowlist for `rg`).
+  if (STRICT_INSPECTION_COMMANDS.has(name)) {
+    if (name === "rg" && !isSafeRgArgs(args)) return undefined;
+    for (const token of args) dropSet.add(token);
+    return dropSet;
+  }
+
+  // Shapes B–F: bare `git` with NO global options before the subcommand (`segment[1]` is the subcommand).
+  if (name !== "git" || segment.length < 2) return undefined;
+  const subToken = segment[1]!;
+  if (subToken.value.startsWith("-")) return undefined;
+  const sub = subToken.value.toLowerCase();
+  const subArgs = segment.slice(2);
+
+  // Shape B: read-only git subcommand without external diff/textconv driver flags.
+  if (GIT_READ_ONLY_SUBCOMMANDS.has(sub)) {
+    if (subArgs.some((token) => GIT_DRIVER_FLAGS.test(token.value))) return undefined;
+    for (const token of subArgs) dropSet.add(token);
+    return dropSet;
+  }
+
+  // Shape C: `git commit` / `git tag` with `-m`/`--message` and no editor invocation.
+  if (sub === "commit" || sub === "tag") {
+    if (hasEditFlag(subArgs)) return undefined;
+    collectMessageDropTokens(subArgs, dropSet);
+    return dropSet;
+  }
+
+  // Shape D: `git stash push` (and optional `-m`/`--message`) without editor invocation.
+  if (sub === "stash") {
+    if (hasEditFlag(subArgs)) return undefined;
+    const actionToken = subArgs.find((token) => !token.value.startsWith("-"));
+    if (actionToken && actionToken.value.toLowerCase() === "push") {
+      dropSet.add(actionToken);
+      collectMessageDropTokens(subArgs, dropSet);
+      return dropSet;
+    }
+    return undefined;
+  }
+
+  // Shapes E & F: `git merge --abort|--continue|--quit` OR single-statement local non-protected merge (#55-2).
+  if (sub === "merge") {
+    if (isSafeMergeControl(segment, 1)) {
+      dropSet.add(subToken);
+      return dropSet;
+    }
+    if (isAllowedLocalMerge(segment, totalSegments, cwd)) {
+      dropSet.add(subToken);
+      collectMessageDropTokens(subArgs, dropSet);
+      return dropSet;
+    }
+    return undefined;
+  }
+
+  return undefined;
+}
+
+/**
+ * Fail-closed allowlist subtractive scan: if ANY token in the command is
+ * dynamic, a redirection, or a shell meta-character (`()\`${}`), OR if ANY
+ * statement in the command falls outside the strict allowlist of harmless
+ * shapes, return the original token list completely unstripped.
  */
 function sanitizeTokensForBoundaryScan(tokens: readonly ShellToken[], cwd?: string): ShellToken[] {
+  if (hasDisallowedGlobalScanToken(tokens)) return [...tokens];
   const segments = scanSegmentsOf(tokens);
-  if (commandDisablesStripping(segments)) return [...tokens];
+  if (segments.length === 0) return [...tokens];
+  const segmentDrops: Set<ShellToken>[] = [];
+  for (const segment of segments) {
+    const drops = allowlistedSegmentDrops(segment.tokens, segments.length, cwd);
+    if (!drops) return [...tokens];
+    segmentDrops.push(drops);
+  }
   const output: ShellToken[] = [];
-
-  for (let segIdx = 0; segIdx < segments.length; segIdx += 1) {
-    const segment = segments[segIdx]!;
-    const { words, start } = segmentCommandWords(segment.tokens);
-    const cmdTokens = words.slice(start);
-    const head = cmdTokens[0];
-    const bareHead = head && !head.dynamic && !head.data && !/[\\/]/u.test(head.value) ? head.value.toLowerCase() : undefined;
-    const unsafeTokens = segmentHasUnsafeShellTokens(segment.tokens);
-    const downstreamHarmless = segment.nextOperator !== "|" || pipelineIsHarmlessText(segments, segIdx + 1);
-    const dropSet = new Set<ShellToken>();
-
-    // 1. Strictly non-executing text commands (only bare names, safe flags, no meta/dynamic tokens, entire `|` pipeline is harmless text).
-    if (!unsafeTokens && isHarmlessTextInvocation(head, cmdTokens.slice(1)) && downstreamHarmless) {
-      for (const token of cmdTokens.slice(1)) {
-        dropSet.add(token);
-      }
-    } else if (!unsafeTokens && bareHead === "git" && downstreamHarmless) {
-      const plainValues = cmdTokens.map((token) => token.value);
-      const subIndex = gitSubcommandIndex(plainValues);
-      const preOptions = subIndex > 0 ? plainValues.slice(1, subIndex) : [];
-      const hasUnsafePreOption = preOptions.some((opt) =>
-        opt === "-c" || opt.startsWith("-c")
-        || opt === "--config-env" || opt.startsWith("--config-env=")
-        || opt === "--exec-path" || opt.startsWith("--exec-path="),
-      );
-      if (subIndex > 0 && !hasUnsafePreOption) {
-        const sub = plainValues[subIndex]!.toLowerCase();
-        const mergeAllowed = sub === "merge" && isAllowedLocalMerge(segment.tokens, words, start, subIndex, segments.length, cwd);
-
-        // 2. Message text values ONLY on subcommands where `-m`/`--message` takes text (`commit`, `tag`, `stash`, `notes`, or an already-allowed `merge`).
-        if (GIT_MESSAGE_SUBCOMMANDS.has(sub) || mergeAllowed) {
-          for (let i = subIndex + 1; i < cmdTokens.length; i += 1) {
-            const token = cmdTokens[i]!;
-            if (token.value === "-m" || token.value === "--message") {
-              const next = cmdTokens[i + 1];
-              if (next) { dropSet.add(next); i += 1; }
-              continue;
-            }
-            if (token.value.startsWith("--message=") || /^-m./u.test(token.value)) {
-              dropSet.add(token);
-            }
-          }
-        }
-
-        // 3. Git read-only subcommands: literal args after subcommand (skip if external diff/textconv driver flags are present).
-        if (GIT_READ_ONLY_SUBCOMMANDS.has(sub) && !plainValues.slice(subIndex + 1).some((v) => GIT_DRIVER_FLAGS.test(v))) {
-          for (const token of cmdTokens.slice(subIndex + 1)) {
-            dropSet.add(token);
-          }
-        }
-
-        // 4. `git stash push`: strip literal `push` sub-action.
-        if (sub === "stash") {
-          const actionToken = cmdTokens.slice(subIndex + 1).find((token) => !token.value.startsWith("-"));
-          if (actionToken && actionToken.value.toLowerCase() === "push") {
-            dropSet.add(actionToken);
-          }
-        }
-
-        // 5 & 6. `git merge --abort|--continue|--quit` OR allowed local non-protected merge (#55-2).
-        if (sub === "merge" && (isSafeMergeControl(cmdTokens, subIndex) || mergeAllowed)) {
-          dropSet.add(cmdTokens[subIndex]!);
-        }
-      }
-    }
-
+  for (let i = 0; i < segments.length; i += 1) {
+    const segment = segments[i]!;
+    const drops = segmentDrops[i]!;
     for (const token of segment.tokens) {
-      if (!dropSet.has(token)) output.push(token);
+      if (!drops.has(token)) output.push(token);
     }
     if (segment.nextOperator) output.push({ value: segment.nextOperator, operator: true, dynamic: false });
   }
