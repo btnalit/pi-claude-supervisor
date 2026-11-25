@@ -9,7 +9,8 @@ import { promisify } from "node:util";
 import type { SupervisorEvent } from "./events.ts";
 import type { PiUsageSample, WorkerAdapter, WorkerEvent, WorkerHandle, WorkerOutputChunk, WorkerStartInput, WorkerStatus } from "./types.ts";
 import type { DecisionWorkerFactory } from "./decision-worker.ts";
-import { Supervisor, extendedDeadlineMs, type HumanInterventionNotice } from "./supervisor.ts";
+import { Supervisor, extendedDeadlineMs, type CandidateNotice, type HumanInterventionNotice } from "./supervisor.ts";
+import type { ReviewInput } from "./reviewer.ts";
 import { ProcessWorkerAdapter } from "./worker/process-adapter.ts";
 import { TmuxWorkerAdapter } from "./worker/tmux-adapter.ts";
 import { WorkerInputError } from "./worker/input-error.ts";
@@ -5093,4 +5094,432 @@ test("a human turn stuck silent mid-turn (an open dialog) is reported once, not 
     assert.notEqual(stalled[0]!.source, "worker_prompt", "an outbound alert, since nobody is at the keyboard");
   });
 });
+
+test("an operator stop racing a Decision Worker park ends stopped with human_stop, not blocked", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-park-stop-race-"));
+  try {
+    await initializeGitRepository(cwd, "worker/park-stop-race");
+    const handle: WorkerHandle = { id: "park-stop-race-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    let releaseStop!: () => void;
+    const stopGate = new Promise<void>((resolve) => { releaseStop = resolve; });
+    let stopCalls = 0;
+    let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+    let eventListener: WorkerStartInput["eventListener"] | undefined;
+    let closure: { cleanupConfirmed: boolean; reason: string } | undefined;
+    const candidateNotices: CandidateNotice[] = [];
+    const humanNotices: unknown[] = [];
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async (input) => { eventListener = input.eventListener; return handle; },
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { stopCalls += 1; if (stopCalls === 1) await stopGate; running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(adapter, events as never, {
+      reviewer: automaticReviewer(),
+      onCandidate: (notice) => { candidateNotices.push(notice); },
+      onHumanRequired: (notice) => { humanNotices.push(notice); },
+    });
+    await supervisor.start({
+      task: "park stop race",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      onDecisionSessionClosed: (_taskId, info) => { closure = info; },
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 5_000 }] },
+      decisionWorkerFactory: (options) => { onAction = options.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+    });
+    const event: WorkerEvent = { type: "turn_completed", handle, result: { subtype: "success", result: "Stuck." }, sequence: 1 };
+    await eventListener?.(event);
+    await supervisor.poll();
+    const parked = onAction?.({ action: "park", reason: "cannot proceed", question: "what next?" }, event);
+    while (stopCalls === 0) await new Promise((resolve) => setImmediate(resolve));
+    const operator = supervisor.stop("operator cancelled");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    releaseStop();
+    await Promise.all([parked, operator]);
+    assert.equal(supervisor.state, "stopped");
+    assert.deepEqual(closure, { cleanupConfirmed: true, reason: "human_stop" });
+    assert.ok(!events.events.some((entry) => entry.type === "candidate_parked"));
+    assert.equal(candidateNotices.length, 0);
+    assert.equal(humanNotices.length, 0);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("an operator stop racing a plain Decision Worker stop on permission_request closes with human_stop", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-plain-stop-race-"));
+  try {
+    await initializeGitRepository(cwd, "worker/plain-stop-race");
+    const handle: WorkerHandle = { id: "plain-stop-race-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    let releaseStop!: () => void;
+    const stopGate = new Promise<void>((resolve) => { releaseStop = resolve; });
+    let stopCalls = 0;
+    let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+    let eventListener: WorkerStartInput["eventListener"] | undefined;
+    let closure: { cleanupConfirmed: boolean; reason: string } | undefined;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async (input) => { eventListener = input.eventListener; return handle; },
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { stopCalls += 1; if (stopCalls === 1) await stopGate; running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(adapter, events as never, { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "plain stop race",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      onDecisionSessionClosed: (_taskId, info) => { closure = info; },
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2, permissionAuthority: "decision-worker" }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 5_000 }] },
+      decisionWorkerFactory: (options) => { onAction = options.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+    });
+    const event: WorkerEvent = { type: "permission_request", handle, request: { requestId: "req-stop-race", toolUseId: "tool-stop-race", toolName: "Bash", input: { command: "echo hi" }, raw: {} } };
+    await eventListener?.(event);
+    await supervisor.poll();
+    const decided = onAction?.({ action: "stop", reason: "stopping on permission" }, event);
+    while (stopCalls === 0) await new Promise((resolve) => setImmediate(resolve));
+    const operator = supervisor.stop("operator cancelled");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    releaseStop();
+    await Promise.all([decided, operator]);
+    assert.equal(supervisor.state, "stopped");
+    assert.deepEqual(closure, { cleanupConfirmed: true, reason: "human_stop" });
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("decisions and failures arriving after operator stop is requested are ignored without send or park", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-post-stop-decision-"));
+  try {
+    await initializeGitRepository(cwd, "worker/post-stop-decision");
+    const handle: WorkerHandle = { id: "post-stop-decision-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    let holdPoll = false;
+    let releasePoll!: () => void;
+    const pollGate = new Promise<void>((resolve) => { releasePoll = resolve; });
+    let pollEntered!: () => void;
+    const pollStarted = new Promise<void>((resolve) => { pollEntered = resolve; });
+    let stopCalls = 0;
+    let sendCalls = 0;
+    let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+    let onFailure: Parameters<DecisionWorkerFactory>[0]["onFailure"] | undefined;
+    let eventListener: WorkerStartInput["eventListener"] | undefined;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async (input) => { eventListener = input.eventListener; return handle; },
+      getStatus: async () => {
+        if (holdPoll) {
+          holdPoll = false;
+          pollEntered();
+          await pollGate;
+        }
+        return { handle, running, activeRequests: 0, processGroupCleaned: !running };
+      },
+      readOutput: async () => [],
+      send: async () => { sendCalls += 1; },
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { stopCalls += 1; running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(adapter, events as never, { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "post stop decision",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: { autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 }, acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 5_000 }] },
+      decisionWorkerFactory: (options) => {
+        onAction = options.onAction;
+        onFailure = options.onFailure;
+        return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} };
+      },
+    });
+    const event: WorkerEvent = { type: "turn_completed", handle, result: { subtype: "success", result: "Turn 1." }, sequence: 1 };
+    await eventListener?.(event);
+    await supervisor.poll();
+    // Hold #exclusive in poll(), queue decisions/failure right behind it, then
+    // request an operator stop before releasing #exclusive so every queued
+    // decision/failure observes #stopRequested !== undefined.
+    holdPoll = true;
+    const holdingPoll = supervisor.poll();
+    await pollStarted;
+    const lateContinue = onAction?.({ action: "continue", message: "keep going", reason: "late" }, event);
+    const latePark = onAction?.({ action: "park", reason: "late park" }, event);
+    const lateFailure = onFailure?.(event, new Error("late decision error"));
+    const stopPromise = supervisor.stop("operator stop");
+    releasePoll();
+    await Promise.all([holdingPoll, lateContinue, latePark, lateFailure, stopPromise]);
+    assert.equal(sendCalls, 0);
+    assert.equal(supervisor.state, "stopped");
+    assert.ok(!events.events.some((entry) => entry.type === "candidate_parked"));
+    assert.equal(events.events.filter((entry) => entry.type === "decision_ignored" && entry.data?.reason === "operator stop requested").length, 3);
+    assert.ok(stopCalls >= 1);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+for (const ownership of ["owned", "adopted"] as const) {
+  test(`release during acceptance verification (${ownership} tmux) parks cleanly without repair or stop`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), `pi-claude-supervisor-release-accept-${ownership}-`));
+    try {
+      await initializeGitRepository(cwd, `worker/release-accept-${ownership}`);
+      const handle: WorkerHandle = { id: `release-accept-${ownership}`, startedAt: new Date().toISOString(), cwd, ownership, sessionName: `pi-cs-release-${ownership}` };
+      let released = false;
+      let stopCalls = 0;
+      let releaseCalls = 0;
+      let sendCalls = 0;
+      let closure: { cleanupConfirmed: boolean; reason: string } | undefined;
+      const adapter: WorkerAdapter = {
+        capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true, repairableSession: true }),
+        start: async () => handle,
+        getStatus: async () => ({ handle, running: true, activeRequests: 0, processGroupCleaned: false }),
+        readOutput: async () => [],
+        send: async () => { sendCalls += 1; if (released) throw new Error("tmux session already released"); },
+        pause: async () => {},
+        resume: async () => {},
+        stop: async () => { stopCalls += 1; },
+        release: async () => { releaseCalls += 1; released = true; },
+        killProcessGroup: async () => { stopCalls += 1; },
+        resumeSession: async () => handle,
+      };
+      const events = new FlakyEventLog("never-fail");
+      const supervisor = new Supervisor(adapter, events as never, { reviewer: automaticReviewer() });
+      await supervisor.start({
+        task: `release during acceptance (${ownership})`,
+        cwd,
+        command: "claude",
+        automation: true,
+        deadlineMs: 0,
+        noOutputTimeoutMs: 0,
+        onDecisionSessionClosed: (_taskId, info) => { closure = info; },
+        spec: {
+          maxRepairRounds: 2,
+          autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 },
+          acceptance: [{ id: "slow", name: "slow", command: process.execPath, args: ["-e", "setTimeout(() => process.exit(1), 10000)"], required: true, timeoutMs: 15_000 }],
+        },
+        decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+      });
+      await supervisor.poll();
+      const verifying = supervisor.verify();
+      await waitFor(() => events.events.some((entry) => entry.type === "acceptance_started"), 3_000);
+      await Promise.all([verifying, supervisor.release("operator detached")]);
+      assert.equal(supervisor.state, "blocked");
+      assert.equal(supervisor.parkReasonLabel, "Released");
+      assert.equal(stopCalls, 0);
+      assert.equal(sendCalls, 0);
+      assert.equal(releaseCalls, 1);
+      assert.ok(!events.events.some((entry) => entry.type === "repair_requested"));
+      assert.deepEqual(closure, { cleanupConfirmed: true, reason: "blocked" });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+test("release during Reviewer stage parks cleanly without repair or stop", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-release-review-"));
+  try {
+    await initializeGitRepository(cwd, "worker/release-review");
+    const handle: WorkerHandle = { id: "release-review-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned", sessionName: "pi-cs-release-review" };
+    let released = false;
+    let stopCalls = 0;
+    let releaseCalls = 0;
+    let sendCalls = 0;
+    let closure: { cleanupConfirmed: boolean; reason: string } | undefined;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true, repairableSession: true }),
+      start: async () => handle,
+      getStatus: async () => ({ handle, running: true, activeRequests: 0, processGroupCleaned: false }),
+      readOutput: async () => [],
+      send: async () => { sendCalls += 1; if (released) throw new Error("tmux session already released"); },
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { stopCalls += 1; },
+      release: async () => { releaseCalls += 1; released = true; },
+      killProcessGroup: async () => { stopCalls += 1; },
+      resumeSession: async () => handle,
+    };
+    const reviewer = {
+      review: async (input: ReviewInput) => {
+        await new Promise<void>((_resolve, reject) => {
+          input.signal?.addEventListener("abort", () => reject(new Error("aborted by release")), { once: true });
+        });
+        return { verdict: "pass" as const, summary: "unreachable", findings: [], round: input.round, checkedAt: new Date().toISOString() };
+      },
+    };
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(adapter, events as never, { reviewer });
+    await supervisor.start({
+      task: "release during review",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      onDecisionSessionClosed: (_taskId, info) => { closure = info; },
+      spec: {
+        maxRepairRounds: 2,
+        autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 },
+        acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 5_000 }],
+      },
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    });
+    await supervisor.poll();
+    const verifying = supervisor.verify();
+    await waitFor(() => events.events.some((entry) => entry.type === "review_started"), 3_000);
+    await Promise.all([verifying, supervisor.release("operator detached during review")]);
+    assert.equal(supervisor.state, "blocked");
+    assert.equal(supervisor.parkReasonLabel, "Released");
+    assert.equal(stopCalls, 0);
+    assert.equal(sendCalls, 0);
+    assert.equal(releaseCalls, 1);
+    assert.ok(!events.events.some((entry) => entry.type === "repair_requested"));
+    assert.deepEqual(closure, { cleanupConfirmed: true, reason: "blocked" });
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("release after verification has already passed completes cleanly without a second release or stop", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-release-after-pass-"));
+  try {
+    await initializeGitRepository(cwd, "worker/release-after-pass");
+    const handle: WorkerHandle = { id: "release-after-pass-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned", sessionName: "pi-cs-release-pass" };
+    let stopCalls = 0;
+    let releaseCalls = 0;
+    let closure: { cleanupConfirmed: boolean; reason: string } | undefined;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true, repairableSession: true }),
+      start: async () => handle,
+      getStatus: async () => ({ handle, running: true, activeRequests: 0, processGroupCleaned: false }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { stopCalls += 1; },
+      release: async () => { releaseCalls += 1; },
+      killProcessGroup: async () => { stopCalls += 1; },
+      resumeSession: async () => handle,
+    };
+    const events = new FlakyEventLog("never-fail");
+    let releasePromise: Promise<void> | undefined;
+    let supervisor!: Supervisor;
+    const reviewer = {
+      review: async (input: ReviewInput) => {
+        // Trigger release() just as the Reviewer returns a passing verdict.
+        releasePromise = supervisor.release("detach right on pass");
+        return { verdict: "pass" as const, summary: "looks good", findings: [], round: input.round, checkedAt: new Date().toISOString() };
+      },
+    };
+    supervisor = new Supervisor(adapter, events as never, { reviewer });
+    await supervisor.start({
+      task: "release on pass",
+      cwd,
+      command: "claude",
+      automation: true,
+      keepWorkerOnCompletion: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      onDecisionSessionClosed: (_taskId, info) => { closure = info; },
+      spec: {
+        maxRepairRounds: 2,
+        autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 },
+        acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 5_000 }],
+      },
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    });
+    await supervisor.poll();
+    const result = await supervisor.verify();
+    await releasePromise;
+    assert.equal(result.ok, true);
+    assert.equal(supervisor.state, "completed");
+    assert.equal(stopCalls, 0);
+    assert.equal(releaseCalls, 1);
+    assert.deepEqual(closure, { cleanupConfirmed: true, reason: "completed" });
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("release failure during verification surfaces cleanupError and cleanupConfirmed=false", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-release-fail-"));
+  try {
+    await initializeGitRepository(cwd, "worker/release-fail");
+    const handle: WorkerHandle = { id: "release-fail-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned", sessionName: "pi-cs-release-fail" };
+    let stopCalls = 0;
+    let closure: { cleanupConfirmed: boolean; reason: string } | undefined;
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: false, persistentSession: true, repairableSession: true }),
+      start: async () => handle,
+      getStatus: async () => ({ handle, running: true, activeRequests: 0, processGroupCleaned: false }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { stopCalls += 1; },
+      release: async () => { throw new Error("injected release failure"); },
+      killProcessGroup: async () => { stopCalls += 1; },
+      resumeSession: async () => handle,
+    };
+    const events = new FlakyEventLog("never-fail");
+    const supervisor = new Supervisor(adapter, events as never, { reviewer: automaticReviewer() });
+    await supervisor.start({
+      task: "release failure during verification",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      onDecisionSessionClosed: (_taskId, info) => { closure = info; },
+      spec: {
+        maxRepairRounds: 2,
+        autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 },
+        acceptance: [{ id: "slow", name: "slow", command: process.execPath, args: ["-e", "setTimeout(() => process.exit(1), 10000)"], required: true, timeoutMs: 15_000 }],
+      },
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    });
+    await supervisor.poll();
+    const verifying = supervisor.verify();
+    await waitFor(() => events.events.some((entry) => entry.type === "acceptance_started"), 3_000);
+    const [verifyResult, releaseResult] = await Promise.allSettled([verifying, supervisor.release("detach fails")]);
+    assert.equal(verifyResult.status, "rejected");
+    assert.equal(releaseResult.status, "rejected");
+    assert.equal(stopCalls, 0);
+    assert.equal(supervisor.state, "failed");
+    assert.deepEqual(closure, { cleanupConfirmed: false, reason: "recoverable_failure" });
+    const failedEvent = events.events.find((entry) => entry.type === "verification_failed");
+    assert.match(String(failedEvent?.data?.cleanupError ?? ""), /injected release failure/u);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 
