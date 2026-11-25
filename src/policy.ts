@@ -1117,6 +1117,12 @@ const GIT_MERGE_SAFE_FLAGS = new Set([
   "--allow-unrelated-histories", "--no-verify",
 ]);
 const SHELL_META_CHARS = /[()`${}]/u;
+/** Commands that can rebind command names, create symlinks/binaries, or export env hooks; if present anywhere in a command, disable all subtractive stripping. */
+const STRIP_DISABLING_COMMANDS = new Set([
+  "hash", "alias", "enable", "ln", "cp", "install", "mv",
+  "export", "declare", "typeset", "readonly", "local", "set", "shopt",
+  "eval", "source", ".", "function",
+]);
 
 interface ScanSegment {
   tokens: ShellToken[];
@@ -1208,7 +1214,8 @@ function hasRemoteNamed(name: string, commonDir: string): boolean {
   if (existsSync(join(commonDir, "refs", "remotes", name))) return true;
   const packed = join(commonDir, "packed-refs");
   try {
-    if (existsSync(packed) && statSync(packed).size <= 2 * 1024 * 1024) {
+    if (existsSync(packed)) {
+      if (statSync(packed).size > 2 * 1024 * 1024) return true;
       const content = readFileSync(packed, "utf8");
       const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
       if (new RegExp(` refs/remotes/${escaped}/`, "u").test(content)) return true;
@@ -1290,28 +1297,52 @@ function isAllowedLocalMerge(segment: readonly ShellToken[], words: readonly She
   return true;
 }
 
-/** True when every downstream command in the `|` pipeline starting after `segIdx` is a clean harmless text command. */
+function isHarmlessTextInvocation(head: ShellToken | undefined, args: readonly ShellToken[]): boolean {
+  if (!head || head.dynamic || head.data || /[\\/]/u.test(head.value)) return false;
+  const name = head.value.toLowerCase();
+  if (!HARMLESS_TEXT_COMMANDS.has(name)) return false;
+  if (name === "rg" && args.some((token) => /^--pre(?:=|$)|^--pre-glob(?:=|$)|^--search-zip$|^-.*z/u.test(token.value))) return false;
+  if (name === "printf" && args.some((token) => token.value === "-v" || /^-v/u.test(token.value))) return false;
+  return true;
+}
+
+/** True when every command in the `|` pipeline starting at `segIdx` is a clean harmless text command. */
 function pipelineIsHarmlessText(segments: readonly ScanSegment[], segIdx: number): boolean {
   for (let i = segIdx; i < segments.length; i += 1) {
     const seg = segments[i]!;
     if (segmentHasUnsafeShellTokens(seg.tokens)) return false;
     const { words, start } = segmentCommandWords(seg.tokens);
-    const head = words[start];
-    const headName = head ? head.value.split(/[\\/]/u).at(-1)?.toLowerCase() : undefined;
-    if (!headName || !HARMLESS_TEXT_COMMANDS.has(headName)) return false;
+    if (!isHarmlessTextInvocation(words[start], words.slice(start + 1))) return false;
     if (seg.nextOperator !== "|") return true;
   }
   return true;
+}
+
+/** True when any statement in the command could rebind command names, mutate env hooks or define shell functions. */
+function commandDisablesStripping(segments: readonly ScanSegment[]): boolean {
+  for (const segment of segments) {
+    const { words, start } = segmentCommandWords(segment.tokens);
+    let idx = start;
+    while (idx < words.length && COMMAND_POSITION_KEYWORDS.has(words[idx]!.value.toLowerCase())) idx += 1;
+    const head = words[idx];
+    const headName = head ? head.value.split(/[\\/]/u).at(-1)?.toLowerCase() : undefined;
+    if (headName && STRIP_DISABLING_COMMANDS.has(headName)) return true;
+    if (words.slice(0, start).some((token) => /^(?:PATH|GIT_|LD_|BASH_ENV|ENV)=/u.test(token.value))) return true;
+    if (segment.tokens.some((token) => !token.operator && (token.value === "()" || token.value === "{" || token.value === "}"))) return true;
+  }
+  return false;
 }
 
 /**
  * Subtractive scan: preserve every existing wrapper, nested-shell, dynamic-arg,
  * remote-config and protected-branch denial, and remove ONLY proven-harmless
  * non-dynamic literal words before running the broad remote/destructive checks.
- * Dynamic tokens, subshells and pipelines feeding non-text commands are never stripped.
+ * Dynamic tokens, subshells, path-qualified binaries, name-rebinding chains,
+ * and pipelines feeding non-text commands are never stripped.
  */
 function sanitizeTokensForBoundaryScan(tokens: readonly ShellToken[], cwd?: string): ShellToken[] {
   const segments = scanSegmentsOf(tokens);
+  if (commandDisablesStripping(segments)) return [...tokens];
   const output: ShellToken[] = [];
 
   for (let segIdx = 0; segIdx < segments.length; segIdx += 1) {
@@ -1319,20 +1350,25 @@ function sanitizeTokensForBoundaryScan(tokens: readonly ShellToken[], cwd?: stri
     const { words, start } = segmentCommandWords(segment.tokens);
     const cmdTokens = words.slice(start);
     const head = cmdTokens[0];
-    const headName = head && !head.dynamic && !head.data ? head.value.split(/[\\/]/u).at(-1)?.toLowerCase() : undefined;
+    const bareHead = head && !head.dynamic && !head.data && !/[\\/]/u.test(head.value) ? head.value.toLowerCase() : undefined;
     const unsafeTokens = segmentHasUnsafeShellTokens(segment.tokens);
+    const downstreamHarmless = segment.nextOperator !== "|" || pipelineIsHarmlessText(segments, segIdx + 1);
     const dropSet = new Set<ShellToken>();
 
-    // 1. Strictly non-executing text commands (only when the entire `|` pipeline is harmless text and no meta/dynamic tokens exist).
-    if (!unsafeTokens && headName && HARMLESS_TEXT_COMMANDS.has(headName) && pipelineIsHarmlessText(segments, segIdx)) {
+    // 1. Strictly non-executing text commands (only bare names, safe flags, no meta/dynamic tokens, entire `|` pipeline is harmless text).
+    if (!unsafeTokens && isHarmlessTextInvocation(head, cmdTokens.slice(1)) && downstreamHarmless) {
       for (const token of cmdTokens.slice(1)) {
         dropSet.add(token);
       }
-    } else if (!unsafeTokens && headName === "git") {
+    } else if (!unsafeTokens && bareHead === "git" && downstreamHarmless) {
       const plainValues = cmdTokens.map((token) => token.value);
       const subIndex = gitSubcommandIndex(plainValues);
       const preOptions = subIndex > 0 ? plainValues.slice(1, subIndex) : [];
-      const hasUnsafePreOption = preOptions.some((opt) => opt === "-c" || opt.startsWith("-c") || opt === "--exec-path" || opt.startsWith("--exec-path="));
+      const hasUnsafePreOption = preOptions.some((opt) =>
+        opt === "-c" || opt.startsWith("-c")
+        || opt === "--config-env" || opt.startsWith("--config-env=")
+        || opt === "--exec-path" || opt.startsWith("--exec-path="),
+      );
       if (subIndex > 0 && !hasUnsafePreOption) {
         const sub = plainValues[subIndex]!.toLowerCase();
         const mergeAllowed = sub === "merge" && isAllowedLocalMerge(segment.tokens, words, start, subIndex, segments.length, cwd);
