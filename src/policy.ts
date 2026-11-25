@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 
@@ -152,7 +152,7 @@ export function evaluatePermission(toolName: string, input: unknown, cwd = proce
   if (!command) return { decision: "deny", reason: "Bash request has no recognizable command" };
   // Lex the command itself: wrapping it as a literal `bash -lc` argument would
   // hide its structure (heredoc bodies, dynamic words) from the token checks.
-  const result = evaluateCommand(command, [], options.remote);
+  const result = evaluateCommand(command, [], options.remote, cwd);
   if (result.decision === "deny") return result;
   const floor = deleteFloorViolation(command, cwd, { writeRoots: options.writeRoots ?? [] });
   return floor ? { decision: "deny", reason: floor } : result;
@@ -1073,13 +1073,13 @@ function containsRemoteHttpMutation(command: string): boolean {
   return hasHttpClient && hasMutationFlag && hasProtectedEndpoint;
 }
 
-export function evaluateCommand(command: string, args: readonly string[] = [], grant?: RemoteGrant): PolicyResult {
+export function evaluateCommand(command: string, args: readonly string[] = [], grant?: RemoteGrant, cwd?: string): PolicyResult {
   const normalized = command.trim();
   if (!normalized) return { decision: "deny", reason: "empty command" };
   const lexical = lexShell(normalized);
   if (lexical.error) return { decision: "deny", reason: `command could not be safely parsed: ${lexical.error}` };
   const literalArgs = args.map((value) => ({ value, operator: false, dynamic: false }));
-  return evaluateTokens([...lexical.tokens, ...literalArgs], 0, new Map(), grant);
+  return evaluateTokens([...lexical.tokens, ...literalArgs], 0, new Map(), grant, cwd);
 }
 
 // Scoped to one permission check. The conservative shell scan encounters the
@@ -1087,7 +1087,339 @@ export function evaluateCommand(command: string, args: readonly string[] = [], g
 // take seconds. Depth remains part of the key because it bounds recursion.
 type NestedCommandCache = Map<string, PolicyResult>;
 
-function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: string, depth: number, cache: NestedCommandCache, grant?: RemoteGrant): PolicyResult | undefined {
+/** Git subcommands that only read repository state; their non-dynamic literal args cannot push, merge or mutate remotes. */
+const GIT_READ_ONLY_SUBCOMMANDS = new Set([
+  "status", "diff", "log", "show", "rev-parse", "rev-list", "ls-files", "blame", "describe",
+  "cat-file", "merge-base", "merge-tree", "shortlog", "whatchanged", "name-rev",
+  "check-ignore", "check-attr", "ls-tree", "diff-tree", "diff-index", "diff-files",
+  "for-each-ref", "show-ref",
+]);
+/** Git options whose literal value is commit/search text, not a subcommand or remote ref. */
+const GIT_TEXT_VALUE_OPTIONS = new Set(["-m", "--message", "--grep", "-S", "-G"]);
+const GIT_MERGE_CONTROL_FLAGS = new Set(["--abort", "--continue", "--quit"]);
+const GIT_MERGE_VALUE_OPTIONS = new Set(["-m", "--message", "-s", "--strategy", "-X", "--strategy-option", "--cleanup", "--log"]);
+const GIT_BRANCH_TAINT_SUBCOMMANDS = new Set(["reset", "rebase", "symbolic-ref", "update-ref", "worktree"]);
+
+interface ScanSegment {
+  tokens: ShellToken[];
+  nextOperator?: string;
+}
+
+function scanSegmentsOf(tokens: readonly ShellToken[]): ScanSegment[] {
+  const segments: ScanSegment[] = [];
+  let current: ShellToken[] = [];
+  for (const token of tokens) {
+    if (token.operator && SEGMENT_SPLIT_OPERATORS.has(token.value)) {
+      if (current.length > 0) segments.push({ tokens: current, nextOperator: token.value });
+      current = [];
+    } else {
+      current.push(token);
+    }
+  }
+  if (current.length > 0) segments.push({ tokens: current });
+  return segments;
+}
+
+function segmentCommandWords(segment: readonly ShellToken[]): { words: ShellToken[]; start: number } {
+  const words: ShellToken[] = [];
+  let afterRedirect = false;
+  for (const token of segment) {
+    if (token.operator) { afterRedirect = REDIRECT_OPERATORS.has(token.value) || token.value === "<<<"; continue; }
+    if (!afterRedirect) words.push(token);
+    afterRedirect = false;
+  }
+  let start = 0;
+  while (start < words.length && !words[start]!.dynamic && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[start]!.value)) start += 1;
+  return { words, start };
+}
+
+function readGitDirs(directory: string): { gitDir: string; commonDir: string } | undefined {
+  const top = gitTopLevel(directory);
+  if (!top) return undefined;
+  const dotGit = join(top, ".git");
+  try {
+    const stat = lstatSync(dotGit);
+    if (stat.isDirectory()) return { gitDir: dotGit, commonDir: dotGit };
+    if (!stat.isFile()) return undefined;
+    const pointer = readFileSync(dotGit, "utf8");
+    const match = /^gitdir:\s*(.+)$/im.exec(pointer);
+    if (!match?.[1]) return undefined;
+    const rawGitDir = match[1].trim();
+    const gitDir = isAbsolute(rawGitDir) ? resolve(rawGitDir) : resolve(top, rawGitDir);
+    let commonDir = gitDir;
+    const commonFile = join(gitDir, "commondir");
+    if (existsSync(commonFile) && lstatSync(commonFile).isFile()) {
+      const rawCommon = readFileSync(commonFile, "utf8").trim();
+      if (rawCommon) commonDir = isAbsolute(rawCommon) ? resolve(rawCommon) : resolve(gitDir, rawCommon);
+    }
+    return { gitDir, commonDir };
+  } catch {
+    return undefined;
+  }
+}
+
+function readCurrentGitBranch(directory: string): string | undefined {
+  const dirs = readGitDirs(directory);
+  if (!dirs) return undefined;
+  try {
+    const head = readFileSync(join(dirs.gitDir, "HEAD"), "utf8").trim();
+    const match = /^ref:\s*refs\/heads\/(.+)$/u.exec(head);
+    return match?.[1]?.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isRemoteTrackingRef(ref: string, commonDir: string): boolean {
+  if (/^refs\/remotes\//iu.test(ref)) return true;
+  const slash = ref.indexOf("/");
+  if (slash <= 0) return false;
+  const prefix = ref.slice(0, slash);
+  if (prefix === "origin" || prefix === "upstream") return true;
+  if (existsSync(join(commonDir, "refs", "remotes", prefix))) return true;
+  const packed = join(commonDir, "packed-refs");
+  try {
+    if (existsSync(packed) && statSync(packed).size <= 2 * 1024 * 1024) {
+      const content = readFileSync(packed, "utf8");
+      const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+      if (new RegExp(` refs/remotes/${escaped}/`, "u").test(content)) return true;
+    }
+  } catch {
+    return true;
+  }
+  return false;
+}
+
+function parseGitCheckoutOrSwitchTarget(words: readonly ShellToken[], subIndex: number): string | null {
+  const args = words.slice(subIndex + 1);
+  if (args.some((token) => token.dynamic || token.data)) return null;
+  const values = args.map((token) => token.value);
+  // Path checkout (`git checkout -- file`) does not switch branches; treat ambiguously as taint.
+  if (values.includes("--") || values.includes("--detach") || values.includes("-d")) return null;
+  let createBranch: string | undefined;
+  const positional: string[] = [];
+  for (let i = 0; i < values.length; i += 1) {
+    const value = values[i]!;
+    if (["-b", "-B", "-c", "-C", "--create", "--force-create"].includes(value)) {
+      const next = values[i + 1];
+      if (!next || next.startsWith("-")) return null;
+      createBranch = next;
+      i += 1;
+      continue;
+    }
+    if (value.startsWith("--create=") || value.startsWith("--force-create=")) {
+      createBranch = value.slice(value.indexOf("=") + 1);
+      continue;
+    }
+    if (value.startsWith("-")) {
+      if (["--orphan", "--track", "-t", "--conflict"].includes(value)) return null;
+      continue;
+    }
+    positional.push(value);
+  }
+  const target = createBranch ?? (positional.length === 1 ? positional[0] : undefined);
+  if (!target || target === "-" || /[~^:@\\]|^\.|\/\.\.|\.\.\//u.test(target)) return null;
+  return target.replace(/^refs\/heads\//u, "");
+}
+
+function resolveGitEffectiveDir(words: readonly ShellToken[], subIndex: number, baseDir: string | undefined): { dir: string | undefined; changed: boolean; unsafeGlobal: boolean } {
+  let dir = baseDir;
+  let changed = false;
+  for (let i = 1; i < subIndex; i += 1) {
+    const token = words[i]!;
+    if (token.dynamic || token.data) return { dir: undefined, changed: true, unsafeGlobal: true };
+    const value = token.value;
+    if (value === "-C") {
+      const next = words[i + 1];
+      if (!next || next.dynamic || next.data) return { dir: undefined, changed: true, unsafeGlobal: true };
+      dir = isAbsolute(next.value) ? resolve(next.value) : dir !== undefined ? resolve(dir, next.value) : undefined;
+      changed = true;
+      i += 1;
+      continue;
+    }
+    if (value.startsWith("-C") && value.length > 2) {
+      const raw = value.slice(2);
+      dir = isAbsolute(raw) ? resolve(raw) : dir !== undefined ? resolve(dir, raw) : undefined;
+      changed = true;
+      continue;
+    }
+    if (value === "--git-dir" || value.startsWith("--git-dir=")
+      || value === "--work-tree" || value.startsWith("--work-tree=")
+      || value === "-c" || value.startsWith("-c")
+      || value === "--config-env" || value.startsWith("--config-env=")
+      || value === "--exec-path" || value.startsWith("--exec-path=")) {
+      return { dir: undefined, changed: true, unsafeGlobal: true };
+    }
+    if (GIT_GLOBAL_VALUE_OPTIONS.has(value)) i += 1;
+  }
+  return { dir, changed, unsafeGlobal: false };
+}
+
+function isSafeMergeControl(words: readonly ShellToken[], subIndex: number): boolean {
+  const args = words.slice(subIndex + 1);
+  if (args.length === 0 || args.some((token) => token.dynamic || token.data)) return false;
+  let sawControl = false;
+  for (const token of args) {
+    if (GIT_MERGE_CONTROL_FLAGS.has(token.value)) { sawControl = true; continue; }
+    if (["-q", "--quiet", "-v", "--verbose"].includes(token.value)) continue;
+    return false;
+  }
+  return sawControl;
+}
+
+function isAllowedLocalMerge(words: readonly ShellToken[], subIndex: number, directory: string | undefined, branchOverride: string | null | undefined): boolean {
+  if (directory === undefined) return false;
+  if (words.some((token) => token.dynamic || token.data)) return false;
+  const { dir: effectiveDir, changed, unsafeGlobal } = resolveGitEffectiveDir(words, subIndex, directory);
+  if (unsafeGlobal || effectiveDir === undefined) return false;
+  const dirs = readGitDirs(effectiveDir);
+  if (!dirs) return false;
+  // Determine target branch: if earlier statements in this command mutated
+  // git state ambiguously, fail closed; if an earlier literal checkout/switch
+  // in the same directory chose a branch, judge against that target.
+  if (branchOverride === null) return false;
+  const targetBranch = !changed && branchOverride !== undefined ? branchOverride : readCurrentGitBranch(effectiveDir);
+  if (!targetBranch || isProtectedBranch(targetBranch)) return false;
+
+  const args = words.slice(subIndex + 1);
+  const sources: string[] = [];
+  let options = true;
+  for (let i = 0; i < args.length; i += 1) {
+    const value = args[i]!.value;
+    if (options && value === "--") { options = false; continue; }
+    if (options && value.startsWith("-")) {
+      if (value === "-F" || value === "--file" || value.startsWith("--file=") || value === "--into-name" || value.startsWith("--into-name=")) return false;
+      if (GIT_MERGE_VALUE_OPTIONS.has(value)) {
+        if (i + 1 >= args.length) return false;
+        i += 1;
+      }
+      continue;
+    }
+    sources.push(value);
+  }
+  if (sources.length === 0) return false;
+  for (const source of sources) {
+    if (!source || source.includes(":") || source.includes("@{")) return false;
+    if (["HEAD", "FETCH_HEAD", "ORIG_HEAD", "MERGE_HEAD"].includes(source)) return false;
+    if (isRemoteTrackingRef(source, dirs.commonDir)) return false;
+    const normalized = source.replace(/^refs\/heads\//u, "");
+    if (!normalized || isProtectedBranch(normalized)) return false;
+  }
+  return true;
+}
+
+/**
+ * Subtractive scan: preserve every existing wrapper, nested-shell, dynamic-arg,
+ * remote-config and protected-branch denial, and remove ONLY proven-harmless
+ * non-dynamic literal words before running the broad remote/destructive checks.
+ * Dynamic tokens are never removed.
+ */
+function sanitizeTokensForBoundaryScan(tokens: readonly ShellToken[], cwd?: string): ShellToken[] {
+  const segments = scanSegmentsOf(tokens);
+  const output: ShellToken[] = [];
+  let directory = cwd;
+  const dirStack: (string | undefined)[] = [];
+  let branchOverride: string | null | undefined = undefined;
+
+  for (let segIdx = 0; segIdx < segments.length; segIdx += 1) {
+    const segment = segments[segIdx]!;
+    const { words, start } = segmentCommandWords(segment.tokens);
+    const cmdTokens = words.slice(start);
+    const head = cmdTokens[0];
+    const headName = head && !head.dynamic && !head.data ? head.value.split(/[\\/]/u).at(-1)?.toLowerCase() : undefined;
+
+    // Track directory changes for local merge target resolution.
+    if (headName === "cd") {
+      directory = resolveCd(cmdTokens.slice(1), directory);
+      branchOverride = directory === undefined ? null : undefined;
+    } else if (headName === "pushd") {
+      dirStack.push(directory);
+      directory = resolveCd(cmdTokens.slice(1), directory);
+      branchOverride = directory === undefined ? null : undefined;
+    } else if (headName === "popd") {
+      directory = dirStack.length > 0 ? dirStack.pop() : undefined;
+      branchOverride = directory === undefined ? null : undefined;
+    }
+
+    // Check next segment executable when piping stdout.
+    const nextSeg = segments[segIdx + 1];
+    const nextCmd = nextSeg ? segmentCommandWords(nextSeg.tokens) : undefined;
+    const nextHead = nextCmd ? nextCmd.words[nextCmd.start] : undefined;
+    const nextName = nextHead && !nextHead.dynamic && !nextHead.data ? nextHead.value.split(/[\\/]/u).at(-1)?.toLowerCase() : undefined;
+    const pipesToNonData = segment.nextOperator === "|" && !(nextName && (DATA_SINK_COMMANDS.has(nextName) || READ_ONLY_COMMANDS.has(nextName)));
+
+    const dropSet = new Set<ShellToken>();
+
+    // 1. Pure text / read-only command statements (when not piping to a shell/executor).
+    if (headName && (DATA_SINK_COMMANDS.has(headName) || READ_ONLY_COMMANDS.has(headName)) && !pipesToNonData) {
+      for (const token of cmdTokens.slice(1)) {
+        if (!token.dynamic && !token.data) dropSet.add(token);
+      }
+    } else if (headName === "git") {
+      const plainValues = cmdTokens.map((token) => token.value);
+      const subIndex = gitSubcommandIndex(plainValues);
+      if (subIndex > 0 && !cmdTokens.slice(0, subIndex + 1).some((token) => token.dynamic || token.data)) {
+        const sub = plainValues[subIndex]!.toLowerCase();
+        // Track same-command branch mutations before any later `git merge`.
+        if (sub === "checkout" || sub === "switch") {
+          const { changed, unsafeGlobal } = resolveGitEffectiveDir(cmdTokens, subIndex, directory);
+          if (unsafeGlobal || changed) branchOverride = null;
+          else branchOverride = parseGitCheckoutOrSwitchTarget(cmdTokens, subIndex);
+        } else if (GIT_BRANCH_TAINT_SUBCOMMANDS.has(sub)) {
+          branchOverride = null;
+        }
+
+        // 2. Git message and search option values (`-m`, `--message`, `--grep`, `-S`, `-G`).
+        for (let i = subIndex + 1; i < cmdTokens.length; i += 1) {
+          const token = cmdTokens[i]!;
+          if (token.dynamic || token.data) continue;
+          if (GIT_TEXT_VALUE_OPTIONS.has(token.value)) {
+            const next = cmdTokens[i + 1];
+            if (next && !next.dynamic && !next.data) { dropSet.add(next); i += 1; }
+            continue;
+          }
+          if (/^(?:--message=|--grep=|-m.|-S.|-G.)/u.test(token.value)) {
+            dropSet.add(token);
+          }
+        }
+
+        // 3. Git read-only subcommands: non-dynamic literal args after subcommand.
+        if (GIT_READ_ONLY_SUBCOMMANDS.has(sub)) {
+          for (const token of cmdTokens.slice(subIndex + 1)) {
+            if (!token.dynamic && !token.data) dropSet.add(token);
+          }
+        }
+
+        // 4. `git stash push`: strip literal `push` sub-action.
+        if (sub === "stash") {
+          const actionToken = cmdTokens.slice(subIndex + 1).find((token) => !token.value.startsWith("-"));
+          if (actionToken && !actionToken.dynamic && !actionToken.data && actionToken.value.toLowerCase() === "push") {
+            dropSet.add(actionToken);
+          }
+        }
+
+        // 5 & 6. `git merge --abort|--continue|--quit` OR allowed local non-protected merge (#55-2).
+        if (sub === "merge" && (isSafeMergeControl(cmdTokens, subIndex) || isAllowedLocalMerge(cmdTokens, subIndex, directory, branchOverride))) {
+          dropSet.add(cmdTokens[subIndex]!);
+        }
+      } else {
+        // Ambiguous git invocation in command chain taints branch tracking.
+        branchOverride = null;
+      }
+    } else if (headName && (SHELL_NAMES.has(headName) || headName === "eval" || cmdTokens.some((token) => /(?:^|[\\/])git$/iu.test(token.value)))) {
+      // Non-plain git or nested shell could mutate HEAD before a later merge.
+      branchOverride = null;
+    }
+
+    for (const token of segment.tokens) {
+      if (!dropSet.has(token)) output.push(token);
+    }
+    if (segment.nextOperator) output.push({ value: segment.nextOperator, operator: true, dynamic: false });
+  }
+  return output;
+}
+
+function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: string, scanTokens: readonly ShellToken[], scanCanonical: string, depth: number, cache: NestedCommandCache, grant?: RemoteGrant): PolicyResult | undefined {
   // A publish grant admits exactly one shape; everything else still falls
   // through to the ordinary boundary denials below.
   if (grant) {
@@ -1096,11 +1428,14 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   }
   const values = tokens.filter((token) => !token.operator).map((token) => token.value);
   const lower = values.map((value) => value.toLowerCase());
+  const scanValues = scanTokens.filter((token) => !token.operator).map((token) => token.value);
+  const scanLower = scanValues.map((value) => value.toLowerCase());
   const hasGit = values.some((value) => /(?:^|[\\/])git$/iu.test(value) || /^(?:git-(?:send|receive|upload)-pack)$/iu.test(value));
-  const hasGitTransport = lower.some((value) => /^(?:git-(?:send|receive|upload)-pack)$/u.test(value));
-  const hasRemoteOperation = lower.some((value) => remoteOperations.has(value));
-  const hasGhRemote = containsRemoteCliMutation(canonical);
-  const hasPackagePublication = lower.some((value) => value === "npm" || value === "pnpm" || value === "yarn") && lower.includes("publish");
+  const scanHasGit = scanValues.some((value) => /(?:^|[\\/])git$/iu.test(value) || /^(?:git-(?:send|receive|upload)-pack)$/iu.test(value));
+  const hasGitTransport = scanLower.some((value) => /^(?:git-(?:send|receive|upload)-pack)$/u.test(value));
+  const hasRemoteOperation = scanLower.some((value) => remoteOperations.has(value));
+  const hasGhRemote = containsRemoteCliMutation(scanCanonical);
+  const hasPackagePublication = scanLower.some((value) => value === "npm" || value === "pnpm" || value === "yarn") && scanLower.includes("publish");
   const hasGitAliasConfiguration = hasGit && lower.some((value) => /^alias\.[^=]*(?:=|$)/u.test(value));
   if (depth < 4) {
     for (const nested of nestedShellCommands(lower, values)) {
@@ -1127,12 +1462,12 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   if ((hasDynamicArgument && hasDynamicCommandName(tokens)) || segments.some((segment) => hasDynamicSensitiveArgument(segment))) {
     return { decision: "deny", reason: "a repository, package, network or shell command with a dynamic argument cannot be capability-checked; substitute the literal value for the shell variable so the command can be read, or use the Write/Edit tools when the intent is to change a file" };
   }
-  if (/\bgit\b[\s\S]*\b(?:push|merge(?!-)|send-pack|receive-pack|update-ref)\b/iu.test(canonical)
-    || /\bgit-(?:send|receive|upload)-pack\b/iu.test(canonical)
-    || containsRemoteCliMutation(canonical)) {
+  if (/\bgit\b[\s\S]*\b(?:push|merge(?!-)|send-pack|receive-pack|update-ref)\b/iu.test(scanCanonical)
+    || /\bgit-(?:send|receive|upload)-pack\b/iu.test(scanCanonical)
+    || containsRemoteCliMutation(scanCanonical)) {
     return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority", boundary: "remote" };
   }
-  if (hasGit && (hasRemoteOperation || hasGitTransport) || hasGhRemote) {
+  if (scanHasGit && (hasRemoteOperation || hasGitTransport) || hasGhRemote) {
     return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority", boundary: "remote" };
   }
   // Repointing a remote would make the grant's remote *name* meaningless and
@@ -1420,7 +1755,7 @@ function evaluateCommandInternal(command: string, depth: number, cache: NestedCo
   return result;
 }
 
-function evaluateTokens(rawTokens: readonly ShellToken[], depth: number, cache: NestedCommandCache, grant?: RemoteGrant): PolicyResult {
+function evaluateTokens(rawTokens: readonly ShellToken[], depth: number, cache: NestedCommandCache, grant?: RemoteGrant, cwd?: string): PolicyResult {
   const { tokens: dataResolved, embedded } = resolveDataTokens(rawTokens);
   const tokens = resolveLiteralBindings(dataResolved);
   if (depth < 4) {
@@ -1434,20 +1769,22 @@ function evaluateTokens(rawTokens: readonly ShellToken[], depth: number, cache: 
   }
   const canonical = tokens.map((token) => token.value).join(" ").trim();
   if (!canonical) return { decision: "deny", reason: "empty command" };
-  const boundary = evaluateRepositoryBoundary(tokens, canonical, depth, cache, grant);
+  const scanTokens = sanitizeTokensForBoundaryScan(tokens, cwd);
+  const scanCanonical = scanTokens.map((token) => token.value).join(" ").trim();
+  const boundary = evaluateRepositoryBoundary(tokens, canonical, scanTokens, scanCanonical, depth, cache, grant);
   if (boundary) return boundary;
-  if (containsRemoteHttpMutation(canonical)) {
+  if (containsRemoteHttpMutation(scanCanonical)) {
     return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
   }
-  if (deniedPatterns.some((pattern) => pattern.test(canonical))) {
-    if (/\b(?:curl|wget)\b[\s\S]*(?:github|gitlab|bitbucket|registry\.npmjs)\b/iu.test(canonical)) {
+  if (deniedPatterns.some((pattern) => pattern.test(scanCanonical))) {
+    if (/\b(?:curl|wget)\b[\s\S]*(?:github|gitlab|bitbucket|registry\.npmjs)\b/iu.test(scanCanonical)) {
       return { decision: "deny", reason: "Worker has no remote repository or main/integration merge authority" };
     }
-    if (/\bgit\b[\s\S]*\b(?:reset|update-ref|symbolic-ref)\b[\s\S]*\b(?:main|master|trunk|integration|develop)\b/iu.test(canonical)
-      || /\bgit\b[\s\S]*\bbranch\b[\s\S]*(?:^|\s)(?:-d|-m|-f|--force|--delete|--move)\b[\s\S]*\b(?:main|master|trunk|integration|develop)\b/iu.test(canonical)) {
+    if (/\bgit\b[\s\S]*\b(?:reset|update-ref|symbolic-ref)\b[\s\S]*\b(?:main|master|trunk|integration|develop)\b/iu.test(scanCanonical)
+      || /\bgit\b[\s\S]*\bbranch\b[\s\S]*(?:^|\s)(?:-d|-m|-f|--force|--delete|--move)\b[\s\S]*\b(?:main|master|trunk|integration|develop)\b/iu.test(scanCanonical)) {
       return { decision: "deny", reason: "Worker cannot rewrite or delete a protected integration branch" };
     }
-    if (/\b(?:npm|pnpm|yarn)\b(?:\s+-\S+)*\s+publish\b/iu.test(canonical)) {
+    if (/\b(?:npm|pnpm|yarn)\b(?:\s+-\S+)*\s+publish\b/iu.test(scanCanonical)) {
       return { decision: "deny", reason: "package publication belongs to the protected release workflow" };
     }
     return { decision: "deny", reason: "command matches a prohibited destructive pattern" };

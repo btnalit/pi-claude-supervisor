@@ -1192,3 +1192,113 @@ test("the Bash permission path applies the delete floor", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("D4 subtractive scan allows harmless text/read-only git and grep commands while keeping remote and shutdown denials", () => {
+  for (const allowed of [
+    'git commit -m "fix: push handler"',
+    'git commit --message="fix: merge and push"',
+    "git stash push",
+    'git stash push -m "wip push"',
+    "git merge --abort",
+    "git merge --continue",
+    "git merge --quit",
+    "git log --grep=merge",
+    "git log -S push",
+    "git show HEAD:src/push.ts",
+    "git diff main..HEAD",
+    "grep -rn shutdown src/",
+    "grep -rn shutdown src/ | head -n 20",
+    "rg reboot docs/",
+  ]) {
+    assert.equal(evaluateCommand(allowed).decision, "allow", `expected allow for: ${allowed}`);
+  }
+  for (const remoteDenied of [
+    "git push origin feat",
+    'git commit -m "fix: push handler" && git push origin feat',
+    "echo 'git push origin main' | sh",
+    "git submodule foreach 'git push'",
+    "git rebase -x 'git push'",
+    "timeout 5 git push",
+    "git merge --abort origin/main",
+    "git merge --no-ff s6/lane-a", // no cwd -> fail closed
+  ]) {
+    const result = evaluateCommand(remoteDenied);
+    assert.equal(result.decision, "deny", `expected deny for: ${remoteDenied}`);
+    assert.equal(result.boundary, "remote", `expected remote boundary for: ${remoteDenied}`);
+  }
+  for (const otherDenied of [
+    'echo "$(git push)"',
+    "sudo shutdown -h now",
+    "systemctl poweroff",
+  ]) {
+    assert.equal(evaluateCommand(otherDenied).decision, "deny", `expected deny for: ${otherDenied}`);
+  }
+});
+
+test("#55-2 allows local non-protected branch merges in main and linked worktrees while blocking protected, remote, detached and TOCTOU merges", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-local-merge-"));
+  const repo = join(root, "repo");
+  const worktree = join(root, "repo-worktrees", "lane-target");
+  const runGit = (cwd: string, args: string[]) => {
+    const res = spawnSync("git", args, { cwd, encoding: "utf8" });
+    assert.equal(res.status, 0, `git ${args.join(" ")} failed: ${res.stderr}`);
+  };
+  try {
+    await mkdir(repo, { recursive: true });
+    runGit(repo, ["init", "-q", "-b", "main"]);
+    runGit(repo, ["config", "user.email", "test@example.invalid"]);
+    runGit(repo, ["config", "user.name", "Test"]);
+    await writeFile(join(repo, "a.txt"), "base\n");
+    runGit(repo, ["add", "a.txt"]);
+    runGit(repo, ["commit", "-qm", "base"]);
+    runGit(repo, ["branch", "s6/lane-a"]);
+    runGit(repo, ["branch", "s6/task"]);
+    // Simulate a custom remote-tracking ref to ensure non-origin remotes are still blocked.
+    await mkdir(join(repo, ".git", "refs", "remotes", "customremote"), { recursive: true });
+    await writeFile(join(repo, ".git", "refs", "remotes", "customremote", "lane-a"), "0".repeat(40) + "\n");
+    await mkdir(join(root, "repo-worktrees"), { recursive: true });
+    runGit(repo, ["worktree", "add", "-q", worktree, "s6/task"]);
+
+    // On protected main branch: local merge is refused.
+    const onMain = evaluatePermission("Bash", bash("git merge --no-ff s6/lane-a"), repo);
+    assert.equal(onMain.decision, "deny");
+    assert.equal(onMain.boundary, "remote");
+
+    // In linked worktree on non-protected branch `s6/task`: local non-protected merge is allowed.
+    assert.equal(evaluatePermission("Bash", bash("git merge --no-ff s6/lane-a"), worktree).decision, "allow");
+    assert.equal(evaluatePermission("Bash", bash('git merge --no-ff -q s6/lane-a -m "merge: lane a push"'), worktree).decision, "allow");
+    // Same-command TOCTOU switching to main before merging is refused.
+    const toctou = evaluatePermission("Bash", bash("git checkout main && git merge --no-ff s6/lane-a"), worktree);
+    assert.equal(toctou.decision, "deny");
+    assert.equal(toctou.boundary, "remote");
+    // Same-command branch taint (reset) before merge is refused.
+    assert.equal(evaluatePermission("Bash", bash("git reset --hard HEAD && git merge --no-ff s6/lane-a"), worktree).decision, "deny");
+    // Protected sources, remote-tracking refs, bare merge, dynamic source and unsafe global flags stay refused.
+    for (const bad of [
+      "git merge main",
+      "git merge master",
+      "git merge s6/main",
+      "git merge origin/feature",
+      "git merge customremote/lane-a",
+      "git merge refs/remotes/origin/lane-a",
+      "git merge",
+      "git --git-dir=.git merge s6/lane-a",
+    ]) {
+      const res = evaluatePermission("Bash", bash(bad), worktree);
+      assert.equal(res.decision, "deny", `expected deny in worktree for: ${bad}`);
+      assert.equal(res.boundary, "remote", `expected remote boundary for: ${bad}`);
+    }
+    assert.equal(evaluatePermission("Bash", bash("git merge $BR"), worktree).decision, "deny");
+    assert.equal(evaluatePermission("Bash", bash("git -c core.hooksPath=/tmp merge s6/lane-a"), worktree).decision, "deny");
+
+    // Switch main repo onto non-protected branch: allowed; then detach HEAD: refused.
+    runGit(repo, ["checkout", "-q", "-b", "feature/integrate"]);
+    assert.equal(evaluatePermission("Bash", bash("git merge --no-ff s6/lane-a"), repo).decision, "allow");
+    runGit(repo, ["checkout", "-q", "--detach", "HEAD"]);
+    const detached = evaluatePermission("Bash", bash("git merge --no-ff s6/lane-a"), repo);
+    assert.equal(detached.decision, "deny");
+    assert.equal(detached.boundary, "remote");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
