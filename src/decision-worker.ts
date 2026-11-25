@@ -127,7 +127,30 @@ const CONFIGURATION_ERROR = /(?:account|organi[sz]ation)[^\n]{0,40}(?:terminated
  * session or this worker's own request timeout, fails the same way every time
  * and stays bounded by maxDecisionRetries.
  */
-const TRANSIENT_ERROR = /overloaded|rate.?limit|too many requests|resource.?exhausted|retry in \d|quota exceeded for metric|exceeded your current quota|\b(?:429|500|502|503|504|524|529)\b|service.?unavailable|temporarily unavailable|server.?error|internal.?error|provider.?returned.?error|network.?error|connection.?(?:error|refused|lost|reset)|other side closed|fetch failed|getaddrinfo|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|upstream.?connect|reset before headers|socket hang up|socket connection was closed|gateway.?time.?out|websocket.?(?:closed|error)|ended without|stream ended before|http2 request did not get a response|you can retry your request|try your request again|please retry your request|try again in|timed? ?out|timeout|terminated|premature close|\b408\b/iu;
+const TRANSIENT_ERROR = /overloaded|rate.?limit|too many requests|resource.?exhausted|retry in \d|quota exceeded for metric|exceeded your current quota|service.?unavailable|temporarily unavailable|server.?error|internal.?error|network.?error|connection.?(?:error|refused|lost|reset)|other side closed|fetch failed|getaddrinfo|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|upstream.?connect|reset before headers|socket hang up|socket connection was closed|gateway.?time.?out|websocket.?(?:closed|error)|ended without|stream ended before|http2 request did not get a response|you can retry your request|try your request again|please retry your request|try again in|timed? ?out|timeout|terminated|premature close/iu;
+
+/** Status positions, not a token count or request id that happens to contain 503. */
+function providerHttpStatus(text: string): number | undefined {
+  const leading = /^(?:HTTP(?:\/\d(?:\.\d)?)?(?:\s+error)?\s*[:=]?\s*)(\d{3})\b/iu.exec(text.trim())
+    ?? /^(\d{3})(?=\s*(?:$|[{:]|<html\b|<!doctype\b|bad request\b|not found\b|unauthorized\b|forbidden\b|payment\b|request timeout\b|too many requests\b|internal (?:server )?error\b|bad gateway\b|service unavailable\b|gateway timeout\b|overloaded\b))/iu.exec(text.trim());
+  if (leading) return Number(leading[1]);
+  const jsonAt = text.indexOf("{");
+  if (jsonAt >= 0) {
+    try {
+      const value = JSON.parse(text.slice(jsonAt)) as Record<string, unknown>;
+      const nested = value.error && typeof value.error === "object" ? value.error as Record<string, unknown> : {};
+      for (const fields of [value, nested]) {
+        for (const key of ["status", "statusCode", "code"]) {
+          const status = fields[key];
+          if (typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599) return status;
+        }
+      }
+      return undefined; // Incidental status text inside a JSON message is not its status.
+    } catch { /* Not a structured error; consider qualified plain-text fields. */ }
+  }
+  const qualified = /\b(?:HTTP(?:\/\d(?:\.\d)?)?(?:\s+error)?|status(?:[ _]code)?)\s*[:=]?\s*(\d{3})\b/iu.exec(text);
+  return qualified ? Number(qualified[1]) : undefined;
+}
 
 /** The Decision Worker's own per-request timeout: the model ran the whole budget. */
 const OWN_TIMEOUT = /^Decision Worker [^\n]* timed out after \d+ms$/u;
@@ -142,7 +165,17 @@ export function classifyDecisionError(error: unknown): DecisionErrorClass {
   const text = error.message.replace(/^[^\n:]*model request failed: /u, "");
   if (CONFIGURATION_ERROR.test(text)) return "configuration";
   // A provider's error turn (pi-ai reports it as a stop reason, not a throw).
-  if (error.name === "DecisionWorkerApiError" && TRANSIENT_ERROR.test(text)) return "transient";
+  // "Provider returned error" alone says nothing about whether waiting helps.
+  if (error.name === "DecisionWorkerApiError") {
+    const status = providerHttpStatus(text);
+    // A primary client-request error must not inherit a retryable status from
+    // quoted upstream evidence. Keep explicit temporary/quota text handling
+    // for authentication/billing-shaped gateway errors as before.
+    if (status !== undefined && status >= 400 && status < 500 && ![401, 402, 403, 408, 429].includes(status)) return "other";
+    if (TRANSIENT_ERROR.test(text)) return "transient";
+    if (status === 401 || status === 402 || status === 403) return "configuration";
+    if (status !== undefined && [408, 429, 500, 502, 503, 504, 524, 529].includes(status)) return "transient";
+  }
   // A thrown transport failure before any provider answered.
   if (/fetch failed|getaddrinfo|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|socket hang up|network.?error/iu.test(text)) return "transient";
   return "other";

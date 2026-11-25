@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { link, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -8,6 +9,26 @@ import { assertSafeWorkerCommand, deleteFloorViolation, evaluateCommand, evaluat
 function bash(command: string) {
   return { command };
 }
+
+test("nested shell checks stay bounded without changing permission decisions", () => {
+  // A separate process makes a performance regression bounded too: the old
+  // repeated-suffix scan blocked the permission loop for almost a minute.
+  const moduleUrl = new URL("./policy.ts", import.meta.url).href;
+  const probe = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { evaluateCommand } from ${JSON.stringify(moduleUrl)};
+    const commands = [
+      ["sh -c ".repeat(120) + "printf ok", "allow"],
+      ["eval ".repeat(80) + "printf ok", "allow"],
+      [Array.from({length: 40}, (_, i) => "sh -c 'printf item_" + i + "'").join("; "), "allow"],
+      ["sh -c ".repeat(120) + "git push origin main", "deny"],
+      ["sh -c ".repeat(120) + "rm -rf /", "deny"],
+    ];
+    console.log(JSON.stringify(commands.map(([command, expected]) => [evaluateCommand(command).decision, expected])));
+  `], { encoding: "utf8", timeout: 5_000 });
+  assert.equal(probe.error, undefined, probe.error?.message);
+  assert.equal(probe.status, 0, probe.stderr);
+  for (const [actual, expected] of JSON.parse(probe.stdout) as string[][]) assert.equal(actual, expected);
+});
 
 test("policy denies destructive commands", () => {
   assert.equal(evaluateCommand("rm -rf /").decision, "deny");

@@ -217,7 +217,9 @@ test("recover --extend hands the task back to automation with a continuation of 
     maxTurns: 2,
     deadlineMs: 60_000,
     noOutputTimeoutMs: 60_000,
-    startedAt: new Date().toISOString(),
+    // Expired recovery grants 30m from now; an unexpired 1m budget plus
+    // 30m would correctly leave 31m instead.
+    startedAt: new Date(Date.now() - 120_000).toISOString(),
     baseCommit,
     baseBranch: "worker/recovery",
     turn: 0,
@@ -251,7 +253,11 @@ test("recover --extend hands the task back to automation with a continuation of 
     assert.ok(shutdownHandler);
 
     await command.handler(`recover --extend 30m ${taskId}`, context);
-    assert.match(messages.at(-1) ?? "", new RegExp(`Worker recovered: task=${taskId} worker=[^;]+; automation resumed with a continuation of the original task; 30m of budget from now`, "u"));
+    assert.match(messages.at(-1) ?? "", new RegExp(`Worker recovered: task=${taskId} worker=[^;]+; automation resumed with a continuation of the original task; [^;]+ of budget from now`, "u"));
+    const recovered = await decisionStore.load(taskId);
+    assert.ok(recovered);
+    const remaining = recovered.deadlineMs - (Date.now() - Date.parse(recovered.startedAt));
+    assert.ok(remaining > 29 * 60_000 && remaining <= 30 * 60_000, `remaining budget: ${remaining}`);
     // The fresh Worker is told what the task was and to look at earlier work
     // first, without anyone having to send it by hand.
     for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -453,8 +459,20 @@ test("index releases a confirmed-clean failed worker cwd reservation", async () 
     const originalAcquire = CwdLeaseStore.prototype.acquire;
     CwdLeaseStore.prototype.acquire = async function(this: CwdLeaseStore, ...args: Parameters<CwdLeaseStore["acquire"]>) {
       const handle = await originalAcquire.apply(this, args);
-      handle.updateWorker = async () => {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+      handle.updateWorker = async (worker) => {
+        const deadline = Date.now() + 5_000;
+        for (;;) {
+          try { await readFile(join(cwd, ".registration-failure-pid"), "utf8"); break; }
+          catch (error) {
+            if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+          }
+          if (worker.pid) {
+            try { process.kill(worker.pid, 0); }
+            catch { throw new Error("registration fixture exited before writing its PID"); }
+          }
+          if (Date.now() > deadline) throw new Error("registration fixture timed out before writing its PID");
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
         throw new Error("injected lease registration failure");
       };
       return handle;

@@ -1111,22 +1111,25 @@ function readProcessStartTimeSync(pid: number): string | undefined {
   catch { return undefined; }
 }
 
-async function readProcessGroupIdentity(pid: number): Promise<ProcessGroupIdentity> {
-  return parseProcessGroupIdentity(await readFile(`/proc/${pid}/stat`, "utf8"), pid);
+async function readProcessGroupIdentity(pid: number): Promise<ProcessGroupIdentity | undefined> {
+  let stat: string;
+  try { stat = await readFile(`/proc/${pid}/stat`, "utf8"); }
+  catch (error) {
+    // procfs can open the file just before its process exits, then fail the
+    // read with ESRCH instead of ENOENT. Neither means the group is cleaned.
+    if (error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ESRCH")) return undefined;
+    throw error;
+  }
+  return parseProcessGroupIdentity(stat, pid);
 }
 
 async function assertProcessGroupIdentity(record: ProcessRecord, pid: number): Promise<void> {
   const identity = record.processGroupIdentity;
   if (record.processGroupIdentityError) throw new Error(`worker process-group identity unavailable: ${record.processGroupIdentityError.message}`);
   if (!identity || identity.pid !== pid || identity.pgid !== pid) throw new Error(`worker process-group identity was not established for ${pid}`);
-  try {
-    const current = await readProcessGroupIdentity(pid);
-    if (current.startTime !== identity.startTime || current.pgid !== identity.pgid) {
-      throw new Error(`worker process-group identity changed for ${pid}`);
-    }
-  } catch (error) {
-    if (error instanceof Error && /ENOENT/u.test(error.message)) return;
-    throw error;
+  const current = await readProcessGroupIdentity(pid);
+  if (current && (current.startTime !== identity.startTime || current.pgid !== identity.pgid)) {
+    throw new Error(`worker process-group identity changed for ${pid}`);
   }
 }
 

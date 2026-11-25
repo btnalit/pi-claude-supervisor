@@ -915,7 +915,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                   await session.resumeAutomation();
                   if (extendMs > 0) await session.send(recoveryContinuation(record.spec?.goal ?? record.task));
                   message = extendMs > 0
-                    ? `Worker recovered: task=${record.taskId} worker=${handle.id}; automation resumed with a continuation of the original task; ${formatDurationMs(Math.max(0, recoveryDeadlineMs - elapsedMs))} of budget from now`
+                    ? `Worker recovered: task=${record.taskId} worker=${handle.id}; automation resumed with a continuation of the original task; ${formatDurationMs(session.deadline?.remainingMs ?? 0)} of budget from now`
                     : `Worker recovered: task=${record.taskId} worker=${handle.id}; automation resumed; the close-out verifies and reviews the repository as it stands`;
                 } catch (error) {
                   const detail = redactText(error instanceof Error ? error.message : String(error));
@@ -1214,6 +1214,7 @@ function formatSessionDetail(taskId: string, session: Supervisor, tmuxModeLabel?
   if (tmuxModeLabel) parts.push(`mode=${tmuxModeLabel}`);
   if (session.humanRequired) parts.push("automation=paused(resume-auto)");
   if (session.candidateParked) parts.push("candidate=parked");
+  if (session.parkReasonLabel) parts.push(`parkReason=${JSON.stringify(session.parkReasonLabel)}`);
   if (task) {
     parts.push(`turn=${session.turn}/${task.maxTurns}`);
     if (session.repairRound > 0) parts.push(`repair=${session.repairRound}`);
