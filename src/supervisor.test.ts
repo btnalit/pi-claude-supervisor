@@ -5515,6 +5515,8 @@ test("release failure during verification surfaces cleanupError and cleanupConfi
     assert.equal(stopCalls, 0);
     assert.equal(supervisor.state, "failed");
     assert.deepEqual(closure, { cleanupConfirmed: false, reason: "recoverable_failure" });
+    const failedEvent = events.events.find((entry) => entry.type === "verification_failed");
+    assert.match(String(failedEvent?.data?.cleanupError ?? ""), /injected release failure/u);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

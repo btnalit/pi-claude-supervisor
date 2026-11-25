@@ -742,7 +742,10 @@ export class Supervisor {
         && status.processGroupCleaned === true
         && (!status.cgroupError || status.cgroupRequired === false);
       if ((status.exitReason === "completed" || intentionalVerification) && cleanupSafe) this.#machine.transition("verifying");
-      else this.#machine.transition("failed");
+      else {
+        this.#machine.transition("failed");
+        this.#settleTerminal();
+      }
       await this.#appendEvent({ type: "worker_exited", taskId, workerId: handle.id, data: { exitCode: status.exitCode, signal: status.signal, reason: status.exitReason, cleanupSafe, cleanupError: status.cleanupError } });
       if (this.#machine.state === "failed") {
         await this.#decision?.close().catch(() => {});
@@ -1545,7 +1548,6 @@ export class Supervisor {
   async #parkCandidate(reason: string, event?: WorkerEvent, question?: string, reasonLabel = "Candidate blocked"): Promise<void> {
     const task = this.#task;
     if (!task || this.#candidateParked || ["completed", "blocked", "failed", "stopped"].includes(this.#machine.state)) return;
-    if (this.#stopRequested !== undefined) return;
     const handle = this.#handle;
     const permission = event?.type === "permission_request" ? {
       requestId: event.request.requestId,
@@ -1565,6 +1567,7 @@ export class Supervisor {
       await this.#finalizeVerification(verification, "blocked", reason, { reasonLabel });
       return;
     }
+    if (this.#stopRequested !== undefined) return;
     this.#candidateParked = true;
     this.#parkReasonLabel = reasonLabel;
     this.#reportProgress("candidate", reason, true);
@@ -2847,6 +2850,7 @@ export class Supervisor {
       }
     }
     if (this.#machine.state === "verifying") this.#machine.transition("failed");
+    this.#settleTerminal();
     this.#reportProgress("failed", `verification operation failed: ${safeMessage(error)}`, true);
     this.#verificationAbortController = undefined;
     if (this.#task) {

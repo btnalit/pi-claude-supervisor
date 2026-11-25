@@ -138,7 +138,7 @@
 **B. 目标不变量**——当前不成立，须以 **独立的行为变更 PR** 实现（建议作为阶段 0.3，见 §5）：
 
 1. ✅ **操作员停止唯一优先**：任何 Decision 终止类动作（普通 stop、park、ask_human、noop→park）与 Decision 失败在操作员停止
-   已请求时都让位；任务以 `stopped` / `human_stop` 结束，不再 park 或落为 `recoverable_failure`。
+   已请求时都让位；任务以 `stopped` / `human_stop` 结束，不再 park 或落为 `recoverable_failure`（注：`#finalizeVerification` 清理等待窗口内后到的 `stop()` 归入阶段 2 `StopIntent` 收口）。
 2. **延迟而不丢失**（interactive 主线放弃）：interactive 模式下人工接管期间 prompt 阶段已直接 defer 给人，仅涉及已冻结的 bridge/jsonl。
 3. ✅ **终态无挂起资源**：进入终态后统一经 `#settleTerminal()` 清除计时器、`#inputRetry` 与 `#pendingDecisionKey`。
 4. **裁决可审计**：每次覆盖带结构化 guard 标识（阶段 2.3 引入；当前 stale 丢弃记 `decision_ignored`，
