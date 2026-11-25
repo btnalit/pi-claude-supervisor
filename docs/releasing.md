@@ -28,7 +28,7 @@ any job fails, is cancelled, or is skipped:
 Configure branch protection for `main` with:
 
 - pull request required;
-- `CI / Quality gate` required and up to date;
+- `CI / Quality gate` and `PR title / Conventional PR title` required and up to date;
 - conversation resolution required;
 - force pushes and branch deletion disabled.
 

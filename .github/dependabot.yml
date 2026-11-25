@@ -10,8 +10,20 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      - dependency-name: "@types/node"
+        update-types:
+          - version-update:semver-major
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      github-actions-minor-patch:
+        update-types:
+          - minor
+          - patch
