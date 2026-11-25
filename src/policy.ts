@@ -1087,6 +1087,18 @@ export function evaluateCommand(command: string, args: readonly string[] = [], g
 // take seconds. Depth remains part of the key because it bounds recursion.
 type NestedCommandCache = Map<string, PolicyResult>;
 
+/**
+ * Strictly non-executing text/inspection commands whose literal arguments can
+ * safely be stripped from broad remote/destructive regex scans (when the
+ * statement has no dynamic/subshell/brace tokens and does not pipe into a
+ * non-text command). Explicitly excludes pagers/editors (`view`, `less`, `more`,
+ * `bat`), `sort` (`--compress-program`), `diff`, `tee` and `jq`.
+ */
+const HARMLESS_TEXT_COMMANDS = new Set([
+  "echo", "printf", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg",
+  "cut", "tr", "uniq", "nl", "tac", "rev", "base64", "md5sum", "sha1sum", "sha256sum",
+  "column", "fold", "paste", "comm", "cmp", "od", "hexdump", "xxd", "ls", "stat", "file",
+]);
 /** Git subcommands that only read repository state; their non-dynamic literal args cannot push, merge or mutate remotes. */
 const GIT_READ_ONLY_SUBCOMMANDS = new Set([
   "status", "diff", "log", "show", "rev-parse", "rev-list", "ls-files", "blame", "describe",
@@ -1094,11 +1106,17 @@ const GIT_READ_ONLY_SUBCOMMANDS = new Set([
   "check-ignore", "check-attr", "ls-tree", "diff-tree", "diff-index", "diff-files",
   "for-each-ref", "show-ref",
 ]);
-/** Git options whose literal value is commit/search text, not a subcommand or remote ref. */
-const GIT_TEXT_VALUE_OPTIONS = new Set(["-m", "--message", "--grep", "-S", "-G"]);
+/** Git subcommands where `-m` / `--message` genuinely accepts free-form message text (excludes `rebase -m`, which is `--merge`). */
+const GIT_MESSAGE_SUBCOMMANDS = new Set(["commit", "tag", "stash", "notes"]);
 const GIT_MERGE_CONTROL_FLAGS = new Set(["--abort", "--continue", "--quit"]);
-const GIT_MERGE_VALUE_OPTIONS = new Set(["-m", "--message", "-s", "--strategy", "-X", "--strategy-option", "--cleanup", "--log"]);
-const GIT_BRANCH_TAINT_SUBCOMMANDS = new Set(["reset", "rebase", "symbolic-ref", "update-ref", "worktree"]);
+const GIT_MERGE_VALUE_OPTIONS = new Set(["-m", "--message", "-s", "--strategy", "-X", "--strategy-option", "--cleanup"]);
+const GIT_MERGE_SAFE_FLAGS = new Set([
+  "--no-ff", "--ff", "--ff-only", "--squash", "--no-squash", "--commit", "--no-commit",
+  "--edit", "--no-edit", "-q", "--quiet", "-v", "--verbose", "--stat", "-n", "--no-stat",
+  "--log", "--no-log", "--rerere-autoupdate", "--no-rerere-autoupdate",
+  "--allow-unrelated-histories", "--no-verify",
+]);
+const SHELL_META_CHARS = /[()`${}]/u;
 
 interface ScanSegment {
   tokens: ShellToken[];
@@ -1131,6 +1149,21 @@ function segmentCommandWords(segment: readonly ShellToken[]): { words: ShellToke
   let start = 0;
   while (start < words.length && !words[start]!.dynamic && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[start]!.value)) start += 1;
   return { words, start };
+}
+
+function segmentHasUnsafeShellTokens(segment: readonly ShellToken[]): boolean {
+  let afterRedirect = false;
+  for (const token of segment) {
+    if (token.operator) {
+      afterRedirect = REDIRECT_OPERATORS.has(token.value) || token.value === "<<<";
+      continue;
+    }
+    if (token.dynamic || token.data) return true;
+    if (afterRedirect && token.value.startsWith("(")) return true;
+    afterRedirect = false;
+    if (SHELL_META_CHARS.test(token.value)) return true;
+  }
+  return false;
 }
 
 function readGitDirs(directory: string): { gitDir: string; commonDir: string } | undefined {
@@ -1170,18 +1203,14 @@ function readCurrentGitBranch(directory: string): string | undefined {
   }
 }
 
-function isRemoteTrackingRef(ref: string, commonDir: string): boolean {
-  if (/^refs\/remotes\//iu.test(ref)) return true;
-  const slash = ref.indexOf("/");
-  if (slash <= 0) return false;
-  const prefix = ref.slice(0, slash);
-  if (prefix === "origin" || prefix === "upstream") return true;
-  if (existsSync(join(commonDir, "refs", "remotes", prefix))) return true;
+function hasRemoteNamed(name: string, commonDir: string): boolean {
+  if (name === "origin" || name === "upstream") return true;
+  if (existsSync(join(commonDir, "refs", "remotes", name))) return true;
   const packed = join(commonDir, "packed-refs");
   try {
     if (existsSync(packed) && statSync(packed).size <= 2 * 1024 * 1024) {
       const content = readFileSync(packed, "utf8");
-      const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
       if (new RegExp(` refs/remotes/${escaped}/`, "u").test(content)) return true;
     }
   } catch {
@@ -1190,69 +1219,11 @@ function isRemoteTrackingRef(ref: string, commonDir: string): boolean {
   return false;
 }
 
-function parseGitCheckoutOrSwitchTarget(words: readonly ShellToken[], subIndex: number): string | null {
-  const args = words.slice(subIndex + 1);
-  if (args.some((token) => token.dynamic || token.data)) return null;
-  const values = args.map((token) => token.value);
-  // Path checkout (`git checkout -- file`) does not switch branches; treat ambiguously as taint.
-  if (values.includes("--") || values.includes("--detach") || values.includes("-d")) return null;
-  let createBranch: string | undefined;
-  const positional: string[] = [];
-  for (let i = 0; i < values.length; i += 1) {
-    const value = values[i]!;
-    if (["-b", "-B", "-c", "-C", "--create", "--force-create"].includes(value)) {
-      const next = values[i + 1];
-      if (!next || next.startsWith("-")) return null;
-      createBranch = next;
-      i += 1;
-      continue;
-    }
-    if (value.startsWith("--create=") || value.startsWith("--force-create=")) {
-      createBranch = value.slice(value.indexOf("=") + 1);
-      continue;
-    }
-    if (value.startsWith("-")) {
-      if (["--orphan", "--track", "-t", "--conflict"].includes(value)) return null;
-      continue;
-    }
-    positional.push(value);
-  }
-  const target = createBranch ?? (positional.length === 1 ? positional[0] : undefined);
-  if (!target || target === "-" || /[~^:@\\]|^\.|\/\.\.|\.\.\//u.test(target)) return null;
-  return target.replace(/^refs\/heads\//u, "");
-}
-
-function resolveGitEffectiveDir(words: readonly ShellToken[], subIndex: number, baseDir: string | undefined): { dir: string | undefined; changed: boolean; unsafeGlobal: boolean } {
-  let dir = baseDir;
-  let changed = false;
-  for (let i = 1; i < subIndex; i += 1) {
-    const token = words[i]!;
-    if (token.dynamic || token.data) return { dir: undefined, changed: true, unsafeGlobal: true };
-    const value = token.value;
-    if (value === "-C") {
-      const next = words[i + 1];
-      if (!next || next.dynamic || next.data) return { dir: undefined, changed: true, unsafeGlobal: true };
-      dir = isAbsolute(next.value) ? resolve(next.value) : dir !== undefined ? resolve(dir, next.value) : undefined;
-      changed = true;
-      i += 1;
-      continue;
-    }
-    if (value.startsWith("-C") && value.length > 2) {
-      const raw = value.slice(2);
-      dir = isAbsolute(raw) ? resolve(raw) : dir !== undefined ? resolve(dir, raw) : undefined;
-      changed = true;
-      continue;
-    }
-    if (value === "--git-dir" || value.startsWith("--git-dir=")
-      || value === "--work-tree" || value.startsWith("--work-tree=")
-      || value === "-c" || value.startsWith("-c")
-      || value === "--config-env" || value.startsWith("--config-env=")
-      || value === "--exec-path" || value.startsWith("--exec-path=")) {
-      return { dir: undefined, changed: true, unsafeGlobal: true };
-    }
-    if (GIT_GLOBAL_VALUE_OPTIONS.has(value)) i += 1;
-  }
-  return { dir, changed, unsafeGlobal: false };
+function isRemoteTrackingRef(ref: string, commonDir: string): boolean {
+  if (/^(?:refs\/)?remotes\//iu.test(ref)) return true;
+  const slash = ref.indexOf("/");
+  if (slash <= 0) return hasRemoteNamed(ref, commonDir);
+  return hasRemoteNamed(ref.slice(0, slash), commonDir);
 }
 
 function isSafeMergeControl(words: readonly ShellToken[], subIndex: number): boolean {
@@ -1267,18 +1238,25 @@ function isSafeMergeControl(words: readonly ShellToken[], subIndex: number): boo
   return sawControl;
 }
 
-function isAllowedLocalMerge(words: readonly ShellToken[], subIndex: number, directory: string | undefined, branchOverride: string | null | undefined): boolean {
-  if (directory === undefined) return false;
-  if (words.some((token) => token.dynamic || token.data)) return false;
-  const { dir: effectiveDir, changed, unsafeGlobal } = resolveGitEffectiveDir(words, subIndex, directory);
-  if (unsafeGlobal || effectiveDir === undefined) return false;
-  const dirs = readGitDirs(effectiveDir);
+/**
+ * #55-2: allow a local non-protected branch merge ONLY under strict, TOCTOU-free
+ * conditions:
+ * - `cwd` is provided;
+ * - the merge is the sole statement in the command (no prior checkout/cd/subshell/script);
+ * - no leading environment assignments (e.g. `GIT_DIR=...`);
+ * - no git global options before `merge` (`subIndex === 1`: no `-C`, `--git-dir`, `-c`);
+ * - no redirections or dynamic/subshell tokens;
+ * - HEAD is an attached non-protected branch, and every source is a literal
+ *   local non-protected branch (not `-`, not a remote or remote-tracking ref,
+ *   no rev syntax `^`/`~`/`..`/`:`/`@{`).
+ */
+function isAllowedLocalMerge(segment: readonly ShellToken[], words: readonly ShellToken[], start: number, subIndex: number, totalSegments: number, cwd: string | undefined): boolean {
+  if (cwd === undefined || totalSegments !== 1 || start !== 0 || subIndex !== 1) return false;
+  if (segment.some((token) => token.operator)) return false;
+  if (segmentHasUnsafeShellTokens(segment)) return false;
+  const dirs = readGitDirs(cwd);
   if (!dirs) return false;
-  // Determine target branch: if earlier statements in this command mutated
-  // git state ambiguously, fail closed; if an earlier literal checkout/switch
-  // in the same directory chose a branch, judge against that target.
-  if (branchOverride === null) return false;
-  const targetBranch = !changed && branchOverride !== undefined ? branchOverride : readCurrentGitBranch(effectiveDir);
+  const targetBranch = readCurrentGitBranch(cwd);
   if (!targetBranch || isProtectedBranch(targetBranch)) return false;
 
   const args = words.slice(subIndex + 1);
@@ -1288,18 +1266,22 @@ function isAllowedLocalMerge(words: readonly ShellToken[], subIndex: number, dir
     const value = args[i]!.value;
     if (options && value === "--") { options = false; continue; }
     if (options && value.startsWith("-")) {
-      if (value === "-F" || value === "--file" || value.startsWith("--file=") || value === "--into-name" || value.startsWith("--into-name=")) return false;
+      if (value === "-") return false; // `git merge -` merges the previous branch.
       if (GIT_MERGE_VALUE_OPTIONS.has(value)) {
         if (i + 1 >= args.length) return false;
         i += 1;
+        continue;
       }
-      continue;
+      if (GIT_MERGE_SAFE_FLAGS.has(value)) continue;
+      if (/^--(?:message|strategy|strategy-option|cleanup|log)=/u.test(value)) continue;
+      if (/^-m./u.test(value)) continue;
+      return false;
     }
     sources.push(value);
   }
   if (sources.length === 0) return false;
   for (const source of sources) {
-    if (!source || source.includes(":") || source.includes("@{")) return false;
+    if (!source || source === "-" || /[:^~]|@\{|\.\./u.test(source)) return false;
     if (["HEAD", "FETCH_HEAD", "ORIG_HEAD", "MERGE_HEAD"].includes(source)) return false;
     if (isRemoteTrackingRef(source, dirs.commonDir)) return false;
     const normalized = source.replace(/^refs\/heads\//u, "");
@@ -1308,18 +1290,29 @@ function isAllowedLocalMerge(words: readonly ShellToken[], subIndex: number, dir
   return true;
 }
 
+/** True when every downstream command in the `|` pipeline starting after `segIdx` is a clean harmless text command. */
+function pipelineIsHarmlessText(segments: readonly ScanSegment[], segIdx: number): boolean {
+  for (let i = segIdx; i < segments.length; i += 1) {
+    const seg = segments[i]!;
+    if (segmentHasUnsafeShellTokens(seg.tokens)) return false;
+    const { words, start } = segmentCommandWords(seg.tokens);
+    const head = words[start];
+    const headName = head ? head.value.split(/[\\/]/u).at(-1)?.toLowerCase() : undefined;
+    if (!headName || !HARMLESS_TEXT_COMMANDS.has(headName)) return false;
+    if (seg.nextOperator !== "|") return true;
+  }
+  return true;
+}
+
 /**
  * Subtractive scan: preserve every existing wrapper, nested-shell, dynamic-arg,
  * remote-config and protected-branch denial, and remove ONLY proven-harmless
  * non-dynamic literal words before running the broad remote/destructive checks.
- * Dynamic tokens are never removed.
+ * Dynamic tokens, subshells and pipelines feeding non-text commands are never stripped.
  */
 function sanitizeTokensForBoundaryScan(tokens: readonly ShellToken[], cwd?: string): ShellToken[] {
   const segments = scanSegmentsOf(tokens);
   const output: ShellToken[] = [];
-  let directory = cwd;
-  const dirStack: (string | undefined)[] = [];
-  let branchOverride: string | null | undefined = undefined;
 
   for (let segIdx = 0; segIdx < segments.length; segIdx += 1) {
     const segment = segments[segIdx]!;
@@ -1327,88 +1320,58 @@ function sanitizeTokensForBoundaryScan(tokens: readonly ShellToken[], cwd?: stri
     const cmdTokens = words.slice(start);
     const head = cmdTokens[0];
     const headName = head && !head.dynamic && !head.data ? head.value.split(/[\\/]/u).at(-1)?.toLowerCase() : undefined;
-
-    // Track directory changes for local merge target resolution.
-    if (headName === "cd") {
-      directory = resolveCd(cmdTokens.slice(1), directory);
-      branchOverride = directory === undefined ? null : undefined;
-    } else if (headName === "pushd") {
-      dirStack.push(directory);
-      directory = resolveCd(cmdTokens.slice(1), directory);
-      branchOverride = directory === undefined ? null : undefined;
-    } else if (headName === "popd") {
-      directory = dirStack.length > 0 ? dirStack.pop() : undefined;
-      branchOverride = directory === undefined ? null : undefined;
-    }
-
-    // Check next segment executable when piping stdout.
-    const nextSeg = segments[segIdx + 1];
-    const nextCmd = nextSeg ? segmentCommandWords(nextSeg.tokens) : undefined;
-    const nextHead = nextCmd ? nextCmd.words[nextCmd.start] : undefined;
-    const nextName = nextHead && !nextHead.dynamic && !nextHead.data ? nextHead.value.split(/[\\/]/u).at(-1)?.toLowerCase() : undefined;
-    const pipesToNonData = segment.nextOperator === "|" && !(nextName && (DATA_SINK_COMMANDS.has(nextName) || READ_ONLY_COMMANDS.has(nextName)));
-
+    const unsafeTokens = segmentHasUnsafeShellTokens(segment.tokens);
     const dropSet = new Set<ShellToken>();
 
-    // 1. Pure text / read-only command statements (when not piping to a shell/executor).
-    if (headName && (DATA_SINK_COMMANDS.has(headName) || READ_ONLY_COMMANDS.has(headName)) && !pipesToNonData) {
+    // 1. Strictly non-executing text commands (only when the entire `|` pipeline is harmless text and no meta/dynamic tokens exist).
+    if (!unsafeTokens && headName && HARMLESS_TEXT_COMMANDS.has(headName) && pipelineIsHarmlessText(segments, segIdx)) {
       for (const token of cmdTokens.slice(1)) {
-        if (!token.dynamic && !token.data) dropSet.add(token);
+        dropSet.add(token);
       }
-    } else if (headName === "git") {
+    } else if (!unsafeTokens && headName === "git") {
       const plainValues = cmdTokens.map((token) => token.value);
       const subIndex = gitSubcommandIndex(plainValues);
-      if (subIndex > 0 && !cmdTokens.slice(0, subIndex + 1).some((token) => token.dynamic || token.data)) {
+      const preOptions = subIndex > 0 ? plainValues.slice(1, subIndex) : [];
+      const hasUnsafePreOption = preOptions.some((opt) => opt === "-c" || opt.startsWith("-c") || opt === "--exec-path" || opt.startsWith("--exec-path="));
+      if (subIndex > 0 && !hasUnsafePreOption) {
         const sub = plainValues[subIndex]!.toLowerCase();
-        // Track same-command branch mutations before any later `git merge`.
-        if (sub === "checkout" || sub === "switch") {
-          const { changed, unsafeGlobal } = resolveGitEffectiveDir(cmdTokens, subIndex, directory);
-          if (unsafeGlobal || changed) branchOverride = null;
-          else branchOverride = parseGitCheckoutOrSwitchTarget(cmdTokens, subIndex);
-        } else if (GIT_BRANCH_TAINT_SUBCOMMANDS.has(sub)) {
-          branchOverride = null;
-        }
+        const mergeAllowed = sub === "merge" && isAllowedLocalMerge(segment.tokens, words, start, subIndex, segments.length, cwd);
 
-        // 2. Git message and search option values (`-m`, `--message`, `--grep`, `-S`, `-G`).
-        for (let i = subIndex + 1; i < cmdTokens.length; i += 1) {
-          const token = cmdTokens[i]!;
-          if (token.dynamic || token.data) continue;
-          if (GIT_TEXT_VALUE_OPTIONS.has(token.value)) {
-            const next = cmdTokens[i + 1];
-            if (next && !next.dynamic && !next.data) { dropSet.add(next); i += 1; }
-            continue;
-          }
-          if (/^(?:--message=|--grep=|-m.|-S.|-G.)/u.test(token.value)) {
-            dropSet.add(token);
+        // 2. Message text values ONLY on subcommands where `-m`/`--message` takes text (`commit`, `tag`, `stash`, `notes`, or an already-allowed `merge`).
+        if (GIT_MESSAGE_SUBCOMMANDS.has(sub) || mergeAllowed) {
+          for (let i = subIndex + 1; i < cmdTokens.length; i += 1) {
+            const token = cmdTokens[i]!;
+            if (token.value === "-m" || token.value === "--message") {
+              const next = cmdTokens[i + 1];
+              if (next) { dropSet.add(next); i += 1; }
+              continue;
+            }
+            if (token.value.startsWith("--message=") || /^-m./u.test(token.value)) {
+              dropSet.add(token);
+            }
           }
         }
 
-        // 3. Git read-only subcommands: non-dynamic literal args after subcommand.
-        if (GIT_READ_ONLY_SUBCOMMANDS.has(sub)) {
+        // 3. Git read-only subcommands: literal args after subcommand (skip if external diff/textconv driver flags are present).
+        if (GIT_READ_ONLY_SUBCOMMANDS.has(sub) && !plainValues.slice(subIndex + 1).some((v) => GIT_DRIVER_FLAGS.test(v))) {
           for (const token of cmdTokens.slice(subIndex + 1)) {
-            if (!token.dynamic && !token.data) dropSet.add(token);
+            dropSet.add(token);
           }
         }
 
         // 4. `git stash push`: strip literal `push` sub-action.
         if (sub === "stash") {
           const actionToken = cmdTokens.slice(subIndex + 1).find((token) => !token.value.startsWith("-"));
-          if (actionToken && !actionToken.dynamic && !actionToken.data && actionToken.value.toLowerCase() === "push") {
+          if (actionToken && actionToken.value.toLowerCase() === "push") {
             dropSet.add(actionToken);
           }
         }
 
         // 5 & 6. `git merge --abort|--continue|--quit` OR allowed local non-protected merge (#55-2).
-        if (sub === "merge" && (isSafeMergeControl(cmdTokens, subIndex) || isAllowedLocalMerge(cmdTokens, subIndex, directory, branchOverride))) {
+        if (sub === "merge" && (isSafeMergeControl(cmdTokens, subIndex) || mergeAllowed)) {
           dropSet.add(cmdTokens[subIndex]!);
         }
-      } else {
-        // Ambiguous git invocation in command chain taints branch tracking.
-        branchOverride = null;
       }
-    } else if (headName && (SHELL_NAMES.has(headName) || headName === "eval" || cmdTokens.some((token) => /(?:^|[\\/])git$/iu.test(token.value)))) {
-      // Non-plain git or nested shell could mutate HEAD before a later merge.
-      branchOverride = null;
     }
 
     for (const token of segment.tokens) {

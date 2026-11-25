@@ -1216,11 +1216,22 @@ test("D4 subtractive scan allows harmless text/read-only git and grep commands w
     "git push origin feat",
     'git commit -m "fix: push handler" && git push origin feat',
     "echo 'git push origin main' | sh",
+    "echo $(git push origin feat)",
+    "cat `git push origin feat`",
+    "echo git push origin feat | cat | sh",
+    "echo push origin feat | tee /dev/null | xargs git",
+    "echo git push origin feat > >(sh)",
+    "cat () { git push origin feat; }; cat",
+    "view -es -c '!git push origin feat' -c q README.md",
+    "git rebase -m --exec='git push origin feat' HEAD~1",
+    "git rebase -S --exec='git push origin feat' HEAD~1",
+    "git rebase -mx'git push origin feat' HEAD~1",
     "git submodule foreach 'git push'",
     "git rebase -x 'git push'",
     "timeout 5 git push",
     "git merge --abort origin/main",
     "git merge --no-ff s6/lane-a", // no cwd -> fail closed
+    "cd /tmp && git merge --no-ff s6/lane-a", // no cwd -> fail closed even after absolute cd
   ]) {
     const result = evaluateCommand(remoteDenied);
     assert.equal(result.decision, "deny", `expected deny for: ${remoteDenied}`);
@@ -1228,6 +1239,9 @@ test("D4 subtractive scan allows harmless text/read-only git and grep commands w
   }
   for (const otherDenied of [
     'echo "$(git push)"',
+    "echo $(npm publish)",
+    "echo $(gh pr merge 1)",
+    "echo $(sudo shutdown -h now)",
     "sudo shutdown -h now",
     "systemctl poweroff",
   ]) {
@@ -1267,22 +1281,37 @@ test("#55-2 allows local non-protected branch merges in main and linked worktree
     // In linked worktree on non-protected branch `s6/task`: local non-protected merge is allowed.
     assert.equal(evaluatePermission("Bash", bash("git merge --no-ff s6/lane-a"), worktree).decision, "allow");
     assert.equal(evaluatePermission("Bash", bash('git merge --no-ff -q s6/lane-a -m "merge: lane a push"'), worktree).decision, "allow");
-    // Same-command TOCTOU switching to main before merging is refused.
-    const toctou = evaluatePermission("Bash", bash("git checkout main && git merge --no-ff s6/lane-a"), worktree);
-    assert.equal(toctou.decision, "deny");
-    assert.equal(toctou.boundary, "remote");
-    // Same-command branch taint (reset) before merge is refused.
-    assert.equal(evaluatePermission("Bash", bash("git reset --hard HEAD && git merge --no-ff s6/lane-a"), worktree).decision, "deny");
-    // Protected sources, remote-tracking refs, bare merge, dynamic source and unsafe global flags stay refused.
+    // Same-command TOCTOU, subshells, cd, -C, and env prefixes are all refused.
+    for (const toctouCmd of [
+      "git checkout main && git merge --no-ff s6/lane-a",
+      "(git checkout main) && git merge s6/lane-a",
+      "git checkout main && cd . && git merge s6/lane-a",
+      "git checkout main && git -C . merge s6/lane-a",
+      "GIT_DIR=../../repo/.git git merge s6/lane-a",
+      "git reset --hard HEAD && git merge --no-ff s6/lane-a",
+    ]) {
+      const toctou = evaluatePermission("Bash", bash(toctouCmd), worktree);
+      assert.equal(toctou.decision, "deny", `expected TOCTOU deny for: ${toctouCmd}`);
+      assert.equal(toctou.boundary, "remote", `expected remote boundary for: ${toctouCmd}`);
+    }
+    // Protected sources, remote-tracking refs, bare merge, rev syntax, --log spoofing, dynamic source and unsafe global flags stay refused.
     for (const bad of [
       "git merge main",
       "git merge master",
       "git merge s6/main",
+      "git merge main^0",
+      "git merge - s6/lane-a",
+      "git merge --log main s6/lane-a",
+      "git merge --log origin/main s6/lane-a",
+      "git merge origin",
       "git merge origin/feature",
+      "git merge remotes/origin/feature",
+      "git merge customremote",
       "git merge customremote/lane-a",
       "git merge refs/remotes/origin/lane-a",
       "git merge",
       "git --git-dir=.git merge s6/lane-a",
+      "git -C . merge s6/lane-a",
     ]) {
       const res = evaluatePermission("Bash", bash(bad), worktree);
       assert.equal(res.decision, "deny", `expected deny in worktree for: ${bad}`);
