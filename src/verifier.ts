@@ -476,7 +476,10 @@ async function readTrackedDiff(cwd: string, ref: string, signal?: AbortSignal): 
   // Git's binary-classified paths, then force text for actual text files.
   // Genuine binaries keep the normal name-only notice, without huge patches.
   const stats = await readGitEvidence(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--numstat", "-z", ref, "--"], signal);
-  if (!stats.complete) return { text: `${normal.text}\n${stats.text}`, complete: false, truncated: stats.truncated };
+  if (!stats.complete) {
+    const bounded = boundEvidence(`${normal.text}\n${stats.text}`);
+    return { ...bounded, complete: false, truncated: stats.truncated || bounded.truncated };
+  }
   const hidden = stats.text.split("\0").filter((entry) => entry.startsWith("-\t-\t")).map((entry) => entry.slice(4));
   if (hidden.length === 0) return normal;
   const groups = new Map<string, string[]>();
