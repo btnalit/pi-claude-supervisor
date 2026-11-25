@@ -1241,6 +1241,10 @@ test("D4 subtractive scan allows harmless text/read-only git and grep commands w
     "GIT_EDITOR=sh git commit --allow-empty -e -m 'git push origin feat'",
     "EDITOR=sh git commit --allow-empty -e -m 'git push origin feat'",
     "git commit --allow-empty -e -m 'git push origin feat'",
+    "git commit --allow-empty --edi -m 'git push origin feat'",
+    "git commit --allow-empty --ed -m 'git push origin feat'",
+    "git tag --ed -m 'git push origin feat' v1",
+    "git tag --edi -m 'git push origin feat' v1",
     "cat() ( xargs git ); echo push origin feat | cat",
     "git log -1 --format='git push origin feat' > x.sh && sh x.sh",
     "git log -1 --format='git push origin feat' |& sh",
@@ -1346,6 +1350,17 @@ test("#55-2 allows local non-protected branch merges in main and linked worktree
     // Switch main repo onto non-protected branch: allowed; then detach HEAD: refused.
     runGit(repo, ["checkout", "-q", "-b", "feature/integrate"]);
     assert.equal(evaluatePermission("Bash", bash("git merge --no-ff s6/lane-a"), repo).decision, "allow");
+    // A FIFO in .git/packed-refs must fail closed immediately without blocking the Supervisor.
+    if (process.platform !== "win32") {
+      const fifoPath = join(repo, ".git", "packed-refs");
+      const mkfifo = spawnSync("mkfifo", [fifoPath], { encoding: "utf8" });
+      if (mkfifo.status === 0) {
+        const fifoRes = evaluatePermission("Bash", bash("git merge --no-ff s6/lane-a"), repo);
+        assert.equal(fifoRes.decision, "deny");
+        assert.equal(fifoRes.boundary, "remote");
+        await rm(fifoPath, { force: true });
+      }
+    }
     runGit(repo, ["checkout", "-q", "--detach", "HEAD"]);
     const detached = evaluatePermission("Bash", bash("git merge --no-ff s6/lane-a"), repo);
     assert.equal(detached.decision, "deny");

@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 
@@ -1183,15 +1183,42 @@ function hasEditFlag(args: readonly ShellToken[]): boolean {
   for (const token of args) {
     const value = token.value;
     if (value === "--") break;
-    if (value === "-e" || value === "--edit" || value === "-c" || value === "--reedit-message" || value.startsWith("--reedit-message=")) return true;
-    // Combined short option cluster containing `e` (e.g. `-ae`, `-am` is fine, `-e` is not).
-    if (value.startsWith("-") && !value.startsWith("--") && value.length > 2) {
-      // Stop before `-m` payload in `-amfoo`.
+    if (value === "-e" || value === "-c") return true;
+    if (value.startsWith("--")) {
+      const flag = value.includes("=") ? value.slice(0, value.indexOf("=")) : value;
+      // Git accepts any unambiguous prefix of `--edit` or `--reedit-message` (e.g. `--e`, `--ed`, `--edi`, `--reedit`).
+      if (flag.length >= 3 && ("--edit".startsWith(flag) || "--reedit-message".startsWith(flag))) return true;
+      continue;
+    }
+    // Combined short option cluster containing `e` or `c` (stop before `-m` payload in `-amfoo`).
+    if (value.startsWith("-") && value.length > 2) {
       const beforeMsg = value.includes("m") ? value.slice(1, value.indexOf("m")) : value.slice(1);
       if (beforeMsg.includes("e") || beforeMsg.includes("c")) return true;
     }
   }
   return false;
+}
+
+/**
+ * Open and read a small regular file without blocking on FIFOs/devices or
+ * following symlinks. Returns undefined on missing, non-regular, oversized or
+ * unreadable files so callers can fail closed.
+ */
+function readSmallRegularFile(path: string, maxBytes: number): string | undefined {
+  let fd: number | undefined;
+  try {
+    const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
+    fd = openSync(path, flags);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > maxBytes) return undefined;
+    return readFileSync(fd, "utf8");
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+  }
 }
 
 function readGitDirs(directory: string): { gitDir: string; commonDir: string } | undefined {
@@ -1202,15 +1229,17 @@ function readGitDirs(directory: string): { gitDir: string; commonDir: string } |
     const stat = lstatSync(dotGit);
     if (stat.isDirectory()) return { gitDir: dotGit, commonDir: dotGit };
     if (!stat.isFile()) return undefined;
-    const pointer = readFileSync(dotGit, "utf8");
+    const pointer = readSmallRegularFile(dotGit, 4096);
+    if (pointer === undefined) return undefined;
     const match = /^gitdir:\s*(.+)$/im.exec(pointer);
     if (!match?.[1]) return undefined;
     const rawGitDir = match[1].trim();
     const gitDir = isAbsolute(rawGitDir) ? resolve(rawGitDir) : resolve(top, rawGitDir);
     let commonDir = gitDir;
     const commonFile = join(gitDir, "commondir");
-    if (existsSync(commonFile) && lstatSync(commonFile).isFile()) {
-      const rawCommon = readFileSync(commonFile, "utf8").trim();
+    if (existsSync(commonFile)) {
+      const rawCommon = readSmallRegularFile(commonFile, 4096)?.trim();
+      if (rawCommon === undefined) return undefined;
       if (rawCommon) commonDir = isAbsolute(rawCommon) ? resolve(rawCommon) : resolve(gitDir, rawCommon);
     }
     return { gitDir, commonDir };
@@ -1222,28 +1251,21 @@ function readGitDirs(directory: string): { gitDir: string; commonDir: string } |
 function readCurrentGitBranch(directory: string): string | undefined {
   const dirs = readGitDirs(directory);
   if (!dirs) return undefined;
-  try {
-    const head = readFileSync(join(dirs.gitDir, "HEAD"), "utf8").trim();
-    const match = /^ref:\s*refs\/heads\/(.+)$/u.exec(head);
-    return match?.[1]?.trim() || undefined;
-  } catch {
-    return undefined;
-  }
+  const head = readSmallRegularFile(join(dirs.gitDir, "HEAD"), 4096)?.trim();
+  if (!head) return undefined;
+  const match = /^ref:\s*refs\/heads\/(.+)$/u.exec(head);
+  return match?.[1]?.trim() || undefined;
 }
 
 function hasRemoteNamed(name: string, commonDir: string): boolean {
   if (name === "origin" || name === "upstream") return true;
   if (existsSync(join(commonDir, "refs", "remotes", name))) return true;
   const packed = join(commonDir, "packed-refs");
-  try {
-    if (existsSync(packed)) {
-      if (lstatSync(packed).isSymbolicLink() || statSync(packed).size > 2 * 1024 * 1024) return true;
-      const content = readFileSync(packed, "utf8");
-      const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-      if (new RegExp(` refs/remotes/${escaped}/`, "u").test(content)) return true;
-    }
-  } catch {
-    return true;
+  if (existsSync(packed)) {
+    const content = readSmallRegularFile(packed, 2 * 1024 * 1024);
+    if (content === undefined) return true; // FIFO, symlink, oversized or unreadable -> fail closed.
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    if (new RegExp(` refs/remotes/${escaped}/`, "u").test(content)) return true;
   }
   return false;
 }
