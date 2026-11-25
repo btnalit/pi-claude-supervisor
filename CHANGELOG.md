@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented here.
 
+## [0.10.1](https://github.com/btnalit/pi-claude-supervisor/compare/v0.10.0...v0.10.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* **interactive:** improve unattended tmux ownership and cleanup ([#78](https://github.com/btnalit/pi-claude-supervisor/issues/78)) ([11e9f79](https://github.com/btnalit/pi-claude-supervisor/commit/11e9f793f4350623eeb379101e30c6d61d403b30))
+* **tmux:** emit exited even when dead-pane cleanup fails ([#88](https://github.com/btnalit/pi-claude-supervisor/issues/88)) ([ef4041b](https://github.com/btnalit/pi-claude-supervisor/commit/ef4041bb7a1930629a2cf473272aedcbd91b3798))
+
 ## [0.10.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.9.2...v0.10.0) (2026-09-24)
 
 
