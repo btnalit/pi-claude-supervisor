@@ -329,6 +329,7 @@ export class Supervisor {
   #parkReasonLabel?: string;
   #stopRequested?: string;
   #stopCloseReason?: DecisionSessionCloseReason;
+  #lastStopWasOperator = false;
   #onDecisionSessionProgress?: (info: { taskId: string; turn: number; repairRound: number; lastFindingSignature?: string; workerCostUsd: number }) => Promise<void> | void;
   #onDecisionSessionClosed?: (taskId: string, info: DecisionSessionClosedInfo) => Promise<void> | void;
   #startAbortController?: AbortController;
@@ -338,6 +339,7 @@ export class Supervisor {
   #startAbortCompletion?: Promise<void>;
   #released = false;
   #releasing = false;
+  #releaseCompletion?: Promise<void>;
   #terminalNoticeSent = false;
   #progressHeartbeatMs = 60_000;
   #decisionModel?: PiModel;
@@ -431,6 +433,8 @@ export class Supervisor {
     this.#parkReasonLabel = undefined;
     this.#released = false;
     this.#releasing = false;
+    this.#releaseCompletion = undefined;
+    this.#lastStopWasOperator = false;
     this.#terminalNoticeSent = false;
     this.#keepWorkerOnCompletion = Boolean(options.interactive) && options.keepWorkerOnCompletion === true;
     this.#usage = emptyUsage();
@@ -973,6 +977,7 @@ export class Supervisor {
     this.#candidateParked = true;
     this.#parkReasonLabel = "Decision startup failed";
     if (this.#machine.state === "starting") this.#machine.transition("blocked");
+    this.#settleTerminal();
     await this.#appendEvent({ type: "decision_worker_failed", taskId: task.taskId, data: { eventType: "startup", error: safeMessage(error) } }).catch((auditError) => {
       console.error(`pi-claude-supervisor decision startup audit failed: ${safeMessage(auditError)}`);
     });
@@ -1086,6 +1091,10 @@ export class Supervisor {
         await this.#appendDecisionIgnored(event, undefined);
         return;
       }
+      if (this.#stopRequested !== undefined) {
+        await this.#appendEvent({ type: "decision_ignored", taskId: this.#task?.taskId, workerId: event.handle.id, data: { reason: "operator stop requested", eventType: event.type, error: safeMessage(error) } }).catch(() => {});
+        return;
+      }
       // A *model* failure for an event overtaken while it failed decides
       // nothing (the Pi Decision Worker already drops those itself; this
       // covers other factories). A failure applying an action or delivering
@@ -1128,6 +1137,10 @@ export class Supervisor {
       const handle = this.#handle;
       if (this.#releasing || this.#released) {
         await this.#appendDecisionIgnored(event, action);
+        return;
+      }
+      if (this.#stopRequested !== undefined) {
+        await this.#appendEvent({ type: "decision_ignored", taskId: task?.taskId, workerId: event.handle.id, data: { action: action.action, reason: "operator stop requested", eventType: event.type } }).catch(() => {});
         return;
       }
       if (!task || !handle || !this.#automation || ["completed", "blocked", "failed", "stopped"].includes(this.#machine.state)) return;
@@ -1497,6 +1510,18 @@ export class Supervisor {
     this.#inputRetryTimer = undefined;
   }
 
+  #detached(): boolean {
+    return this.#releasing || this.#released;
+  }
+
+  #settleTerminal(): void {
+    this.#pendingDecisionKey = undefined;
+    this.#pendingDecisionRetrying = false;
+    this.#inputRetry = undefined;
+    this.#clearWaitTimer();
+    this.#clearHumanIdleTimer();
+  }
+
   /**
    * Record, best effort, that the task's current branch diverged from the
    * last one observed. The task is anchored to its baseline commit, not to a
@@ -1519,6 +1544,7 @@ export class Supervisor {
   async #parkCandidate(reason: string, event?: WorkerEvent, question?: string, reasonLabel = "Candidate blocked"): Promise<void> {
     const task = this.#task;
     if (!task || this.#candidateParked || ["completed", "blocked", "failed", "stopped"].includes(this.#machine.state)) return;
+    if (this.#stopRequested !== undefined) return;
     const handle = this.#handle;
     const permission = event?.type === "permission_request" ? {
       requestId: event.request.requestId,
@@ -1542,15 +1568,24 @@ export class Supervisor {
     this.#parkReasonLabel = reasonLabel;
     this.#reportProgress("candidate", reason, true);
     let cleanupError: unknown;
+    let operatorStop = false;
     if (handle && ["running", "waiting", "paused", "starting"].includes(this.#machine.state)) {
       try {
-        await this.#stopInternal(`park candidate: ${reason}`, true, "blocked");
+        operatorStop = await this.#stopInternal(`park candidate: ${reason}`, true, "blocked");
       } catch (error) {
+        operatorStop = this.#lastStopWasOperator;
         cleanupError = error;
       }
     }
+    if (operatorStop) {
+      this.#candidateParked = false;
+      this.#parkReasonLabel = undefined;
+      if (cleanupError) throw cleanupError;
+      return;
+    }
     if (this.#machine.state === "stopped") this.#machine.transition("blocked");
     else if (["starting", "running", "waiting", "paused"].includes(this.#machine.state)) this.#machine.transition("blocked");
+    this.#settleTerminal();
     const notice: CandidateNotice = {
       taskId: task.taskId,
       workerId: handle?.id,
@@ -1845,6 +1880,8 @@ export class Supervisor {
       : this.#machine.state === "starting" || this.#startAbortController
         ? this.abortStart(reason)
         : Promise.resolve();
+    this.#releaseCompletion = preemptiveRelease;
+    void preemptiveRelease.catch(() => {});
     await this.#decision?.close().catch(() => {});
     this.#decision = undefined;
     await withTimeout(this.#exclusive(async () => {
@@ -1879,10 +1916,11 @@ export class Supervisor {
       this.#preemptiveStop = this.#adapter.stop(this.#handle, reason);
       void this.#preemptiveStop.catch(() => { /* consumed by serialized stop */ });
     }
-    return this.#exclusive(() => this.#stopInternal(reason, true, options.preserveDecisionSession ? "recoverable_failure" : "human_stop"));
+    await this.#exclusive(() => this.#stopInternal(reason, true, options.preserveDecisionSession ? "recoverable_failure" : "human_stop"));
   }
 
-  async #stopInternal(reason: string, flushPendingEvents = true, closeReason: DecisionSessionCloseReason = "recoverable_failure"): Promise<void> {
+  async #stopInternal(reason: string, flushPendingEvents = true, closeReason: DecisionSessionCloseReason = "recoverable_failure"): Promise<boolean> {
+    this.#lastStopWasOperator = false;
     this.#clearHumanIdleTimer();
     // The preemptive adapter stop already killed the Worker; a persistently
     // failing event log must not block the state transition below.
@@ -1894,14 +1932,19 @@ export class Supervisor {
     this.#remoteGrant = undefined;
     if (!this.#handle) throw new Error("no active task");
     if (this.#machine.state === "stopped") {
+      const operatorStop = this.#stopRequested !== undefined;
+      this.#lastStopWasOperator = operatorStop;
       this.#stopRequested = undefined;
       this.#stopCloseReason = undefined;
       const preemptiveStop = this.#preemptiveStop;
       this.#preemptiveStop = undefined;
       if (preemptiveStop) await preemptiveStop;
-      return;
+      return operatorStop;
     }
     if (this.#machine.state === "failed") {
+      const operatorStop = this.#stopRequested !== undefined;
+      const effectiveCloseReason = operatorStop ? (this.#stopCloseReason ?? "human_stop") : closeReason;
+      this.#lastStopWasOperator = operatorStop;
       this.#stopRequested = undefined;
       this.#stopCloseReason = undefined;
       // A failed startup or cleanup attempt may still retain a live handle.
@@ -1914,8 +1957,8 @@ export class Supervisor {
       const cleanupConfirmed = await this.#isCleanupConfirmed(this.#handle);
       await this.#decision?.close().catch(() => {});
       this.#decision = undefined;
-      await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", { cleanupConfirmed, reason: closeReason })).catch(() => {});
-      return;
+      await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", { cleanupConfirmed, reason: effectiveCloseReason })).catch(() => {});
+      return operatorStop;
     }
     if (this.#machine.state === "completed") {
       if (this.#handle) {
@@ -1931,9 +1974,9 @@ export class Supervisor {
         }
         await this.#drainOutputAfterStop(this.#handle);
       }
-      return;
+      return false;
     }
-    if (!["running", "waiting", "paused", "starting", "verifying"].includes(this.#machine.state)) return;
+    if (!["running", "waiting", "paused", "starting", "verifying"].includes(this.#machine.state)) return false;
     this.#clearWatchdog();
     this.#reportProgress("stopping", reason, true);
     const preemptiveStop = this.#preemptiveStop;
@@ -1955,9 +1998,13 @@ export class Supervisor {
     }
     const cleanupConfirmed = await this.#isCleanupConfirmed(this.#handle);
     const stopped = cleanupConfirmed;
+    const operatorStop = this.#stopRequested !== undefined;
+    const effectiveCloseReason = operatorStop ? (this.#stopCloseReason ?? "human_stop") : closeReason;
+    this.#lastStopWasOperator = operatorStop;
     this.#machine.transition(stopped ? "stopped" : "failed");
     this.#stopRequested = undefined;
     this.#stopCloseReason = undefined;
+    this.#settleTerminal();
     let eventError: unknown;
     try {
       await this.#appendEvent({ type: stopped ? "worker_stopped" : "worker_stop_failed", taskId: this.#task?.taskId, workerId: this.#handle.id, data: { reason, ...(stopError ? { error: safeMessage(stopError) } : {}), ...(cleanupConfirmed ? {} : { cleanupConfirmed: false }) } });
@@ -1966,13 +2013,14 @@ export class Supervisor {
     }
     await this.#decision?.close().catch(() => {});
     this.#decision = undefined;
-    await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", { cleanupConfirmed, reason: stopped ? closeReason : "recoverable_failure" })).catch(() => {});
-    if (!stopped && closeReason !== "human_stop") {
+    await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", { cleanupConfirmed, reason: stopped ? effectiveCloseReason : "recoverable_failure" })).catch(() => {});
+    if (!stopped && effectiveCloseReason !== "human_stop") {
       await this.#notifyFailure(`worker cleanup could not be confirmed: ${reason}`);
     }
     const errors = [flushError, stopError, outputError, eventError].filter(Boolean);
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1) throw new AggregateError(errors, "worker stop cleanup and audit failed");
+    return operatorStop;
   }
 
   async #drainOutputAfterStop(handle: WorkerHandle): Promise<void> {
@@ -2069,6 +2117,11 @@ export class Supervisor {
     } catch (error) {
       if (this.#stopRequested !== undefined) {
         return this.#finalizeVerification(cancelledAcceptanceReport(safeMessage(error)));
+      }
+      if (this.#detached()) {
+        const parked = cancelledAcceptanceReport("Worker released during verification");
+        this.#lastVerification = parked;
+        return this.#finalizeVerification(parked, "blocked", "Worker released during verification", { reasonLabel: "Released" });
       }
       if (this.#automation) {
         const parked = cancelledAcceptanceReport(`verification operation failed: ${safeMessage(error)}`);
@@ -2254,6 +2307,10 @@ export class Supervisor {
     // going to use it; saying so keeps "candidate is ready" honest.
     if (!this.#automation) {
       await this.#notePublishShortfall(handle.id, { reason: "manual mode does not run a publish turn; push the verified candidate yourself" });
+      return false;
+    }
+    if (this.#detached()) {
+      await this.#notePublishShortfall(handle.id, { reason: "the Worker was released from supervision before the publish turn" });
       return false;
     }
     if (this.#humanRequired || this.#stopRequested !== undefined) {
@@ -2575,6 +2632,10 @@ export class Supervisor {
     const task = this.#task;
     const handle = this.#handle;
     if (!task || !this.#automation || this.#humanRequired) return false;
+    if (this.#detached()) {
+      await this.#appendEvent({ type: "candidate_blocked", taskId: task.taskId, workerId: handle?.id, data: { reason: `${reason}; Worker was released from supervision, no repair round` } });
+      return false;
+    }
     if (this.#stopVerification !== undefined) {
       await this.#appendEvent({ type: "candidate_blocked", taskId: task.taskId, workerId: handle?.id, data: { reason: `${reason}; the Decision Worker chose stop, so no repair round is sent` } });
       return false;
@@ -2655,19 +2716,27 @@ export class Supervisor {
     this.#remoteGrant = undefined;
     const stopRequested = this.#stopRequested !== undefined;
     const stopCloseReason = this.#stopCloseReason ?? "human_stop";
-    if (outcome === "blocked") {
+    const detached = this.#detached();
+    if (!stopRequested && outcome === "blocked") {
       this.#candidateParked = true;
-      this.#parkReasonLabel = options.reasonLabel ?? (options.publishOnly ? "Publish unconfirmed" : "Verification blocked");
+      this.#parkReasonLabel = detached ? "Released" : (options.reasonLabel ?? (options.publishOnly ? "Publish unconfirmed" : "Verification blocked"));
     }
     // A completed interactive task may keep its persistent session open for
     // the operator instead of tearing it down; a stop requested mid-verify or
     // a blocked/failed outcome always falls back to today's stop behavior.
-    const keepOpen = !stopRequested && this.#stopVerification === undefined && outcome === "completed" && result.ok
+    const keepOpen = !detached && !stopRequested && this.#stopVerification === undefined && outcome === "completed" && result.ok
       && this.#keepWorkerOnCompletion && Boolean(this.#adapter.release) && Boolean(this.#handle);
     let cleanupError: unknown;
     let releasedInteractive = false;
     if (this.#handle) {
-      if (keepOpen) {
+      if (detached) {
+        try {
+          await this.#releaseCompletion;
+          this.#released = true;
+        } catch (error) {
+          cleanupError = error;
+        }
+      } else if (keepOpen) {
         try {
           // Match the generic release() path: no output drain. The session
           // stays alive and its transcript keeps growing after detach.
@@ -2701,6 +2770,7 @@ export class Supervisor {
     const publishOnlyBlock = !stopRequested && outcome === "blocked" && result.ok && !cleanupError && options.publishOnly === true;
     const terminalState = stopRequested ? "stopped" : verificationSucceeded ? "completed" : outcome === "blocked" && !cleanupError ? "blocked" : "failed";
     if (this.#machine.state === "verifying") this.#machine.transition(terminalState);
+    this.#settleTerminal();
     const candidateReason = outcomeReason ?? (result.ok ? "candidate is ready after independent acceptance" : "candidate did not satisfy acceptance/review");
     this.#reportProgress(stopRequested ? "stopping" : verificationSucceeded ? "completed" : terminalState === "blocked" ? "candidate" : "failed", stopRequested ? "verification stopped by operator" : verificationSucceeded ? "verification and independent review passed" : candidateReason, true);
     const eventData = { ...result, ...(stopRequested ? { cancelled: true, stopReason: this.#stopRequested } : {}), ...(terminalState === "blocked" ? { candidateReason, reasonLabel: this.#parkReasonLabel } : {}), ...(cleanupError ? { cleanupError: safeMessage(cleanupError) } : {}), ...(this.#lastObservedBranch ? { branch: this.#lastObservedBranch, protectedBranch: isProtectedBranch(this.#lastObservedBranch) } : {}) };
@@ -2727,7 +2797,7 @@ export class Supervisor {
     // The process was released, not stopped, so #isCleanupConfirmed's "the
     // process died" checks do not apply; the release call above already
     // confirmed the disconnect succeeded.
-    const cleanupConfirmed = releasedInteractive ? true : (!cleanupError && await this.#isCleanupConfirmed(this.#handle));
+    const cleanupConfirmed = detached ? !cleanupError : releasedInteractive ? true : (!cleanupError && await this.#isCleanupConfirmed(this.#handle));
     await this.#decision?.close().catch(() => {});
     this.#decision = undefined;
     this.#stopRequested = undefined;

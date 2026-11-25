@@ -137,18 +137,14 @@
 
 **B. 目标不变量**——当前不成立，须以 **独立的行为变更 PR** 实现（建议作为阶段 0.3，见 §5）：
 
-1. **操作员停止唯一优先**：任何 Decision 终止类动作（普通 stop、park、ask_human、noop→park）在操作员停止
-   已请求时都让位；任务以 `stopped` / `human_stop` 结束。（复审已用临时测试复现：Decision `park` 与操作员 stop
-   竞态时任务以 `blocked` 结束；Decision 普通 stop 竞态时关闭原因为 `recoverable_failure` 而非 `human_stop`。）
-2. **延迟而不丢失**：人工闸门期间的权限回应在闸门关闭后重放，或权限请求被重新交给 Decision Worker。
-3. **终态无挂起资源**：进入终态后清除计时器、中止控制器与 `#pendingDecisionKey`（当前 stop/park/finalize 不清除后者）。
+1. ✅ **操作员停止唯一优先**：任何 Decision 终止类动作（普通 stop、park、ask_human、noop→park）与 Decision 失败在操作员停止
+   已请求时都让位；任务以 `stopped` / `human_stop` 结束，不再 park 或落为 `recoverable_failure`。
+2. **延迟而不丢失**（interactive 主线放弃）：interactive 模式下人工接管期间 prompt 阶段已直接 defer 给人，仅涉及已冻结的 bridge/jsonl。
+3. ✅ **终态无挂起资源**：进入终态后统一经 `#settleTerminal()` 清除计时器、`#inputRetry` 与 `#pendingDecisionKey`。
 4. **裁决可审计**：每次覆盖带结构化 guard 标识（阶段 2.3 引入；当前 stale 丢弃记 `decision_ignored`，
    权限覆盖记 `permission_decision`，`decision_overridden` 仅有文本 `reason`）。
-5. **释放后不再驱动或停止 Worker**：验证进行中 `release()` 时，Supervisor 仍会尝试修复轮（`#requestRepair` 不检查
-   `#releasing`）并在收尾时对已释放的 handle 调用 `adapter.stop`。对真实 tmux 适配器：`send()` 在已释放记录上抛错，
-   修复未送达但已记 `repair_requested`；随后 `stop` 再次 release，面板仍在运行，owned handle 的清理确认失败 →
-   任务以 **`failed`**（`verification_failed`，恢复关闭原因 `recoverable_failure`）结束——验收与审查阶段皆然
-   （复审以 tmux 形态的假适配器复现）；adopted handle 则以 parked 结束。**直接影响 interactive tmux 模式。**
+5. ✅ **释放后不再驱动或停止 Worker**：验证进行中 `release()` 时，`#requestRepair`/`#requestPublish` 跳过修复与发布轮，
+   `#finalizeVerification` 等待既有释放完成而不再调用 `adapter.stop`/`release`，未通过验证的释放以 `blocked`（`parkReasonLabel: "Released"`，`cleanupConfirmed: true`）结束，已通过验证则保持 `completed`。
 
 ### 3.3 子生命周期（目标形态，覆盖现有真实路径）
 
@@ -170,7 +166,7 @@ Verification（每轮）：
        ├─ revise ▶ repair?（同上）；重复发现 ▶ human ▶ parked
        └─ human / Reviewer 失败 ▶ parked
   任一阶段：操作员停止 ▶ cancelled（stopped）；证据采集失败 ▶ parked
-  验证中 release：owned tmux handle ▶ 尝试修复/停止已释放的 handle ▶ failed；adopted handle ▶ parked（缺陷，见 §3.2 B5）
+  验证中 release：跳过修复/发布轮、不再停止已释放 handle ▶ parked（blocked，reasonLabel="Released"）；若验证已通过则保持 completed（见 §3.2 B5 ✅）
   验证中 takeover：在 #exclusive 队列中等待验证结束后才生效
   （注：所有 blocked 的验证结果都会置 #candidateParked，“blocked”与“parked”在状态上相同）
 StopIntent（终止意图，现状）：
