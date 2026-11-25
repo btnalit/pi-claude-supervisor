@@ -1,0 +1,41 @@
+name: PR title
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  title:
+    name: Conventional PR title
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Validate Conventional PR title
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_REF: ${{ github.ref_name }}
+        run: |
+          title="$PR_TITLE"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            title="$(gh pr list --repo "$GH_REPO" --head "$HEAD_REF" --base main --state open --json title --jq '.[0].title // ""')"
+            if [ -z "$title" ]; then
+              echo "No open pull request targeting main found for branch $HEAD_REF" >&2
+              exit 1
+            fi
+          fi
+          PR_TITLE="$title" node --input-type=module -e 'if (!/^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([\w./-]+\))?!?: .+/u.test(process.env.PR_TITLE)) throw new Error("Use a Conventional Commit PR title: " + process.env.PR_TITLE);'

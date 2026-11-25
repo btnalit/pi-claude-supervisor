@@ -31,7 +31,7 @@ jobs:
       tag: ${{ steps.target.outputs.tag }}
       sha: ${{ steps.target.outputs.sha }}
     steps:
-      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         if: ${{ !inputs.tag }}
         with:
@@ -39,7 +39,7 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
       - name: Run CI for bot-created release PRs
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           RELEASE_PRS: ${{ steps.release.outputs.prs || '[]' }}
         with:
@@ -55,10 +55,11 @@ jobs:
                 throw new Error('Unexpected release PR origin');
               }
               await github.rest.actions.createWorkflowDispatch({...context.repo, workflow_id: 'ci.yml', ref: data.head.ref});
+              await github.rest.actions.createWorkflowDispatch({...context.repo, workflow_id: 'pr-title.yml', ref: data.head.ref});
             }
       - name: Resolve and validate release commit
         id: target
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           REQUESTED_TAG: ${{ inputs.tag }}
           CREATED_TAG: ${{ steps.release.outputs.tag_name }}
@@ -105,17 +106,17 @@ jobs:
       RELEASE_SHA: ${{ needs.plan.outputs.sha }}
       NODE_AUTH_TOKEN: ${{ vars.NPM_AUTH_MODE == 'token' && secrets.NPM_TOKEN || '' }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The publishing tools come from this trusted main workflow, not an artifact.
           ref: ${{ env.RELEASE_SHA }}
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.verify.outputs.artifact }}
           path: dist
