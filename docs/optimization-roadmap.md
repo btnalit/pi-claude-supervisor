@@ -6,7 +6,7 @@
 > [`automation-hardening-plan.md`](automation-hardening-plan.md) 记录自动化加固；本文只覆盖 0.9.2 之后的
 > **收敛与稳定性** 工作，不改变它们确立的边界与目标。
 
-## 本地后续可靠性修复（基于 v0.10.0，尚未发布）
+## v0.10.1 可靠性修复（基于 v0.10.0）
 
 此轮不搬回已关闭、未合并的 PR #61 安全硬化，也不扩大静态删除解析或 structured bridge 功能。
 

@@ -918,7 +918,10 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         record.handle.pid = pane.pid;
       }
       if (pane.exitCode !== undefined) record.exitCode = pane.exitCode;
-      if (pane.dead && !record.cleanupComplete) await this.#cleanup(record, false);
+      if (pane.dead && !record.cleanupComplete) {
+        try { await this.#cleanup(record, false); }
+        catch (cleanupError) { record.cleanupError ??= asError(cleanupError); }
+      }
     } catch (error) {
       if (isMissingSession(error)) {
         record.paneDead = true;
@@ -1439,8 +1442,9 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
       }
       if (pane.exitCode !== undefined) record.exitCode = pane.exitCode;
       if (pane.dead) {
-        await this.#cleanup(record, false);
-        this.#emit(record, { type: "exited", handle: record.handle, exitCode: record.exitCode, signal: record.signal });
+        try { await this.#cleanup(record, false); }
+        catch (cleanupError) { record.cleanupError ??= asError(cleanupError); }
+        finally { this.#emit(record, { type: "exited", handle: record.handle, exitCode: record.exitCode, signal: record.signal }); }
         return;
       }
       if (record.interactive) {

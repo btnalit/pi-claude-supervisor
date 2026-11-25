@@ -714,6 +714,56 @@ for (const injectFailure of [false, true]) {
   });
 }
 
+test("tmux monitor still emits exited when dead-pane cleanup throws a transient error", { skip: !tmuxAvailable, concurrency: false, timeout: 15_000 }, async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-monitor-cleanup-err-"));
+  const exitTrigger = join(stateDir, "exit-now");
+  const adapter = new TmuxWorkerAdapter({ stateDir, pollIntervalMs: 25, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+  const events: WorkerEvent[] = [];
+  let handle: Awaited<ReturnType<TmuxWorkerAdapter["start"]>> | undefined;
+  let rmFailures = 0;
+  let failRm = true;
+  let restore = () => {};
+  try {
+    handle = await adapter.start({
+      task: "exit on trigger",
+      cwd: stateDir,
+      command: process.execPath,
+      args: ["-e", `const fs = require("node:fs"); process.stdout.write(">\\n"); const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(exitTrigger)})) { clearInterval(timer); process.exit(0); } }, 20);`],
+      sendInitialInput: false,
+      eventListener: (event) => { events.push(event); },
+    });
+    const originalRm = fsPromises.rm;
+    const rmMock = t.mock.method(fsPromises, "rm", async (...args: Parameters<typeof originalRm>) => {
+      const target = String(args[0]);
+      if (target.startsWith(stateDir) && target !== stateDir && failRm) {
+        rmFailures += 1;
+        throw Object.assign(new Error("injected runtimeDir cleanup failure"), { code: "EIO" });
+      }
+      return originalRm(...args);
+    });
+    syncBuiltinESMExports();
+    restore = () => { rmMock.mock.restore(); syncBuiltinESMExports(); };
+    await writeFile(exitTrigger, "exit\n");
+    await waitFor(() => events.some((event) => event.type === "exited"));
+    const exited = events.find((event) => event.type === "exited");
+    assert.ok(exited && exited.type === "exited");
+    assert.equal(exited.handle.id, handle.id);
+    assert.ok(rmFailures >= 1);
+    const failedStatus = await adapter.getStatus(handle);
+    assert.equal(failedStatus.running, false);
+    assert.match(failedStatus.cleanupError ?? "", /injected runtimeDir cleanup failure/u);
+    failRm = false;
+    restore();
+    const retried = await adapter.getStatus(handle);
+    assert.equal(retried.running, false);
+    assert.equal(retried.cleanupError, undefined);
+  } finally {
+    restore();
+    if (handle) await adapter.stop(handle, "monitor cleanup error fixture").catch(() => {});
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("automatic tmux allows a Claude child and cgroup cleanup reaps it", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
   const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-tmux-nested-test-"));
   const fixture = join(stateDir, "fixture.mjs");
