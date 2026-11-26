@@ -2617,7 +2617,7 @@ function isRoutineCargo(rest: readonly string[], effectiveDir: string, boundaryC
     if (equals < 0 && CARGO_BOOL_FLAGS.has(flag)) continue;
     if (CARGO_VALUE_FLAGS.has(flag)) {
       const value = equals > 0 ? word.slice(equals + 1) : cargoArguments[index + 1];
-      if (!value) return false;
+      if (!value || (equals < 0 && value.startsWith("-"))) return false;
       if (equals < 0) index += 1;
       continue;
     }
@@ -2650,12 +2650,12 @@ function isRoutineCargo(rest: readonly string[], effectiveDir: string, boundaryC
 
 const GO_BOOL_FLAGS = new Set([
   "-v", "-race", "-short", "-json", "-failfast", "-a", "-n", "-x",
-  "-work", "-trimpath", "-cover", "-benchmem", "-m", "-all", "-deps",
+  "-work", "-trimpath", "-cover", "-benchmem", "-m", "-all", "-deps", "-buildvcs",
 ]);
 const GO_VALUE_FLAGS = new Set([
   "-run", "-skip", "-bench", "-benchtime", "-count", "-timeout",
   "-parallel", "-p", "-tags", "-f", "-coverpkg", "-covermode",
-  "-shuffle", "-mod", "-buildvcs", "-list",
+  "-shuffle", "-mod", "-list",
 ]);
 const GO_PATH_FLAGS = new Set(["-o", "-C", "-coverprofile"]);
 
@@ -2671,6 +2671,11 @@ function isRoutineGo(rest: readonly string[], effectiveDir: string, boundaryCwd:
     // Go's flag package accepts `-flag` and `--flag` interchangeably.
     const normFlag = rawFlag.startsWith("--") ? rawFlag.slice(1) : rawFlag;
     if (equals < 0 && GO_BOOL_FLAGS.has(normFlag)) continue;
+    if (normFlag === "-buildvcs" && equals > 0) {
+      const val = word.slice(equals + 1);
+      if (val === "auto" || val === "true" || val === "false") continue;
+      return false;
+    }
     if (GO_VALUE_FLAGS.has(normFlag)) {
       const value = equals > 0 ? word.slice(equals + 1) : rest[index + 1];
       if (!value) return false;
