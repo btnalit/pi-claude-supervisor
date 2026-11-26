@@ -418,11 +418,7 @@ const WRITE_FLOOR_CONTROL_KEYWORDS = new Set([
   "case", "esac", "select", "coproc", "function", "{", "}",
 ]);
 const WRITE_FLOOR_DEFERRED_BUILTINS = new Set(["eval", "source", ".", "trap", "alias", "shopt"]);
-const WRITE_FLOOR_ENV_MUTATORS = new Set(["export", "declare", "typeset", "readonly", "local", "read"]);
-const WRITE_FLOOR_PRE_CD_READ_ONLY = new Set([
-  "true", "false", ":", "echo", "printf", "pwd", "ls", "stat", "test", "[", "[[",
-  "cat", "head", "tail", "grep", "rg", "git", "which", "basename", "dirname", "realpath",
-]);
+const WRITE_FLOOR_ENV_MUTATORS = new Set(["export", "declare", "typeset", "readonly", "local", "read", "mapfile", "readarray"]);
 
 /** True only when `text` is a single `$(…)` whose opening `$(` closes at the very last character (never `$(a) $(b)`). */
 function isSingleBalancedCommandSubst(text: string): boolean {
@@ -532,12 +528,12 @@ function writeFloorScript(
       || t.value === "(){"
       || /^[A-Za-z_][A-Za-z0-9_]*\(\)\{?$/u.test(t.value);
   });
+  const hasAnySubst = rawSubstBodies.length > 0 || nonDataTokens.some((t) => t.inSubst === true);
 
   // Pass 1: compute per-segment possibleDirs and whole-command allSeenDirs.
   const segmentDirs: Array<Set<string | undefined>> = [];
   const allSeenDirs = new Set<string | undefined>([start]);
   let possibleDirs = new Set<string | undefined>([start]);
-  let preCdMutatingSeen = false;
   let globalCwdUnknown = false;
   let preChainDirs: Set<string | undefined> | undefined;
 
@@ -580,7 +576,6 @@ function writeFloorScript(
     }
     const cmdTok = words[cmdIdx];
     const cmdWord = cmdTok?.value.replace(/^[({]+|[});]+$/gu, "") ?? "";
-    const head = floorCommandName(words[first]);
 
     // Deferred evaluators (`eval`, `source`, `.`, `trap`, `alias`, `shopt`) or
     // dynamic command names can change cwd or define aliases arbitrarily -> fail closed.
@@ -591,7 +586,7 @@ function writeFloorScript(
       continue;
     }
 
-    // Dynamic env mutators (`declare $v=~`, `export $v=~`, `printf -v $v`) could set CDPATH.
+    // Dynamic env mutators (`declare $v=~`, `export $v=~`, `mapfile -t $v`, `printf -v $v`) could set CDPATH.
     // Check only the variable NAME (before `=`), so `export FOO="$BAR"` stays allowed.
     if (WRITE_FLOOR_ENV_MUTATORS.has(cmdWord) && words.slice(cmdIdx + 1).some((w) => {
       if (w.value.startsWith("-")) return false;
@@ -611,15 +606,16 @@ function writeFloorScript(
       continue;
     }
 
-    // In control-flow mode, ANY mention of `cd`/`pushd`/`popd` outside stop commands
-    // (including `if`/`while`/`for`/`case` arms/subshells/functions) fails closed globally.
+    // In control-flow mode, ANY mention of `cd`/`pushd`/`popd` OR deferred
+    // builtins (`eval`/`source`/`.`/`trap`/`alias`/`shopt`) anywhere in the
+    // segment — with NO stop-command exemption (a `case` arm `echo) cd ~` or
+    // function `echo () { cd ~; }` begins with `echo`!) — fails closed globally.
     if (hasControlFlow) {
-      const stopCmd = head !== undefined && FLOOR_STOP_COMMANDS.has(head) && head !== "tee";
-      const hasDirWord = !stopCmd && words.slice(first).some((w) => {
+      const hasDirOrDeferred = words.slice(first).some((w) => {
         const clean = w.value.replace(/^[({$]+|[});]+$/gu, "");
-        return clean === "cd" || clean === "pushd" || clean === "popd";
+        return clean === "cd" || clean === "pushd" || clean === "popd" || WRITE_FLOOR_DEFERRED_BUILTINS.has(clean);
       });
-      if (hasDirWord) {
+      if (hasDirOrDeferred) {
         globalCwdUnknown = true;
         possibleDirs.add(undefined);
         allSeenDirs.add(undefined);
@@ -633,8 +629,12 @@ function writeFloorScript(
 
     if (cmdWord === "cd" || cmdWord === "pushd") {
       if (inPipelineOrBg) continue;
+      // If `cd` appears inside a command/process substitution (`$(true && cd sub)`),
+      // it never changes the outer shell's directory — do NOT shift `possibleDirs`.
+      if (cmdTok?.inSubst) continue;
       const parsed = parseSimpleCdOperand(words.slice(cmdIdx + 1));
-      if (parsed.invalid || (parsed.target && cdpathCouldShadow(parsed.target.value))) {
+      // Bare `pushd` swaps the directory stack rather than moving to `$HOME`.
+      if (parsed.invalid || (cmdWord === "pushd" && !parsed.target) || (parsed.target && cdpathCouldShadow(parsed.target.value))) {
         possibleDirs.add(undefined);
         allSeenDirs.add(undefined);
         continue;
@@ -644,8 +644,6 @@ function writeFloorScript(
       for (const dir of possibleDirs) {
         const resolvedNext = resolveCd(parsed.target ? [parsed.target] : [], dir);
         if (!resolvedNext || !directoryAccessible(resolvedNext)) {
-          // Missing/unaccessible target (e.g. `cd .ssh` with CDPATH or `cd nope`):
-          // fail closed with `undefined` instead of guessing an in-R directory.
           nextDirs.add(undefined);
           allSeenDirs.add(undefined);
           allAccessibleAndPhysical = false;
@@ -657,19 +655,23 @@ function writeFloorScript(
         nextDirs.add(physical);
         allSeenDirs.add(physical);
         if (physical !== resolvedNext) {
-          // Symlinked cd target: include BOTH lexical and physical paths so `..`
-          // is checked against both views.
           nextDirs.add(resolvedNext);
           allSeenDirs.add(resolvedNext);
           allAccessibleAndPhysical = false;
         }
       }
-      const canReplace = !preCdMutatingSeen
+      // ONLY replace `possibleDirs` for the ONE unambiguous top-level idiom:
+      // `cd <existing-accessible-non-symlink-dir> && ...` at segment 0 with
+      // ZERO substitutions and ZERO control flow anywhere in the command.
+      // Every other `cd`/`pushd` strictly UNIONS old + new directories.
+      const canReplace = segIdx === 0
+        && cmdWord === "cd"
+        && !hasAnySubst
         && allAccessibleAndPhysical
-        && (prevJoiner === undefined || prevJoiner === "&&" || (prevJoiner === ";" && segIdx === 0))
-        && (segment.joiner === "&&" || segment.joiner === undefined || (segment.joiner === ";" && segIdx === 0));
+        && prevJoiner === undefined
+        && segment.joiner === "&&";
       if (canReplace) {
-        if (segment.joiner === "&&") preChainDirs = new Set(possibleDirs);
+        preChainDirs ??= new Set(possibleDirs);
         possibleDirs = nextDirs;
       } else {
         for (const d of nextDirs) possibleDirs.add(d);
@@ -683,10 +685,6 @@ function writeFloorScript(
         allSeenDirs.add(undefined);
       }
       continue;
-    }
-
-    if (head && !WRITE_FLOOR_PRE_CD_READ_ONLY.has(head)) {
-      preCdMutatingSeen = true;
     }
   }
 
@@ -1390,9 +1388,10 @@ function segmentWords(segment: readonly ShellToken[]): ShellToken[] {
   for (const token of segment) {
     if (token.operator) {
       if (REDIRECT_OPERATORS.has(token.value)) {
-        // Strip a leading fd number (`2>/dev/null`, `{fd}>/dev/null`) belonging to the redirect.
+        // Strip ONLY an adjacent fd prefix (`2>/dev/null`, `{fd}>/dev/null`),
+        // never a space-separated argument (`cd sub 2 >/dev/null`, `cp -l a 2 >/dev/null`).
         const prev = words.at(-1);
-        if (prev && !prev.quoted && /^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})$/u.test(prev.value)) words.pop();
+        if (prev?.fdPrefix) words.pop();
         skipNext = true;
       } else {
         skipNext = false;
@@ -2000,6 +1999,10 @@ interface ShellToken {
   leadingOpenParens?: number;
   /** Number of unquoted, unescaped trailing `)` subshell closers (excluding `)` that close `$(…)` / `))`). */
   trailingCloseParens?: number;
+  /** True when the token was lexed while inside an open `$(…)` / `<(…)` / `>(…)` substitution. */
+  inSubst?: boolean;
+  /** True when this unquoted digit/`{fd}` token immediately preceded a redirection operator with no whitespace (`2>/dev/null`, NOT `2 >/dev/null`). */
+  fdPrefix?: boolean;
 }
 
 const protectedBranches = new Set(["main", "master", "trunk", "integration", "develop"]);
@@ -3276,7 +3279,7 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
   // pure data, which the boundary never needs to see.
   let expectDelimiter: { stripTabs: boolean } | undefined;
   const pendingHeredocs: { delimiter: string; quoted: boolean; stripTabs: boolean }[] = [];
-  const flush = (): void => {
+  const flush = (adjacentRedirect = false): void => {
     if (!started) return;
     // A bare `[`, `[[`, `]`, `]]`, `{` or `}` is shell syntax, not an expansion.
     if (/^[[\]{}]+$/u.test(value)) dynamic = false;
@@ -3288,6 +3291,7 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
     // Arithmetic `((…))` is not a subshell paren opener/closer.
     const effectiveLeading = value.startsWith("((") && leadingOpenParens >= 2 ? leadingOpenParens - 2 : leadingOpenParens;
     const effectiveTrailing = value.endsWith("))") && trailingCloseParens >= 2 ? trailingCloseParens - 2 : trailingCloseParens;
+    const fdPrefix = adjacentRedirect && !tokenQuoted && /^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})$/u.test(value);
     tokens.push({
       value,
       operator: false,
@@ -3296,6 +3300,8 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
       ...(tokenQuoted ? { quoted: true } : {}),
       ...(effectiveLeading > 0 ? { leadingOpenParens: effectiveLeading } : {}),
       ...(effectiveTrailing > 0 ? { trailingCloseParens: effectiveTrailing } : {}),
+      ...(substParenDepth > 0 ? { inSubst: true } : {}),
+      ...(fdPrefix ? { fdPrefix: true } : {}),
     });
     value = "";
     dynamic = false;
@@ -3307,10 +3313,7 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
     trailingCloseParens = 0;
   };
   const pushOperator = (operator: string): void => {
-    flush();
-    // Never reset substParenDepth while inside an open `$(…)` / `<(…)` / `>(…)`:
-    // statement operators like `;` inside `$(true; true)` stay inside the substitution.
-    if (substParenDepth === 0 && SEGMENT_SPLIT_OPERATORS.has(operator)) substParenDepth = 0;
+    flush(REDIRECT_OPERATORS.has(operator) || operator === "<<<");
     tokens.push({ value: operator, operator: true, dynamic: false });
   };
   /** Consume the heredoc bodies that start after the newline at `newlineIndex`; returns the index to resume lexing at. */

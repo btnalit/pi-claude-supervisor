@@ -1894,6 +1894,16 @@ test("Write Floor v1 (#55-3) blocks out-of-R and .git writes across redirects, t
       "source x.sh; echo x >> .bashrc",
       "2>/dev/null cd ~; echo x >> .bashrc",
       `chmod -x ${sub}; cd ${sub}; echo evil >> ../../pwn.txt`,
+      // Opus 5.5 round-5 adversarial repros (P0-A, P0-B, P0-C, P1-D):
+      "case echo in x) ;; echo) cd ~;; esac; echo evil >> .bashrc",
+      "echo () { cd ~; }; echo; printf 'evil\\n' >> .bashrc",
+      "case x in x) eval 'cd ~';; esac; echo evil >> .bashrc",
+      "f() { eval 'cd ~'; }; f; echo evil >> .bashrc",
+      "echo $(true && cd packages/app && true) && echo evil >> ../../pwn.txt",
+      "<(cd packages/app; true); echo evil >> ../../pwn.txt",
+      "cd packages/app 2 >/dev/null; echo evil >> ../../pwn.txt",
+      "cp -l ~/.bashrc 2 >/dev/null; echo evil >> 2",
+      "V=CD$(printf PATH); mapfile -t $V <<< \"$HOME/Work/other\"; cd packages; echo evil > x.txt",
     ]) {
       assert.ok(judge(cmd), `Write Floor expected deny: ${cmd}`);
       assert.equal(evaluatePermission("Bash", bash(cmd), repo, opts).decision, "deny", `evaluatePermission expected deny: ${cmd}`);
