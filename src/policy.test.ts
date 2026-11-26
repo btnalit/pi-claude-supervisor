@@ -1705,6 +1705,7 @@ test("Write Floor v1 (#55-3) blocks out-of-R and .git writes across redirects, t
       "echo hi > .github/workflows/ci.yml",
       "echo hi > .gitignore",
       "echo cd; echo hi > notes.txt",
+      "until [ -n \"$(grep -l 'err' a.txt 2>/dev/null)\" ]; do sleep 1; done",
       "echo hi > \"$UNKNOWN_OUT\"",
       "tee out.log",
       "tee -a -",
@@ -1846,6 +1847,20 @@ test("Write Floor v1 (#55-3) blocks out-of-R and .git writes across redirects, t
       "trap 'echo evil > ~/.bashrc' EXIT",
       `sh <<< 'echo evil > ${outside}/pwn.txt'`,
       `bash <<< 'printf x >| ${outside}/pwn.txt'`,
+      // Opus 5.5 round-3 adversarial repros (possibleDirs + multi-word subst + conditional/bg/failed cd):
+      "eval cd ~; echo evil >> .bashrc",
+      "time cd ~; echo evil >> .bashrc",
+      "case x in x) cd ~;; esac; echo evil >> .bashrc",
+      "f () { cd ~; }; f; echo evil >> .bashrc",
+      "$(echo cd) ~; echo evil >> .bashrc",
+      "(cd ~; x=$(date +%s); echo evil >> .bashrc)",
+      "(cd ~; cat <(true); echo evil >> .bashrc)",
+      `(cd ${sub}; echo $(pwd)); echo evil >> ../outside/pwn.txt`,
+      `cd ~; echo \\' $(cp ${repo}/a.txt .bashrc)`,
+      `cd ~; echo "'" $(cp ${repo}/a.txt .bashrc)`,
+      `cd ${sub} & echo evil >> ../outside/pwn.txt`,
+      `false && cd ${sub}; echo evil >> ../outside/pwn.txt`,
+      `cd ${repo}/nope; echo evil >> ../outside/pwn.txt`,
     ]) {
       assert.ok(judge(cmd), `Write Floor expected deny: ${cmd}`);
       assert.equal(evaluatePermission("Bash", bash(cmd), repo, opts).decision, "deny", `evaluatePermission expected deny: ${cmd}`);

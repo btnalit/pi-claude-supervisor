@@ -429,59 +429,55 @@ function writeFloorScript(
   }
   const bindings = floorBindings(command, lexical.tokens, inherited, roots.defaultTmpDir);
   const nested = (body: string, directory: string | undefined): string | undefined => writeFloorScript(body, directory, roots, bindings, depth + 1);
-  // Check raw command substitutions first (preserves backslash escapes like `echo \' $(...)`).
-  for (const body of substitutionBodies(withoutQuotedHeredocs(command))) {
-    const violation = nested(body, start);
-    if (violation) return violation;
-  }
-  const { tokens: dataResolved, embedded, embeddedBySegment } = resolveDataTokens(lexical.tokens);
+  const rawSubstBodies = substitutionBodies(withoutQuotedHeredocs(command));
+  const { tokens: dataResolved, embeddedBySegment } = resolveDataTokens(lexical.tokens);
   const tokens = resolveLiteralBindings(applyFloorBindings(dataResolved, bindings));
 
-  let directory = start;
-  const pushdStack: Array<string | undefined> = [];
-  const subshellStack: Array<string | undefined> = [];
+  // Track the set of ALL directories the shell could plausibly be in at this
+  // point (including `undefined` when unknown). For unconditional `cd` into a
+  // verified existing directory outside a subshell/pipeline/background, replace
+  // the set; for subshell, conditional (`&&`/`||`), or possibly-failing `cd`,
+  // take the UNION of old and new directories so neither an early exit nor a
+  // skipped `cd` can ever hide an outside-R relative write.
+  let possibleDirs = new Set<string | undefined>([start]);
+  const allSeenDirs = new Set<string | undefined>([start]);
+  const pushdStack: Array<Set<string | undefined>> = [];
+  let inSubshell = 0;
   const segments = floorSegments(tokens);
+
+  const checkAllDirs = (fn: (dir: string | undefined) => string | undefined): string | undefined => {
+    for (const dir of possibleDirs) {
+      const violation = fn(dir);
+      if (violation) return violation;
+    }
+    return undefined;
+  };
 
   for (let segIdx = 0; segIdx < segments.length; segIdx += 1) {
     const segment = segments[segIdx]!;
     const prevJoiner = segIdx > 0 ? segments[segIdx - 1]!.joiner : undefined;
     const firstTok = segment.tokens[0];
     const lastTok = segment.tokens.at(-1);
-    const opensParen = Boolean(firstTok && (firstTok.leadingOpenParens ?? 0) > 0);
-    const closeCount = lastTok?.trailingCloseParens ?? 0;
-    if (opensParen) {
-      for (let p = 0; p < (firstTok!.leadingOpenParens ?? 0); p += 1) subshellStack.push(directory);
-    }
+    inSubshell += firstTok?.leadingOpenParens ?? 0;
 
-    // 1. Evaluate any command/process substitutions within this segment against
-    //    the CURRENT tracked `directory` (skipping quoted heredoc bodies).
-    const segmentText = segment.tokens
-      .filter((t) => !t.data && !t.heredoc)
-      .map((t) => t.value)
-      .join(" ")
-      .replace(/([<>])\s+\(/gu, "$1(");
-    for (const body of substitutionBodies(segmentText)) {
-      const violation = nested(body, directory);
-      if (violation) return violation;
-    }
-    // Evaluate any heredoc-embedded shell bodies belonging to THIS segment at THIS directory.
+    // 1. Evaluate any heredoc-embedded shell bodies belonging to THIS segment at its possible dirs.
     const segEmbedded = embeddedBySegment.get(segIdx);
     if (segEmbedded) {
       for (const body of segEmbedded) {
-        const violation = nested(body, directory);
-        if (violation) return violation;
+        const v = checkAllDirs((dir) => nested(body, dir));
+        if (v) return v;
       }
     }
 
-    // 2. Check all shell output redirections on this segment (regardless of command).
+    // 2. Check all shell output redirections on this segment against every possible directory.
     const redirectTargets = extractOutputRedirectTargets(segment.tokens);
     for (const target of redirectTargets) {
-      const violation = judgeWriteTarget(target, directory, roots, { allowRootDir: false, verb: "write to" });
-      if (violation) return violation;
+      const v = checkAllDirs((dir) => judgeWriteTarget(target, dir, roots, { allowRootDir: false, verb: "write to" }));
+      if (v) return v;
     }
 
     // 3. Check pipe-to-shell, quoted-script runners (`sh -c`, `trap`, `bash <<<`, `env -S`),
-    //    command-position `cd`/`pushd`/`popd`, and command-based writes.
+    //    `cd`/`pushd`/`popd`, and command-based writes.
     const words = segmentWords(segment.tokens);
     let first = 0;
     while (first < words.length && (FLOOR_KEYWORDS.has(words[first]!.value) || /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[first]!.value))) first += 1;
@@ -492,11 +488,11 @@ function writeFloorScript(
       const intoShell = (segment.joiner === "|" || segment.joiner === "|&")
         && SHELL_NAMES.has(floorCommandName(segmentWords(segments[segIdx + 1]?.tokens ?? [])[0]) ?? "");
       if (intoShell) {
-        const violation = nested(words.slice(first + 1).map((word) => word.value).join(" "), directory);
-        if (violation) return violation;
+        const body = words.slice(first + 1).map((word) => word.value).join(" ");
+        const v = checkAllDirs((dir) => nested(body, dir));
+        if (v) return v;
       }
 
-      // Mirror floorScript's runner & quoted-script checks (`sh -c`, `trap`, `watch`, `bash <<<`, `npm exec`, `uv run`).
       const runs = head !== undefined && PACKAGE_RUNNERS.has(head) && words.slice(first + 1).some((word) =>
         RUNNER_SUBCOMMANDS.has(word.value) || (BIN_RUNNERS.has(head) && WRITE_FLOOR_COMMANDS.has(floorCommandName(word) ?? "")),
       );
@@ -505,59 +501,98 @@ function writeFloorScript(
       if (!stops) {
         const segValues = words.slice(first).map((w) => w.value);
         for (const body of nestedShellCommands(segValues.map((v) => v.toLowerCase()), segValues)) {
-          const violation = nested(body, directory);
-          if (violation) return violation;
+          const v = checkAllDirs((dir) => nested(body, dir));
+          if (v) return v;
         }
         for (let cursor = first + 1; cursor < words.length; cursor += 1) {
           const word = words[cursor]!;
           if (head === "git" && (GIT_MESSAGE_OPTIONS.has(words[cursor - 1]!.value) || /^--(?:message|grep|file)=/u.test(word.value))) continue;
+          // Command substitutions `$(…)` are already evaluated unwrapped via `rawSubstBodies`.
+          if (word.value.startsWith("$(") && word.value.endsWith(")")) continue;
           if (/\s/u.test(word.value) && WRITE_WORD.test(word.value)) {
-            const violation = nested(word.value.replace(/^[A-Za-z0-9_.-]+=/u, ""), directory);
-            if (violation) return violation;
+            const cleaned = word.value.replace(/^[A-Za-z0-9_.-]+=/u, "");
+            const v = checkAllDirs((dir) => nested(cleaned, dir));
+            if (v) return v;
           }
         }
       }
 
-      // Only recognize `cd`/`pushd`/`popd` in command position (optionally
-      // after `builtin`/`command`), never as a filename operand like `tee ./cd`
-      // or `echo cd /tmp/a/b/c`. Pipeline segments (`|`/`|&`) run in subshells
-      // and do not change the parent shell's directory; function definitions
-      // containing `cd`/`pushd` invalidate `directory` fail-closed.
+      // Recognize `cd`/`pushd`/`popd` in command position (optionally after
+      // `builtin`/`command`/`time`). Never treat operand paths like `./cd` or
+      // `tools/cd` as directory changes; fail closed (`undefined`) when `eval`,
+      // a dynamic command, `case`, or any function definition (`f(){`, `f () {`,
+      // `function`) mentions `cd`/`pushd`/`popd`.
       let cmdIdx = first;
-      while (cmdIdx < words.length && (words[cmdIdx]!.value === "builtin" || words[cmdIdx]!.value === "command")) cmdIdx += 1;
-      const cmdWord = words[cmdIdx]?.value.replace(/^\(+/u, "").replace(/\)+$/u, "");
-      const inPipeline = prevJoiner === "|" || prevJoiner === "|&" || segment.joiner === "|" || segment.joiner === "|&";
-      const isFnDef = /^[A-Za-z_][A-Za-z0-9_]*\(\)\{?$/u.test(words[first]!.value) || words[first]!.value === "function";
+      while (cmdIdx < words.length && ["builtin", "command", "time"].includes(words[cmdIdx]!.value.replace(/^\(+/u, ""))) cmdIdx += 1;
+      const cmdTok = words[cmdIdx];
+      const cmdWord = cmdTok?.value.replace(/^\(+/u, "").replace(/\)+$/u, "");
+      const inPipelineOrBg = prevJoiner === "|" || prevJoiner === "|&"
+        || segment.joiner === "|" || segment.joiner === "|&" || segment.joiner === "&";
 
       if (cmdWord === "cd" || cmdWord === "pushd") {
-        if (!inPipeline) {
-          if (cmdWord === "pushd") pushdStack.push(directory);
-          directory = resolveCd(words.slice(cmdIdx + 1), directory);
+        if (!inPipelineOrBg) {
+          if (cmdWord === "pushd") pushdStack.push(new Set(possibleDirs));
+          const cdArgs = words.slice(cmdIdx + 1);
+          const nextDirs = new Set<string | undefined>();
+          let allExistAsDir = true;
+          for (const dir of possibleDirs) {
+            const resolvedNext = resolveCd(cdArgs, dir);
+            nextDirs.add(resolvedNext);
+            allSeenDirs.add(resolvedNext);
+            if (!resolvedNext) {
+              allExistAsDir = false;
+            } else {
+              try { if (!statSync(resolvedNext).isDirectory()) allExistAsDir = false; }
+              catch { allExistAsDir = false; }
+            }
+          }
+          const conditionalOrSubshell = inSubshell > 0 || prevJoiner === "&&" || prevJoiner === "||" || !allExistAsDir;
+          if (conditionalOrSubshell) {
+            // Keep BOTH old and new directories so a skipped/failed/subshell-scoped `cd`
+            // can never hide a write relative to the original directory OR the new one.
+            for (const nextDir of nextDirs) possibleDirs.add(nextDir);
+          } else {
+            possibleDirs = nextDirs;
+          }
         }
       } else if (cmdWord === "popd") {
-        if (!inPipeline) {
-          directory = pushdStack.length > 0 ? pushdStack.pop() : undefined;
+        if (!inPipelineOrBg) {
+          const popped = pushdStack.length > 0 ? pushdStack.pop()! : new Set<string | undefined>([undefined]);
+          if (inSubshell > 0 || prevJoiner === "&&" || prevJoiner === "||") {
+            for (const dir of popped) { possibleDirs.add(dir); allSeenDirs.add(dir); }
+          } else {
+            possibleDirs = popped;
+            for (const dir of popped) allSeenDirs.add(dir);
+          }
         }
       } else {
-        if (isFnDef && words.slice(first + 1).some((w) => ["cd", "pushd", "popd"].includes(w.value.replace(/^[({]+|[});]+$/gu, "")))) {
-          directory = undefined;
+        const mentionsDirBuiltin = words.slice(first).some((w) => {
+          const clean = w.value.replace(/^[({$]+|[});]+$/gu, "");
+          return clean === "cd" || clean === "pushd" || clean === "popd";
+        });
+        const isIndirectDirRunner = cmdWord === "eval"
+          || Boolean(cmdTok?.dynamic)
+          || words.slice(first).some((w) => w.value === "case" || w.value === "function" || w.value === "()" || w.value === "(){" || /^[A-Za-z_][A-Za-z0-9_]*\(\)\{?$/u.test(w.value));
+        if (isIndirectDirRunner && mentionsDirBuiltin) {
+          possibleDirs.add(undefined);
+          allSeenDirs.add(undefined);
         }
         if (!stops) {
-          const violation = checkWriteCommandsInWords(words, first, directory, roots, nested);
-          if (violation) return violation;
+          const v = checkAllDirs((dir) => checkWriteCommandsInWords(words, first, dir, roots, nested));
+          if (v) return v;
         }
       }
     }
 
-    for (let p = 0; p < closeCount && subshellStack.length > 0; p += 1) {
-      directory = subshellStack.pop();
-    }
+    inSubshell = Math.max(0, inSubshell - (lastTok?.trailingCloseParens ?? 0));
   }
 
-  // Fallback for any embedded body not mapped to a specific segment index.
-  if (embeddedBySegment.size === 0) {
-    for (const body of embedded) {
-      const violation = nested(body, start);
+  // Evaluate raw-source command/process substitutions (`$(…)`, `<(…)`, `>(…)`,
+  // backticks) against EVERY directory seen during the command so `cd ~; echo \' $(cp ...)`
+  // and `cd ~; echo "'" $(cp ...)` are always checked at `~` with raw quoting preserved.
+  for (const body of rawSubstBodies) {
+    for (const dir of allSeenDirs) {
+      const violation = nested(body, dir);
       if (violation) return violation;
     }
   }
@@ -3087,10 +3122,10 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
     leadingOpenParens = 0;
     atLeadingParen = true;
     trailingCloseParens = 0;
-    substParenDepth = 0;
   };
   const pushOperator = (operator: string): void => {
     flush();
+    if (SEGMENT_SPLIT_OPERATORS.has(operator)) substParenDepth = 0;
     tokens.push({ value: operator, operator: true, dynamic: false });
   };
   /** Consume the heredoc bodies that start after the newline at `newlineIndex`; returns the index to resume lexing at. */
@@ -3170,7 +3205,6 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
     if (character === "$" || character === "`") {
       atLeadingParen = false;
       trailingCloseParens = 0;
-      if (character === "$" && next === "(") substParenDepth += 1;
       dynamic = true;
       value += character;
       started = true;
@@ -3184,6 +3218,16 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
     if (character === "~") { atLeadingParen = false; trailingCloseParens = 0; if (value === "" || /[=:]$/u.test(value)) dynamic = true; value += character; started = true; continue; }
     if ("*?[]{}".includes(character)) { atLeadingParen = false; trailingCloseParens = 0; dynamic = true; value += character; started = true; continue; }
     if (";&|<>".includes(character)) {
+      if ((character === "<" || character === ">") && next === "(") {
+        // Process substitution `<(…)` / `>(…)` — track paren depth without counting its `)` as a subshell closer.
+        pushOperator(character);
+        substParenDepth += 1;
+        value += "(";
+        started = true;
+        atLeadingParen = false;
+        index += 1;
+        continue;
+      }
       if (character === "<" && next === "<") {
         const third = input[index + 2];
         if (third === "<") { pushOperator("<<<"); index += 2; continue; }
@@ -3212,8 +3256,13 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
       continue;
     }
     if (character === "(") {
-      if (atLeadingParen) leadingOpenParens += 1;
-      else if (substParenDepth > 0) substParenDepth += 1;
+      const prevChar = index > 0 ? input[index - 1] : undefined;
+      if (prevChar === "$" || substParenDepth > 0) {
+        substParenDepth += 1;
+        atLeadingParen = false;
+      } else if (atLeadingParen) {
+        leadingOpenParens += 1;
+      }
       trailingCloseParens = 0;
     } else if (character === ")") {
       atLeadingParen = false;
