@@ -1783,7 +1783,19 @@ const D5_GIT_BRANCH_ALLOWED_FLAGS = new Set(["--list", "-l", "--contains", "--me
 const D5_GIT_TAG_READ_ONLY_FLAGS = new Set(["-l", "--list", "--contains", "--merged", "--no-merged"]);
 const D5_GIT_TAG_ALLOWED_FLAGS = new Set(["-l", "--list", "--contains", "--merged", "--no-merged", "-n", "--sort", "--format", "--points-at", "--no-color", "--color", "-i", "--ignore-case"]);
 const D5_PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn"]);
-const D5_PACKAGE_RUNNER_SUBCOMMANDS = new Set(["run", "exec", "dlx", "x"]);
+const D5_PACKAGE_ALLOWED_SUBCOMMANDS = new Set(["test", "run", "exec", "lint", "build", "check", "typecheck", "ls", "list"]);
+const D5_PACKAGE_RUNNER_SUBCOMMANDS = new Set(["run", "exec"]);
+const D5_PACKAGE_PRE_BOOL_FLAGS = new Set(["-r", "--recursive", "-w", "--workspace-root", "-s", "--silent"]);
+/** Text/read-only commands that never execute their positional arguments as commands. */
+const D5_TEXT_ONLY_COMMANDS = new Set([
+  "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ls", "stat", "file",
+  "wc", "diff", "md5sum", "sha1sum", "sha256sum", "bat", "view", "echo", "printf", "sort", "uniq",
+  "cut", "tr", "nl", "tac", "rev", "column", "fold", "paste", "comm", "cmp", "od", "hexdump", "xxd",
+  "base64", "jq", "yq", "tee",
+]);
+/** Container CLIs where an inner `sh -c` argument is routine; still denies if git/remote/publish/network words appear. */
+const D5_CONTAINER_COMMANDS = new Set(["docker", "podman"]);
+const D5_CONTAINER_FORBIDDEN_WORDS = new Set(["git", "gh", "glab", "hub", "npm", "pnpm", "yarn", "npx", "curl", "wget", "ssh", "scp", "rsync", "sftp", "claude"]);
 
 /** True when `value` contains only filename glob metacharacters (`*`, `?`, `[...]`) and no shell variable, substitution, tilde, or brace expansion. */
 function isPureFilenameGlob(value: string): boolean {
@@ -1849,12 +1861,18 @@ function isReadOnlyGitDynamicSafe(argv: readonly ShellToken[]): boolean {
   return false;
 }
 
-/** True when a non-publish npm/pnpm/yarn command has literal subcommand/target and ONLY pure filename glob dynamic args (e.g. `pnpm exec biome check src/*.test.ts`). */
-function isPackageManagerGlobOnlySafe(argv: readonly ShellToken[]): boolean {
+/**
+ * True when a non-publish npm/pnpm/yarn command uses only allowlisted
+ * pre-subcommand flags, an allowlisted non-publish subcommand, a safe literal
+ * target (for `run`/`exec`, recursively checked against `hasDynamicSensitiveArgument`
+ * so `pnpm exec git pu*` stays denied), and ONLY pure filename glob dynamic args.
+ */
+function isPackageManagerGlobOnlySafe(argv: readonly ShellToken[], depth: number): boolean {
   const values = argv.map((t) => t.value);
   const lower = values.map((v) => v.toLowerCase());
   if (lower.includes("publish")) return false;
-  // Locate the subcommand; reject any dynamic token before or at the subcommand.
+  // Strictly allowlist pre-subcommand flags so `-C . pub*` / `--prefix . pub*`
+  // can never shift a flag value into subcommand position.
   let subIndex = -1;
   for (let i = 1; i < argv.length; i += 1) {
     const tok = argv[i]!;
@@ -1864,14 +1882,19 @@ function isPackageManagerGlobOnlySafe(argv: readonly ShellToken[]): boolean {
       i += 1;
       continue;
     }
-    if (tok.value.startsWith("-")) continue;
+    if (tok.value.startsWith("--filter=") || tok.value.startsWith("-F=")) continue;
+    if (D5_PACKAGE_PRE_BOOL_FLAGS.has(tok.value)) continue;
+    if (tok.value.startsWith("-")) return false;
     subIndex = i;
     break;
   }
   if (subIndex < 0) return false;
   const sub = lower[subIndex]!;
-  if (sub === "publish") return false;
-  // For `run`/`exec`/`dlx`/`x`, the script or binary name immediately after the subcommand MUST also be literal.
+  if (!D5_PACKAGE_ALLOWED_SUBCOMMANDS.has(sub)) return false;
+  // Every dynamic token after the subcommand must be a pure filename glob.
+  if (!argv.slice(subIndex + 1).every((tok) => !tok.dynamic || isPureFilenameGlob(tok.value))) return false;
+  // For `run`/`exec`, the target script/binary MUST be literal and its own argv
+  // must pass the full dynamic-sensitive check (so `pnpm exec git pu*` denies).
   if (D5_PACKAGE_RUNNER_SUBCOMMANDS.has(sub)) {
     let targetIndex = subIndex + 1;
     while (targetIndex < argv.length && argv[targetIndex]!.value.startsWith("-")) {
@@ -1879,18 +1902,32 @@ function isPackageManagerGlobOnlySafe(argv: readonly ShellToken[]): boolean {
       targetIndex += 1;
     }
     if (targetIndex >= argv.length || argv[targetIndex]!.dynamic) return false;
+    if (sub === "exec") {
+      if (depth >= 4) return false;
+      if (hasDynamicSensitiveArgument(argv.slice(targetIndex), depth + 1)) return false;
+    } else if (argv.slice(targetIndex + 1).some((tok) => {
+      const base = tok.value.split(/[\\/]/u).at(-1)?.toLowerCase() ?? "";
+      return DYNAMIC_SENSITIVE_COMMANDS.has(base);
+    })) {
+      return false;
+    }
   }
-  // Every dynamic token in the statement must be a pure filename glob (no $VAR, $(...), backticks, ~, braces).
-  return argv.slice(subIndex + 1).every((tok) => !tok.dynamic || isPureFilenameGlob(tok.value));
+  return true;
 }
 
 /**
  * True when one statement combines a dynamic word with a command whose dynamic
- * argument could reach the boundary (D5: inspect command position only, unwrap
- * literal `timeout`/`time`/`nohup`, allow dynamic args after strictly read-only
- * git subcommands and pure filename globs on non-publish package commands).
+ * argument could reach the boundary (D5 fail-closed design: keep the original
+ * anywhere-in-statement sensitive-command deny as the default, and exempt ONLY
+ * statements whose command-position executable is explicitly proven safe:
+ *   1. text/read-only commands that never execute their args (`grep`, `echo`, …),
+ *   2. container CLIs (`docker`/`podman`) containing no git/remote/network words,
+ *   3. strictly read-only `git` subcommands with literal global flags/subcommand,
+ *   4. allowlisted non-publish `npm`/`pnpm`/`yarn` commands with pure filename globs,
+ *   after optionally unwrapping literal `timeout`/`time`/`nohup`).
  */
-function hasDynamicSensitiveArgument(segment: readonly ShellToken[]): boolean {
+function hasDynamicSensitiveArgument(segment: readonly ShellToken[], depth = 0): boolean {
+  if (depth > 4) return true;
   // A leading `NAME=value` prefix sets the environment and a redirection
   // target names a file; neither reaches the command's argv, so
   // `npm_config_cache=$TMPDIR/x npm run check` and `git show HEAD:f > $OLD/f`
@@ -1914,13 +1951,12 @@ function hasDynamicSensitiveArgument(segment: readonly ShellToken[]): boolean {
   if (argv.length === 0 || !argv.some((token) => token.dynamic)) return false;
 
   // Unwrap transparent wrappers (`timeout`, `time`, `nohup`) up to 4 levels.
-  for (let depth = 0; depth < 4; depth += 1) {
+  for (let unwrapDepth = 0; unwrapDepth < 4; unwrapDepth += 1) {
     if (argv[0]!.dynamic) return true;
     const unwrapped = unwrapDynamicSafeWrapper(argv);
     if (unwrapped === undefined) break;
     if (unwrapped === "dynamic") return true;
     argv = unwrapped;
-    // Skip any leading env assignments inside the unwrapped command.
     let innerStart = 0;
     while (innerStart < argv.length && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(argv[innerStart]!.value)) innerStart += 1;
     argv = argv.slice(innerStart);
@@ -1929,15 +1965,34 @@ function hasDynamicSensitiveArgument(segment: readonly ShellToken[]): boolean {
 
   if (argv[0]!.dynamic) return true;
   const cmd = argv[0]!.value.replace(/^\(+/u, "").split(/[\\/]/u).at(-1)?.toLowerCase() ?? "";
-  const lower = argv.map((t) => t.value.toLowerCase());
-  const canonical = argv.map((t) => t.value).join(" ");
+  const values = argv.map((t) => t.value);
+  const lower = values.map((v) => v.toLowerCase());
+  const executables = lower.map((v) => v.split(/[\\/]/u).at(-1) ?? v);
+  const canonical = values.join(" ");
 
-  if (cmd === "git") return !isReadOnlyGitDynamicSafe(argv);
-  if (/^git-(?:send|receive|upload)-pack$/u.test(cmd)) return true;
-  if (D5_PACKAGE_MANAGERS.has(cmd)) return !isPackageManagerGlobOnlySafe(argv);
-  if (cmd === "find") return lower.some((value) => FIND_EXEC_ACTIONS.has(value));
   if (containsRemoteCliMutation(canonical)) return true;
-  return DYNAMIC_SENSITIVE_COMMANDS.has(cmd);
+  if (values.some((v) => /^git-(?:send|receive|upload)-pack$/iu.test(v))) return true;
+
+  // Explicit safe exemptions (everything else falls through to fail-closed anywhere-in-statement check):
+  if (D5_TEXT_ONLY_COMMANDS.has(cmd)) {
+    if (cmd === "rg" && argv.some((t) => t.value.startsWith("--pre") || t.value === "-z" || t.value === "--search-zip" || /^-[A-Za-z]*z/u.test(t.value))) {
+      return true;
+    }
+    return false;
+  }
+  if (D5_CONTAINER_COMMANDS.has(cmd)) {
+    return executables.some((exe) => D5_CONTAINER_FORBIDDEN_WORDS.has(exe));
+  }
+  if (cmd === "git") return !isReadOnlyGitDynamicSafe(argv);
+  if (D5_PACKAGE_MANAGERS.has(cmd)) return !isPackageManagerGlobOnlySafe(argv, depth);
+
+  // Fail-closed default: catches `case`, `coproc`, `f()`, `linux64`, `uv run`,
+  // `sudo`, `env`, `sh`, `xargs`, `find -exec`, and any unknown wrapper that
+  // contains a sensitive command word anywhere in the statement.
+  return values.some((value) => /(?:^|[\\/])git$/iu.test(value))
+    || (lower.some((value) => value === "npm" || value === "pnpm" || value === "yarn") && lower.includes("publish"))
+    || executables.some((executable) => DYNAMIC_SENSITIVE_COMMANDS.has(executable))
+    || (executables.includes("find") && lower.some((value) => FIND_EXEC_ACTIONS.has(value)));
 }
 
 /** A dynamic word in command position (`$CMD …`, `; $CMD`, `do . $file`) could name anything. */

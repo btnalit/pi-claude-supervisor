@@ -1618,14 +1618,24 @@ test("D5 checks sensitive commands in command position only, unwraps literal tim
     "git branch --list -D $BRANCH",
     "git tag $NEW_TAG",
     "git tag -l -d $TAG",
-    // Package manager with variable expansion, dynamic subcommand/script, or publish
+    // Package manager with variable expansion, dynamic subcommand/script, relocating flag, sensitive target, or publish
     "npm run $script",
     "pnpm exec $bin src/*.ts",
     "pnpm $sub src/*.ts",
     "pnpm publish *.tgz",
     "npm publish $DIR",
+    "pnpm -C . pub*",
+    "npm --prefix . pub*",
+    "pnpm exec git pu* origin main",
     "pnpm --filter=$PKG test",
     "npm test -- --grep=$PAT",
+    // Hiding sensitive commands behind shell constructs or unknown wrappers must stay DENIED
+    "case x in x) git $S origin main;; esac",
+    "f() { git $S origin main; }",
+    "coproc git $S origin main",
+    "linux64 git $S origin main",
+    "uv run git $S origin main",
+    "docker run alpine git $S origin main",
     // Transparent wrapper with dynamic wrapper args or wrapping sensitive command
     "timeout $DUR docker ps",
     "timeout 30 $CMD",
