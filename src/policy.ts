@@ -418,7 +418,7 @@ const WRITE_FLOOR_CONTROL_KEYWORDS = new Set([
   "case", "esac", "select", "coproc", "function", "{", "}",
 ]);
 const WRITE_FLOOR_DEFERRED_BUILTINS = new Set(["eval", "source", ".", "trap", "alias", "shopt"]);
-const WRITE_FLOOR_ENV_MUTATORS = new Set(["export", "declare", "typeset", "readonly", "local", "read", "mapfile", "readarray"]);
+const WRITE_FLOOR_ENV_MUTATORS = new Set(["export", "declare", "typeset", "readonly", "local", "read", "mapfile", "readarray", "getopts", "let"]);
 const WRITE_FLOOR_NAMEREF_BUILTINS = new Set(["declare", "typeset", "local"]);
 
 /** True only when `text` is a single `$(…)` whose opening `$(` closes at the very last character (never `$(a) $(b)`). */
@@ -536,11 +536,16 @@ function writeFloorScript(
   const allSeenDirs = new Set<string | undefined>([start]);
   let possibleDirs = new Set<string | undefined>([start]);
   let globalCwdUnknown = false;
+  let hasDynamicEarlier = false;
   let preChainDirs: Set<string | undefined> | undefined;
 
   for (let segIdx = 0; segIdx < segments.length; segIdx += 1) {
     const segment = segments[segIdx]!;
     const prevJoiner = segIdx > 0 ? segments[segIdx - 1]!.joiner : undefined;
+    const prevHasDynamic = hasDynamicEarlier;
+    if (segment.tokens.some((t) => !t.operator && !t.data && (t.dynamic || t.value.startsWith("((")))) {
+      hasDynamicEarlier = true;
+    }
     // If a flat `cd` replaced `possibleDirs` only for its `&&` chain, union back
     // the pre-cd directory once the `&&` chain ends (`;`, `||`, `&`).
     if (preChainDirs && prevJoiner !== "&&") {
@@ -598,15 +603,25 @@ function writeFloorScript(
       continue;
     }
 
-    // Dynamic env mutators (`declare $v=~`, `export $v=~`, `mapfile -t $v`, `printf -v $v`)
-    // or namerefs (`declare -n r=$x`, `typeset -n`, `local -n`) could set CDPATH.
+    // Dynamic `(( ... ))` arithmetic evaluation can assign a computed variable name
+    // (e.g. `(( $x ))` where `x='CDPATH=1'`).
+    if (cmdWord.startsWith("((") && words.slice(cmdIdx).some((w) => w.dynamic || /[$`*?[\]{}~]/u.test(w.value))) {
+      globalCwdUnknown = true;
+      possibleDirs.add(undefined);
+      allSeenDirs.add(undefined);
+      continue;
+    }
+
+    // Dynamic env mutators (`declare $v=~`, `export $v=~`, `mapfile -t $v`, `getopts / "$x"`,
+    // `let "$x"`, `printf -v $v` / `printf -v"$v"`) or namerefs (`declare -n r=$x`,
+    // `typeset -n`, `local -n`) could set CDPATH.
     // Check only the variable NAME (before `=`) for non-nameref assignments so `export FOO="$BAR"` stays allowed.
     if (WRITE_FLOOR_ENV_MUTATORS.has(cmdWord)) {
       const restWords = words.slice(cmdIdx + 1);
       const hasNameref = WRITE_FLOOR_NAMEREF_BUILTINS.has(cmdWord)
         && restWords.some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*n/u.test(w.value));
       const hasDynamicName = restWords.some((w) => {
-        if (w.value.startsWith("-")) return false;
+        if (w.value.startsWith("-") && cmdWord !== "let") return false;
         const eq = w.value.indexOf("=");
         const varName = eq >= 0 ? w.value.slice(0, eq) : w.value;
         return /[$`*?[\]{}~]/u.test(varName);
@@ -618,7 +633,17 @@ function writeFloorScript(
         continue;
       }
     }
-    if (cmdWord === "printf" && words.slice(cmdIdx + 1).some((w, i, arr) => w === arr[i] && (w.value === "-v" || w.value.startsWith("-v")) && (arr[i + 1]?.dynamic || /\bCDPATH\b/u.test(arr[i + 1]?.value ?? "")))) {
+    if (cmdWord === "printf" && words.slice(cmdIdx + 1).some((w, i, arr) => {
+      if (w.value === "-v") {
+        const target = arr[i + 1];
+        return Boolean(target && (target.dynamic || /[$`*?[\]{}~]/u.test(target.value) || /\bCDPATH\b/u.test(target.value)));
+      }
+      if (w.value.startsWith("-v") && w.value.length > 2) {
+        const rest = w.value.slice(2);
+        return /[$`*?[\]{}~]/u.test(rest) || /\bCDPATH\b/u.test(rest);
+      }
+      return false;
+    })) {
       globalCwdUnknown = true;
       possibleDirs.add(undefined);
       allSeenDirs.add(undefined);
@@ -728,8 +753,21 @@ function writeFloorScript(
       // it never changes the outer shell's directory — do NOT shift `possibleDirs`.
       if (cmdTok?.inSubst) continue;
       const parsed = parseSimpleCdOperand(words.slice(cmdIdx + 1));
+      // Structural CDPATH closure: in bash, `cd <bare-relative>` (not starting with
+      // `/`, `./`, `../`, `.`, `..`) consults `CDPATH`. If ANY earlier statement in
+      // this shell invocation contained a dynamic expansion or arithmetic evaluation,
+      // an arbitrary builtin could have computed and assigned `CDPATH` at runtime.
+      const isBareRelative = parsed.target !== undefined
+        && !parsed.target.value.startsWith("/")
+        && !parsed.target.value.startsWith("./")
+        && !parsed.target.value.startsWith("../")
+        && parsed.target.value !== "."
+        && parsed.target.value !== "..";
       // Bare `pushd` swaps the directory stack rather than moving to `$HOME`.
-      if (parsed.invalid || (cmdWord === "pushd" && !parsed.target) || (parsed.target && cdpathCouldShadow(parsed.target.value))) {
+      if (parsed.invalid
+        || (cmdWord === "pushd" && !parsed.target)
+        || (parsed.target && cdpathCouldShadow(parsed.target.value))
+        || (prevHasDynamic && isBareRelative)) {
         possibleDirs.add(undefined);
         allSeenDirs.add(undefined);
         continue;

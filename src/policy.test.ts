@@ -1670,6 +1670,7 @@ test("Write Floor v1 (#55-3) blocks out-of-R and .git writes across redirects, t
     await Promise.all([
       mkdir(join(repo, ".git", "hooks"), { recursive: true }),
       mkdir(join(repo, ".ssh"), { recursive: true }),
+      mkdir(join(repo, "home", "user", ".ssh"), { recursive: true }),
       mkdir(join(repo, "2"), { recursive: true }),
       mkdir(sub, { recursive: true }),
       mkdir(shared, { recursive: true }),
@@ -1713,6 +1714,7 @@ test("Write Floor v1 (#55-3) blocks out-of-R and .git writes across redirects, t
       "if true; then git add .; fi; echo ok > notes.txt",
       "export -n FOO && echo ok > notes.txt",
       "read -n 1 v <<< x && echo ok > notes.txt",
+      "printf -v out %s hi && echo ok > notes.txt",
       "echo hi > \"$UNKNOWN_OUT\"",
       "tee out.log",
       "tee -a -",
@@ -1929,6 +1931,12 @@ test("Write Floor v1 (#55-3) blocks out-of-R and .git writes across redirects, t
       "case x in x)declare -n r=$x;; esac; r=$HOME; cd .ssh; echo k >> authorized_keys",
       "x=CD$(printf PATH); : <${!x:=$HOME}; cd .ssh; echo k >> authorized_keys",
       ": <${CDPATH:=$HOME}; cd .ssh; echo k >> authorized_keys",
+      // Opus 5.5 round-9 adversarial repros (attached printf -v, getopts, let, (( )), nested ${!x[...]:=}):
+      "x=CD$(printf PATH); printf -v\"$x\" %s \"$HOME\"; cd .ssh; echo k >> authorized_keys",
+      "x=CD$(printf PATH); getopts / \"$x\" -/; cd home/user/.ssh; echo k >> authorized_keys",
+      "x=CD$(printf PATH); let \"$x=1\"; cd .ssh; echo k >> authorized_keys",
+      "x=CD$(printf PATH)=1; (( $x )); cd .ssh; echo k >> authorized_keys",
+      "x=(CD$(printf PATH)); : ${!x[${#}]:=$HOME}; cd .ssh; echo k >> authorized_keys",
     ]) {
       assert.ok(judge(cmd), `Write Floor expected deny: ${cmd}`);
       assert.equal(evaluatePermission("Bash", bash(cmd), repo, opts).decision, "deny", `evaluatePermission expected deny: ${cmd}`);
