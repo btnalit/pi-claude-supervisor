@@ -2276,7 +2276,10 @@ function routineCdTarget(
   nextJoiner: string | undefined,
 ): string | "invalid" | undefined {
   const words = segment.filter((token) => !token.operator).map((token) => token.value);
-  if (words.length === 0 || words[0]!.toLowerCase() !== "cd") return undefined;
+  // Match `cd` case-sensitively: on case-insensitive filesystems (macOS), `CD`
+  // can invoke `/usr/bin/cd` in a subprocess that exits 0 without changing the
+  // parent shell's cwd.
+  if (words.length === 0 || words[0] !== "cd") return undefined;
   // Redirections on cd, preceding `|`/`||`/`&`, or anything other than `&&`
   // after `cd` (including a bare trailing `cd`) make execution or later cwd
   // tracking ambiguous.
@@ -2530,102 +2533,201 @@ function isRoutinePnpm(rest: readonly string[]): boolean {
   return false;
 }
 
-const MAKE_LONG_PATH_FLAGS = /^--(?:directory|file|makefile|include-dir)$/u;
-const MAKE_DANGEROUS_FLAGS = /^(?:-e|--environment-overrides|-E|--eval)$/u;
+// Strict allowlists for make / cargo / go / pytest flags: any unrecognized,
+// abbreviated, or clustered flag returns false (escalating to the Decision
+// Worker instead of auto-approving as routine).
+const MAKE_BOOL_FLAGS = new Set([
+  "-n", "--just-print", "--dry-run", "--recon",
+  "-s", "--silent", "--quiet",
+  "-k", "--keep-going",
+  "-B", "--always-make",
+  "-i", "--ignore-errors",
+  "-w", "--print-directory", "--no-print-directory",
+  "-S", "--no-keep-going", "--stop",
+]);
 
 function isRoutineMake(rest: readonly string[], effectiveDir: string, boundaryCwd: string, writeRoots: readonly string[]): boolean {
   for (let index = 0; index < rest.length; index += 1) {
     const word = rest[index]!;
-    const equals = word.indexOf("=");
-    const flag = equals > 0 ? word.slice(0, equals) : word;
-    if (MAKE_DANGEROUS_FLAGS.test(flag)) return false;
-    // Attached short forms: `-E...`, `-e...` (e.g. `-E'pwn:;id'`, `-ke`).
-    if (word.startsWith("-") && !word.startsWith("--") && (/^-[A-Za-z]*[Ee]/u.test(word))) return false;
+    if (word === "--") continue;
+    if (word.startsWith("-")) {
+      if (MAKE_BOOL_FLAGS.has(word)) continue;
+      if (word === "-j" || word === "--jobs") {
+        if (index + 1 < rest.length && /^\d+$/u.test(rest[index + 1]!)) index += 1;
+        continue;
+      }
+      if (/^(?:-j\d+|--jobs=\d+)$/u.test(word)) continue;
+      if (word === "-C" || word === "--directory") {
+        const value = rest[index + 1];
+        if (!value || !isInsideBoundaryArgument(value, effectiveDir, boundaryCwd, writeRoots)) return false;
+        index += 1;
+        continue;
+      }
+      if (word.startsWith("--directory=")) {
+        const value = word.slice("--directory=".length);
+        if (!value || !isInsideBoundaryArgument(value, effectiveDir, boundaryCwd, writeRoots)) return false;
+        continue;
+      }
+      // Reject all other flags (including -f, -I, -e, -E, abbreviated --ev, short clusters like -kC..).
+      return false;
+    }
     // Block all Makefile variable assignments (`SHELL=…`, `CC=…`, `MAKE=…`, etc.).
-    if (!word.startsWith("-") && equals > 0) return false;
-    // Attached short path flags (`-C/tmp`, `-f/etc/passwd`, `-I/tmp`).
-    if (word.startsWith("-") && !word.startsWith("--") && /^-[CfI]/u.test(word)) {
-      const value = word.length > 2 ? word.slice(2) : rest[index + 1];
-      if (!value || !isInsideBoundaryArgument(value, effectiveDir, boundaryCwd, writeRoots)) return false;
-      if (word.length === 2) index += 1;
-      continue;
-    }
-    if (MAKE_LONG_PATH_FLAGS.test(flag)) {
-      const value = equals > 0 ? word.slice(equals + 1) : rest[index + 1];
-      if (!value || !isInsideBoundaryArgument(value, effectiveDir, boundaryCwd, writeRoots)) return false;
-      if (equals < 0) index += 1;
-    }
+    if (word.includes("=")) return false;
   }
   return true;
 }
 
-const CARGO_PATH_FLAGS = /^--(?:manifest-path|target-dir|out-dir)$/u;
+const CARGO_BOOL_FLAGS = new Set([
+  "--release", "--debug", "--all-targets", "--all-features", "--no-default-features",
+  "--workspace", "--all", "--lib", "--bins", "--tests", "--benches", "--examples",
+  "--doc", "--no-run", "--no-fail-fast", "--locked", "--frozen", "--offline",
+  "--quiet", "-q", "--verbose", "-v", "-vv", "--check", "--no-deps",
+]);
+const CARGO_VALUE_FLAGS = new Set([
+  "-p", "--package", "-F", "--features", "-j", "--jobs",
+  "--bin", "--test", "--bench", "--example", "--profile", "--target",
+  "--color", "--message-format", "--format-version", "--edition", "--depth", "--edges",
+]);
+const CARGO_PATH_FLAGS = new Set(["--manifest-path", "--target-dir"]);
+const CARGO_PASSTHROUGH_BOOL_FLAGS = new Set([
+  "--nocapture", "--show-output", "--exact", "--ignored", "--include-ignored",
+  "--list", "--quiet", "-q", "--check",
+]);
+const CARGO_PASSTHROUGH_VALUE_FLAGS = new Set([
+  "--test-threads", "--color", "--skip", "--format",
+  "-D", "--deny", "-W", "--warn", "-A", "--allow",
+]);
 
 function isRoutineCargo(rest: readonly string[], effectiveDir: string, boundaryCwd: string, writeRoots: readonly string[]): boolean {
   const separator = rest.indexOf("--");
   const cargoArguments = separator >= 0 ? rest.slice(0, separator) : rest;
+  const passthrough = separator >= 0 ? rest.slice(separator + 1) : [];
   let subcommand: string | undefined;
   for (let index = 0; index < cargoArguments.length; index += 1) {
     const word = cargoArguments[index]!;
+    if (!word.startsWith("-")) {
+      if (!subcommand) {
+        subcommand = word.toLowerCase();
+        if (!ROUTINE_CARGO_SUBCOMMANDS.has(subcommand)) return false;
+      }
+      continue;
+    }
     const equals = word.indexOf("=");
     const flag = equals > 0 ? word.slice(0, equals) : word;
-    if (flag === "--config" || word === "-Z" || word.startsWith("-Z")) return false;
-    if (CARGO_PATH_FLAGS.test(flag)) {
+    if (equals < 0 && CARGO_BOOL_FLAGS.has(flag)) continue;
+    if (CARGO_VALUE_FLAGS.has(flag)) {
+      const value = equals > 0 ? word.slice(equals + 1) : cargoArguments[index + 1];
+      if (!value) return false;
+      if (equals < 0) index += 1;
+      continue;
+    }
+    if (CARGO_PATH_FLAGS.has(flag)) {
       const value = equals > 0 ? word.slice(equals + 1) : cargoArguments[index + 1];
       if (!value || !isInsideBoundaryArgument(value, effectiveDir, boundaryCwd, writeRoots)) return false;
       if (equals < 0) index += 1;
       continue;
     }
-    if (word.startsWith("-") || word.startsWith("+")) continue;
-    if (!subcommand) subcommand = word.toLowerCase();
+    // Reject any unrecognized flag (including --config, -Z, -vZ..., +nightly).
+    return false;
   }
-  return subcommand !== undefined && ROUTINE_CARGO_SUBCOMMANDS.has(subcommand);
+  if (!subcommand) return false;
+  for (let index = 0; index < passthrough.length; index += 1) {
+    const word = passthrough[index]!;
+    if (!word.startsWith("-")) continue;
+    const equals = word.indexOf("=");
+    const flag = equals > 0 ? word.slice(0, equals) : word;
+    if (equals < 0 && CARGO_PASSTHROUGH_BOOL_FLAGS.has(flag)) continue;
+    if (CARGO_PASSTHROUGH_VALUE_FLAGS.has(flag)) {
+      const value = equals > 0 ? word.slice(equals + 1) : passthrough[index + 1];
+      if (!value) return false;
+      if (equals < 0) index += 1;
+      continue;
+    }
+    return false;
+  }
+  return true;
 }
 
-const GO_BLOCKED_FLAGS = new Set(["-exec", "-toolexec", "-vettool", "-overlay"]);
-const GO_PATH_FLAGS = new Set(["-o", "-C", "-coverprofile", "-cpuprofile", "-memprofile", "-trace", "-blockprofile", "-mutexprofile", "-outputdir", "-pkgdir", "-modfile"]);
+const GO_BOOL_FLAGS = new Set([
+  "-v", "-race", "-short", "-json", "-failfast", "-a", "-n", "-x",
+  "-work", "-trimpath", "-cover", "-benchmem", "-m", "-all", "-deps",
+]);
+const GO_VALUE_FLAGS = new Set([
+  "-run", "-skip", "-bench", "-benchtime", "-count", "-timeout",
+  "-parallel", "-p", "-tags", "-f", "-coverpkg", "-covermode",
+  "-shuffle", "-mod", "-buildvcs", "-list",
+]);
+const GO_PATH_FLAGS = new Set(["-o", "-C", "-coverprofile"]);
 
 function isRoutineGo(rest: readonly string[], effectiveDir: string, boundaryCwd: string, writeRoots: readonly string[]): boolean {
   const subcommand = rest[0]?.toLowerCase();
   if (!subcommand || !ROUTINE_GO_SUBCOMMANDS.has(subcommand)) return false;
   for (let index = 1; index < rest.length; index += 1) {
     const word = rest[index]!;
+    if (word === "--") break;
+    if (!word.startsWith("-")) continue;
     const equals = word.indexOf("=");
     const rawFlag = equals > 0 ? word.slice(0, equals) : word;
-    // Go's flag package accepts both `-flag` and `--flag` interchangeably.
+    // Go's flag package accepts `-flag` and `--flag` interchangeably.
     const normFlag = rawFlag.startsWith("--") ? rawFlag.slice(1) : rawFlag;
-    if (GO_BLOCKED_FLAGS.has(normFlag)) return false;
+    if (equals < 0 && GO_BOOL_FLAGS.has(normFlag)) continue;
+    if (GO_VALUE_FLAGS.has(normFlag)) {
+      const value = equals > 0 ? word.slice(equals + 1) : rest[index + 1];
+      if (!value) return false;
+      if (equals < 0) index += 1;
+      continue;
+    }
     if (GO_PATH_FLAGS.has(normFlag)) {
       const value = equals > 0 ? word.slice(equals + 1) : rest[index + 1];
       if (!value || !isInsideBoundaryArgument(value, effectiveDir, boundaryCwd, writeRoots)) return false;
       if (equals < 0) index += 1;
+      continue;
     }
+    // Reject all other flags (including -ldflags, -gccgoflags, -compiler, -exec, -toolexec, -vettool, -trace, -overlay, -pkgdir, -modfile).
+    return false;
   }
   return true;
 }
 
-const PYTEST_LONG_PATH_FLAGS = /^--(?:rootdir|confcutdir|basetemp|junitxml|junit-xml|log-file|html|cov-config)$/u;
+const PYTEST_BOOL_FLAGS = new Set([
+  "-q", "--quiet", "-v", "--verbose", "-s", "-x", "--exitfirst",
+  "--ff", "--failed-first", "--lf", "--last-failed", "--nf", "--new-first",
+  "--no-header", "--no-summary", "--collect-only", "--co", "--version",
+  "--disable-warnings", "--strict-markers", "--strict-config", "--full-trace",
+  "--show-capture=no", "--show-capture=stdout", "--show-capture=stderr", "--show-capture=all",
+  "--color=yes", "--color=no", "--color=auto",
+]);
+const PYTEST_VALUE_FLAGS = new Set([
+  "-k", "-m", "--tb", "--maxfail", "-r", "--durations", "-n", "--capture", "--color", "--show-capture",
+]);
+const PYTEST_PATH_FLAGS = new Set(["-c", "--rootdir", "--basetemp", "--junitxml", "--junit-xml"]);
 
 function isRoutinePytest(rest: readonly string[], effectiveDir: string, boundaryCwd: string, writeRoots: readonly string[]): boolean {
   for (let index = 0; index < rest.length; index += 1) {
     const word = rest[index]!;
+    if (word === "--") break;
+    if (!word.startsWith("-")) continue;
     const equals = word.indexOf("=");
     const flag = equals > 0 ? word.slice(0, equals) : word;
-    // Reject ini overrides (`-o`, `-o...`, `--override-ini`, `--override-ini=...`)
-    // which can redirect `cache_dir`, `addopts`, or plugin paths outside R.
-    if (flag === "-o" || flag === "--override-ini" || (word.startsWith("-o") && !word.startsWith("--"))) return false;
-    // Attached or spaced `-c` config file path.
-    if (word === "-c" || (word.startsWith("-c") && !word.startsWith("--"))) {
-      const value = word.length > 2 ? word.slice(2) : rest[index + 1];
-      if (!value || !isInsideBoundaryArgument(value, effectiveDir, boundaryCwd, writeRoots)) return false;
-      if (word.length === 2) index += 1;
+    if (PYTEST_BOOL_FLAGS.has(word)) continue;
+    // Allow short boolean clusters ONLY from `{q, v, s, x}` (e.g. `-vv`, `-qx`, `-sv`).
+    if (/^-[qvsx]+$/u.test(word)) continue;
+    // Allow `-r<chars>` (e.g. `-ra`, `-rfE`).
+    if (/^-r[A-Za-z]+$/u.test(word)) continue;
+    if (PYTEST_VALUE_FLAGS.has(flag)) {
+      const value = equals > 0 ? word.slice(equals + 1) : rest[index + 1];
+      if (!value) return false;
+      if (equals < 0) index += 1;
       continue;
     }
-    if (PYTEST_LONG_PATH_FLAGS.test(flag)) {
+    if (PYTEST_PATH_FLAGS.has(flag)) {
       const value = equals > 0 ? word.slice(equals + 1) : rest[index + 1];
       if (!value || !isInsideBoundaryArgument(value, effectiveDir, boundaryCwd, writeRoots)) return false;
       if (equals < 0) index += 1;
+      continue;
     }
+    // Reject all other flags (including -o, -qo, -vc/..., --override-ini, -p, etc.).
+    return false;
   }
   return true;
 }
