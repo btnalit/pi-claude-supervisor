@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { delimiter, join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { assertAutomaticClaudePermissionConfiguration, assertTrustedAutomaticClaudeExecutable, automaticClaudeArgs, automaticWorkerEnvironment, workerEnvironment } from "./environment.ts";
@@ -16,10 +16,13 @@ test("worker environment keeps essentials and excludes unrelated credentials", (
   assert.equal(result.RANDOM_TOKEN, undefined);
 });
 
-test("automatic Worker environment keeps Claude's Bash in the task directory unless the caller chose otherwise", () => {
-  assert.equal(automaticWorkerEnvironment({}, { PATH: "/bin" }).CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR, "1");
-  assert.equal(automaticWorkerEnvironment({ CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR: "0" }, {}).CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR, "0");
-  assert.equal(automaticWorkerEnvironment({}, { CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR: "0" }).CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR, "0");
+test("automatic Worker environment keeps Claude's Bash in the task directory and disables autoupdater unless overridden", () => {
+  const defaults = automaticWorkerEnvironment({}, { PATH: "/bin" });
+  assert.equal(defaults.CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR, "1");
+  assert.equal(defaults.DISABLE_AUTOUPDATER, "1");
+  assert.equal(automaticWorkerEnvironment({ CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR: "0", DISABLE_AUTOUPDATER: "0" }, {}).CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR, "0");
+  assert.equal(automaticWorkerEnvironment({ DISABLE_AUTOUPDATER: "0" }, {}).DISABLE_AUTOUPDATER, "0");
+  assert.equal(automaticWorkerEnvironment({}, { CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR: "0", DISABLE_AUTOUPDATER: "0" }).DISABLE_AUTOUPDATER, "0");
 });
 
 test("automatic Worker environment preserves credentials, helpers and custom settings", () => {
@@ -214,5 +217,38 @@ test("automatic mode rejects a recovery executable identity mismatch", async () 
     await assert.rejects(() => assertTrustedAutomaticClaudeExecutable("claude", expectedPath), /expected pinned identity/u);
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("D6: trusted Claude executable accepts user-owned group-writable directories (umask 002) while rejecting world-writable paths", { skip: process.platform === "win32" }, async () => {
+  const base = await mkdtemp(join(process.cwd(), ".pi-claude-supervisor-d6-"));
+  const groupDir = join(base, "group-writable");
+  const worldDir = join(base, "world-writable");
+  const prevPath = process.env.PATH;
+  const prevTrusted = process.env.PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE;
+  try {
+    await mkdir(groupDir, { mode: 0o775 });
+    await chmod(groupDir, 0o775);
+    const groupClaude = join(groupDir, "claude");
+    await writeFile(groupClaude, "#!/bin/sh\nexit 0\n", { mode: 0o775 });
+    await chmod(groupClaude, 0o775);
+
+    delete process.env.PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE;
+    process.env.PATH = `${groupDir}${delimiter}${prevPath ?? ""}`;
+    const resolved = await assertTrustedAutomaticClaudeExecutable("claude");
+    assert.ok(resolved.endsWith("claude"));
+
+    await mkdir(worldDir, { mode: 0o777 });
+    await chmod(worldDir, 0o777);
+    const worldClaude = join(worldDir, "claude");
+    await writeFile(worldClaude, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    process.env.PATH = `${worldDir}${delimiter}${prevPath ?? ""}`;
+    await assert.rejects(() => assertTrustedAutomaticClaudeExecutable("claude"), /writable by or owned by an untrusted user/u);
+  } finally {
+    if (prevPath === undefined) delete process.env.PATH;
+    else process.env.PATH = prevPath;
+    if (prevTrusted === undefined) delete process.env.PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE;
+    else process.env.PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE = prevTrusted;
+    await rm(base, { recursive: true, force: true });
   }
 });

@@ -72,6 +72,7 @@ export function automaticWorkerEnvironment(
     if (value !== undefined && name !== "CLAUDECODE") result[name] = value;
   }
   result.CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR ??= "1";
+  result.DISABLE_AUTOUPDATER ??= "1";
   return result;
 }
 
@@ -350,13 +351,16 @@ async function assertSecureExecutablePath(path: string): Promise<void> {
   if (!executable.isFile()) throw new Error("resolved Claude executable is not a regular file");
   if (process.platform !== "win32") {
     const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-    if ((executable.mode & 0o022) !== 0 || (uid !== undefined && executable.uid !== uid && executable.uid !== 0)) {
+    // Reject world-writable (0o002) or untrusted-owner paths; allow group-writable
+    // (0o020) when owned by the current user or root so UPG/umask-002 distros
+    // and Homebrew prefixes do not falsely fail startup (D6).
+    if ((executable.mode & 0o002) !== 0 || (uid !== undefined && executable.uid !== uid && executable.uid !== 0)) {
       throw new Error("resolved Claude executable is writable by or owned by an untrusted user");
     }
     let directory = dirname(path);
     while (true) {
       const info = await stat(directory);
-      if ((info.mode & 0o022) !== 0 || (uid !== undefined && info.uid !== uid && info.uid !== 0)) {
+      if ((info.mode & 0o002) !== 0 || (uid !== undefined && info.uid !== uid && info.uid !== 0)) {
         throw new Error("a directory containing the resolved Claude executable is writable by or owned by an untrusted user");
       }
       const parent = dirname(directory);
