@@ -304,7 +304,7 @@ copy-mode、Stop-hook block、后台任务、AskUserQuestion、限流模拟；�
 
 ### 阶段 0：先度量（2 个 PR）
 
-**0.1 质量报告命令**（无运行时行为变更）：`npm run report -- <events.jsonl…>`，支持读取轮转日志，统计：
+**0.1 ✅ 质量报告命令**（无运行时行为变更）：`npm run report -- [--json] [--include-rotated] [--since <ISO|duration>] <events.jsonl…>`（`scripts/report.mjs`），流式读取轮转与当前日志，统计：
 - 任务终态分布（由多类事件推导，推导规则写进代码与文档）与 park/block 原因直方图；
 - 修复轮次分布、`decision_overridden` 次数（阶段 2 之前按 `reason` 文本归类）、`decision_worker_failed` 次数；
 - 首个候选耗时、Worker 成本、Decision/Reviewer token、Reviewer 格式失败率。
