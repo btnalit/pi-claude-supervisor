@@ -535,7 +535,11 @@ function writeFloorScript(
   const segmentDirs: Array<Set<string | undefined>> = [];
   const allSeenDirs = new Set<string | undefined>([start]);
   let possibleDirs = new Set<string | undefined>([start]);
-  let globalCwdUnknown = false;
+  let globalCwdUnknown = lexical.tokens.some((t) => !t.operator && !t.heredoc && (/CDPATH|cdable_vars/u.test(t.value) || /\$\{!/u.test(t.value)));
+  if (globalCwdUnknown) {
+    possibleDirs.add(undefined);
+    allSeenDirs.add(undefined);
+  }
   let hasDynamicEarlier = false;
   let preChainDirs: Set<string | undefined> | undefined;
 
@@ -3346,7 +3350,7 @@ function resolveDataTokens(tokens: readonly ShellToken[]): { tokens: ShellToken[
     }
     segments.at(-1)!.tokens.push(token);
   }
-  const commandOf = (segment: readonly ShellToken[]): { name: string; words: string[] } | undefined => {
+  const commandOf = (segment: readonly ShellToken[]): { name: string; words: string[]; mutatesShellVar: boolean } | undefined => {
     let afterRedirect = false;
     let name: string | undefined;
     const words: string[] = [];
@@ -3362,7 +3366,8 @@ function resolveDataTokens(tokens: readonly ShellToken[]): { tokens: ShellToken[
       }
       words.push(word);
     }
-    return name === undefined ? undefined : { name, words };
+    const mutatesShellVar = name === "printf" && segment.some((token) => !token.operator && token.value.startsWith("-v"));
+    return name === undefined ? undefined : { name, words, mutatesShellVar };
   };
   const resolved: ShellToken[] = [];
   const embedded: string[] = [];
@@ -3373,14 +3378,16 @@ function resolveDataTokens(tokens: readonly ShellToken[]): { tokens: ShellToken[
       resolved.push(...segment.tokens, ...(segment.joiner ? [{ value: segment.joiner, operator: true, dynamic: false }] : []));
       return;
     }
-    const consumers: { name: string; words: string[] }[] = [];
+    const consumers: { name: string; words: string[]; mutatesShellVar: boolean }[] = [];
     for (let cursor = index; cursor < segments.length; cursor += 1) {
       const command = commandOf(segments[cursor]!.tokens);
       if (command) consumers.push(command);
       if (segments[cursor]!.joiner !== "|" && segments[cursor]!.joiner !== "|&") break;
     }
     const shellConsumer = consumers.some((consumer) => SHELL_NAMES.has(consumer.name) || consumer.name === "eval" || consumer.name === "source" || consumer.name === ".");
-    const sinkOnly = consumers.length > 0 && consumers.every((consumer) => DATA_SINK_COMMANDS.has(consumer.name) || (consumer.name === "git" && consumer.words.includes("commit")));
+    const sinkOnly = consumers.length > 0 && consumers.every((consumer) =>
+      (!consumer.mutatesShellVar && DATA_SINK_COMMANDS.has(consumer.name))
+      || (consumer.name === "git" && consumer.words.includes("commit")));
     if (shellConsumer) {
       const bodyTexts = bodies.map((token) => token.value);
       embedded.push(...bodyTexts);
