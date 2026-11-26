@@ -218,7 +218,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     if (terminal && info.cleanupConfirmed) {
       // Do not remove taskTempRoot while a kept-open/released Worker is still
       // alive using it as TMPDIR.
-      if (!info.workerReleased) await cleanupTaskTempRoot(record.taskTempRoot).catch(() => {});
+      if (!sessions.get(taskId)?.released) await cleanupTaskTempRoot(record.taskTempRoot).catch(() => {});
       await decisionStore.close(taskId);
       return;
     }

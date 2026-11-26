@@ -82,8 +82,6 @@ export interface SupervisorProgress {
 export interface DecisionSessionClosedInfo {
   cleanupConfirmed: boolean;
   reason: DecisionSessionCloseReason;
-  /** True when the Worker was intentionally released/kept open rather than stopped. */
-  workerReleased?: boolean;
 }
 
 export interface SupervisorTokenUsage {
@@ -2134,7 +2132,7 @@ export class Supervisor {
     this.#decision = undefined;
     const closeReasonForStop = stopped ? effectiveCloseReason : "recoverable_failure";
     await this.#cleanupOwnedTaskTempRoot(!this.#released && (closeReasonForStop === "completed" || closeReasonForStop === "human_stop"));
-    await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", { cleanupConfirmed, reason: closeReasonForStop, ...(this.#released ? { workerReleased: true } : {}) })).catch(() => {});
+    await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", { cleanupConfirmed, reason: closeReasonForStop })).catch(() => {});
     if (!stopped && effectiveCloseReason !== "human_stop") {
       await this.#notifyFailure(`worker cleanup could not be confirmed: ${reason}`);
     }
@@ -2933,7 +2931,6 @@ export class Supervisor {
     await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", {
       cleanupConfirmed,
       reason: verificationCloseReason,
-      ...(workerReleased ? { workerReleased: true } : {}),
     })).catch(() => {});
     this.#verificationAbortController = undefined;
     if (cleanupError && eventError) throw new AggregateError([cleanupError, eventError], "verification cleanup and audit failed");

@@ -5750,7 +5750,7 @@ test("interactive keepWorkerOnCompletion retains taskTempRoot while the released
     await initializeGitRepository(cwd, "worker/d9a-keepopen");
     const handle: WorkerHandle = { id: "d9a-keepopen-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
     let released = false;
-    let closedInfo: { cleanupConfirmed: boolean; reason: string; workerReleased?: boolean } | undefined;
+    let closedInfo: { cleanupConfirmed: boolean; reason: string } | undefined;
     let capturedListener: WorkerStartInput["eventListener"];
     const adapter: WorkerAdapter = {
       capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true, repairableSession: true }),
@@ -5792,8 +5792,8 @@ test("interactive keepWorkerOnCompletion retains taskTempRoot while the released
     await supervisor.verify();
     assert.equal(supervisor.state, "completed");
     assert.equal(released, true);
-    assert.equal(closedInfo?.reason, "completed");
-    assert.equal(closedInfo?.workerReleased, true);
+    assert.equal(supervisor.released, true);
+    assert.deepEqual(closedInfo, { cleanupConfirmed: true, reason: "completed" });
     // taskTempRoot MUST remain alive on disk because the released Claude TUI still uses it as TMPDIR.
     await access(taskTempDir);
   } finally {
