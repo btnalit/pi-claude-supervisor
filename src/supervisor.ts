@@ -376,6 +376,8 @@ export class Supervisor {
   get parkReasonLabel() { return this.#parkReasonLabel; }
   /** True after the persistent worker was detached from this Supervisor. */
   get released() { return this.#released; }
+  /** True when the active task is running under unattended automation. */
+  get automation() { return this.#automation; }
   /** Wall-clock budget of the active task, or undefined when no deadline is configured. */
   get deadline(): DecisionDeadlineContext | undefined { return this.#deadlineContext(); }
   /** Structural copy of the Worker + Pi-side token/cost accounting for this task. */

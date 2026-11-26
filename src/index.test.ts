@@ -1164,3 +1164,171 @@ test("a finished task stays visible in status and sessions after its session is 
     await rm(leaseDir, { recursive: true, force: true });
   }
 });
+
+test("Pi shutdown stops unfinished owned automatic tmux sessions while detaching manual persistent sessions", { skip: !trustedCheckout && untrustedCheckoutSkipReason, concurrency: false }, async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-t5-auto-"));
+  const manualCwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-t5-manual-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-t5-state-"));
+  const leaseDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-t5-leases-"));
+  const fakeBin = await mkdtemp(join(process.cwd(), ".pi-claude-supervisor-t5-bin-"));
+  const fakeClaude = join(fakeBin, "claude");
+  await copyFile(process.execPath, fakeClaude);
+  await chmod(fakeClaude, 0o700);
+  assert.equal(spawnSync("git", ["init", "-q"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["config", "user.email", "test@example.invalid"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["config", "user.name", "Test"], { cwd, stdio: "ignore" }).status, 0);
+  await writeFile(join(cwd, "base.txt"), "base\n");
+  assert.equal(spawnSync("git", ["add", "base.txt"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["commit", "-qm", "base"], { cwd, stdio: "ignore" }).status, 0);
+  assert.equal(spawnSync("git", ["switch", "-c", "worker/t5-min"], { cwd, stdio: "ignore" }).status, 0);
+  const baseCommit = spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).stdout.trim();
+  const taskId = "55555555-5555-4555-8555-555555555555";
+  const decisionStore = new DecisionSessionStore(join(stateDir, "decision-sessions"));
+  const decisionDir = decisionStore.sessionDirectory(taskId);
+  await mkdir(decisionDir, { recursive: true });
+  const decisionSessionFile = join(decisionDir, "session.jsonl");
+  await writeFile(decisionSessionFile, `${JSON.stringify({ type: "session", version: 3, id: randomUUID(), timestamp: new Date().toISOString(), cwd })}\n`);
+  await decisionStore.save({
+    taskId,
+    task: "t5-min shutdown stop test",
+    cwd,
+    command: "claude",
+    args: [],
+    resolvedExecutable: fakeClaude,
+    decisionSessionFile,
+    maxTurns: 2,
+    deadlineMs: 60_000,
+    noOutputTimeoutMs: 60_000,
+    startedAt: new Date().toISOString(),
+    baseCommit,
+    baseBranch: "worker/t5-min",
+    turn: 0,
+    state: "active",
+  });
+
+  const keys = [
+    "PI_CLAUDE_SUPERVISOR_STATE_DIR", "PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR",
+    "PI_CLAUDE_SUPERVISOR_TRANSPORT", "PI_CLAUDE_SUPERVISOR_CGROUP_MODE",
+    "PI_CLAUDE_SUPERVISOR_MODE", "PI_CLAUDE_SUPERVISOR_AUTOMATION",
+    "PI_CLAUDE_SUPERVISOR_TMUX_MODE", "PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS",
+    "PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE", "PI_CLAUDE_SUPERVISOR_WORKER",
+  ] as const;
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]])) as Record<typeof keys[number], string | undefined>;
+  const previousPath = process.env.PATH;
+
+  const autoWorkerId = randomUUID();
+  const manualWorkerId = randomUUID();
+  const autoCalls = { stop: 0, release: 0 };
+  const manualCalls = { stop: 0, release: 0 };
+  let autoRunning = true;
+  let manualRunning = true;
+  let manualDetached = false;
+
+  const startMock = t.mock.method(TmuxWorkerAdapter.prototype, "start", async (input: { cwd: string; automatic?: boolean }) => ({
+    id: input.automatic ? autoWorkerId : manualWorkerId,
+    startedAt: new Date().toISOString(),
+    cwd: input.cwd,
+    pid: process.pid,
+    ownership: "owned" as const,
+    sessionName: input.automatic ? `pi-supervisor-${autoWorkerId}` : `pi-supervisor-${manualWorkerId}`,
+  }));
+  const stopMock = t.mock.method(TmuxWorkerAdapter.prototype, "stop", async (handle: { id: string }) => {
+    if (handle.id === autoWorkerId) { autoCalls.stop += 1; autoRunning = false; }
+    else { manualCalls.stop += 1; manualRunning = false; }
+  });
+  const releaseMock = t.mock.method(TmuxWorkerAdapter.prototype, "release", async (handle: { id: string }) => {
+    if (handle.id === autoWorkerId) { autoCalls.release += 1; }
+    else { manualCalls.release += 1; manualDetached = true; }
+  });
+  const statusMock = t.mock.method(TmuxWorkerAdapter.prototype, "getStatus", async (handle: { id: string; startedAt: string; cwd: string }) => {
+    if (handle.id === autoWorkerId) {
+      return { handle, running: autoRunning, activeRequests: 0, processGroupCleaned: !autoRunning };
+    }
+    return { handle, running: manualRunning, detached: manualDetached, activeRequests: 0, processGroupCleaned: !manualRunning };
+  });
+  const readOutputMock = t.mock.method(TmuxWorkerAdapter.prototype, "readOutput", async () => []);
+
+  let autoShutdown: (() => Promise<void>) | undefined;
+  let manualShutdown: (() => Promise<void>) | undefined;
+  try {
+    // 1. Automatic owned tmux session: Pi shutdown MUST stop it (not release) and keep Decision record recoverable.
+    for (const key of keys) delete process.env[key];
+    process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
+    process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
+    process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "tmux";
+    process.env.PI_CLAUDE_SUPERVISOR_TMUX_MODE = "structured";
+    process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "required";
+    process.env.PI_CLAUDE_SUPERVISOR_MODE = "auto";
+    process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "1";
+    process.env.PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS = "0";
+    process.env.PATH = `${fakeBin}${delimiter}${previousPath ?? ""}`;
+
+    const autoRegs: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
+    extension({
+      registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) { autoRegs.commands.push({ name, definition }); },
+      on(name: string, handler: () => Promise<void>) { autoRegs.events.push({ name, handler }); },
+    } as never);
+    const autoCmd = autoRegs.commands.find(({ name }) => name === "supervise")!.definition;
+    autoShutdown = autoRegs.events.find(({ name }) => name === "session_shutdown")!.handler;
+    const autoCtx: TestContext = { cwd, hasUI: true, ui: { confirm: async () => false, notify: () => {} } };
+    await autoCmd.handler(`recover ${taskId}`, autoCtx);
+    assert.equal(autoCalls.stop, 0, "owned automatic tmux worker should be running before shutdown");
+    assert.equal(autoCalls.release, 0, "owned automatic tmux worker should not be released before shutdown");
+    await autoShutdown();
+
+    assert.equal(autoCalls.stop, 1, "owned automatic tmux worker must be stopped on shutdown");
+    assert.equal(autoCalls.release, 0, "owned automatic tmux worker must not be released unsupervised on shutdown");
+    const afterShutdownRecord = await decisionStore.load(taskId);
+    assert.equal(afterShutdownRecord?.state, "active", "Decision Worker record stays recoverable after shutdown stop");
+    assert.ok((await decisionStore.list({ activeOnly: true })).some((record) => record.taskId === taskId), "task remains listed as recoverable");
+    const leasesAfterAuto = await new CwdLeaseStore(leaseDir).list();
+    assert.equal(leasesAfterAuto.length, 0, "cwd lease is released after owned automatic worker stop");
+
+    // 2. Manual owned persistent tmux session: Pi shutdown continues to detach/release.
+    for (const key of keys) delete process.env[key];
+    process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
+    process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
+    process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "tmux";
+    process.env.PI_CLAUDE_SUPERVISOR_TMUX_MODE = "structured";
+    process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "off";
+    process.env.PI_CLAUDE_SUPERVISOR_MODE = "manual";
+    process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "0";
+    process.env.PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS = "0";
+    process.env.PI_CLAUDE_SUPERVISOR_WORKER = `${process.execPath} -e "setInterval(() => {}, 10000)"`;
+
+    const manualRegs: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
+    extension({
+      registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) { manualRegs.commands.push({ name, definition }); },
+      on(name: string, handler: () => Promise<void>) { manualRegs.events.push({ name, handler }); },
+    } as never);
+    const manualCmd = manualRegs.commands.find(({ name }) => name === "supervise")!.definition;
+    manualShutdown = manualRegs.events.find(({ name }) => name === "session_shutdown")!.handler;
+    const manualCtx: TestContext = { cwd: manualCwd, hasUI: true, ui: { confirm: async () => false, notify: () => {} } };
+    await manualCmd.handler("start manual persistent task", manualCtx);
+    assert.equal(manualCalls.stop, 0, "manual persistent tmux worker should be running before shutdown");
+    assert.equal(manualCalls.release, 0, "manual persistent tmux worker should not be released before shutdown");
+    await manualShutdown();
+
+    assert.equal(manualCalls.release, 1, "owned manual persistent tmux worker still detaches on shutdown");
+    assert.equal(manualCalls.stop, 0, "owned manual persistent tmux worker is not killed on shutdown");
+  } finally {
+    if (autoShutdown) await autoShutdown().catch(() => {});
+    if (manualShutdown) await manualShutdown().catch(() => {});
+    startMock.mock.restore();
+    stopMock.mock.restore();
+    releaseMock.mock.restore();
+    statusMock.mock.restore();
+    readOutputMock.mock.restore();
+    for (const key of keys) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await rm(cwd, { recursive: true, force: true });
+    await rm(manualCwd, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
+    await rm(leaseDir, { recursive: true, force: true });
+    await rm(fakeBin, { recursive: true, force: true });
+  }
+});

@@ -325,7 +325,12 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     const healthyPersistent = persistent && !["failed", "completed", "stopped"].includes(session.state);
     const cleanupRequired = taskId ? cleanupRequiredTasks.has(taskId) : false;
     const markCleanupRequired = () => { if (taskId) cleanupRequiredTasks.add(taskId); };
-    if (adoptedPersistent || (releasePersistent && healthyPersistent && !cleanupRequired)) {
+    // Adopted sessions belong to the user and are always released. Owned
+    // manual persistent sessions detach on shutdown so they can be re-adopted;
+    // unfinished owned automatic sessions are stopped (preserving recoverable
+    // Decision Worker state) so a restart cannot leave an unsupervised Claude
+    // writing to the same worktree alongside a recovered Worker (T5-min).
+    if (adoptedPersistent || (releasePersistent && healthyPersistent && !cleanupRequired && !session.automation)) {
       await session.release(reason);
       return;
     }
