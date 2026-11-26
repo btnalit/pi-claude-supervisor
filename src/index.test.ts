@@ -1224,6 +1224,7 @@ test("Pi shutdown stops unfinished owned automatic tmux sessions while detaching
   let manualRunning = true;
   let manualDetached = false;
 
+  const preflightMock = t.mock.method(TmuxWorkerAdapter.prototype, "preflight", async () => {});
   const startMock = t.mock.method(TmuxWorkerAdapter.prototype, "start", async (input: { cwd: string; automatic?: boolean }) => ({
     id: input.automatic ? autoWorkerId : manualWorkerId,
     startedAt: new Date().toISOString(),
@@ -1272,6 +1273,7 @@ test("Pi shutdown stops unfinished owned automatic tmux sessions while detaching
     autoShutdown = autoRegs.events.find(({ name }) => name === "session_shutdown")!.handler;
     const autoCtx: TestContext = { cwd, hasUI: true, ui: { confirm: async () => false, notify: () => {} } };
     await autoCmd.handler(`recover ${taskId}`, autoCtx);
+    assert.equal(startMock.mock.callCount(), 1, "owned automatic tmux worker should have started");
     assert.equal(autoCalls.stop, 0, "owned automatic tmux worker should be running before shutdown");
     assert.equal(autoCalls.release, 0, "owned automatic tmux worker should not be released before shutdown");
     await autoShutdown();
@@ -1305,6 +1307,7 @@ test("Pi shutdown stops unfinished owned automatic tmux sessions while detaching
     manualShutdown = manualRegs.events.find(({ name }) => name === "session_shutdown")!.handler;
     const manualCtx: TestContext = { cwd: manualCwd, hasUI: true, ui: { confirm: async () => false, notify: () => {} } };
     await manualCmd.handler("start manual persistent task", manualCtx);
+    assert.equal(startMock.mock.callCount(), 2, "manual persistent tmux worker should have started");
     assert.equal(manualCalls.stop, 0, "manual persistent tmux worker should be running before shutdown");
     assert.equal(manualCalls.release, 0, "manual persistent tmux worker should not be released before shutdown");
     await manualShutdown();
@@ -1314,6 +1317,7 @@ test("Pi shutdown stops unfinished owned automatic tmux sessions while detaching
   } finally {
     if (autoShutdown) await autoShutdown().catch(() => {});
     if (manualShutdown) await manualShutdown().catch(() => {});
+    preflightMock.mock.restore();
     startMock.mock.restore();
     stopMock.mock.restore();
     releaseMock.mock.restore();
