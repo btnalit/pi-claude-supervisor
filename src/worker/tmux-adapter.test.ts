@@ -1486,6 +1486,9 @@ setInterval(() => {}, 10000);
   assert.equal(created.status, 0, created.stderr);
   const hookSource = createFakeHookSource();
   const adapter = new TmuxWorkerAdapter({ stateDir, permissionDecisionTimeoutMs: 150, inputConfirmTimeoutMs: 300, pollIntervalMs: 40, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+  // Fake hook sources hold no ref'd socket while the adapter's timeout timer is unref'd;
+  // keep Node 22's event loop alive until the permission timeouts resolve.
+  const keepAlive = setInterval(() => {}, 50);
   let handle;
   try {
     handle = await adapter.start({
@@ -1519,6 +1522,7 @@ setInterval(() => {}, 10000);
     });
     assert.deepEqual(bashReply, {});
   } finally {
+    clearInterval(keepAlive);
     if (handle) await adapter.release(handle, "t8a test cleanup").catch(() => {});
     spawnSync("tmux", ["-S", socketPath, "kill-server"], { stdio: "ignore" });
     await rm(stateDir, { recursive: true, force: true });
