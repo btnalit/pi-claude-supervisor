@@ -2390,12 +2390,20 @@ export class TmuxWorkerAdapter implements WorkerAdapter {
         // as a no-op instead of failing the Supervisor's action handler.
         record.permissionResponses.add(requestId);
         this.#logOutput(record, `[supervisor] permission request ${requestId} timed out waiting for a Supervisor decision\n`);
-        // PreToolUse: no opinion, so Claude's own flow continues into its
-        // PermissionRequest hook. PermissionRequest: an empty reply would open
+        // PreToolUse: normally no opinion so Claude's own flow continues into
+        // its PermissionRequest hook — EXCEPT AskUserQuestion, which has no
+        // PermissionRequest fallback and would open an unattended TUI modal
+        // that blocks forever. PermissionRequest: an empty reply would open
         // Claude's interactive dialog and wait for a human who is not there;
-        // deny instead, so Claude can simply try the call again.
-        resolve(phase === "prompt"
-          ? { permissionDecision: "deny", permissionDecisionReason: "the Supervisor's permission decision timed out; retry the same tool call" }
+        // deny instead, so Claude can retry or continue in ordinary text.
+        const denyOnTimeout = phase === "prompt" || event.tool_name === "AskUserQuestion";
+        resolve(denyOnTimeout
+          ? {
+            permissionDecision: "deny",
+            permissionDecisionReason: event.tool_name === "AskUserQuestion"
+              ? "the Supervisor did not answer AskUserQuestion before the hook timed out; state your question or chosen assumption in ordinary text instead"
+              : "the Supervisor's permission decision timed out; retry the same tool call",
+          }
           : {});
       }, timeoutMs);
       timer.unref?.();
