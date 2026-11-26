@@ -4,6 +4,14 @@ import { chmod, lstat, mkdir, readFile, readdir, realpath, rm, rmdir, stat, writ
 import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { redactSensitive } from "./redaction.ts";
+import { pathsOverlapCanonical } from "./write-roots.ts";
+
+class UnsupportedLeaseVersionError extends Error {
+  constructor(version: unknown) {
+    super(`unsupported cwd lease schema version: ${String(version)}; upgrade pi-claude-supervisor before modifying this lease registry`);
+    this.name = "UnsupportedLeaseVersionError";
+  }
+}
 
 export type CwdLeaseTransport = "process-pipe" | "jsonl" | "pty" | "tmux";
 
@@ -45,10 +53,13 @@ export interface CwdLeaseCleanup {
 }
 
 export interface CwdLeaseRecord {
-  version: 1;
+  /** Schema v1 = cwd-only lease; v2 = multi-root lease carrying `roots`. */
+  version: 1 | 2;
   leaseId: string;
   taskId: string;
   cwd: string;
+  /** Canonical extra write roots leased alongside `cwd` (always sorted & deduplicated). */
+  roots?: string[];
   ownerPid: number;
   ownerStartTime?: string;
   acquiredAt: string;
@@ -80,6 +91,8 @@ export interface CwdLeaseAcquireOptions {
   takeover?: CwdLeaseTakeover;
   /** Persist the no-spawn startup phase as part of lease acquisition. */
   startup?: boolean;
+  /** Extra declared write roots to reserve alongside `cwd` (canonicalized and stored in v2 leases). */
+  roots?: readonly string[];
 }
 
 export interface CwdLeaseHandle {
@@ -142,12 +155,15 @@ export class CwdLeaseStore {
     assertTaskId(taskId);
     if (options.takeover) assertTaskId(options.takeover.taskId);
     const canonicalCwd = await realpath(resolve(cwd));
+    const canonicalRoots = await canonicalizeLeaseRoots(options.roots ?? [], canonicalCwd);
+    const candidatePaths = [canonicalCwd, ...canonicalRoots];
     const now = new Date().toISOString();
     const lease: CwdLeaseRecord = {
-      version: 1,
+      version: canonicalRoots.length > 0 ? 2 : 1,
       leaseId: randomUUID(),
       taskId,
       cwd: canonicalCwd,
+      ...(canonicalRoots.length > 0 ? { roots: canonicalRoots } : {}),
       ownerPid: process.pid,
       ownerStartTime: await processStartTime(process.pid),
       acquiredAt: now,
@@ -164,7 +180,12 @@ export class CwdLeaseStore {
         let takeoverLease: CwdLeaseRecord | undefined;
         let takeoverProof: TakeoverProof | undefined;
         for (const existing of leases) {
-          if (options.handoff && existing.cwd === canonicalCwd && !existing.pendingCleanup && await matchesHandoff(existing, options.handoff)) {
+          const existingPaths = leasePaths(existing);
+          if (options.handoff
+            && existing.cwd === canonicalCwd
+            && sameRootSet(existing.roots, canonicalRoots)
+            && !existing.pendingCleanup
+            && await matchesHandoff(existing, options.handoff)) {
             if (handoffLease) throw new Error("multiple matching tmux cwd leases; refusing ambiguous handoff");
             handoffLease = existing;
             // Adopt in place so a crash cannot leave both the old and new
@@ -175,9 +196,10 @@ export class CwdLeaseStore {
             else delete lease.pendingStartup;
             continue;
           }
-          if (!pathsOverlap(existing.cwd, canonicalCwd)) continue;
+          if (!anyPathsOverlap(existingPaths, candidatePaths)) continue;
           if (options.takeover?.taskId === existing.taskId
             && existing.cwd === canonicalCwd
+            && sameRootSet(existing.roots, canonicalRoots)
             && !existing.pendingCleanup) {
             const proof = await canTakeoverLease(existing);
             if (proof) {
@@ -361,11 +383,12 @@ export class CwdLeaseStore {
         const value = JSON.parse(await readFile(leasePath, "utf8")) as Partial<CwdLeaseRecord>;
         lease = normalizeLease(value);
       } catch (error) {
-        if (isTransientIoError(error)) throw error;
+        if (isTransientIoError(error) || error instanceof UnsupportedLeaseVersionError) throw error;
         // One unreadable or incompatible record (disk full, truncated write,
-        // a schema this build no longer accepts) must not block every other
-        // cwd lease in the registry. Quarantine it out of the directory this
-        // scan reads instead, and keep going.
+        // a corrupt JSON file) must not block every other cwd lease in the
+        // registry. Quarantine it out of the directory this scan reads instead,
+        // and keep going. Newer schema versions are NOT quarantined so an older
+        // build can never silently drop a newer supervisor's multi-root lock.
         await this.#quarantine(name, leasePath, error);
         continue;
       }
@@ -419,6 +442,12 @@ export class CwdLeaseStore {
         lease.cwd = await realpath(lease.cwd);
       } catch {
         lease.cwd = resolve(lease.cwd);
+      }
+      if (lease.roots && lease.roots.length > 0) {
+        lease.roots = await Promise.all(lease.roots.map(async (root) => {
+          try { return await realpath(root); }
+          catch { return resolve(root); }
+        }));
       }
       leases.push(lease);
     }
@@ -499,9 +528,40 @@ export class CwdLeaseStore {
 }
 
 export function pathsOverlap(first: string, second: string): boolean {
-  const left = resolve(first);
-  const right = resolve(second);
-  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+  return pathsOverlapCanonical(first, second);
+}
+
+export function anyPathsOverlap(first: readonly string[], second: readonly string[]): boolean {
+  return first.some((left) => second.some((right) => pathsOverlap(left, right)));
+}
+
+function leasePaths(lease: Pick<CwdLeaseRecord, "cwd" | "roots">): string[] {
+  return lease.roots && lease.roots.length > 0 ? [lease.cwd, ...lease.roots] : [lease.cwd];
+}
+
+function sameRootSet(first: readonly string[] | undefined, second: readonly string[] | undefined): boolean {
+  const left = [...(first ?? [])].sort();
+  const right = [...(second ?? [])].sort();
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
+}
+
+async function canonicalizeLeaseRoots(roots: readonly string[], canonicalCwd: string): Promise<string[]> {
+  if (roots.length === 0) return [];
+  const canonical: string[] = [];
+  const seen = new Set<string>();
+  for (const root of roots) {
+    if (typeof root !== "string" || !root.startsWith("/")) throw new Error(`invalid cwd lease root: ${String(root)}`);
+    const resolved = await realpath(resolve(root));
+    if (pathsOverlap(resolved, canonicalCwd)) throw new Error(`cwd lease root overlaps cwd: ${redactText(resolved)}`);
+    if (seen.has(resolved)) continue;
+    for (const existing of canonical) {
+      if (pathsOverlap(existing, resolved)) throw new Error(`cwd lease roots overlap each other: ${redactText(existing)} and ${redactText(resolved)}`);
+    }
+    seen.add(resolved);
+    canonical.push(resolved);
+  }
+  return canonical.sort();
 }
 
 type WorkerIdentityInput = Pick<CwdLeaseWorker, "pid" | "cgroupPath" | "tmuxTarget" | "tmuxPaneId" | "paneStartTime" | "paneCommand" | "tmuxServerPid" | "tmuxServerStartTime" | "cgroupIdentity" | "workerId" | "retainCgroupUntilLeaseRelease"> & { id?: string };
@@ -1211,7 +1271,11 @@ function normalizeCleanup(value: unknown): CwdLeaseCleanup | undefined {
 }
 
 function normalizeLease(value: Partial<CwdLeaseRecord>): CwdLeaseRecord {
-  if (value.version !== 1 || typeof value.leaseId !== "string" || !/^[0-9a-f-]{36}$/iu.test(value.leaseId)
+  if (typeof value.version === "number" && Number.isSafeInteger(value.version) && value.version > 2) {
+    throw new UnsupportedLeaseVersionError(value.version);
+  }
+  if ((value.version !== 1 && value.version !== 2)
+    || typeof value.leaseId !== "string" || !/^[0-9a-f-]{36}$/iu.test(value.leaseId)
     || typeof value.taskId !== "string" || !/^[0-9a-f-]{36}$/iu.test(value.taskId)
     || typeof value.cwd !== "string" || !value.cwd.startsWith("/")
     || !Number.isSafeInteger(value.ownerPid) || (value.ownerPid ?? 0) < 1
@@ -1219,6 +1283,17 @@ function normalizeLease(value: Partial<CwdLeaseRecord>): CwdLeaseRecord {
     || typeof value.updatedAt !== "string" || !Number.isFinite(Date.parse(value.updatedAt))
     || (value.ownerStartTime !== undefined && (typeof value.ownerStartTime !== "string" || !/^\d+$/u.test(value.ownerStartTime)))) {
     throw new Error("invalid cwd lease record");
+  }
+  let roots: string[] | undefined;
+  if (value.roots !== undefined) {
+    if (!Array.isArray(value.roots) || !value.roots.every((entry) => typeof entry === "string" && entry.startsWith("/") && !entry.includes("\0"))) {
+      throw new Error("invalid cwd lease roots");
+    }
+    const normalized = [...new Set(value.roots.map((entry) => resolve(entry)))].sort();
+    if (normalized.length > 0) roots = normalized;
+  }
+  if (value.version === 1 && roots && roots.length > 0) {
+    throw new Error("invalid cwd lease record: v1 lease cannot carry roots");
   }
   const worker = value.worker;
   if (worker && (typeof worker !== "object" || !["process-pipe", "jsonl", "pty", "tmux"].includes(worker.transport as string))) throw new Error("invalid cwd lease worker identity");
@@ -1230,10 +1305,11 @@ function normalizeLease(value: Partial<CwdLeaseRecord>): CwdLeaseRecord {
   const pendingCleanup = normalizeCleanup(value.pendingCleanup);
   const ownerPid = value.ownerPid!;
   return {
-    version: 1,
+    version: roots && roots.length > 0 ? 2 : value.version,
     leaseId: value.leaseId,
     taskId: value.taskId,
     cwd: resolve(value.cwd),
+    ...(roots && roots.length > 0 ? { roots } : {}),
     ownerPid,
     ownerStartTime: typeof value.ownerStartTime === "string" ? value.ownerStartTime : undefined,
     acquiredAt: value.acquiredAt,

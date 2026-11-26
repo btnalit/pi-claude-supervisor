@@ -229,3 +229,46 @@ test("a task on an sk- branch in an sk- directory keeps its Decision session", a
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("DecisionSessionStore persists spec.writeRoots, pinnedWriteRoots, and taskTempRoot without credential redaction", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-decision-wroots-"));
+  try {
+    const store = new DecisionSessionStore(directory);
+    const taskId = "99999999-9999-4999-8999-999999999999";
+    await mkdir(store.sessionDirectory(taskId), { recursive: true });
+    const pinnedRoot = { declared: "/srv/sk-lane_2026_a", canonical: "/srv/sk-lane_2026_a", dev: 42, ino: 99 };
+    const tempRoot = { declared: "/tmp/pi-claude-task-sk-1234567890", canonical: "/tmp/pi-claude-task-sk-1234567890", dev: 7, ino: 88 };
+    await store.save({
+      taskId,
+      task: "multi-root persistence",
+      spec: {
+        goal: "multi-root persistence",
+        scope: [],
+        constraints: [],
+        forbidden: [],
+        writeRoots: ["/srv/sk-lane_2026_a"],
+        acceptance: [{ id: "ok", name: "ok", command: "true", args: [], required: true, timeoutMs: 1_000 }],
+        maxRepairRounds: 1,
+        autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" },
+      },
+      cwd: "/srv/sk-main_repo",
+      command: "claude",
+      args: [],
+      decisionSessionFile: join(store.sessionDirectory(taskId), "session.jsonl"),
+      maxTurns: 10,
+      deadlineMs: 60_000,
+      noOutputTimeoutMs: 60_000,
+      startedAt: new Date().toISOString(),
+      pinnedWriteRoots: [pinnedRoot],
+      taskTempRoot: tempRoot,
+      turn: 0,
+      state: "active",
+    });
+    const restored = await new DecisionSessionStore(directory).load(taskId);
+    assert.deepEqual(restored?.spec?.writeRoots, ["/srv/sk-lane_2026_a"]);
+    assert.deepEqual(restored?.pinnedWriteRoots, [pinnedRoot]);
+    assert.deepEqual(restored?.taskTempRoot, tempRoot);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

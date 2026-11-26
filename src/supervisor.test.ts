@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5655,6 +5655,83 @@ test("permission_request Decision Worker API failure denies fail-closed without 
   assert.equal(supervisor.state, "blocked");
   assert.equal(supervisor.candidateParked, true);
   assert.equal(responded.length, 2, "configuration error must park instead of silently denying");
+});
+
+test("automatic Supervisor injects task-scoped TMPDIR/TMP/TEMP, honors declared writeRoots, blocks /tmp sibling writes, and cleans up temp root on completion", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-d9a-"));
+  const cwd = join(base, "repo");
+  const sibling = join(base, "lane-a");
+  const outsideTmp = join(base, "other-tmp");
+  try {
+    await Promise.all([mkdir(cwd), mkdir(sibling), mkdir(outsideTmp)]);
+    await initializeGitRepository(cwd, "worker/d9a-test");
+    const handle: WorkerHandle = { id: "d9a-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    let capturedListener: WorkerStartInput["eventListener"];
+    const responded: Array<{ requestId: string; behavior: string }> = [];
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async (input) => { capturedEnv = input.env; capturedListener = input.eventListener; return handle; },
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+      respondPermission: async (_h, requestId, _tu, decision) => { responded.push({ requestId, behavior: decision.behavior }); },
+    };
+    const supervisor = new Supervisor(adapter, undefined, {
+      reviewer: { review: async () => ({ verdict: "pass", summary: "ok", findings: [], round: 0, checkedAt: new Date().toISOString() }) },
+    });
+    await supervisor.start({
+      task: "d9a temp root test",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: {
+        writeRoots: [sibling],
+        autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2, permissionAuthority: "policy" },
+        acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 2_000 }],
+      },
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    });
+    const taskTemp = supervisor.taskTempRoot;
+    assert.ok(taskTemp, "automatic task gets a private taskTempRoot");
+    assert.equal(capturedEnv?.TMPDIR, taskTemp.canonical);
+    assert.equal(capturedEnv?.TMP, taskTemp.canonical);
+    assert.equal(capturedEnv?.TEMP, taskTemp.canonical);
+
+    // Write inside taskTempRoot -> allow.
+    capturedListener?.({ type: "permission_request", handle, request: { requestId: "r-tmp", toolUseId: "t-tmp", toolName: "Write", input: { file_path: join(taskTemp.canonical, "script.py") }, raw: {} } });
+    // Write inside declared writeRoot -> allow.
+    capturedListener?.({ type: "permission_request", handle, request: { requestId: "r-lane", toolUseId: "t-lane", toolName: "Write", input: { file_path: join(sibling, "edit.ts") }, raw: {} } });
+    // Write to sibling directory under /tmp -> deny.
+    capturedListener?.({ type: "permission_request", handle, request: { requestId: "r-out", toolUseId: "t-out", toolName: "Write", input: { file_path: join(outsideTmp, "escape.txt") }, raw: {} } });
+    // Delete inside sibling /tmp directory -> deny (narrowed delete floor).
+    capturedListener?.({ type: "permission_request", handle, request: { requestId: "r-del", toolUseId: "t-del", toolName: "Bash", input: { command: `rm -rf ${outsideTmp}/x` }, raw: {} } });
+    await supervisor.poll();
+
+    assert.equal(responded.find((r) => r.requestId === "r-tmp")?.behavior, "allow");
+    assert.equal(responded.find((r) => r.requestId === "r-lane")?.behavior, "allow");
+    assert.equal(responded.find((r) => r.requestId === "r-out")?.behavior, "deny");
+    assert.equal(responded.find((r) => r.requestId === "r-del")?.behavior, "deny");
+
+    // Completing the task removes its owned taskTempRoot.
+    await supervisor.verify();
+    assert.equal(supervisor.state, "completed");
+    let stillExists = true;
+    try { await access(taskTemp.canonical); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") stillExists = false;
+    }
+    assert.equal(stillExists, false, "owned taskTempRoot is cleaned up on terminal completion");
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
 });
 
 

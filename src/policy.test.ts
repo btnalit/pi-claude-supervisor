@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { assertSafeWorkerCommand, deleteFloorViolation, evaluateCommand, evaluatePermission, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, sameDirectory, shellQuote } from "./policy.ts";
+import { createTaskTempRoot, pinWriteRoots } from "./write-roots.ts";
 
 function bash(command: string) {
   return { command };
@@ -1367,5 +1368,41 @@ test("#55-2 allows local non-protected branch merges in main and linked worktree
     assert.equal(detached.boundary, "remote");
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("pinnedWriteRoots enforce symlink/replace-in-place invalidation, .git protection, whole-root delete block, and narrowed task temp root", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-pinned-policy-"));
+  const cwd = join(base, "cwd");
+  const lane = join(base, "lane-a");
+  const outside = join(base, "outside");
+  const taskTmp = await createTaskTempRoot("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+  try {
+    await Promise.all([mkdir(cwd), mkdir(lane), mkdir(outside)]);
+    await writeFile(join(lane, "keep.txt"), "ok\n");
+    const pinned = pinWriteRoots([lane], cwd);
+    const opts = { pinnedWriteRoots: [...pinned, taskTmp], tempRoots: [] as string[] };
+
+    // Writes inside declared pinned root and task temp root are allowed; sibling /tmp is denied.
+    assert.equal(evaluatePermission("Write", { file_path: join(lane, "file.ts") }, cwd, opts).decision, "allow");
+    assert.equal(evaluatePermission("Write", { file_path: join(taskTmp.canonical, "probe.py") }, cwd, opts).decision, "allow");
+    assert.equal(evaluatePermission("Write", { file_path: join(outside, "nope.ts") }, cwd, opts).decision, "deny");
+    // .git inside pinned root is still denied.
+    assert.equal(evaluatePermission("Write", { file_path: join(lane, ".git", "config") }, cwd, opts).decision, "deny");
+    // Deleting child inside pinned root / task temp root is allowed; deleting whole root or sibling /tmp is denied.
+    assert.equal(evaluatePermission("Bash", bash(`rm -f ${lane}/keep.txt`), cwd, opts).decision, "allow");
+    assert.equal(evaluatePermission("Bash", bash(`rm -f ${taskTmp.canonical}/probe.py`), cwd, opts).decision, "allow");
+    assert.equal(evaluatePermission("Bash", bash(`rm -rf ${lane}`), cwd, opts).decision, "deny");
+    assert.equal(evaluatePermission("Bash", bash(`rm -rf ${taskTmp.canonical}`), cwd, opts).decision, "deny");
+    assert.equal(evaluatePermission("Bash", bash(`rm -rf ${outside}`), cwd, opts).decision, "deny");
+
+    // Swapping pinned root with a symlink invalidates BOTH writes and deletes immediately.
+    await rm(lane, { recursive: true, force: true });
+    await symlink(outside, lane);
+    assert.equal(evaluatePermission("Write", { file_path: join(lane, "escape.ts") }, cwd, opts).decision, "deny");
+    assert.equal(evaluatePermission("Bash", bash(`rm -f ${lane}/escape.ts`), cwd, opts).decision, "deny");
+  } finally {
+    await rm(taskTmp.canonical, { recursive: true, force: true }).catch(() => {});
+    await rm(base, { recursive: true, force: true });
   }
 });

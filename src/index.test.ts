@@ -1336,3 +1336,70 @@ test("Pi shutdown stops unfinished owned automatic tmux sessions while detaching
     await rm(fakeBin, { recursive: true, force: true });
   }
 });
+
+test("index --write-root enforces multi-root overlap, cleans reservations on mid-start failure, and rejects --write-root on recover", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-idx-wroots-"));
+  const cwdA = join(base, "cwd-a");
+  const cwdB = join(base, "cwd-b");
+  const laneA = join(base, "lane-a");
+  const stateDir = join(base, "state");
+  const leaseDir = join(base, "leases");
+  const keys = [
+    "PI_CLAUDE_SUPERVISOR_WORKER", "PI_CLAUDE_SUPERVISOR_STATE_DIR", "PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR",
+    "PI_CLAUDE_SUPERVISOR_TRANSPORT", "PI_CLAUDE_SUPERVISOR_CGROUP_MODE",
+    "PI_CLAUDE_SUPERVISOR_MODE", "PI_CLAUDE_SUPERVISOR_AUTOMATION",
+  ] as const;
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]])) as Record<typeof keys[number], string | undefined>;
+  let shutdownHandler: (() => Promise<void>) | undefined;
+  try {
+    await Promise.all([mkdir(cwdA), mkdir(cwdB), mkdir(laneA), mkdir(stateDir), mkdir(leaseDir)]);
+    for (const key of keys) delete process.env[key];
+    process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
+    process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
+    process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "process-pipe";
+    process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "off";
+    process.env.PI_CLAUDE_SUPERVISOR_MODE = "manual";
+    process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "0";
+
+    const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
+    const messages: string[] = [];
+    const makeCtx = (dir: string): TestContext => ({ cwd: dir, hasUI: true, ui: { confirm: async () => false, notify: (message) => messages.push(message) } });
+
+    // 1. Mid-start failure with --write-root releases BOTH lease and in-process reservation.
+    process.env.PI_CLAUDE_SUPERVISOR_WORKER = join(base, "missing-worker-bin");
+    extension({
+      registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) { registrations.commands.push({ name, definition }); },
+      on(name: string, handler: () => Promise<void>) { registrations.events.push({ name, handler }); },
+    } as never);
+    const command = registrations.commands.find(({ name }) => name === "supervise")!.definition;
+    shutdownHandler = registrations.events.find(({ name }) => name === "session_shutdown")!.handler;
+
+    await command.handler(`start --write-root ${laneA} fail mid start`, makeCtx(cwdA));
+    assert.match(messages.at(-1) ?? "", /ENOENT|failed/u);
+    assert.equal((await new CwdLeaseStore(leaseDir).list()).length, 0, "failed mid-start must release its multi-root lease");
+
+    // 2. Starting with a working worker on the same cwdA + --write-root laneA now succeeds (in-process pending reservation was cleared).
+    process.env.PI_CLAUDE_SUPERVISOR_WORKER = `${process.execPath} -e "setInterval(() => {}, 10000)"`;
+    await command.handler(`start --write-root ${laneA} live multi-root task`, makeCtx(cwdA));
+    assert.match(messages.at(-1) ?? "", /Worker started:/u);
+
+    // 3. Concurrent start whose cwd overlaps laneA is rejected.
+    await command.handler("start conflict on laneA cwd", makeCtx(laneA));
+    assert.match(messages.at(-1) ?? "", /overlapping cwd or writeRoot/u);
+
+    // 4. Concurrent start from cwdB whose --write-root overlaps cwdA is rejected.
+    await command.handler(`start --write-root ${cwdA} conflict on cwdA root`, makeCtx(cwdB));
+    assert.match(messages.at(-1) ?? "", /overlapping cwd or writeRoot/u);
+
+    // 5. recover rejects --write-root override.
+    await command.handler(`recover --takeover --write-root ${laneA} 11111111-1111-4111-8111-111111111111`, makeCtx(cwdA));
+    assert.match(messages.at(-1) ?? "", /--write-root cannot be changed during recovery/u);
+  } finally {
+    if (shutdownHandler) await shutdownHandler().catch(() => {});
+    for (const key of keys) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+    await rm(base, { recursive: true, force: true });
+  }
+});

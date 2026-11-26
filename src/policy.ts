@@ -1,6 +1,7 @@
 import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
+import { verifyPinnedWriteRoot, type PinnedWriteRoot } from "./write-roots.ts";
 
 export type PolicyDecision = "allow" | "review" | "deny";
 
@@ -30,8 +31,12 @@ export interface PolicyResult {
  * authority boundaries below remain special-cased.
  */
 export interface PermissionPolicyOptions {
-  /** Extra directories the Worker may write to (Claude's per-session scratchpad); each must be an absolute path. */
+  /** Extra directories the Worker may write to (Claude's per-session scratchpad/memory); each must be an absolute path. */
   writeRoots?: readonly string[];
+  /** Startup-pinned extra write roots (declared TaskSpec.writeRoots + task-scoped temp dir), re-verified by lstat/dev/ino/realpath on every check. */
+  pinnedWriteRoots?: readonly PinnedWriteRoot[];
+  /** Override for delete-floor temp roots; when set (e.g. `[]` when using a task-scoped pinned temp root), narrows deletes away from shared `/tmp`. */
+  tempRoots?: readonly string[];
   /** A publish-phase grant; absent (the default) keeps the Worker with no remote authority at all. */
   remote?: RemoteGrant;
 }
@@ -134,11 +139,15 @@ export function evaluatePermission(toolName: string, input: unknown, cwd = proce
   if (toolName === "Edit" || toolName === "Write" || toolName === "NotebookEdit") {
     const paths = fileToolPaths(input);
     if (paths.length === 0) return { decision: "deny", reason: `${toolName} request has no recognizable file path` };
-    const violation = paths.map((path) => ({ path, classification: classifyWritePath(path, cwd, options.writeRoots) })).find((entry) => entry.classification !== undefined);
+    const violation = paths.map((path) => ({ path, classification: classifyWritePath(path, cwd, options.writeRoots, options.pinnedWriteRoots) })).find((entry) => entry.classification !== undefined);
     if (violation?.classification === "outside-cwd") {
-      // Only name an alternative the Worker actually has: writeRoots is empty
-      // for a bridge Worker and before an adopted session's first hook event.
-      const alternatives = (options.writeRoots ?? []).length > 0 ? `; writes are also allowed under ${(options.writeRoots ?? []).join(", ")}` : "";
+      // Only name alternatives the Worker actually has right now: unverified
+      // pinned roots are omitted so a swapped/deleted root is never advertised.
+      const available = [
+        ...(options.pinnedWriteRoots ?? []).filter((root) => verifyPinnedWriteRoot(root) !== undefined).map((root) => root.declared),
+        ...(options.writeRoots ?? []),
+      ];
+      const alternatives = available.length > 0 ? `; writes are also allowed under ${available.join(", ")}` : "";
       return { decision: "deny", reason: `Worker cannot write outside the task working directory: ${violation.path}${alternatives}` };
     }
     if (violation?.classification === "cwd-missing") return { decision: "deny", reason: `the task working directory no longer exists, so nothing can be written under it: ${violation.path}` };
@@ -154,13 +163,19 @@ export function evaluatePermission(toolName: string, input: unknown, cwd = proce
   // hide its structure (heredoc bodies, dynamic words) from the token checks.
   const result = evaluateCommand(command, [], options.remote, cwd);
   if (result.decision === "deny") return result;
-  const floor = deleteFloorViolation(command, cwd, { writeRoots: options.writeRoots ?? [] });
+  const floor = deleteFloorViolation(command, cwd, {
+    writeRoots: options.writeRoots ?? [],
+    ...(options.pinnedWriteRoots ? { pinnedWriteRoots: options.pinnedWriteRoots } : {}),
+    ...(options.tempRoots !== undefined ? { tempRoots: options.tempRoots } : {}),
+  });
   return floor ? { decision: "deny", reason: floor } : result;
 }
 
 export interface DeleteFloorOptions {
   /** Extra directories the task may write (and so delete) in. */
   writeRoots?: readonly string[];
+  /** Startup-pinned extra write roots verified by lstat/dev/ino/realpath on every check. */
+  pinnedWriteRoots?: readonly PinnedWriteRoot[];
   /** Shared scratch roots; defaults to the OS temp directory and /tmp. */
   tempRoots?: readonly string[];
 }
@@ -196,7 +211,7 @@ export interface DeleteFloorOptions {
  * `ln -sf`, `>`) remain outside what this floor reads.
  */
 export function deleteFloorViolation(command: string, cwd: string, options: DeleteFloorOptions = {}): string | undefined {
-  const roots = deleteFloorRoots(cwd, options.writeRoots ?? [], options.tempRoots ?? [tmpdir(), "/tmp"]);
+  const roots = deleteFloorRoots(cwd, options.writeRoots ?? [], options.tempRoots ?? [tmpdir(), "/tmp"], options.pinnedWriteRoots ?? []);
   return floorScript(command, cwd, roots, new Map(), 0);
 }
 
@@ -337,11 +352,17 @@ function floorScript(command: string, start: string | undefined, roots: FloorRoo
 
 const FLOOR_KEYWORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "!", "(", "{", "}", "done", "fi", "esac"]);
 
-function deleteFloorRoots(cwd: string, writeRoots: readonly string[], tempRoots: readonly string[]): FloorRoots {
+function deleteFloorRoots(cwd: string, writeRoots: readonly string[], tempRoots: readonly string[], pinnedWriteRoots: readonly PinnedWriteRoot[] = []): FloorRoots {
   const canonical = (path: string): string => {
     try { return realpathSync.native(path); } catch { return resolve(path); }
   };
-  const others = [...writeRoots, ...tempRoots].filter((root) => isAbsolute(root)).map(canonical);
+  const verifiedPinned = pinnedWriteRoots
+    .map((root) => verifyPinnedWriteRoot(root))
+    .filter((path): path is string => path !== undefined);
+  const others = [
+    ...verifiedPinned,
+    ...[...writeRoots, ...tempRoots].filter((root) => isAbsolute(root)).map(canonical),
+  ];
   return { cwd: canonical(cwd), others: [...new Set(others)] };
 }
 
@@ -814,15 +835,23 @@ function pathBelow(value: string, roots: readonly string[]): string | undefined 
   return undefined;
 }
 
-function classifyWritePath(value: string, cwd: string, writeRoots: readonly string[] = []): WritePathViolation | undefined {
+function classifyWritePath(
+  value: string,
+  cwd: string,
+  writeRoots: readonly string[] = [],
+  pinnedWriteRoots: readonly PinnedWriteRoot[] = [],
+): WritePathViolation | undefined {
   if (value.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return "git-metadata";
-  // A path inside an extra write root (Claude's own scratchpad or memory
-  // directory) is judged against that root instead of the cwd, with the same
-  // per-segment symlink and metadata rules. A root need not exist yet: Claude
-  // creates its memory directory on the first write, and failing closed there
-  // denied the very write the outside-cwd message points at. Each root is
-  // resolved once; the walk below never re-resolves it.
   if (isAbsolute(value)) {
+    for (const pinned of pinnedWriteRoots) {
+      const verified = verifyPinnedWriteRoot(pinned);
+      if (!verified) continue;
+      const below = pathBelow(value, [pinned.declared, verified]);
+      if (below === undefined) continue;
+      return walkWritePath(below, verified);
+    }
+    // Session write roots (Claude's own scratchpad or memory directory): may
+    // not exist yet on first write, resolved once before the per-segment walk.
     for (const root of writeRoots) {
       if (!isAbsolute(root)) continue;
       const resolvedRoot = resolveExistingPath(root);
@@ -872,12 +901,20 @@ function walkWritePath(relativePath: string, root: string): WritePathViolation |
     normalized.push(segment);
   }
   const absolute = join(root, ...normalized);
+  // Defense-in-depth: confirm the deepest existing ancestor of `absolute`
+  // resolves within `root` (and contains no `.git` segment).
+  const canonicalRoot = resolveExistingPath(root);
+  const resolvedAncestor = resolveExistingPath(absolute);
+  const rootPrefix = canonicalRoot === "/" ? "/" : `${canonicalRoot}/`;
+  if (resolvedAncestor !== canonicalRoot && !resolvedAncestor.startsWith(rootPrefix)) return "outside-cwd";
+  if (resolvedAncestor.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return "git-metadata";
   try {
     const info = statSync(absolute);
     // A regular file with multiple links may be an alias for a Git ref or
     // other metadata file even when its pathname contains no `.git` segment.
     if (info.isFile() && info.nlink > 1) return "git-metadata";
     const resolved = realpathSync.native(absolute);
+    if (resolved !== canonicalRoot && !resolved.startsWith(rootPrefix)) return "outside-cwd";
     if (resolved.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return "git-metadata";
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -2138,7 +2175,11 @@ export function isRoutinePermission(toolName: string, input: unknown, cwd: strin
     const command = input && typeof input === "object" && typeof (input as { command?: unknown }).command === "string"
       ? (input as { command: string }).command
       : "";
-    return command ? isRoutineShellCommand(command, cwd, options.writeRoots ?? []) : false;
+    const verifiedPinned = (options.pinnedWriteRoots ?? [])
+      .map((root) => verifyPinnedWriteRoot(root))
+      .filter((path): path is string => path !== undefined);
+    const allRoots = [...verifiedPinned, ...(options.writeRoots ?? [])];
+    return command ? isRoutineShellCommand(command, cwd, allRoots) : false;
   }
   // WebFetch, WebSearch, Task, mcp__* tools and any unrecognized tool name.
   return false;

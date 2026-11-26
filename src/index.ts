@@ -14,7 +14,8 @@ import { evaluateCommand } from "./policy.ts";
 import { HumanWebhookNotifier } from "./notifications.ts";
 import { autoInstallHooks, autonomyDefaults, closeWorkerOnCompletion, deadlineGraceMs, deadlineMs, deadlineWarningMs, decisionCompactionTokens, decisionModel, decisionSessionRetentionDays, eventLogMaxBytes, formatDurationMs, humanIdleResumeMs, loadSupervisorEnvironment, noOutputTimeoutMs, parseDurationMs, progressHeartbeatMs, reviewTimeoutMs, reviewerModel, tmuxMode, workerAutocompactTokens, workerMcpConfigPath, workerModel } from "./config.ts";
 import { DecisionSessionStore, type DecisionSessionRecord } from "./decision-session-store.ts";
-import { CwdLeaseStore, type CwdLeaseHandle, leaseOwnerLive, pathsOverlap, workerIdentity } from "./cwd-lease.ts";
+import { CwdLeaseStore, type CwdLeaseHandle, anyPathsOverlap, leaseOwnerLive, workerIdentity } from "./cwd-lease.ts";
+import { cleanupTaskTempRoot, pinWriteRoots, reverifyOrRecreateTaskTempRoot, reverifyPinnedWriteRoots, type PinnedWriteRoot } from "./write-roots.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import { PiReadOnlyReviewer } from "./reviewer.ts";
 import { resolvePiModel } from "./pi-model.ts";
@@ -194,21 +195,28 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
   const finishedSessions = new Map<string, { finishedAt: number; detail: string }>();
   const cwdLeases = new Map<string, CwdLeaseHandle>();
   const cleanupRequiredTasks = new Set<string>();
-  const reservedCwds = new Map<string, string>();
-  const pendingCwds = new Set<string>();
+  const reservedPathsByTask = new Map<string, string[]>();
+  const pendingPathsByTask = new Map<string, string[]>();
   const pendingStarts = new Set<Promise<void>>();
   const pendingStartSessions = new Set<Supervisor>();
   const unconfirmedSweepAttempts = new Map<string, number>();
+  const protectedWriteRootPaths = [stateDir, leaseDir, decisionStore.directory, hookSocketDirectory(stateDir)];
   let activeTaskId: string | undefined;
   let shuttingDown = false;
   let shutdownPromise: Promise<void> | undefined;
   let detachedLeaseSweepTimer: NodeJS.Timeout | undefined;
+
+  const allReservedPaths = (): string[] => [
+    ...[...pendingPathsByTask.values()].flat(),
+    ...[...reservedPathsByTask.values()].flat(),
+  ];
 
   const handleDecisionSessionClosed = async (taskId: string, info: DecisionSessionClosedInfo): Promise<void> => {
     const record = await decisionStore.load(taskId);
     if (!record || record.state !== "active") return;
     const terminal = info.reason === "completed" || info.reason === "human_stop";
     if (terminal && info.cleanupConfirmed) {
+      await cleanupTaskTempRoot(record.taskTempRoot).catch(() => {});
       await decisionStore.close(taskId);
       return;
     }
@@ -246,7 +254,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
       while (finishedSessions.size > MAX_FINISHED_SESSIONS) finishedSessions.delete(finishedSessions.keys().next().value!);
     }
     sessions.delete(taskId);
-    reservedCwds.delete(taskId);
+    reservedPathsByTask.delete(taskId);
     cleanupRequiredTasks.delete(taskId);
     unconfirmedSweepAttempts.delete(taskId);
     if (activeTaskId === taskId) activeTaskId = undefined;
@@ -392,12 +400,18 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           const specPath = takeOption(rest, "--spec");
           const deadlineOption = takeOption(rest, "--deadline");
           const remoteOption = takeOption(rest, "--remote");
+          const cliWriteRoots = takeRepeatedOption(rest, "--write-root");
           if (remoteOption !== undefined && !["none", "push", "pr"].includes(remoteOption)) throw new Error(`--remote expects none, push or pr: ${remoteOption}`);
           const taskDeadlineMs = deadlineOption === undefined ? deadlineMs() : parseTaskDeadline(deadlineOption);
           const tmuxSession = operation === "adopt-tmux" ? rest.shift() : undefined;
           const task = rest.join(" ").trim();
           const fileSpec = specPath ? await readTaskSpecFile(specPath, ctx.cwd) : undefined;
-          const spec = fileSpec ?? { autonomy: autonomyDefaults() };
+          const spec: Partial<Omit<TaskSpec, "autonomy">> & { autonomy: TaskSpec["autonomy"] } = fileSpec
+            ? { ...fileSpec }
+            : { autonomy: autonomyDefaults() };
+          if (cliWriteRoots.length > 0) {
+            spec.writeRoots = [...(spec.writeRoots ?? []), ...cliWriteRoots];
+          }
           // An explicit --remote overrides both the spec file and the env default.
           if (remoteOption) spec.autonomy = { ...spec.autonomy, remoteAuthority: remoteOption as "none" | "push" | "pr" };
           const goal = fileSpec?.goal ?? task;
@@ -408,7 +422,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           // own events through hooks exactly like an owned one.
           const taskAutomation = (operation !== "adopt-tmux" || tmuxMode() === "interactive") && automation && spec.autonomy.unattended;
           const interactive = taskAutomation && adapter.capabilities().transport === "tmux" && tmuxMode() === "interactive";
-          if (!goal) throw new Error(operation === "adopt-tmux" ? "Usage: /supervise adopt-tmux [--spec <file>] [--deadline <duration>] [--remote none|push|pr] <tmux-session> <task>" : "Usage: /supervise start [--spec <file>] [--deadline <duration>] [--remote none|push|pr] <task>");
+          if (!goal) throw new Error(operation === "adopt-tmux" ? "Usage: /supervise adopt-tmux [--spec <file>] [--deadline <duration>] [--remote none|push|pr] [--write-root <dir>] <tmux-session> <task>" : "Usage: /supervise start [--spec <file>] [--deadline <duration>] [--remote none|push|pr] [--write-root <dir>] <task>");
           if (operation === "adopt-tmux" && adapter.capabilities().transport !== "tmux") throw new Error("/supervise adopt-tmux requires PI_CLAUDE_SUPERVISOR_TRANSPORT=tmux");
           if (operation === "adopt-tmux" && interactive && !await userHooksInstalled(claudeUserSettingsPath())) {
             await hookServerReady?.catch(() => {});
@@ -425,15 +439,20 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           const reviewer = taskAutomation ? await getReviewer() : undefined;
           if (shuttingDown) throw new Error("Pi session is shutting down");
           const cwdKey = await canonicalCwd(ctx.cwd);
+          // Pin declared writeRoots first so the lease, in-process reservation,
+          // and Supervisor policy all operate on the exact same canonical roots.
+          const pinnedWriteRoots = pinWriteRoots(spec.writeRoots ?? [], cwdKey, { protectedPaths: protectedWriteRootPaths });
+          const canonicalRoots = pinnedWriteRoots.map((root) => root.canonical);
+          const taskPaths = [cwdKey, ...canonicalRoots];
           await releaseSettledReservations();
           if (shuttingDown) throw new Error("Pi session is shutting down");
-          const reservedPaths = [...pendingCwds, ...reservedCwds.values()];
-          if (reservedPaths.some((reserved) => pathsOverlap(reserved, cwdKey))) {
-            throw new Error("An active, starting, or unreaped worker uses an overlapping cwd; use a separate worktree for concurrent sessions");
+          if (anyPathsOverlap(allReservedPaths(), taskPaths)) {
+            throw new Error("An active, starting, or unreaped worker uses an overlapping cwd or writeRoot; use separate directories for concurrent sessions");
           }
           const taskId = randomUUID();
           const lease = await cwdLeaseStore.acquire(cwdKey, taskId, adapter.capabilities().transport, {
             startup: taskAutomation,
+            ...(canonicalRoots.length > 0 ? { roots: canonicalRoots } : {}),
             ...(tmuxSession ? { handoff: { sessionName: tmuxSession, tmuxSocket: process.env.PI_CLAUDE_SUPERVISOR_TMUX_SOCKET } } : {}),
           });
           cwdLeases.set(taskId, lease);
@@ -441,7 +460,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             await releaseLease(taskId);
             throw new Error("Pi session is shutting down");
           }
-          pendingCwds.add(cwdKey);
+          pendingPathsByTask.set(taskId, taskPaths);
           const session = new Supervisor(adapter, events, {
             reviewer,
             reviewTimeoutMs: reviewTimeoutMs(),
@@ -472,6 +491,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 onProgress: progress(ctx),
                 task: goal,
                 spec,
+                pinnedWriteRoots,
+                protectedWriteRootPaths,
                 cwd: cwdKey,
                 command,
                 args: workerArgs,
@@ -557,6 +578,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                     ...(info.baseBranch ? { baseBranch: info.baseBranch } : {}),
                     ...(info.remoteBaseline ? { remoteBaseline: info.remoteBaseline } : {}),
                     ...(info.resolvedExecutable ? { resolvedExecutable: info.resolvedExecutable } : {}),
+                    ...(info.pinnedWriteRoots && info.pinnedWriteRoots.length > 0 ? { pinnedWriteRoots: info.pinnedWriteRoots } : {}),
+                    ...(info.taskTempRoot ? { taskTempRoot: info.taskTempRoot } : {}),
                     turn: info.turn,
                     repairRound: info.repairRound,
                     ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}),
@@ -599,18 +622,18 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
               // Register immediately after spawn so shutdown can retry cleanup if
               // the first stop attempt fails.
               sessions.set(startedTaskId, session);
-              reservedCwds.set(startedTaskId, cwdKey);
+              reservedPathsByTask.set(startedTaskId, taskPaths);
               activeTaskId = startedTaskId;
               if (shuttingDown) {
                 try {
                   await stopSession(session, "Pi session shutdown during worker start", true, true);
                   sessions.delete(startedTaskId);
-                  reservedCwds.delete(startedTaskId);
+                  reservedPathsByTask.delete(startedTaskId);
                 } finally {
                   if (session.state !== "stopped") {
                     // Keep the session registered for the shutdown retry below.
                     sessions.set(startedTaskId, session);
-                    reservedCwds.set(startedTaskId, cwdKey);
+                    reservedPathsByTask.set(startedTaskId, taskPaths);
                   }
                 }
                 throw new Error("Pi session shut down during worker start");
@@ -627,13 +650,15 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 && (cleanupRequired || session.handle.ownership === "adopted");
               if (retainHandle) {
                 sessions.set(failedTaskId, session);
-                reservedCwds.set(failedTaskId, cwdKey);
+                reservedPathsByTask.set(failedTaskId, taskPaths);
                 activeTaskId = failedTaskId;
               } else if (!cleanupRequired && !startupCleanupCompleted) {
                 const released = await releaseLease(taskId);
-                if (!released && failedTaskId) {
+                if (released) {
+                  startupCleanupCompleted = true;
+                } else if (failedTaskId) {
                   sessions.set(failedTaskId, session);
-                  reservedCwds.set(failedTaskId, cwdKey);
+                  reservedPathsByTask.set(failedTaskId, taskPaths);
                   activeTaskId = failedTaskId;
                 }
               }
@@ -653,13 +678,15 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
               && (cleanupRequired || session.handle.ownership === "adopted");
             if (retainHandle) {
               sessions.set(failedTaskId, session);
-              reservedCwds.set(failedTaskId, cwdKey);
+              reservedPathsByTask.set(failedTaskId, taskPaths);
               activeTaskId = failedTaskId;
             } else if (!cleanupRequired && !startupCleanupCompleted) {
               const released = await releaseLease(taskId);
-              if (!released && failedTaskId) {
+              if (released) {
+                startupCleanupCompleted = true;
+              } else if (failedTaskId) {
                 sessions.set(failedTaskId, session);
-                reservedCwds.set(failedTaskId, cwdKey);
+                reservedPathsByTask.set(failedTaskId, taskPaths);
                 activeTaskId = failedTaskId;
               }
             }
@@ -667,10 +694,12 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           } finally {
             pendingStarts.delete(startOperation);
             pendingStartSessions.delete(session);
-            pendingCwds.delete(cwdKey);
+            pendingPathsByTask.delete(taskId);
           }
         } else if (operation === "recover") {
           const usage = "Usage: /supervise recover [--takeover] [--extend <duration>] <task-id>";
+          const cliWriteRoots = takeRepeatedOption(rest, "--write-root", ["--takeover"]);
+          if (cliWriteRoots.length > 0) throw new Error("--write-root cannot be changed during recovery; recovery reuses the persisted writeRoots");
           const extendOption = takeOption(rest, "--extend", ["--takeover"]);
           const takeover = rest.includes("--takeover");
           const taskId = rest.find((value) => value !== "--takeover");
@@ -697,11 +726,20 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             throw new Error(`Cannot recover task after its wall-clock deadline (${formatDurationMs(elapsedMs - recoveryDeadlineMs)} ago); pass --extend <duration> to grant a close-out budget from now, or /supervise discard ${taskId} to drop the record`);
           }
           const cwdKey = await canonicalCwd(record.cwd);
+          const pinnedWriteRoots: PinnedWriteRoot[] = record.pinnedWriteRoots && record.pinnedWriteRoots.length > 0
+            ? reverifyPinnedWriteRoots(record.pinnedWriteRoots, cwdKey, { protectedPaths: protectedWriteRootPaths })
+            : (record.spec?.writeRoots && record.spec.writeRoots.length > 0
+              ? pinWriteRoots(record.spec.writeRoots, cwdKey, { protectedPaths: protectedWriteRootPaths })
+              : []);
+          const canonicalRoots = pinnedWriteRoots.map((root) => root.canonical);
+          const taskPaths = [cwdKey, ...canonicalRoots];
+          const taskTempRoot = record.taskTempRoot
+            ? await reverifyOrRecreateTaskTempRoot(record.taskTempRoot, record.taskId)
+            : undefined;
           await releaseSettledReservations();
           if (shuttingDown) throw new Error("Pi session is shutting down");
-          const reservedPaths = [...pendingCwds, ...reservedCwds.values()];
-          if (reservedPaths.some((reserved) => pathsOverlap(reserved, cwdKey))) {
-            throw new Error("An active, starting, or unreaped worker uses an overlapping cwd; use a separate worktree for recovery");
+          if (anyPathsOverlap(allReservedPaths(), taskPaths)) {
+            throw new Error("An active, starting, or unreaped worker uses an overlapping cwd or writeRoot; use separate directories for recovery");
           }
           const policy = evaluateCommand(record.command, record.args);
           if (policy.decision === "deny") throw new Error(`Worker command denied: ${policy.reason}`);
@@ -719,6 +757,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           const approval = record.approval;
           const lease = await cwdLeaseStore.acquire(cwdKey, record.taskId, adapter.capabilities().transport, {
             startup: automaticRecovery,
+            ...(canonicalRoots.length > 0 ? { roots: canonicalRoots } : {}),
             ...(takeover ? {
               takeover: {
                 taskId: record.taskId,
@@ -741,7 +780,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             await releaseLease(record.taskId);
             throw error;
           }
-          pendingCwds.add(cwdKey);
+          pendingPathsByTask.set(record.taskId, taskPaths);
           const session = new Supervisor(adapter, events, {
             reviewer,
             reviewTimeoutMs: reviewTimeoutMs(),
@@ -840,6 +879,9 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 initialRepairRound: record.repairRound,
                 initialFindingSignature: record.lastFindingSignature,
                 initialWorkerCostUsd: record.workerCostUsd,
+                pinnedWriteRoots,
+                ...(taskTempRoot ? { taskTempRoot } : {}),
+                protectedWriteRootPaths,
                 decisionSessionFile: record.decisionSessionFile,
                 decisionSessionDir: decisionStore.directory,
                 onDecisionSessionReady: async (info) => {
@@ -862,6 +904,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                     ...(info.baseBranch ? { baseBranch: info.baseBranch } : {}),
                     ...(info.remoteBaseline ? { remoteBaseline: info.remoteBaseline } : {}),
                     ...(info.resolvedExecutable ? { resolvedExecutable: info.resolvedExecutable } : {}),
+                    ...(info.pinnedWriteRoots && info.pinnedWriteRoots.length > 0 ? { pinnedWriteRoots: info.pinnedWriteRoots } : {}),
+                    ...(info.taskTempRoot ? { taskTempRoot: info.taskTempRoot } : {}),
                     turn: info.turn,
                     repairRound: info.repairRound,
                     ...(info.lastFindingSignature ? { lastFindingSignature: info.lastFindingSignature } : {}),
@@ -894,7 +938,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 throw new Error("Recovered Worker registration was not durably confirmed");
               }
               sessions.set(record.taskId, session);
-              reservedCwds.set(record.taskId, cwdKey);
+              reservedPathsByTask.set(record.taskId, taskPaths);
               activeTaskId = record.taskId;
               await session.takeover();
               await decisionStore.markRecoveryIdle(record.taskId);
@@ -961,12 +1005,12 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
                 } else {
                   cleanupRequiredTasks.add(record.taskId);
                   sessions.set(record.taskId, session);
-                  reservedCwds.set(record.taskId, cwdKey);
+                  reservedPathsByTask.set(record.taskId, taskPaths);
                   activeTaskId = record.taskId;
                 }
               } else {
                 sessions.set(record.taskId, session);
-                reservedCwds.set(record.taskId, cwdKey);
+                reservedPathsByTask.set(record.taskId, taskPaths);
                 activeTaskId = record.taskId;
               }
               throw error;
@@ -978,7 +1022,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           } finally {
             pendingStarts.delete(recoveryOperation);
             pendingStartSessions.delete(session);
-            pendingCwds.delete(cwdKey);
+            pendingPathsByTask.delete(record.taskId);
           }
         } else if (operation === "discard") {
           const [taskId, ...extra] = rest;
@@ -1005,6 +1049,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             }
             throw new Error(`Task still holds the cwd lease for ${redactText(lease.cwd)} (owner pid ${lease.ownerPid} is gone); run /supervise recover --takeover --extend 0 ${taskId} to prove the old Worker is gone and close the task out, then stop it if needed`);
           }
+          await cleanupTaskTempRoot(record.taskTempRoot).catch(() => {});
           await decisionStore.close(taskId);
           message = `Discarded recoverable task ${taskId} (cwd ${redactText(record.cwd)}); its Decision Worker session file is kept until retention pruning`;
         } else if (operation === "sessions") {
@@ -1183,6 +1228,26 @@ function takeOption(rest: string[], name: string, flags: readonly string[] = [])
   }
   const inline = rest.findIndex((value) => value.startsWith(`${name}=`));
   return inline >= 0 ? rest.splice(inline, 1)[0]?.slice(name.length + 1) : undefined;
+}
+
+function takeRepeatedOption(rest: string[], name: string, flags: readonly string[] = []): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < rest.length && rest[index].startsWith("--"); ) {
+    if (rest[index] === name) {
+      const value = rest.splice(index, 2)[1];
+      if (!value) throw new Error(`${name} requires a value`);
+      values.push(value);
+      continue;
+    }
+    if (rest[index].startsWith(`${name}=`)) {
+      const value = rest.splice(index, 1)[0]!.slice(name.length + 1);
+      if (!value) throw new Error(`${name} requires a value`);
+      values.push(value);
+      continue;
+    }
+    index += (!flags.includes(rest[index]) && !rest[index].includes("=")) ? 2 : 1;
+  }
+  return values;
 }
 
 /** `--deadline` accepts `8h`, `90m`, `2h30m`, plain milliseconds, or `0` to disable the deadline for this task; the same 5m–7d range as `DEADLINE_MS`. */
