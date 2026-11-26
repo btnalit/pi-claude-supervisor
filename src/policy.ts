@@ -556,11 +556,11 @@ function writeFloorScript(
     let first = 0;
     while (first < words.length && (FLOOR_KEYWORDS.has(words[first]!.value) || /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[first]!.value))) first += 1;
 
-    // Detect `CDPATH` / `cdable_vars` OR indirect parameter expansion (`${!...}`,
-    // which in bash can assign `CDPATH` dynamically even with nested braces like
-    // `${!x[${#}]:=$HOME}`) across ALL non-operator, non-data tokens — including
-    // input-redirect targets like `<${!x:=$HOME}` that `segmentWords` drops.
-    if (segment.tokens.some((t) => !t.operator && !t.data && (/\b(?:CDPATH|cdable_vars)\b/u.test(t.value) || /\$\{!/u.test(t.value)))) {
+    // Detect `CDPATH` / `cdable_vars` (without `\b` anchors so attached forms like
+    // `read -aCDPATH` or `printf -vCDPATH` are caught) OR indirect parameter expansion
+    // (`${!...}`) across ALL non-operator, non-data tokens — including input-redirect
+    // targets like `<${!x:=$HOME}` that `segmentWords` drops.
+    if (segment.tokens.some((t) => !t.operator && !t.data && (/CDPATH|cdable_vars/u.test(t.value) || /\$\{!/u.test(t.value)))) {
       globalCwdUnknown = true;
       possibleDirs.add(undefined);
       allSeenDirs.add(undefined);
@@ -621,6 +621,10 @@ function writeFloorScript(
       const hasNameref = WRITE_FLOOR_NAMEREF_BUILTINS.has(cmdWord)
         && restWords.some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*n/u.test(w.value));
       const hasDynamicName = restWords.some((w) => {
+        if (cmdWord === "read" && !w.value.startsWith("--")) {
+          const attachedArray = /^-[A-Za-z]*a(.+)$/u.exec(w.value);
+          if (attachedArray && /[$`*?[\]{}~]/u.test(attachedArray[1]!)) return true;
+        }
         if (w.value.startsWith("-") && cmdWord !== "let") return false;
         const eq = w.value.indexOf("=");
         const varName = eq >= 0 ? w.value.slice(0, eq) : w.value;
