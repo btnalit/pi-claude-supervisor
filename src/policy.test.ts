@@ -4,7 +4,7 @@ import { link, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { assertSafeWorkerCommand, deleteFloorViolation, evaluateCommand, evaluatePermission, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, sameDirectory, shellQuote } from "./policy.ts";
+import { assertSafeWorkerCommand, deleteFloorViolation, evaluateCommand, evaluatePermission, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, sameDirectory, shellQuote, writeFloorViolation } from "./policy.ts";
 import { createTaskTempRoot, pinWriteRoots } from "./write-roots.ts";
 
 function bash(command: string) {
@@ -1655,5 +1655,136 @@ test("D5 checks sensitive commands in command position only, unwraps literal tim
     "find . -exec echo \"$X\" {} +",
   ]) {
     assert.equal(evaluateCommand(cmd).decision, "deny", `D5 expected deny: ${cmd}`);
+  }
+});
+
+test("Write Floor v1 (#55-3) blocks out-of-R and .git writes across redirects, tee, cp/install/ln, worktree add/move, and nested shells while allowing in-R writes", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-write-floor-"));
+  const repo = join(base, "repo");
+  const sub = join(repo, "packages", "app");
+  const shared = join(repo, "packages", "shared");
+  const lane = join(base, "lane-a");
+  const outside = join(base, "outside");
+  const taskTmp = await createTaskTempRoot("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+  try {
+    await Promise.all([
+      mkdir(join(repo, ".git", "hooks"), { recursive: true }),
+      mkdir(sub, { recursive: true }),
+      mkdir(shared, { recursive: true }),
+      mkdir(lane, { recursive: true }),
+      mkdir(outside, { recursive: true }),
+    ]);
+    await writeFile(join(repo, "a.txt"), "a\n");
+    await writeFile(join(repo, ".git", "HEAD"), "ref: refs/heads/main\n");
+    await writeFile(join(shared, "util.ts"), "export const u = 1;\n");
+    await symlink(outside, join(repo, "escape-link"));
+
+    const pinned = pinWriteRoots([lane], repo);
+    const opts = { pinnedWriteRoots: [...pinned, taskTmp], tempRoots: [taskTmp.canonical] };
+    const judge = (command: string) => writeFloorViolation(command, repo, opts);
+
+    // Allowed in-R writes, safe device sinks, fd duplications, quoted heredoc bodies, and unresolvable dynamic targets.
+    for (const cmd of [
+      "echo hi > notes.txt",
+      "echo hi >> packages/app/out.log",
+      "echo hi >| dist.txt",
+      "echo hi &> build.log",
+      "echo hi &>> build.log",
+      "echo hi 2>&1 | tail -5",
+      "echo hi >&2",
+      "echo hi >&-",
+      "echo hi > /dev/null",
+      "echo hi > /dev/stderr",
+      "echo hi > /dev/fd/2",
+      `echo hi > ${lane}/file.ts`,
+      "echo hi > \"$TMPDIR/out.log\"",
+      "S=$(mktemp -d); echo hi > \"$S/out.log\"",
+      "cat > notes.md <<'EOF'\necho pwn > /etc/passwd\nEOF",
+      "[[ a > b ]] && echo ok",
+      "(( 5 > 3 )) && echo ok",
+      "echo hi > .github/workflows/ci.yml",
+      "echo hi > .gitignore",
+      "echo hi > \"$UNKNOWN_OUT\"",
+      "tee out.log",
+      "tee -a -",
+      `tee ${lane}/out.log`,
+      "cp a.txt \"$PWD\"",
+      "cp a.txt packages/app/b.txt",
+      `cp a.txt ${lane}/b.txt`,
+      "install -d packages/app/newdir",
+      "install -m 0755 a.txt packages/app/a.txt",
+      "ln -s ../shared/util.ts packages/app/util.ts",
+      "ln a.txt b-hard.txt",
+      `git worktree add ${lane}/wt -b feat/wt`,
+    ]) {
+      assert.equal(judge(cmd), undefined, `Write Floor expected allow: ${cmd}`);
+    }
+
+    // Denied out-of-R writes, .git pointer/metadata overwrites, escaping symlinks/hardlinks, worktree escapes, and nested writes.
+    for (const cmd of [
+      `echo pwn > ${outside}/pwn.txt`,
+      `echo pwn >> ${outside}/pwn.txt`,
+      `echo pwn >| ${outside}/pwn.txt`,
+      `echo pwn &> ${outside}/pwn.txt`,
+      `echo pwn &>> ${outside}/pwn.txt`,
+      `echo pwn <> ${outside}/pwn.txt`,
+      `echo pwn >&${outside}/pwn.txt`,
+      `echo pwn 2>${outside}/pwn.txt`,
+      `echo>${outside}/pwn.txt`,
+      `> ${outside}/pwn.txt echo pwn`,
+      `exec > ${outside}/pwn.txt`,
+      `cat <<'EOF' > ${outside}/pwn.txt\nhi\nEOF`,
+      "echo pwn > .git/config",
+      "echo pwn > .git/hooks/pre-commit",
+      `echo 'gitdir: /tmp/evil' > ${lane}/.git`,
+      "echo pwn > ~/pwn.txt",
+      "HOME=/tmp/x echo pwn > ~/pwn.txt",
+      "echo pwn > escape-link/pwn.txt",
+      "echo pwn > escape-link/../pwn.txt",
+      "(cd packages/app); echo pwn > ../pwn.txt",
+      `(cd ${outside} && echo pwn > inner.txt)`,
+      `echo hi | tee ${outside}/pwn.txt`,
+      "echo hi | tee -a .git/config",
+      `env -C ${outside} tee pwn.txt`,
+      `sudo -u root tee ${outside}/pwn.txt`,
+      `timeout 10 tee ${outside}/pwn.txt`,
+      `find . -exec cp {} ${outside}/ \\;`,
+      `cp a.txt ${outside}/pwn.txt`,
+      `cp -t ${outside} a.txt`,
+      `cp -rt${outside} a.txt`,
+      `cp --targ=${outside} a.txt`,
+      "cp -T a.txt \"$PWD\"",
+      "cp a.txt .git/config",
+      `cp a.txt ${lane}/.git`,
+      `install -d ${outside}/newdir`,
+      `install -m 0755 a.txt ${outside}/a.txt`,
+      `ln -s ${outside}/target link`,
+      "ln -s ../../../outside/target packages/app/link",
+      "ln -s .git/hooks h",
+      `ln -sf a.txt ${outside}/link`,
+      "ln -snf a.txt \"$PWD\"",
+      `ln ${outside}/src ./hard`,
+      "ln .git/HEAD ./hard",
+      `cp -l ${outside}/src ./hard`,
+      `git worktree add ${outside}/wt`,
+      "git worktree add -b feat ../escape HEAD",
+      "git worktree add --orphan -b feat ../escape",
+      "git -C packages -C app worktree add ../../../escape",
+      `git worktree move wt ${outside}/moved-wt`,
+      `sh -c 'echo x > ${outside}/pwn.txt'`,
+      `echo "$(tee ${outside}/pwn.txt)"`,
+      `echo hi > >(tee ${outside}/pwn.txt)`,
+    ]) {
+      assert.ok(judge(cmd), `Write Floor expected deny: ${cmd}`);
+      assert.equal(evaluatePermission("Bash", bash(cmd), repo, opts).decision, "deny", `evaluatePermission expected deny: ${cmd}`);
+    }
+
+    // Swapping pinned root with a symlink invalidates writes to it immediately.
+    await rm(lane, { recursive: true, force: true });
+    await symlink(outside, lane);
+    assert.ok(judge(`echo pwn > ${lane}/escape.ts`));
+  } finally {
+    await rm(taskTmp.canonical, { recursive: true, force: true }).catch(() => {});
+    await rm(base, { recursive: true, force: true });
   }
 });
