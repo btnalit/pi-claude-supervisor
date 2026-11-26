@@ -551,9 +551,11 @@ function writeFloorScript(
     let first = 0;
     while (first < words.length && (FLOOR_KEYWORDS.has(words[first]!.value) || /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[first]!.value))) first += 1;
 
-    // Detect `CDPATH` / `cdable_vars` OR indirect parameter assignment (`${!x:=...}`,
-    // which in bash can assign `CDPATH` dynamically) anywhere in non-heredoc words.
-    if (words.some((w) => /\b(?:CDPATH|cdable_vars)\b/u.test(w.value) || /\$\{![^}]*[:?]?=/u.test(w.value))) {
+    // Detect `CDPATH` / `cdable_vars` OR indirect parameter expansion (`${!...}`,
+    // which in bash can assign `CDPATH` dynamically even with nested braces like
+    // `${!x[${#}]:=$HOME}`) across ALL non-operator, non-data tokens — including
+    // input-redirect targets like `<${!x:=$HOME}` that `segmentWords` drops.
+    if (segment.tokens.some((t) => !t.operator && !t.data && (/\b(?:CDPATH|cdable_vars)\b/u.test(t.value) || /\$\{!/u.test(t.value)))) {
       globalCwdUnknown = true;
       possibleDirs.add(undefined);
       allSeenDirs.add(undefined);
@@ -655,25 +657,35 @@ function writeFloorScript(
           inCmdPos = true;
           continue;
         }
-        // Unspaced `case` arm (`x)cd`, `"x")cd`, `x)$(printf …)`, `x)mapfile`, `x)declare`):
-        // an unquoted `)` mid-token starts a new command immediately after it.
+        // Unspaced `case` arm (`x)cd`, `"x)")cd`, `x|\))cd`, `$(echo x))cd`, `x)$(printf …)`):
+        // check the command text after EVERY `)` in `rawVal` (pattern itself may contain `)`).
         if (rawVal.includes(")")) {
-          const afterParen = rawVal.slice(rawVal.indexOf(")") + 1).replace(/^[({]+|[});]+$/gu, "");
-          if (afterParen) {
+          let matchedWrapper = false;
+          let matchedDanger = false;
+          for (const piece of rawVal.split(")").slice(1)) {
+            const afterParen = piece.replace(/^[({]+|[});]+$/gu, "");
+            if (!afterParen) continue;
             if (afterParen === "cd" || afterParen === "pushd" || afterParen === "popd"
               || WRITE_FLOOR_DEFERRED_BUILTINS.has(afterParen)
               || /[$`*?[\]{}]/u.test(afterParen)
               || ((afterParen === "mapfile" || afterParen === "readarray") && words.slice(wi + 1).some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*C/u.test(w.value)))
               || (WRITE_FLOOR_NAMEREF_BUILTINS.has(afterParen) && words.slice(wi + 1).some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*n/u.test(w.value)))) {
-              globalCwdUnknown = true;
-              possibleDirs.add(undefined);
-              allSeenDirs.add(undefined);
+              matchedDanger = true;
               break;
             }
             if (afterParen === "builtin" || afterParen === "command" || afterParen === "time") {
-              inCmdPos = true;
-              continue;
+              matchedWrapper = true;
             }
+          }
+          if (matchedDanger) {
+            globalCwdUnknown = true;
+            possibleDirs.add(undefined);
+            allSeenDirs.add(undefined);
+            break;
+          }
+          if (matchedWrapper) {
+            inCmdPos = true;
+            continue;
           }
         }
         if (inCmdPos && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(rawVal)) continue;

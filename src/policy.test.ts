@@ -1711,6 +1711,8 @@ test("Write Floor v1 (#55-3) blocks out-of-R and .git writes across redirects, t
       "cd packages/app && echo hi > ../out.txt",
       "S=packages && export NEXTTIME_DATA=\"$S/app\" && echo hi > notes.txt",
       "if true; then git add .; fi; echo ok > notes.txt",
+      "export -n FOO && echo ok > notes.txt",
+      "read -n 1 v <<< x && echo ok > notes.txt",
       "echo hi > \"$UNKNOWN_OUT\"",
       "tee out.log",
       "tee -a -",
@@ -1919,6 +1921,14 @@ test("Write Floor v1 (#55-3) blocks out-of-R and .git writes across redirects, t
       "case x in x)$(printf '\\143\\144') ~;; esac; echo evil >> .bashrc",
       "case x in \"x\") $(printf '\\143\\144') ~;; esac; echo evil >> .bashrc",
       "x=CD$(printf PATH); : ${!x:=$HOME}; cd .ssh; echo k >> authorized_keys",
+      // Opus 5.5 round-8 adversarial repros (multi-`)` case arm patterns, input-redirect `${!x:=...}` / `CDPATH`, unspaced mapfile/declare):
+      "case \"x)\" in \"x)\")cd ~;; esac; echo evil >> .bashrc",
+      "case x in x|\\))cd ~;; esac; echo evil >> .bashrc",
+      "case $(echo x) in $(echo x))cd ~;; esac; echo evil >> .bashrc",
+      "case x in x)mapfile -C 'cd ..;:' -c 1 a <<< x;; esac; echo evil >> pwn.txt",
+      "case x in x)declare -n r=$x;; esac; r=$HOME; cd .ssh; echo k >> authorized_keys",
+      "x=CD$(printf PATH); : <${!x:=$HOME}; cd .ssh; echo k >> authorized_keys",
+      ": <${CDPATH:=$HOME}; cd .ssh; echo k >> authorized_keys",
     ]) {
       assert.ok(judge(cmd), `Write Floor expected deny: ${cmd}`);
       assert.equal(evaluatePermission("Bash", bash(cmd), repo, opts).decision, "deny", `evaluatePermission expected deny: ${cmd}`);
