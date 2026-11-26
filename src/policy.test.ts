@@ -1706,6 +1706,8 @@ test("Write Floor v1 (#55-3) blocks out-of-R and .git writes across redirects, t
       "echo hi > .gitignore",
       "echo cd; echo hi > notes.txt",
       "until [ -n \"$(grep -l 'err' a.txt 2>/dev/null)\" ]; do sleep 1; done",
+      "cd packages/app && echo hi > ../out.txt",
+      "S=packages && export NEXTTIME_DATA=\"$S/app\" && echo hi > notes.txt",
       "echo hi > \"$UNKNOWN_OUT\"",
       "tee out.log",
       "tee -a -",
@@ -1861,6 +1863,37 @@ test("Write Floor v1 (#55-3) blocks out-of-R and .git writes across redirects, t
       `cd ${sub} & echo evil >> ../outside/pwn.txt`,
       `false && cd ${sub}; echo evil >> ../outside/pwn.txt`,
       `cd ${repo}/nope; echo evil >> ../outside/pwn.txt`,
+      // Opus 5.5 round-4 + Advisor adversarial repros:
+      // P0-1: conditional/loop/case/fn `cd` must NOT replace possibleDirs
+      `if false; then cd ${sub}; fi; echo evil >> ../../pwn.txt`,
+      `case y in x) true; cd ${sub};; esac; echo evil >> ../../pwn.txt`,
+      `while false; do cd ${sub}; done; echo evil >> ../../pwn.txt`,
+      `f(){ true; cd ${sub}; }; echo evil >> ../../pwn.txt`,
+      // P0-2: statement operator `;` inside `$(...)` must NOT drop subshell tracking
+      `(x=$(true; true); cd ${sub}); echo evil >> ../../pwn.txt`,
+      // P0-3: `time -p cd`, `command -p cd`, later `case` arm, `(case ...)`
+      "time -p cd ~; echo evil >> .bashrc",
+      "command -p cd ~; echo evil >> .bashrc",
+      "case x in y) ;; x) cd ~;; esac; echo evil >> .bashrc",
+      "(case x in x) cd ~;; esac; echo evil >> .bashrc)",
+      // P0-4: single-quoted `$(...)` and multiple `$(a) $(b)` inside `trap`/`watch`
+      `trap '$(cp a.txt ${outside}/pwn.txt)' EXIT`,
+      `trap '$(true) $(cp a.txt ${outside}/pwn.txt)' EXIT`,
+      `watch '$(cp a.txt ${outside}/pwn.txt)'`,
+      // P0-5: deferred bodies (`trap`, function, loop) combined with later `cd`
+      "trap 'echo evil >> .bashrc' EXIT; cd ~",
+      "f(){ echo evil >> .bashrc; }; cd ~; f",
+      "for i in 1 2; do echo x >> pwn.txt; cd ..; done",
+      // P1 + Advisor: CDPATH / cdable_vars / deferred eval/source/alias / redirect before cd / mutating pre-cd
+      "export CDPATH=$HOME; cd .ssh; echo k >> authorized_keys",
+      "export CD''PATH=$HOME; cd .ssh; echo k >> authorized_keys",
+      "declare $V=$HOME; cd .ssh; echo k >> authorized_keys",
+      "shopt -s cdable_vars; h=$HOME; cd h; echo k >> .bashrc",
+      "trap 'cd ~' DEBUG; echo x >> .bashrc",
+      "eval 'cd ~'; echo x >> .bashrc",
+      "source x.sh; echo x >> .bashrc",
+      "2>/dev/null cd ~; echo x >> .bashrc",
+      `chmod -x ${sub}; cd ${sub}; echo evil >> ../../pwn.txt`,
     ]) {
       assert.ok(judge(cmd), `Write Floor expected deny: ${cmd}`);
       assert.equal(evaluatePermission("Bash", bash(cmd), repo, opts).decision, "deny", `evaluatePermission expected deny: ${cmd}`);
