@@ -833,9 +833,9 @@ function parseDecision(text: string, event: WorkerEvent): DecisionAction {
     const allowed = new Set(["continue", "redirect", "answer", "allow_permission", "deny_permission", "verify", "retry", "stop", "park", "ask_human", "noop", "wait"]);
     if (!allowed.has(action)) throw new Error(`unsupported action: ${action}`);
     const reason = typeof value.reason === "string" && value.reason.trim() ? boundedDecisionText(value.reason, "reason") : "no reason provided";
-    const confidence = value.confidence === undefined ? undefined : typeof value.confidence === "number" && Number.isFinite(value.confidence) && value.confidence >= 0 && value.confidence <= 1
-      ? value.confidence
-      : (() => { throw new Error("confidence must be a finite number between 0 and 1"); })();
+    const confidence = value.confidence === undefined ? undefined : typeof value.confidence === "number" && Number.isFinite(value.confidence)
+      ? Math.min(1, Math.max(0, value.confidence))
+      : (() => { throw new Error("confidence must be a finite number"); })();
     if (["continue", "redirect", "answer"].includes(action)) {
       if (typeof value.message !== "string" || !value.message.trim()) throw new Error("message required");
       return { action: action as "continue" | "redirect" | "answer", message: boundedDecisionText(value.message, "message"), reason, confidence };
@@ -856,9 +856,26 @@ function parseDecision(text: string, event: WorkerEvent): DecisionAction {
   }
 }
 
-function boundedDecisionText(value: string, field: string): string {
-  if (Buffer.byteLength(value, "utf8") > MAX_DECISION_FIELD_BYTES) throw new Error(`${field} exceeds ${MAX_DECISION_FIELD_BYTES} bytes`);
-  return value;
+function boundedDecisionText(value: string, _field: string): string {
+  if (Buffer.byteLength(value, "utf8") <= MAX_DECISION_FIELD_BYTES) return value;
+  const trimmed = value.trim();
+  if (Buffer.byteLength(trimmed, "utf8") <= MAX_DECISION_FIELD_BYTES) return trimmed;
+  return truncateUtf8Bytes(trimmed, MAX_DECISION_FIELD_BYTES);
+}
+
+function truncateUtf8Bytes(value: string, maxBytes: number): string {
+  const suffix = "…";
+  const suffixBytes = Buffer.byteLength(suffix, "utf8");
+  const budget = Math.max(0, maxBytes - suffixBytes);
+  let bytes = 0;
+  let end = 0;
+  for (const ch of value) {
+    const chBytes = Buffer.byteLength(ch, "utf8");
+    if (bytes + chBytes > budget) break;
+    bytes += chBytes;
+    end += ch.length;
+  }
+  return `${value.slice(0, end)}${suffix}`;
 }
 
 function eventKey(event: WorkerEvent): string {

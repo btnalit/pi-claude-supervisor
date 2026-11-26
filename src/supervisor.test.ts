@@ -1638,8 +1638,61 @@ test("unexpected exit notifies a failed candidate in automation mode", async () 
   assert.equal(candidates[0]?.status, "failed");
 });
 
-test("noop on a completed turn parks the candidate", async () => {
-  const handle: WorkerHandle = { id: "noop-turn-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+test("noop on a completed turn overrides to verify instead of parking", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-noop-turn-"));
+  try {
+    await initializeGitRepository(cwd, "worker/noop-turn");
+    const handle: WorkerHandle = { id: "noop-turn-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let running = true;
+    let reviews = 0;
+    let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+    let eventListener: WorkerStartInput["eventListener"] | undefined;
+    const events = new FlakyEventLog("never-fail");
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "jsonl", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true }),
+      start: async (input) => { eventListener = input.eventListener; return handle; },
+      getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      stop: async () => { running = false; },
+      killProcessGroup: async () => { running = false; },
+      resumeSession: async () => handle,
+    };
+    const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+      reviewer: { review: async () => { reviews += 1; return { verdict: "pass" as const, summary: "ok", findings: [], round: 0, checkedAt: new Date().toISOString() }; } },
+    });
+    await supervisor.start({
+      task: "noop turn",
+      cwd,
+      command: "claude",
+      automation: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      spec: {
+        autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 },
+        acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 2_000 }],
+      },
+      decisionWorkerFactory: (options) => { onAction = options.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+    });
+    const turn: WorkerEvent = { type: "turn_completed", handle, result: {}, sequence: 1 };
+    eventListener?.(turn);
+    await supervisor.poll();
+    await onAction?.({ action: "noop", reason: "nothing to do" }, turn);
+    assert.equal(reviews, 1);
+    assert.equal(supervisor.state, "completed");
+    assert.equal(supervisor.candidateParked, false);
+    const overridden = events.events.find((event) => event.type === "decision_overridden");
+    assert.equal(overridden?.data?.action, "noop");
+    assert.equal(overridden?.data?.override, "verify");
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("noop on a permission_request still parks the candidate", async () => {
+  const handle: WorkerHandle = { id: "noop-perm-worker", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
   let running = true;
   let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
   const adapter: WorkerAdapter = {
@@ -1656,7 +1709,7 @@ test("noop on a completed turn parks the candidate", async () => {
   };
   const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
   await supervisor.start({
-    task: "noop turn",
+    task: "noop perm",
     cwd: process.cwd(),
     command: "claude",
     automation: true,
@@ -1665,7 +1718,10 @@ test("noop on a completed turn parks the candidate", async () => {
     spec: automaticSpec(),
     decisionWorkerFactory: (options) => { onAction = options.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
   });
-  await onAction?.({ action: "noop", reason: "nothing to do" }, { type: "turn_completed", handle, result: {}, sequence: 1 });
+  await onAction?.(
+    { action: "noop", reason: "unsure" },
+    { type: "permission_request", handle, request: { requestId: "req-noop", toolUseId: "tu-noop", toolName: "Bash", input: { command: "curl https://example.com" }, raw: {} } },
+  );
   assert.equal(supervisor.state, "blocked");
   assert.equal(supervisor.candidateParked, true);
 });
@@ -5520,6 +5576,85 @@ test("release failure during verification surfaces cleanupError and cleanupConfi
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+});
+
+test("permission_request Decision Worker API failure denies fail-closed without parking, while configuration failure still parks", async () => {
+  const handle: WorkerHandle = { id: "d1-perm-fallback", startedAt: new Date().toISOString(), cwd: process.cwd(), ownership: "owned" };
+  let running = true;
+  const responded: Array<{ requestId: string; behavior: string; message?: string }> = [];
+  let onFailure: Parameters<DecisionWorkerFactory>[0]["onFailure"] | undefined;
+  let capturedListener: WorkerStartInput["eventListener"];
+  const events = new FlakyEventLog("never-fail");
+  const adapter: WorkerAdapter = {
+    capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true, repairableSession: true }),
+    start: async (input) => { capturedListener = input.eventListener; return handle; },
+    getStatus: async () => ({ handle, running, activeRequests: 1, processGroupCleaned: !running }),
+    readOutput: async () => [],
+    send: async () => {},
+    pause: async () => {},
+    resume: async () => {},
+    stop: async () => { running = false; },
+    killProcessGroup: async () => { running = false; },
+    resumeSession: async () => handle,
+    respondPermission: async (_h, requestId, _toolUseId, decision) => { responded.push({ requestId, behavior: decision.behavior, message: decision.message }); },
+  };
+  const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+  await supervisor.start({
+    task: "d1 permission fallback",
+    cwd: process.cwd(),
+    command: "claude",
+    automation: true,
+    deadlineMs: 0,
+    noOutputTimeoutMs: 0,
+    spec: automaticSpec(),
+    decisionWorkerFactory: (options) => {
+      onFailure = options.onFailure;
+      return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} };
+    },
+  });
+
+  const permEvent: WorkerEvent = {
+    type: "permission_request",
+    handle,
+    request: { requestId: "req-d1-1", toolUseId: "tu-d1-1", toolName: "Bash", input: { command: "curl https://example.com" }, raw: {} },
+  };
+  capturedListener?.(permEvent);
+  await supervisor.poll();
+  await onFailure?.(permEvent, new Error("503 service unavailable"));
+
+  assert.equal(supervisor.state, "running");
+  assert.equal(supervisor.candidateParked, false);
+  assert.equal(responded.length, 1);
+  assert.equal(responded[0]?.requestId, "req-d1-1");
+  assert.equal(responded[0]?.behavior, "deny");
+  assert.ok(events.events.some((event) => event.type === "decision_worker_failed" && event.data?.fallback === "deny_permission"));
+  assert.ok(events.events.some((event) => event.type === "permission_decision" && event.data?.policy === "decision_error_fallback" && event.data?.behavior === "deny"));
+
+  const askEvent: WorkerEvent = {
+    type: "permission_request",
+    handle,
+    request: { requestId: "req-d1-ask", toolUseId: "tu-d1-ask", toolName: "AskUserQuestion", input: { questions: [] }, raw: {}, phase: "pre" },
+  };
+  capturedListener?.(askEvent);
+  await supervisor.poll();
+  await onFailure?.(askEvent, new Error("upstream timeout"));
+  assert.equal(supervisor.state, "running");
+  assert.equal(responded.length, 2);
+  assert.equal(responded[1]?.behavior, "deny");
+  assert.match(responded[1]?.message ?? "", /AskUserQuestion/u);
+
+  const configErr = Object.assign(new Error("401 unauthorized: invalid API key"), { decisionWorkerConfiguration: true });
+  const permEvent2: WorkerEvent = {
+    type: "permission_request",
+    handle,
+    request: { requestId: "req-d1-cfg", toolUseId: "tu-d1-cfg", toolName: "Bash", input: { command: "curl https://example.com" }, raw: {} },
+  };
+  capturedListener?.(permEvent2);
+  await supervisor.poll();
+  await onFailure?.(permEvent2, configErr);
+  assert.equal(supervisor.state, "blocked");
+  assert.equal(supervisor.candidateParked, true);
+  assert.equal(responded.length, 2, "configuration error must park instead of silently denying");
 });
 
 

@@ -1471,6 +1471,64 @@ test("an unanswered PermissionRequest is denied for a retry, and a late answer i
   }
 });
 
+test("an unanswered PreToolUse AskUserQuestion is denied on timeout while ordinary PreToolUse still defers", { skip: !tmuxAvailable, concurrency: false }, async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-t8a-"));
+  const socketPath = join(stateDir, "tmux.sock");
+  const sessionName = `pi-t8a-${process.pid}-${Date.now()}`;
+  const claudeScript = join(stateDir, "claude");
+  await writeFile(claudeScript, `#!/usr/bin/env node
+process.stdout.write("\\u276f \\n" + "\\u2500".repeat(40) + "\\n");
+process.stdin.resume();
+setInterval(() => {}, 10000);
+`);
+  await chmod(claudeScript, 0o700);
+  const created = spawnSync("tmux", ["-S", socketPath, "new-session", "-d", "-s", sessionName, "-c", stateDir, claudeScript], { encoding: "utf8" });
+  assert.equal(created.status, 0, created.stderr);
+  const hookSource = createFakeHookSource();
+  const adapter = new TmuxWorkerAdapter({ stateDir, permissionDecisionTimeoutMs: 150, inputConfirmTimeoutMs: 300, pollIntervalMs: 40, startupTimeoutMs: 5_000, terminationGraceMs: 200 });
+  // Fake hook sources hold no ref'd socket while the adapter's timeout timer is unref'd;
+  // keep Node 22's event loop alive until the permission timeouts resolve.
+  const keepAlive = setInterval(() => {}, 50);
+  let handle;
+  try {
+    handle = await adapter.start({
+      task: "t8a askuserquestion timeout test",
+      cwd: stateDir,
+      command: "claude",
+      tmuxSession: sessionName,
+      tmuxSocket: socketPath,
+      automatic: true,
+      interactive: true,
+      hookSource,
+      sendInitialInput: false,
+    });
+    assert.ok(handle.pid);
+    const askReply = await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: handle.pid + 1,
+      ppid: handle.pid,
+      tmuxPane: handle.tmuxPaneId,
+      event: { hook_event_name: "PreToolUse", session_id: "session-t8a", cwd: stateDir, tool_name: "AskUserQuestion", tool_use_id: "tu-ask", tool_input: { questions: [] } },
+    });
+    assert.equal(askReply?.permissionDecision, "deny");
+    assert.match(String(askReply?.permissionDecisionReason), /AskUserQuestion.*timed out/u);
+
+    const bashReply = await hookSource.dispatch(stateDir, {
+      version: 1,
+      pid: handle.pid + 1,
+      ppid: handle.pid,
+      tmuxPane: handle.tmuxPaneId,
+      event: { hook_event_name: "PreToolUse", session_id: "session-t8a", cwd: stateDir, tool_name: "Bash", tool_use_id: "tu-bash", tool_input: { command: "echo hi" } },
+    });
+    assert.deepEqual(bashReply, {});
+  } finally {
+    clearInterval(keepAlive);
+    if (handle) await adapter.release(handle, "t8a test cleanup").catch(() => {});
+    spawnSync("tmux", ["-S", socketPath, "kill-server"], { stdio: "ignore" });
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("requests that do not bind to the pane are ignored", { skip: !automaticTmuxAvailable, concurrency: false }, async () => {
   const fixture = await startInteractiveOwnedFixture();
   const { adapter, handle, events, stateDir, hookSource } = fixture;

@@ -955,3 +955,60 @@ test("a turn superseded during an outage is dropped, not failed, and the next ev
   await worker.close();
 });
 
+test("out-of-range finite confidence is clamped to [0, 1] while non-finite values still park", async () => {
+  const { session } = createFakeSession([
+    { stopReason: "stop", text: "ack" },
+    { stopReason: "stop", text: JSON.stringify({ action: "verify", reason: "high confidence", confidence: 1.5 }) },
+    { stopReason: "stop", text: JSON.stringify({ action: "verify", reason: "negative confidence", confidence: -0.25 }) },
+    { stopReason: "stop", text: JSON.stringify({ action: "verify", reason: "bad type", confidence: "high" }) },
+    { stopReason: "stop", text: JSON.stringify({ action: "verify", reason: "bad type", confidence: "high" }) },
+  ]);
+  const actions: DecisionAction[] = [];
+  const worker = new PiDecisionWorker(baseOptions({
+    onAction: (action) => { actions.push(action); },
+    sessionFactory: async () => ({ session }),
+  }));
+  await worker.start();
+  worker.notify(turnCompletedEvent(1));
+  await until(() => actions.length === 1);
+  assert.equal(actions[0]?.action, "verify");
+  assert.equal(actions[0]?.confidence, 1);
+
+  worker.notify(turnCompletedEvent(2));
+  await until(() => actions.length === 2);
+  assert.equal(actions[1]?.action, "verify");
+  assert.equal(actions[1]?.confidence, 0);
+
+  worker.notify(turnCompletedEvent(3));
+  await until(() => actions.length === 3);
+  assert.equal(actions[2]?.action, "park");
+  assert.match(actions[2]?.reason ?? "", /confidence must be a finite number/u);
+  await worker.close();
+});
+
+test("oversized decision fields (> 8 KB) are UTF-8 truncated instead of parking", async () => {
+  const longReason = "🚀".repeat(3_000); // 12,000 UTF-8 bytes
+  const longMessage = `   ${"界".repeat(4_000)}   `; // > 12,000 UTF-8 bytes
+  const { session } = createFakeSession([
+    { stopReason: "stop", text: "ack" },
+    { stopReason: "stop", text: JSON.stringify({ action: "continue", reason: longReason, message: longMessage }) },
+  ]);
+  const actions: DecisionAction[] = [];
+  const worker = new PiDecisionWorker(baseOptions({
+    onAction: (action) => { actions.push(action); },
+    sessionFactory: async () => ({ session }),
+  }));
+  await worker.start();
+  worker.notify(turnCompletedEvent(1));
+  await until(() => actions.length === 1);
+  assert.equal(actions[0]?.action, "continue");
+  assert.ok(Buffer.byteLength(actions[0]!.reason, "utf8") <= 8 * 1024);
+  assert.ok(actions[0]!.reason.endsWith("…"));
+  assert.equal(actions[0]!.reason.includes("\uFFFD"), false);
+  assert.ok("message" in actions[0]! && typeof actions[0]!.message === "string");
+  assert.ok(Buffer.byteLength(actions[0]!.message, "utf8") <= 8 * 1024);
+  assert.ok(actions[0]!.message.endsWith("…"));
+  assert.equal(actions[0]!.message.includes("\uFFFD"), false);
+  await worker.close();
+});
+

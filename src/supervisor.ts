@@ -1117,6 +1117,47 @@ export class Supervisor {
         : isDecisionActionError(error) ? "Decision action failed"
           : isDecisionConfigurationError(error) ? "Decision Worker configuration failed"
             : "Decision Worker API failed";
+      // D1 tail: a transient Decision Worker model/API failure on a single
+      // permission request should fail closed for that tool call instead of
+      // parking the entire task. Configuration errors and action/delivery
+      // errors still park.
+      if (event.type === "permission_request"
+        && !inputFailure && !isDecisionActionError(error) && !isDecisionConfigurationError(error)
+        && this.#adapter.respondPermission) {
+        if (this.#humanRequired || this.#takeoverRequested) {
+          await this.#appendEvent({ type: "decision_deferred", taskId: this.#task?.taskId, workerId: event.handle.id, data: { reason: "human takeover active while permission decision failed", eventType: event.type, error: safeMessage(error) } }).catch(() => {});
+          return;
+        }
+        await this.#appendEvent({
+          type: "decision_worker_failed",
+          taskId: this.#task?.taskId,
+          workerId: event.handle.id,
+          data: { eventType: event.type, error: safeMessage(error), fallback: "deny_permission" },
+        });
+        const message = event.request.toolName === "AskUserQuestion"
+          ? "Supervisor Decision Worker failed while answering AskUserQuestion; state your question or chosen assumption in ordinary text instead"
+          : "Supervisor Decision Worker failed while evaluating this permission request; retry or use a narrower approach";
+        try {
+          await this.#adapter.respondPermission(this.#handle, event.request.requestId, event.request.toolUseId, { behavior: "deny", message });
+          this.#pendingPermissions.delete(event.request.requestId);
+          await this.#appendEvent({
+            type: "permission_decision",
+            taskId: this.#task?.taskId,
+            workerId: this.#handle.id,
+            data: { requestId: event.request.requestId, toolName: event.request.toolName, behavior: "deny", policy: "decision_error_fallback", actor: "supervisor" },
+          });
+          return;
+        } catch (fallbackError) {
+          await this.#appendEvent({
+            type: "decision_action_failed",
+            taskId: this.#task?.taskId,
+            workerId: event.handle.id,
+            data: { eventType: event.type, error: safeMessage(fallbackError) },
+          });
+          await this.#parkCandidate(`Decision action failed: ${safeMessage(fallbackError)}`, event, undefined, "Decision action failed");
+          return;
+        }
+      }
       await this.#appendEvent({
         type: inputFailure ? "worker_input_failed" : isDecisionActionError(error) ? "decision_action_failed" : "decision_worker_failed",
         taskId: this.#task?.taskId,
@@ -1259,7 +1300,18 @@ export class Supervisor {
         return;
       }
       if (action.action === "noop") {
-        if (event.type === "turn_completed" || event.type === "permission_request") {
+        if (event.type === "turn_completed") {
+          if (await this.#decisionIsStale(event)) return;
+          await this.#appendEvent({
+            type: "decision_overridden",
+            taskId: task.taskId,
+            workerId: handle.id,
+            data: { action: "noop", override: "verify", reason: "noop on turn_completed treated as verify", eventType: event.type },
+          });
+          await this.#startVerification(handle, event, "Decision Worker");
+          return;
+        }
+        if (event.type === "permission_request") {
           await this.#parkCandidate(`Decision Worker returned noop for ${event.type}; a concrete action is required`, event);
           return;
         }
