@@ -7,10 +7,11 @@
  *   npm run report -- [--json] [--include-rotated] [--since <ISO|duration>] [events.jsonl ...]
  *
  * Task outcome derivation rule (applied in chronological order per taskId):
- *   - `verification_passed` -> `completed`
- *   - `worker_stopped` -> `stopped` (unless `verification_passed` already finalized the task)
- *   - `candidate_parked` -> `parked` (unless superseded by later `verification_passed` or `worker_stopped`)
- *   - `verification_failed` | `candidate_failed` | `worker_start_failed` -> `failed`
+ *   - `verification_passed` -> `completed` (terminal, never overwritten)
+ *   - `candidate_parked` -> `parked` (overrides `stopped`, because `#parkCandidate` writes `worker_stopped` before `candidate_parked`)
+ *   - `candidate_failed` -> `failed` (overrides `stopped`, because watchdog/failure paths write `worker_stopped` before `candidate_failed`)
+ *   - `verification_failed` | `worker_start_failed` -> `failed` (unless already `completed`, `stopped`, or `parked`)
+ *   - `worker_stopped` -> `stopped` (unless `completed`; overrides `verification_failed` when operator stops during verification)
  *   - No terminal event observed -> `in_progress`
  */
 import { createReadStream } from "node:fs";
@@ -48,14 +49,14 @@ export async function expandLogPaths(inputs, { includeRotated = false } = {}) {
 
   for (const input of inputs) {
     const resolved = resolve(input);
-    let info;
+    let info = null;
     try {
       info = await stat(resolved);
     } catch {
-      add(resolved);
-      continue;
+      // File may be absent (e.g., momentarily right after rotation); still
+      // scan rotated siblings when --include-rotated is requested.
     }
-    if (info.isDirectory()) {
+    if (info?.isDirectory()) {
       const entries = await readdir(resolved);
       const rotated = entries
         .filter((name) => name.startsWith("events.jsonl.") && ROTATED_SUFFIX_RE.test(name.slice("events.jsonl".length)))
@@ -81,10 +82,27 @@ export async function expandLogPaths(inputs, { includeRotated = false } = {}) {
 export function categorizeOverrideReason(data) {
   const override = typeof data?.override === "string" ? data.override : "";
   const action = typeof data?.action === "string" ? data.action : "";
-  const reason = typeof data?.reason === "string" ? data.reason : "";
+  const rawReason = typeof data?.reason === "string" ? data.reason : "";
+  const reason = rawReason.replace(/\b\d+\b/gu, "<N>");
   if (action && override) return `${action} -> ${override}${reason ? ` (${truncateLabel(reason, 60)})` : ""}`;
   if (reason) return truncateLabel(reason, 80);
   return "unspecified";
+}
+
+function isReviewerFormatOrApiFailure(data) {
+  if (!data || typeof data !== "object" || data.verdict !== "human") return false;
+  if (typeof data.summary === "string" && /^independent Reviewer failed:/iu.test(data.summary.trim())) {
+    return true;
+  }
+  if (Array.isArray(data.findings)) {
+    return data.findings.some((finding) =>
+      finding
+      && typeof finding === "object"
+      && finding.id === "REVIEW-OUTPUT"
+      && !/repository evidence is incomplete or truncated/iu.test(String(finding.message ?? "")),
+    );
+  }
+  return false;
 }
 
 function truncateLabel(value, maxLen = 80) {
@@ -110,6 +128,7 @@ function percentile(sortedNumbers, p) {
 export function createAggregator({ sinceMs } = {}) {
   const tasks = new Map();
   const parkReasons = new Map();
+  const blockReasons = new Map();
   const overrideReasons = new Map();
   const permissionByActor = new Map();
   const permissionByBehavior = new Map();
@@ -184,7 +203,9 @@ export function createAggregator({ sinceMs } = {}) {
         break;
       case "candidate_parked": {
         if (task) {
-          if (task.outcome !== "completed" && task.outcome !== "stopped") task.outcome = "parked";
+          // `#parkCandidate` writes `worker_stopped` before `candidate_parked`,
+          // so `candidate_parked` must override `stopped`.
+          if (task.outcome !== "completed") task.outcome = "parked";
           if (Number.isFinite(atMs) && task.firstCandidateAtMs === null) task.firstCandidateAtMs = atMs;
         }
         const rawLabel = typeof data.reasonLabel === "string" && data.reasonLabel.trim()
@@ -194,15 +215,23 @@ export function createAggregator({ sinceMs } = {}) {
             : typeof data.reason === "string" && data.reason.trim()
               ? data.reason
               : "(unspecified)";
-        const label = truncateLabel(rawLabel, 80);
-        increment(parkReasons, label);
-        if (/reviewer\b.*(?:malformed|invalid|format|parse|json|api failed|timed out)/iu.test(String(data.reason ?? data.candidateReason ?? rawLabel))) {
-          reviewerFormatOrApiFailures += 1;
-        }
+        increment(parkReasons, truncateLabel(rawLabel, 80));
         break;
       }
-      case "verification_failed":
+      case "candidate_blocked": {
+        const rawBlock = typeof data.reason === "string" && data.reason.trim()
+          ? data.reason
+          : "(unspecified)";
+        increment(blockReasons, truncateLabel(rawBlock, 80));
+        break;
+      }
       case "candidate_failed":
+        if (task && task.outcome !== "completed") {
+          // Watchdog/failure paths write `worker_stopped` before `candidate_failed`.
+          task.outcome = "failed";
+        }
+        break;
+      case "verification_failed":
       case "worker_start_failed":
         if (task) {
           if (task.outcome !== "completed" && task.outcome !== "stopped" && task.outcome !== "parked") task.outcome = "failed";
@@ -278,6 +307,7 @@ export function createAggregator({ sinceMs } = {}) {
         reviewsCompleted += 1;
         const verdict = typeof data.verdict === "string" ? data.verdict : "unknown";
         increment(reviewVerdicts, verdict);
+        if (isReviewerFormatOrApiFailure(data)) reviewerFormatOrApiFailures += 1;
         break;
       }
       default:
@@ -306,9 +336,7 @@ export function createAggregator({ sinceMs } = {}) {
     }
     candidateDurationsMs.sort((a, b) => a - b);
     const taskCount = tasks.size;
-    const uncompletedReviews = Math.max(0, reviewsStarted - reviewsCompleted);
-    const effectiveReviewerFailures = Math.max(uncompletedReviews, reviewerFormatOrApiFailures);
-    const reviewerFailureRate = reviewsStarted > 0 ? effectiveReviewerFailures / reviewsStarted : 0;
+    const reviewerFailureRate = reviewsCompleted > 0 ? reviewerFormatOrApiFailures / reviewsCompleted : 0;
 
     return {
       files,
@@ -320,6 +348,7 @@ export function createAggregator({ sinceMs } = {}) {
         total: taskCount,
         outcomes: sortedEntries(outcomes),
         parkReasons: sortedEntries(parkReasons),
+        blockReasons: sortedEntries(blockReasons),
         repairRounds: {
           total: totalRepairRounds,
           averagePerTask: taskCount > 0 ? Number((totalRepairRounds / taskCount).toFixed(2)) : 0,
@@ -363,7 +392,7 @@ export function createAggregator({ sinceMs } = {}) {
         started: reviewsStarted,
         completed: reviewsCompleted,
         verdicts: sortedEntries(reviewVerdicts),
-        formatOrApiFailures: effectiveReviewerFailures,
+        formatOrApiFailures: reviewerFormatOrApiFailures,
         failureRate: Number(reviewerFailureRate.toFixed(4)),
       },
     };
@@ -427,8 +456,12 @@ export function formatReport(report) {
   lines.push(`Tasks (${report.tasks.total} total) — outcomes:`);
   lines.push(formatHistogram(report.tasks.outcomes));
   lines.push("");
-  lines.push("Park / block reasons:");
+  lines.push("Park reasons:");
   lines.push(formatHistogram(report.tasks.parkReasons));
+  if (Object.keys(report.tasks.blockReasons ?? {}).length > 0) {
+    lines.push("Candidate block reasons:");
+    lines.push(formatHistogram(report.tasks.blockReasons));
+  }
   lines.push("");
   const rr = report.tasks.repairRounds;
   lines.push(`Repair rounds: total=${rr.total}, avg/task=${rr.averagePerTask}, dist=[0:${rr.distribution["0"]}, 1:${rr.distribution["1"]}, 2:${rr.distribution["2"]}, 3+:${rr.distribution["3+"]}]`);
@@ -500,6 +533,9 @@ async function main(argv) {
   const rawPaths = inputs.length > 0 ? inputs : [defaultEventLogPath()];
   const filePaths = await expandLogPaths(rawPaths, { includeRotated });
   const report = await analyzeFiles(filePaths, { sinceMs });
+  if (inputs.length > 0 && report.files.length === 0) {
+    console.error(`Warning: no readable event log files matched: ${inputs.join(", ")}`);
+  }
   console.log(jsonOutput ? JSON.stringify(report, null, 2) : formatReport(report));
 }
 
