@@ -1771,6 +1771,125 @@ function segmentsOf(tokens: readonly ShellToken[]): ShellToken[][] {
 }
 
 /** True when one statement combines a dynamic word with a command whose dynamic argument could reach the boundary. */
+/** Pure shell syntax keywords that introduce a command without executing anything themselves. */
+const SHELL_SYNTAX_PREFIX_KEYWORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "!", "(", "{"]);
+/** Strictly read-only git subcommands whose dynamic arguments after the subcommand cannot mutate refs or reach remotes (D5). */
+const D5_READ_ONLY_GIT_SUBCOMMANDS = new Set([
+  "status", "diff", "log", "show", "rev-parse", "rev-list", "ls-files", "blame",
+  "describe", "cat-file", "merge-base", "shortlog", "ls-tree", "name-rev", "check-ignore", "for-each-ref",
+]);
+const D5_GIT_BRANCH_READ_ONLY_FLAGS = new Set(["--list", "-l", "--contains", "--merged", "--no-merged", "--show-current"]);
+const D5_GIT_BRANCH_ALLOWED_FLAGS = new Set(["--list", "-l", "--contains", "--merged", "--no-merged", "--show-current", "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--no-color", "--color", "--sort", "--format", "--points-at", "--abbrev", "--no-abbrev", "--column", "--no-column", "-i", "--ignore-case"]);
+const D5_GIT_TAG_READ_ONLY_FLAGS = new Set(["-l", "--list", "--contains", "--merged", "--no-merged"]);
+const D5_GIT_TAG_ALLOWED_FLAGS = new Set(["-l", "--list", "--contains", "--merged", "--no-merged", "-n", "--sort", "--format", "--points-at", "--no-color", "--color", "-i", "--ignore-case"]);
+const D5_PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn"]);
+const D5_PACKAGE_RUNNER_SUBCOMMANDS = new Set(["run", "exec", "dlx", "x"]);
+
+/** True when `value` contains only filename glob metacharacters (`*`, `?`, `[...]`) and no shell variable, substitution, tilde, or brace expansion. */
+function isPureFilenameGlob(value: string): boolean {
+  return /[*?[]/u.test(value) && !/[$`~{}()]/u.test(value);
+}
+
+/**
+ * Unwrap a transparent timing/nohup wrapper (`timeout`, `time`, `nohup`) in
+ * command position ONLY when all wrapper flags/duration are literal. Returns
+ * the wrapped argv slice, `"dynamic"` if the wrapper's own args are dynamic or
+ * malformed, or `undefined` if `argv[0]` is not an unwrappable wrapper.
+ */
+function unwrapDynamicSafeWrapper(argv: readonly ShellToken[]): readonly ShellToken[] | "dynamic" | undefined {
+  const head = argv[0]?.value.split(/[\\/]/u).at(-1)?.toLowerCase();
+  if (!head) return undefined;
+  if (head === "time" || head === "nohup") {
+    let idx = 1;
+    while (idx < argv.length && argv[idx]!.value.startsWith("-")) {
+      if (argv[idx]!.dynamic) return "dynamic";
+      idx += 1;
+    }
+    return idx < argv.length ? argv.slice(idx) : "dynamic";
+  }
+  if (head === "timeout") {
+    let idx = 1;
+    while (idx < argv.length && argv[idx]!.value.startsWith("-")) {
+      const flag = argv[idx]!.value;
+      if (argv[idx]!.dynamic) return "dynamic";
+      if (flag !== "--foreground" && flag !== "--preserve-status") return "dynamic";
+      idx += 1;
+    }
+    if (idx >= argv.length || argv[idx]!.dynamic || !/^\d+(?:\.\d+)?[smhd]?$/u.test(argv[idx]!.value)) return "dynamic";
+    idx += 1;
+    return idx < argv.length ? argv.slice(idx) : "dynamic";
+  }
+  return undefined;
+}
+
+/** True when a git command in command position is strictly read-only with all global options and the subcommand itself literal. */
+function isReadOnlyGitDynamicSafe(argv: readonly ShellToken[]): boolean {
+  const values = argv.map((t) => t.value);
+  const subIndex = gitSubcommandIndex(values);
+  if (subIndex < 0) return false;
+  // Any dynamic token before or at the subcommand (e.g. `git $SUB`, `git -C $DIR status`, `git -c $OPT status`) is refused.
+  if (argv.slice(0, subIndex + 1).some((token) => token.dynamic)) return false;
+  const sub = values[subIndex]!.toLowerCase();
+  const rest = argv.slice(subIndex + 1);
+  // Reject driver/output relocation flags even on read-only subcommands.
+  if (rest.some((t) => GIT_DRIVER_FLAGS.test(t.value) || t.value === "-o" || t.value.startsWith("--output"))) return false;
+  if (D5_READ_ONLY_GIT_SUBCOMMANDS.has(sub)) return true;
+  if (sub === "branch") {
+    const flags = rest.filter((t) => t.value.startsWith("-")).map((t) => t.value.split("=")[0]!);
+    const hasReadOnlyFlag = flags.some((f) => D5_GIT_BRANCH_READ_ONLY_FLAGS.has(f));
+    const allSafeFlags = flags.every((f) => D5_GIT_BRANCH_ALLOWED_FLAGS.has(f));
+    return hasReadOnlyFlag && allSafeFlags;
+  }
+  if (sub === "tag") {
+    const flags = rest.filter((t) => t.value.startsWith("-")).map((t) => t.value.split("=")[0]!);
+    const hasReadOnlyFlag = flags.some((f) => D5_GIT_TAG_READ_ONLY_FLAGS.has(f));
+    const allSafeFlags = flags.every((f) => D5_GIT_TAG_ALLOWED_FLAGS.has(f) || /^-n\d*$/u.test(f));
+    return hasReadOnlyFlag && allSafeFlags;
+  }
+  return false;
+}
+
+/** True when a non-publish npm/pnpm/yarn command has literal subcommand/target and ONLY pure filename glob dynamic args (e.g. `pnpm exec biome check src/*.test.ts`). */
+function isPackageManagerGlobOnlySafe(argv: readonly ShellToken[]): boolean {
+  const values = argv.map((t) => t.value);
+  const lower = values.map((v) => v.toLowerCase());
+  if (lower.includes("publish")) return false;
+  // Locate the subcommand; reject any dynamic token before or at the subcommand.
+  let subIndex = -1;
+  for (let i = 1; i < argv.length; i += 1) {
+    const tok = argv[i]!;
+    if (tok.dynamic) return false;
+    if (tok.value === "--filter" || tok.value === "-F") {
+      if (i + 1 >= argv.length || argv[i + 1]!.dynamic) return false;
+      i += 1;
+      continue;
+    }
+    if (tok.value.startsWith("-")) continue;
+    subIndex = i;
+    break;
+  }
+  if (subIndex < 0) return false;
+  const sub = lower[subIndex]!;
+  if (sub === "publish") return false;
+  // For `run`/`exec`/`dlx`/`x`, the script or binary name immediately after the subcommand MUST also be literal.
+  if (D5_PACKAGE_RUNNER_SUBCOMMANDS.has(sub)) {
+    let targetIndex = subIndex + 1;
+    while (targetIndex < argv.length && argv[targetIndex]!.value.startsWith("-")) {
+      if (argv[targetIndex]!.dynamic) return false;
+      targetIndex += 1;
+    }
+    if (targetIndex >= argv.length || argv[targetIndex]!.dynamic) return false;
+  }
+  // Every dynamic token in the statement must be a pure filename glob (no $VAR, $(...), backticks, ~, braces).
+  return argv.slice(subIndex + 1).every((tok) => !tok.dynamic || isPureFilenameGlob(tok.value));
+}
+
+/**
+ * True when one statement combines a dynamic word with a command whose dynamic
+ * argument could reach the boundary (D5: inspect command position only, unwrap
+ * literal `timeout`/`time`/`nohup`, allow dynamic args after strictly read-only
+ * git subcommands and pure filename globs on non-publish package commands).
+ */
 function hasDynamicSensitiveArgument(segment: readonly ShellToken[]): boolean {
   // A leading `NAME=value` prefix sets the environment and a redirection
   // target names a file; neither reaches the command's argv, so
@@ -1779,22 +1898,46 @@ function hasDynamicSensitiveArgument(segment: readonly ShellToken[]): boolean {
   const words: ShellToken[] = [];
   let afterRedirect = false;
   for (const token of segment) {
-    if (token.operator) { afterRedirect = [">", ">>", "<", "<<<"].includes(token.value); continue; }
-    if (!afterRedirect) words.push(token);
+    if (token.operator) { afterRedirect = [">", ">>", "<", "<<<", ">|", "&>"].includes(token.value); continue; }
+    if (!afterRedirect && !token.data) words.push(token);
     afterRedirect = false;
   }
   let argvStart = 0;
-  while (argvStart < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[argvStart]!.value)) argvStart += 1;
-  if (!words.slice(argvStart).some((token) => token.dynamic)) return false;
-  const values = words.map((token) => token.value);
-  const lower = values.map((value) => value.toLowerCase());
-  const executables = lower.map((value) => value.split(/[\\/]/u).at(-1) ?? value);
-  const canonical = values.join(" ");
-  return values.some((value) => /(?:^|[\\/])git$/iu.test(value) || /^git-(?:send|receive|upload)-pack$/iu.test(value))
-    || containsRemoteCliMutation(canonical)
-    || (lower.some((value) => value === "npm" || value === "pnpm" || value === "yarn") && lower.includes("publish"))
-    || executables.some((executable) => DYNAMIC_SENSITIVE_COMMANDS.has(executable))
-    || (executables.includes("find") && lower.some((value) => FIND_EXEC_ACTIONS.has(value)));
+  while (argvStart < words.length) {
+    const raw = words[argvStart]!.value;
+    const stripped = raw.toLowerCase().replace(/^\(+/u, "") || "(";
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/u.test(raw)) { argvStart += 1; continue; }
+    if (!words[argvStart]!.dynamic && SHELL_SYNTAX_PREFIX_KEYWORDS.has(stripped)) { argvStart += 1; continue; }
+    break;
+  }
+  let argv: readonly ShellToken[] = words.slice(argvStart);
+  if (argv.length === 0 || !argv.some((token) => token.dynamic)) return false;
+
+  // Unwrap transparent wrappers (`timeout`, `time`, `nohup`) up to 4 levels.
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (argv[0]!.dynamic) return true;
+    const unwrapped = unwrapDynamicSafeWrapper(argv);
+    if (unwrapped === undefined) break;
+    if (unwrapped === "dynamic") return true;
+    argv = unwrapped;
+    // Skip any leading env assignments inside the unwrapped command.
+    let innerStart = 0;
+    while (innerStart < argv.length && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(argv[innerStart]!.value)) innerStart += 1;
+    argv = argv.slice(innerStart);
+    if (argv.length === 0 || !argv.some((token) => token.dynamic)) return false;
+  }
+
+  if (argv[0]!.dynamic) return true;
+  const cmd = argv[0]!.value.replace(/^\(+/u, "").split(/[\\/]/u).at(-1)?.toLowerCase() ?? "";
+  const lower = argv.map((t) => t.value.toLowerCase());
+  const canonical = argv.map((t) => t.value).join(" ");
+
+  if (cmd === "git") return !isReadOnlyGitDynamicSafe(argv);
+  if (/^git-(?:send|receive|upload)-pack$/u.test(cmd)) return true;
+  if (D5_PACKAGE_MANAGERS.has(cmd)) return !isPackageManagerGlobOnlySafe(argv);
+  if (cmd === "find") return lower.some((value) => FIND_EXEC_ACTIONS.has(value));
+  if (containsRemoteCliMutation(canonical)) return true;
+  return DYNAMIC_SENSITIVE_COMMANDS.has(cmd);
 }
 
 /** A dynamic word in command position (`$CMD …`, `; $CMD`, `do . $file`) could name anything. */
