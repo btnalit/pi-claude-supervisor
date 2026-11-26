@@ -264,7 +264,8 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
       void rm(join(hookSocketDirectory(stateDir), `settings-${taskId}.json`), { force: true }).catch(() => {});
     }
   };
-  const releaseSettledReservations = async (): Promise<void> => {
+  const releaseSettledReservations = async (options: { onShutdown?: boolean } = {}): Promise<void> => {
+    const onShutdown = options.onShutdown === true;
     for (const [taskId, session] of sessions) {
       const terminal = ["completed", "blocked", "stopped", "failed"].includes(session.state);
       const detached = session.released;
@@ -274,9 +275,10 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         continue;
       }
       // A stuck session is otherwise polled at 1 Hz forever; back off to once
-      // every 10 sweeps after the first 10 unconfirmed attempts.
+      // every 10 sweeps after the first 10 unconfirmed attempts (never back off
+      // on shutdown).
       const attempts = unconfirmedSweepAttempts.get(taskId) ?? 0;
-      if (!(attempts < 10 || attempts % 10 === 0)) {
+      if (!onShutdown && !(attempts < 10 || attempts % 10 === 0)) {
         unconfirmedSweepAttempts.set(taskId, attempts + 1);
         continue;
       }
@@ -286,13 +288,17 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           && session.handle.ownership === "adopted"
           && !status.running;
         // A hand-back (owned interactive `release()`, on completion or park)
-        // leaves the Worker intentionally running. Retain its cwd lease while
-        // the pane is alive so another task or `/supervise recover` cannot
-        // start a second Worker in the same worktree; release once the pane is
-        // confirmed gone (operator exited tmux or ran `/supervise stop`).
+        // leaves the Worker intentionally running. While Pi is live, retain the
+        // cwd lease until `!status.running` so no second Worker can overlap the
+        // worktree. At Pi shutdown, a kept-open *completed* session's Decision
+        // Worker record is already closed (so `recover --takeover` could never
+        // free its lease after a restart), so release its lease cleanly on
+        // shutdown; parked `blocked` sessions keep an active recoverable record
+        // and retain their lease while the pane lives.
         const handedBackGone = detached && status.detached === true && !status.running;
-        const cleanupConfirmed = status.processGroupCleaned === true || adoptedDetachConfirmed || handedBackGone;
-        if (!status.running && cleanupConfirmed && !status.cleanupError && (!status.cgroupError || status.cgroupRequired === false)) {
+        const completedHandBackAtShutdown = onShutdown && session.state === "completed" && detached && status.detached === true;
+        const cleanupConfirmed = status.processGroupCleaned === true || adoptedDetachConfirmed || handedBackGone || completedHandBackAtShutdown;
+        if ((completedHandBackAtShutdown || !status.running) && cleanupConfirmed && !status.cleanupError && (!status.cgroupError || status.cgroupRequired === false)) {
           if (await releaseLease(taskId)) forgetSession(taskId);
           else unconfirmedSweepAttempts.set(taskId, attempts + 1);
         } else {
@@ -1111,6 +1117,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
             await session.resume(); message = `Worker resumed: ${sessionId}.`;
           } else if (operation === "stop") {
             await stopSession(session, remaining.join(" ") || "human requested stop");
+            unconfirmedSweepAttempts.delete(sessionId);
             await releaseSettledReservations();
             message = `Worker stopped: ${sessionId}.`;
           } else if (operation === "verify") {
@@ -1163,7 +1170,7 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         }
       }
       const results = await Promise.allSettled([...sessions.values()].map((session) => stopSession(session, "Pi session shutdown", true, true)));
-      await releaseSettledReservations();
+      await releaseSettledReservations({ onShutdown: true });
       if (hookServer) {
         try {
           // listen() may still be in flight (e.g. shutdown racing startup, or

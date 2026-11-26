@@ -5972,6 +5972,105 @@ test("T11: interactive park (both direct park and verification block) hands back
       assert.equal(releaseCalls, 0);
       assert.equal(stopCalls, 1);
     }
+
+    // 4. Operator stop racing park hand-back release still wins with stopped/human_stop and no candidate_parked.
+    {
+      const cwdRace = join(base, "repo-race");
+      await mkdir(cwdRace);
+      await initializeGitRepository(cwdRace, "worker/t11-race");
+      const handle: WorkerHandle = { id: "t11-race-worker", startedAt: new Date().toISOString(), cwd: cwdRace, ownership: "owned" };
+      let running = true;
+      let released = false;
+      let killCalls = 0;
+      let releaseStarted!: () => void;
+      const releaseEntered = new Promise<void>((resolve) => { releaseStarted = resolve; });
+      let finishRelease!: () => void;
+      const releaseGate = new Promise<void>((resolve) => { finishRelease = resolve; });
+      let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+      const closures: Array<{ cleanupConfirmed: boolean; reason: string }> = [];
+      const events = new FlakyEventLog("never-fail");
+      const adapter: WorkerAdapter = {
+        capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true, repairableSession: true }),
+        start: async () => handle,
+        getStatus: async () => ({ handle, running, detached: released, activeRequests: 0, processGroupCleaned: !running }),
+        readOutput: async () => [],
+        send: async () => {},
+        pause: async () => {},
+        resume: async () => {},
+        release: async () => { releaseStarted(); await releaseGate; released = true; },
+        stop: async () => { /* tmux adapter turns stop into release once release started */ },
+        killProcessGroup: async () => { killCalls += 1; running = false; released = false; },
+        resumeSession: async () => handle,
+      };
+      const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], { reviewer: automaticReviewer() });
+      await supervisor.start({
+        task: "t11 stop races park release",
+        cwd: cwdRace,
+        command: "claude",
+        automation: true,
+        interactive: true,
+        keepWorkerOnCompletion: true,
+        deadlineMs: 0,
+        noOutputTimeoutMs: 0,
+        onDecisionSessionClosed: (_taskId, info) => { closures.push(info); },
+        spec: automaticSpec(),
+        decisionWorkerFactory: (opts) => { onAction = opts.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+      });
+      const parkPromise = onAction!({ action: "park", reason: "race test" }, { type: "turn_completed", handle, result: {}, sequence: 1 });
+      await releaseEntered;
+      const stopPromise = supervisor.stop("operator overrides park hand-back");
+      finishRelease();
+      await Promise.all([parkPromise, stopPromise]);
+      assert.equal(supervisor.state, "stopped");
+      assert.equal(supervisor.candidateParked, false);
+      assert.equal(killCalls, 1);
+      assert.deepEqual(closures.at(-1), { cleanupConfirmed: true, reason: "human_stop" });
+      assert.equal(events.events.some((e) => e.type === "candidate_parked"), false);
+    }
+
+    // 5. release() throwing during park hand-back fails closed (state=failed, released=false).
+    {
+      const cwdErr = join(base, "repo-release-err");
+      await mkdir(cwdErr);
+      await initializeGitRepository(cwdErr, "worker/t11-release-err");
+      const handle: WorkerHandle = { id: "t11-err-worker", startedAt: new Date().toISOString(), cwd: cwdErr, ownership: "owned" };
+      let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+      const closures: Array<{ cleanupConfirmed: boolean; reason: string }> = [];
+      const adapter: WorkerAdapter = {
+        capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true, repairableSession: true }),
+        start: async () => handle,
+        getStatus: async () => ({ handle, running: true, detached: false, activeRequests: 0, processGroupCleaned: false }),
+        readOutput: async () => [],
+        send: async () => {},
+        pause: async () => {},
+        resume: async () => {},
+        release: async () => { throw new Error("injected park release failure"); },
+        stop: async () => {},
+        killProcessGroup: async () => {},
+        resumeSession: async () => handle,
+      };
+      const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
+      await supervisor.start({
+        task: "t11 park release throw",
+        cwd: cwdErr,
+        command: "claude",
+        automation: true,
+        interactive: true,
+        keepWorkerOnCompletion: true,
+        deadlineMs: 0,
+        noOutputTimeoutMs: 0,
+        onDecisionSessionClosed: (_taskId, info) => { closures.push(info); },
+        spec: automaticSpec(),
+        decisionWorkerFactory: (opts) => { onAction = opts.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+      });
+      await assert.rejects(
+        async () => { await onAction!({ action: "park", reason: "release throws" }, { type: "turn_completed", handle, result: {}, sequence: 1 }); },
+        /injected park release failure/u,
+      );
+      assert.equal(supervisor.state, "failed");
+      assert.equal(supervisor.released, false);
+      assert.deepEqual(closures.at(-1), { cleanupConfirmed: false, reason: "recoverable_failure" });
+    }
   } finally {
     if (tempDir1) await rm(tempDir1, { recursive: true, force: true }).catch(() => {});
     if (tempDir2) await rm(tempDir2, { recursive: true, force: true }).catch(() => {});

@@ -2146,6 +2146,11 @@ export class Supervisor {
     }
     if (this.#machine.state === "completed" || (this.#machine.state === "blocked" && this.#released)) {
       const wasBlocked = this.#machine.state === "blocked";
+      const preemptiveStop = this.#preemptiveStop;
+      this.#preemptiveStop = undefined;
+      this.#stopRequested = undefined;
+      this.#stopCloseReason = undefined;
+      if (preemptiveStop) await preemptiveStop.catch(() => {});
       if (this.#handle) {
         if (this.#released && this.#handle.ownership === "owned") {
           // The handle was released, not stopped, when the task completed or
