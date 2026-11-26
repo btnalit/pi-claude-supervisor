@@ -379,8 +379,10 @@ pane id, pane PID/start time, and pane command all match; ordinary starts
 cannot consume another task's lease. If post-start worker identity registration
 fails, owned workers are stopped before the lease is released; cleanup failure
 retains both the worker and lease fail-closed. Explicit `stop` cleans owned tmux
-sessions, while Pi shutdown detaches persistent sessions so they remain explicitly
-re-adoptable. A detached adopted session retains its lease while the verified pane
+sessions. On Pi shutdown, unfinished owned automatic sessions are stopped
+(preserving recoverable Decision Worker state so a later `recover` never leaves
+two Workers writing to the same worktree), while adopted and manual persistent
+sessions detach so they remain explicitly re-adoptable. A detached adopted session retains its lease while the verified pane
 is alive; the extension periodically rechecks released sessions and removes the
 lease only after the pane is confirmed gone. If that check fails, the lease is
 retained rather than allowing a cwd overlap.
