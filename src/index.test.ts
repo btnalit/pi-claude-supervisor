@@ -1403,3 +1403,161 @@ test("index --write-root enforces multi-root overlap, cleans reservations on mid
     await rm(base, { recursive: true, force: true });
   }
 });
+
+test("T11: handed-back interactive parked session retains cwd lease while pane lives and releases after explicit /supervise stop", { skip: !trustedCheckout && untrustedCheckoutSkipReason, concurrency: false }, async (t) => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-t11-index-"));
+  const cwd = join(base, "repo");
+  const stateDir = join(base, "state");
+  const leaseDir = join(base, "leases");
+  const fakeBin = await mkdtemp(join(process.cwd(), ".pi-claude-supervisor-t11-bin-"));
+  const keys = [
+    "PI_CLAUDE_SUPERVISOR_STATE_DIR", "PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR",
+    "PI_CLAUDE_SUPERVISOR_TRANSPORT", "PI_CLAUDE_SUPERVISOR_CGROUP_MODE",
+    "PI_CLAUDE_SUPERVISOR_MODE", "PI_CLAUDE_SUPERVISOR_AUTOMATION",
+    "PI_CLAUDE_SUPERVISOR_TMUX_MODE", "PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS",
+    "PI_CLAUDE_SUPERVISOR_CLOSE_WORKER_ON_COMPLETION", "PI_CLAUDE_SUPERVISOR_TRUSTED_CLAUDE",
+    "PI_CLAUDE_SUPERVISOR_WORKER",
+  ] as const;
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]])) as Record<typeof keys[number], string | undefined>;
+  const previousPath = process.env.PATH;
+  let shutdownHandler: (() => Promise<void>) | undefined;
+  const workerId = randomUUID();
+  let running = true;
+  let detached = false;
+  let killCalls = 0;
+
+  const preflightMock = t.mock.method(TmuxWorkerAdapter.prototype, "preflight", async () => {});
+  let eventListener: ((event: unknown) => void) | undefined;
+  const startMock = t.mock.method(TmuxWorkerAdapter.prototype, "start", async (input: { cwd: string; eventListener?: (event: unknown) => void }) => {
+    eventListener = input.eventListener;
+    return {
+      id: workerId,
+      startedAt: new Date().toISOString(),
+      cwd: input.cwd,
+      pid: process.pid,
+      ownership: "owned" as const,
+      sessionName: `pi-supervisor-${workerId}`,
+    };
+  });
+  const releaseMock = t.mock.method(TmuxWorkerAdapter.prototype, "release", async () => { detached = true; });
+  const killMock = t.mock.method(TmuxWorkerAdapter.prototype, "killProcessGroup", async () => { killCalls += 1; running = false; detached = false; });
+  const stopMock = t.mock.method(TmuxWorkerAdapter.prototype, "stop", async () => { running = false; detached = false; });
+  const statusMock = t.mock.method(TmuxWorkerAdapter.prototype, "getStatus", async (handle: { id: string; startedAt: string; cwd: string }) => ({
+    handle,
+    running,
+    detached,
+    activeRequests: 0,
+    processGroupCleaned: !running,
+  }));
+  const readOutputMock = t.mock.method(TmuxWorkerAdapter.prototype, "readOutput", async () => []);
+
+  try {
+    await Promise.all([mkdir(cwd), mkdir(stateDir), mkdir(leaseDir)]);
+    const fakeClaude = join(fakeBin, "claude");
+    await copyFile(process.execPath, fakeClaude);
+    await chmod(fakeClaude, 0o700);
+    assert.equal(spawnSync("git", ["init", "-q"], { cwd, stdio: "ignore" }).status, 0);
+    assert.equal(spawnSync("git", ["config", "user.email", "test@example.invalid"], { cwd, stdio: "ignore" }).status, 0);
+    assert.equal(spawnSync("git", ["config", "user.name", "Test"], { cwd, stdio: "ignore" }).status, 0);
+    await writeFile(join(cwd, "base.txt"), "base\n");
+    assert.equal(spawnSync("git", ["add", "base.txt"], { cwd, stdio: "ignore" }).status, 0);
+    assert.equal(spawnSync("git", ["commit", "-qm", "base"], { cwd, stdio: "ignore" }).status, 0);
+    assert.equal(spawnSync("git", ["switch", "-c", "worker/t11-index"], { cwd, stdio: "ignore" }).status, 0);
+    const baseCommit = spawnSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).stdout.trim();
+    const taskId = "77777777-7777-4777-8777-777777777777";
+    const decisionStore = new DecisionSessionStore(join(stateDir, "decision-sessions"));
+    const decisionDir = decisionStore.sessionDirectory(taskId);
+    await mkdir(decisionDir, { recursive: true });
+    const decisionSessionFile = join(decisionDir, "session.jsonl");
+    await writeFile(decisionSessionFile, `${JSON.stringify({ type: "session", version: 3, id: randomUUID(), timestamp: new Date().toISOString(), cwd })}\n`);
+    await decisionStore.save({
+      taskId,
+      task: "t11 lease retention test",
+      spec: {
+        goal: "t11 lease retention test",
+        scope: [],
+        constraints: [],
+        forbidden: [],
+        acceptance: [{ id: "fail", name: "fail", command: process.execPath, args: ["-e", "process.exit(1)"], required: true, timeoutMs: 2_000 }],
+        maxRepairRounds: 0,
+        autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 1, permissionAuthority: "hybrid", remoteAuthority: "none", remoteName: "origin" },
+      },
+      cwd,
+      command: "claude",
+      args: [],
+      resolvedExecutable: fakeClaude,
+      decisionSessionFile,
+      maxTurns: 2,
+      deadlineMs: 60_000,
+      noOutputTimeoutMs: 60_000,
+      startedAt: new Date().toISOString(),
+      baseCommit,
+      baseBranch: "worker/t11-index",
+      turn: 0,
+      state: "active",
+    });
+
+    for (const key of keys) delete process.env[key];
+    process.env.PI_CLAUDE_SUPERVISOR_STATE_DIR = stateDir;
+    process.env.PI_CLAUDE_SUPERVISOR_CWD_LEASE_DIR = leaseDir;
+    process.env.PI_CLAUDE_SUPERVISOR_TRANSPORT = "tmux";
+    process.env.PI_CLAUDE_SUPERVISOR_TMUX_MODE = "interactive";
+    process.env.PI_CLAUDE_SUPERVISOR_CGROUP_MODE = "required";
+    process.env.PI_CLAUDE_SUPERVISOR_MODE = "auto";
+    process.env.PI_CLAUDE_SUPERVISOR_AUTOMATION = "1";
+    process.env.PI_CLAUDE_SUPERVISOR_AUTO_INSTALL_HOOKS = "0";
+    process.env.PI_CLAUDE_SUPERVISOR_CLOSE_WORKER_ON_COMPLETION = "0";
+    process.env.PATH = `${fakeBin}${delimiter}${previousPath ?? ""}`;
+
+    const registrations: { commands: Array<{ name: string; definition: { handler: (args: string, ctx: TestContext) => Promise<void> } }>; events: Array<{ name: string; handler: () => Promise<void> }> } = { commands: [], events: [] };
+    const messages: string[] = [];
+    const ctx: TestContext = { cwd, hasUI: true, ui: { confirm: async () => false, notify: (m) => messages.push(m) } };
+    extension({
+      registerCommand(name: string, definition: { handler: (args: string, ctx: TestContext) => Promise<void> }) { registrations.commands.push({ name, definition }); },
+      on(name: string, handler: () => Promise<void>) { registrations.events.push({ name, handler }); },
+    } as never);
+    const command = registrations.commands.find(({ name }) => name === "supervise")!.definition;
+    shutdownHandler = registrations.events.find(({ name }) => name === "session_shutdown")!.handler;
+
+    await command.handler(`recover ${taskId}`, ctx);
+    await command.handler(`resume-auto ${taskId}`, ctx);
+    eventListener?.({
+      type: "turn_completed",
+      handle: { id: workerId, startedAt: new Date().toISOString(), cwd, ownership: "owned", sessionName: `pi-supervisor-${workerId}` },
+      result: {},
+      sequence: 1,
+    });
+    // Failing acceptance check with 0 repair rounds triggers verification block -> interactive park hand-back.
+    await command.handler(`verify ${taskId}`, ctx);
+    assert.equal(detached, true, "verification block should hand back the interactive tmux session");
+    assert.equal(running, true, "handed-back session remains alive");
+
+    // While the handed-back pane is still alive, a new /supervise start on the same cwd MUST be blocked (lease retained).
+    await command.handler("start overlapping task while handed back", ctx);
+    assert.match(messages.at(-1) ?? "", /overlapping cwd|lease is held/u);
+    assert.equal((await new CwdLeaseStore(leaseDir).list()).length, 1, "lease must remain held while handed-back pane lives");
+
+    // Explicit /supervise stop kills the handed-back owned worker via killProcessGroup and frees the lease.
+    await command.handler(`stop ${taskId}`, ctx);
+    assert.equal(running, false);
+    assert.equal(killCalls, 1, "explicit /supervise stop must kill the handed-back blocked owned worker");
+    assert.equal((await new CwdLeaseStore(leaseDir).list()).length, 0, "lease is released after explicit stop kills handed-back pane");
+  } finally {
+    if (shutdownHandler) await shutdownHandler().catch(() => {});
+    preflightMock.mock.restore();
+    startMock.mock.restore();
+    releaseMock.mock.restore();
+    killMock.mock.restore();
+    stopMock.mock.restore();
+    statusMock.mock.restore();
+    readOutputMock.mock.restore();
+    for (const key of keys) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await rm(base, { recursive: true, force: true });
+    await rm(fakeBin, { recursive: true, force: true });
+  }
+});

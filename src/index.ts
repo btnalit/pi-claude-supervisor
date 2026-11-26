@@ -285,12 +285,14 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
         const adoptedDetachConfirmed = detached
           && session.handle.ownership === "adopted"
           && !status.running;
-        // A hand-back (owned interactive `release()`) leaves the Worker
-        // intentionally running; `detached` is its own cleanup confirmation
-        // and does not wait for `!status.running`.
-        const handedBackConfirmed = status.detached === true;
-        const cleanupConfirmed = status.processGroupCleaned === true || adoptedDetachConfirmed || handedBackConfirmed;
-        if ((handedBackConfirmed || !status.running) && cleanupConfirmed && !status.cleanupError && (!status.cgroupError || status.cgroupRequired === false)) {
+        // A hand-back (owned interactive `release()`, on completion or park)
+        // leaves the Worker intentionally running. Retain its cwd lease while
+        // the pane is alive so another task or `/supervise recover` cannot
+        // start a second Worker in the same worktree; release once the pane is
+        // confirmed gone (operator exited tmux or ran `/supervise stop`).
+        const handedBackGone = detached && status.detached === true && !status.running;
+        const cleanupConfirmed = status.processGroupCleaned === true || adoptedDetachConfirmed || handedBackGone;
+        if (!status.running && cleanupConfirmed && !status.cleanupError && (!status.cgroupError || status.cgroupRequired === false)) {
           if (await releaseLease(taskId)) forgetSession(taskId);
           else unconfirmedSweepAttempts.set(taskId, attempts + 1);
         } else {

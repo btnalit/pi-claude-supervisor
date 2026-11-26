@@ -1686,7 +1686,71 @@ export class Supervisor {
     this.#reportProgress("candidate", reason, true);
     let cleanupError: unknown;
     let operatorStop = false;
-    if (handle && ["running", "waiting", "paused", "starting"].includes(this.#machine.state)) {
+    let releasedInteractive = false;
+    const handBackOnPark = !this.#detached()
+      && this.#keepWorkerOnCompletion
+      && Boolean(this.#adapter.release)
+      && Boolean(handle)
+      && ["running", "waiting", "paused", "starting"].includes(this.#machine.state);
+    if (handBackOnPark && handle) {
+      this.#clearWatchdog();
+      try {
+        await this.#adapter.release!(handle, "candidate parked; interactive session kept open");
+        this.#released = true;
+        releasedInteractive = true;
+      } catch (error) {
+        cleanupError = error;
+      }
+      if (this.#stopRequested !== undefined) {
+        // Operator stop raced the release: operator stop still owns the outcome (B1).
+        const preemptiveStop = this.#preemptiveStop;
+        this.#preemptiveStop = undefined;
+        this.#candidateParked = false;
+        this.#parkReasonLabel = undefined;
+        try {
+          if (preemptiveStop) await preemptiveStop.catch(() => {});
+          if (releasedInteractive && handle.ownership === "owned") {
+            await this.#adapter.killProcessGroup(handle, this.#stopRequested);
+            await this.#drainOutputAfterStop(handle);
+            if (await this.#isCleanupConfirmed(handle)) {
+              this.#released = false;
+              await this.#cleanupOwnedTaskTempRoot((this.#stopCloseReason ?? "human_stop") === "human_stop");
+            }
+          } else {
+            await this.#stopInternal(this.#stopRequested, false, this.#stopCloseReason ?? "human_stop");
+            return;
+          }
+          const confirmed = await this.#isCleanupConfirmed(handle);
+          this.#lastStopWasOperator = true;
+          this.#machine.transition(confirmed ? "stopped" : "failed");
+          const closeReason = this.#stopCloseReason ?? "human_stop";
+          this.#stopRequested = undefined;
+          this.#stopCloseReason = undefined;
+          this.#settleTerminal();
+          await this.#appendEvent({ type: confirmed ? "worker_stopped" : "worker_stop_failed", taskId: task.taskId, workerId: handle.id, data: { reason: "operator stop during park hand-back", ...(confirmed ? {} : { cleanupConfirmed: false }) } }).catch(() => {});
+          await this.#decision?.close().catch(() => {});
+          this.#decision = undefined;
+          await Promise.resolve(this.#onDecisionSessionClosed?.(task.taskId, { cleanupConfirmed: confirmed, reason: confirmed ? closeReason : "recoverable_failure" })).catch(() => {});
+        } catch (stopErr) {
+          cleanupError = cleanupError ? new AggregateError([cleanupError, stopErr], "park hand-back stop cleanup failed") : stopErr;
+        }
+        if (cleanupError) throw cleanupError;
+        return;
+      }
+      if (releasedInteractive) {
+        try {
+          await this.#appendEvent({ type: "worker_released", taskId: task.taskId, workerId: handle.id, data: { reason: "candidate parked; interactive session kept open" } });
+        } catch (error) {
+          cleanupError = error;
+        }
+      }
+      await this.#decision?.close().catch(() => {});
+      this.#decision = undefined;
+      await Promise.resolve(this.#onDecisionSessionClosed?.(task.taskId, {
+        cleanupConfirmed: !cleanupError,
+        reason: cleanupError ? "recoverable_failure" : "blocked",
+      })).catch(() => {});
+    } else if (handle && ["running", "waiting", "paused", "starting"].includes(this.#machine.state)) {
       try {
         operatorStop = await this.#stopInternal(`park candidate: ${reason}`, true, "blocked");
       } catch (error) {
@@ -1701,14 +1765,17 @@ export class Supervisor {
       return;
     }
     if (this.#machine.state === "stopped") this.#machine.transition("blocked");
-    else if (["starting", "running", "waiting", "paused"].includes(this.#machine.state)) this.#machine.transition("blocked");
+    else if (["starting", "running", "waiting", "paused"].includes(this.#machine.state)) this.#machine.transition(cleanupError ? "failed" : "blocked");
     this.#settleTerminal();
+    const parkedReason = releasedInteractive && !cleanupError
+      ? `${reason}; interactive session stays open (/supervise stop closes it)`
+      : reason;
     const notice: CandidateNotice = {
       taskId: task.taskId,
       workerId: handle?.id,
       cwd: task.cwd,
       task: task.task,
-      reason,
+      reason: parkedReason,
       reasonLabel,
       question,
       permission,
@@ -2077,19 +2144,28 @@ export class Supervisor {
       await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", { cleanupConfirmed, reason: effectiveCloseReason })).catch(() => {});
       return operatorStop;
     }
-    if (this.#machine.state === "completed") {
+    if (this.#machine.state === "completed" || (this.#machine.state === "blocked" && this.#released)) {
+      const wasBlocked = this.#machine.state === "blocked";
       if (this.#handle) {
         if (this.#released && this.#handle.ownership === "owned") {
-          // The handle was released, not stopped, when the task completed
-          // with a kept-open interactive session (#finalizeVerification); the
-          // adapter's own stop() would just re-release an already-released
-          // record. Kill the process group directly so an explicit stop
-          // actually closes the session.
+          // The handle was released, not stopped, when the task completed or
+          // parked with a kept-open interactive session; the adapter's own
+          // stop() would just re-release an already-released record. Kill the
+          // process group directly so an explicit stop actually closes it.
           await this.#adapter.killProcessGroup(this.#handle, reason);
         } else {
           await this.#adapter.stop(this.#handle, reason);
         }
         await this.#drainOutputAfterStop(this.#handle);
+        const confirmed = this.#handle.ownership === "owned" && await this.#isCleanupConfirmed(this.#handle);
+        if (confirmed) {
+          this.#released = false;
+          await this.#cleanupOwnedTaskTempRoot(true);
+          if (wasBlocked) {
+            await this.#appendEvent({ type: "worker_stopped", taskId: this.#task?.taskId, workerId: this.#handle.id, data: { reason } }).catch(() => {});
+            await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", { cleanupConfirmed: true, reason: closeReason })).catch(() => {});
+          }
+        }
       }
       return false;
     }
@@ -2840,10 +2916,12 @@ export class Supervisor {
       this.#candidateParked = true;
       this.#parkReasonLabel = detached ? "Released" : (options.reasonLabel ?? (options.publishOnly ? "Publish unconfirmed" : "Verification blocked"));
     }
-    // A completed interactive task may keep its persistent session open for
-    // the operator instead of tearing it down; a stop requested mid-verify or
-    // a blocked/failed outcome always falls back to today's stop behavior.
-    const keepOpen = !detached && !stopRequested && this.#stopVerification === undefined && outcome === "completed" && result.ok
+    // A completed or parked interactive task may keep its persistent session
+    // open for the operator instead of tearing it down (T11, reusing
+    // CLOSE_WORKER_ON_COMPLETION); a stop requested mid-verify or a failed
+    // outcome always falls back to stop behavior.
+    const keepOpen = !detached && !stopRequested && this.#stopVerification === undefined
+      && ((outcome === "completed" && result.ok) || outcome === "blocked")
       && this.#keepWorkerOnCompletion && Boolean(this.#adapter.release) && Boolean(this.#handle);
     let cleanupError: unknown;
     let releasedInteractive = false;
@@ -2859,7 +2937,10 @@ export class Supervisor {
         try {
           // Match the generic release() path: no output drain. The session
           // stays alive and its transcript keeps growing after detach.
-          await this.#adapter.release!(this.#handle, "task completed; interactive session kept open");
+          const releaseReason = outcome === "completed"
+            ? "task completed; interactive session kept open"
+            : "candidate parked; interactive session kept open";
+          await this.#adapter.release!(this.#handle, releaseReason);
           this.#released = true;
           releasedInteractive = true;
         } catch (error) {
@@ -2908,7 +2989,12 @@ export class Supervisor {
     }
     if (releasedInteractive) {
       try {
-        await this.#appendEvent({ type: "worker_released", taskId: this.#task?.taskId, workerId: this.#handle?.id, data: { reason: "task completed; interactive session kept open" } });
+        await this.#appendEvent({
+          type: "worker_released",
+          taskId: this.#task?.taskId,
+          workerId: this.#handle?.id,
+          data: { reason: verificationSucceeded ? "task completed; interactive session kept open" : "candidate parked; interactive session kept open" },
+        });
       } catch (error) {
         eventError = eventError ? new AggregateError([eventError, error], "verification lifecycle audit failed") : error;
       }
@@ -2945,7 +3031,9 @@ export class Supervisor {
         task: task?.task ?? "",
         reason: verificationSucceeded
           ? `${releasedInteractive ? "candidate is ready; the interactive session stays open (/supervise stop closes it)" : "candidate is ready"}${this.#prUrl ? `; pull request ${this.#prUrl}` : ""}${this.#publishShortfall ? `; not published: ${this.#publishShortfall}` : ""}`
-          : candidateReason,
+          : releasedInteractive
+            ? `${candidateReason}; interactive session stays open (/supervise stop closes it)`
+            : candidateReason,
         ...(verificationSucceeded ? {} : { reasonLabel: this.#parkReasonLabel }),
         status: verificationSucceeded ? "ready" : "blocked",
         deliverable: verificationSucceeded || publishOnlyBlock,

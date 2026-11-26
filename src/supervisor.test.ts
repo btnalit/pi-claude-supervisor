@@ -5802,4 +5802,181 @@ test("interactive keepWorkerOnCompletion retains taskTempRoot while the released
   }
 });
 
+test("T11: interactive park (both direct park and verification block) hands back the session, retains taskTempRoot, and explicit stop kills it", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-t11-"));
+  const cwd1 = join(base, "repo-direct");
+  const cwd2 = join(base, "repo-verify");
+  const cwd3 = join(base, "repo-close");
+  let tempDir1: string | undefined;
+  let tempDir2: string | undefined;
+  try {
+    await Promise.all([mkdir(cwd1), mkdir(cwd2), mkdir(cwd3)]);
+    await Promise.all([
+      initializeGitRepository(cwd1, "worker/t11-direct"),
+      initializeGitRepository(cwd2, "worker/t11-verify"),
+      initializeGitRepository(cwd3, "worker/t11-close"),
+    ]);
+
+    // 1. Direct #parkCandidate hand-back -> explicit stop kills it & removes taskTempRoot.
+    {
+      const handle: WorkerHandle = { id: "t11-direct-worker", startedAt: new Date().toISOString(), cwd: cwd1, ownership: "owned" };
+      let running = true;
+      let released = false;
+      let stopCalls = 0;
+      let killCalls = 0;
+      let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+      const closures: Array<{ cleanupConfirmed: boolean; reason: string }> = [];
+      const notices: CandidateNotice[] = [];
+      const adapter: WorkerAdapter = {
+        capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true, repairableSession: true }),
+        start: async () => handle,
+        getStatus: async () => ({ handle, running, detached: released, activeRequests: 0, processGroupCleaned: !running }),
+        readOutput: async () => [],
+        send: async () => {},
+        pause: async () => {},
+        resume: async () => {},
+        release: async () => { released = true; },
+        stop: async () => { stopCalls += 1; running = false; },
+        killProcessGroup: async () => { killCalls += 1; running = false; released = false; },
+        resumeSession: async () => handle,
+      };
+      const supervisor = new Supervisor(adapter, undefined, {
+        reviewer: automaticReviewer(),
+        onCandidate: (notice) => { notices.push(notice); },
+      });
+      await supervisor.start({
+        task: "t11 direct park hand-back",
+        cwd: cwd1,
+        command: "claude",
+        automation: true,
+        interactive: true,
+        keepWorkerOnCompletion: true,
+        deadlineMs: 0,
+        noOutputTimeoutMs: 0,
+        onDecisionSessionClosed: (_taskId, info) => { closures.push(info); },
+        spec: automaticSpec(),
+        decisionWorkerFactory: (opts) => { onAction = opts.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+      });
+      tempDir1 = supervisor.taskTempRoot?.canonical;
+      assert.ok(tempDir1);
+
+      await onAction?.({ action: "park", reason: "needs product decision" }, { type: "turn_completed", handle, result: {}, sequence: 1 });
+      assert.equal(supervisor.state, "blocked");
+      assert.equal(supervisor.released, true);
+      assert.equal(released, true);
+      assert.equal(stopCalls, 0, "park hand-back must release, not stop");
+      assert.match(notices[0]?.reason ?? "", /interactive session stays open/u);
+      assert.deepEqual(closures[0], { cleanupConfirmed: true, reason: "blocked" });
+      await access(tempDir1);
+
+      // Explicit /supervise stop on handed-back blocked session kills the process group & cleans taskTempRoot.
+      await supervisor.stop("operator closes handed-back parked session");
+      assert.equal(killCalls, 1);
+      assert.equal(running, false);
+      assert.deepEqual(closures.at(-1), { cleanupConfirmed: true, reason: "human_stop" });
+      await assert.rejects(() => access(tempDir1!), { code: "ENOENT" });
+    }
+
+    // 2. Verification blocked with keepWorkerOnCompletion hands back instead of stopping.
+    {
+      const handle: WorkerHandle = { id: "t11-verify-worker", startedAt: new Date().toISOString(), cwd: cwd2, ownership: "owned" };
+      let running = true;
+      let released = false;
+      let stopCalls = 0;
+      let killCalls = 0;
+      let listener: WorkerStartInput["eventListener"];
+      const adapter: WorkerAdapter = {
+        capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true, repairableSession: true }),
+        start: async (input) => { listener = input.eventListener; return handle; },
+        getStatus: async () => ({ handle, running, detached: released, activeRequests: 0, processGroupCleaned: !running }),
+        readOutput: async () => [],
+        send: async () => {},
+        pause: async () => {},
+        resume: async () => {},
+        release: async () => { released = true; },
+        stop: async () => { stopCalls += 1; running = false; },
+        killProcessGroup: async () => { killCalls += 1; running = false; released = false; },
+        resumeSession: async () => handle,
+      };
+      const supervisor = new Supervisor(adapter, undefined, {
+        reviewer: { review: async () => ({ verdict: "human", summary: "needs human judgment", findings: [], round: 0, checkedAt: new Date().toISOString() }) },
+      });
+      await supervisor.start({
+        task: "t11 verify block hand-back",
+        cwd: cwd2,
+        command: "claude",
+        automation: true,
+        interactive: true,
+        keepWorkerOnCompletion: true,
+        deadlineMs: 0,
+        noOutputTimeoutMs: 0,
+        spec: {
+          maxRepairRounds: 0,
+          autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 },
+          acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 2_000 }],
+        },
+        decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+      });
+      tempDir2 = supervisor.taskTempRoot?.canonical;
+      assert.ok(tempDir2);
+
+      listener?.({ type: "turn_completed", handle, result: {}, sequence: 1 });
+      await supervisor.poll();
+      await supervisor.verify();
+      assert.equal(supervisor.state, "blocked");
+      assert.equal(supervisor.released, true);
+      assert.equal(released, true);
+      assert.equal(stopCalls, 0);
+      await access(tempDir2);
+
+      await supervisor.stop("operator stop after verify block");
+      assert.equal(killCalls, 1);
+      await assert.rejects(() => access(tempDir2!), { code: "ENOENT" });
+    }
+
+    // 3. keepWorkerOnCompletion=false (CLOSE_WORKER_ON_COMPLETION=1) still stops the Worker on park.
+    {
+      const handle: WorkerHandle = { id: "t11-close-worker", startedAt: new Date().toISOString(), cwd: cwd3, ownership: "owned" };
+      let running = true;
+      let releaseCalls = 0;
+      let stopCalls = 0;
+      let onAction: Parameters<DecisionWorkerFactory>[0]["onAction"] | undefined;
+      const adapter: WorkerAdapter = {
+        capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true, repairableSession: true }),
+        start: async () => handle,
+        getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+        readOutput: async () => [],
+        send: async () => {},
+        pause: async () => {},
+        resume: async () => {},
+        release: async () => { releaseCalls += 1; },
+        stop: async () => { stopCalls += 1; running = false; },
+        killProcessGroup: async () => { running = false; },
+        resumeSession: async () => handle,
+      };
+      const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
+      await supervisor.start({
+        task: "t11 close on park",
+        cwd: cwd3,
+        command: "claude",
+        automation: true,
+        interactive: true,
+        keepWorkerOnCompletion: false,
+        deadlineMs: 0,
+        noOutputTimeoutMs: 0,
+        spec: automaticSpec(),
+        decisionWorkerFactory: (opts) => { onAction = opts.onAction; return { start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }; },
+      });
+      await onAction?.({ action: "park", reason: "close requested" }, { type: "turn_completed", handle, result: {}, sequence: 1 });
+      assert.equal(supervisor.state, "blocked");
+      assert.equal(releaseCalls, 0);
+      assert.equal(stopCalls, 1);
+    }
+  } finally {
+    if (tempDir1) await rm(tempDir1, { recursive: true, force: true }).catch(() => {});
+    if (tempDir2) await rm(tempDir2, { recursive: true, force: true }).catch(() => {});
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
 

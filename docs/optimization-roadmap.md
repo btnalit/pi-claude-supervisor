@@ -247,7 +247,7 @@ interface DecisionGuard {
 | T8 (T8a ✅) | interactive 模式下 `#monitor` 不看屏幕；`permission_prompt` 通知只记日志；AskUserQuestion 的 PreToolUse 超时返回 `{}` [code] | 对话框只能靠 20 分钟 watchdog（失败）发现；转圈卡住的轮次要等 4 小时 | **T8a 已实现**：AskUserQuestion 在 PreToolUse 阶段超时改为 `deny`（提示改用普通文本说明假设后继续）；**T8b/T8c 延后至 spike 后**：无待决请求时收到 `permission_prompt`/`elicitation_dialog` 通知与“活跃轮次内长时间无 hook 活动”看门狗 | 中 |
 | T9 | hook 服务端单行 1 MB 上限，超限直接断开 [code] | 大文件 Write/Edit 权限请求或超长 Stop 失败 → 回退到等人的对话框 | relay 截断超长字段（保留长度与哈希），提高上限；**被截断的 Bash 命令一律拒绝**（不能对截断文本做策略判断） | 中 |
 | T10 | hook socket 位于 `$XDG_RUNTIME_DIR`（无 linger 时随最后会话退出被删）；自动模式要求可写的委派 cgroup（ssh `session-N.scope` 为 root 所有）[code][hyp] | 所有 hook 静默 no-op；从 ssh 启动即失败 | socket 移到 `/tmp/pi-claude-supervisor-<uid>` 并定期自检重建；与 D7 一并解决 cgroup；文档写明 `loginctl enable-linger` 与 `systemd-run --user --scope -p Delegate=yes` | 中 |
-| T11 | 验证中 release 以 `failed` 结束（§3.2 B5）；park 时 `#stopInternal` 关闭 owned tmux 会话 | 早上接手时 Claude 上下文已丢失 | 与 0.3 一并修 B5；interactive 模式下 park 改为 **交还会话（hand-back）**，保留 Claude 上下文供人接手 | 中 |
+| T11 ✅ | 验证中 release 以 `failed` 结束（§3.2 B5）；park 时 `#stopInternal` 关闭 owned tmux 会话 | 早上接手时 Claude 上下文已丢失 | **已实现**：B5 已在 0.3 修复；interactive 模式下 park（包含 `#parkCandidate` 与验证期 `blocked`）复用 `CLOSE_WORKER_ON_COMPLETION`（默认 false）改为 **交还会话（hand-back）**，保留 Claude 上下文与 `taskTempRoot`，在 pane 存活期间保留 cwd 租约（防同工作树双写），且显式 `/supervise stop` 可终止已交还的 `blocked` 会话并清理临时目录 | 中 |
 
 **其余（小项）**：信任对话框按 500 ms 间隔循环处理（2.1.281 有输入保护 [bin]）；其他启动对话框失败时附屏幕尾部；
 权限决策时长封顶在 hook 预算内并丢弃过期排队事件；验证持有 `#exclusive` 期间 pre-phase 策略回答移到锁外；
