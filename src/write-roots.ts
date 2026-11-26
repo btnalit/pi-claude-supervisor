@@ -1,4 +1,4 @@
-import { constants as fsConstants, closeSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from "node:fs";
+import { constants as fsConstants, closeSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -39,8 +39,8 @@ export function isPinnedWriteRoot(value: unknown): value is PinnedWriteRoot {
   const candidate = value as Partial<PinnedWriteRoot>;
   return typeof candidate.declared === "string" && isAbsolute(candidate.declared) && candidate.declared.length <= MAX_WRITE_ROOT_PATH_LENGTH && !candidate.declared.includes("\0")
     && typeof candidate.canonical === "string" && isAbsolute(candidate.canonical) && candidate.canonical.length <= MAX_WRITE_ROOT_PATH_LENGTH && !candidate.canonical.includes("\0")
-    && typeof candidate.dev === "number" && Number.isSafeInteger(candidate.dev) && candidate.dev >= 0
-    && typeof candidate.ino === "number" && Number.isSafeInteger(candidate.ino) && candidate.ino >= 0;
+    && typeof candidate.dev === "number" && Number.isFinite(candidate.dev) && candidate.dev >= 0
+    && typeof candidate.ino === "number" && Number.isFinite(candidate.ino) && candidate.ino >= 0;
 }
 
 /** True when `a` and `b` are the same path or one is an ancestor of the other. */
@@ -99,10 +99,11 @@ function resolveGitCommonDir(startDir: string): string | undefined {
   for (;;) {
     const dotGit = join(current, ".git");
     try {
-      const info = lstatSync(dotGit);
+      const info = statSync(dotGit);
       if (info.isDirectory()) return canonicalOrResolved(dotGit);
       if (info.isFile()) {
-        const text = readSmallRegularFile(dotGit, MAX_GIT_POINTER_BYTES);
+        const resolvedDotGit = canonicalOrResolved(dotGit);
+        const text = readSmallRegularFile(resolvedDotGit, MAX_GIT_POINTER_BYTES);
         const match = text?.match(/^gitdir:\s*(.+?)\s*$/mu);
         if (!match?.[1]) return undefined;
         const gitDir = resolve(current, match[1]);

@@ -215,7 +215,7 @@ export function deleteFloorViolation(command: string, cwd: string, options: Dele
   return floorScript(command, cwd, roots, new Map(), 0);
 }
 
-interface FloorRoots { cwd: string; others: string[] }
+interface FloorRoots { cwd: string; others: string[]; defaultTmpDir?: string }
 
 const FLOOR_MAX_DEPTH = 6;
 const DELETE_COMMANDS = new Set(["rm", "rmdir", "unlink", "shred", "mv", "rimraf"]);
@@ -251,7 +251,7 @@ function floorScript(command: string, start: string | undefined, roots: FloorRoo
   // At the top an unparsable command is already refused by evaluateCommand;
   // nested text that does not parse cannot be read, so a delete in it is refused.
   if (lexical.error) return depth > 0 && DELETE_WORD.test(command) ? "Worker cannot delete through a script the policy cannot parse" : undefined;
-  const bindings = floorBindings(command, lexical.tokens, inherited);
+  const bindings = floorBindings(command, lexical.tokens, inherited, roots.defaultTmpDir);
   const nested = (body: string, directory: string | undefined): string | undefined => floorScript(body, directory, roots, bindings, depth + 1);
   for (const body of substitutionBodies(withoutQuotedHeredocs(command))) {
     const violation = nested(body, start);
@@ -359,11 +359,13 @@ function deleteFloorRoots(cwd: string, writeRoots: readonly string[], tempRoots:
   const verifiedPinned = pinnedWriteRoots
     .map((root) => verifyPinnedWriteRoot(root))
     .filter((path): path is string => path !== undefined);
+  const canonicalTemps = tempRoots.filter((root) => isAbsolute(root)).map(canonical);
   const others = [
     ...verifiedPinned,
-    ...[...writeRoots, ...tempRoots].filter((root) => isAbsolute(root)).map(canonical),
+    ...writeRoots.filter((root) => isAbsolute(root)).map(canonical),
+    ...canonicalTemps,
   ];
-  return { cwd: canonical(cwd), others: [...new Set(others)] };
+  return { cwd: canonical(cwd), others: [...new Set(others)], defaultTmpDir: canonicalTemps[0] };
 }
 
 /** Statements split at `|`, `&&`, `||`, `;` and `&`, each with the operator that follows it. */
@@ -443,12 +445,14 @@ function substitutionBodies(command: string): string[] {
  * `$HOME`/`$TMPDIR` are the process's own — each only while the command
  * does not assign the name again.
  */
-function floorBindings(command: string, tokens: readonly ShellToken[], inherited: ReadonlyMap<string, string>): Map<string, string> {
+function floorBindings(command: string, tokens: readonly ShellToken[], inherited: ReadonlyMap<string, string>, defaultTmpDir?: string): Map<string, string> {
   // A name is trusted only while its one definition is its only bare mention:
   // `d+=…`, `printf -v d`, `read d`, `mapfile d` or a second `d=` drop it.
   const bareMentions = (name: string): number => (command.match(new RegExp(`(?<![$\\w{-])${name}(?![\\w])`, "gu")) ?? []).length;
   const bindings = new Map([...inherited].filter(([name]) => bareMentions(name) === 0));
-  for (const [name, value] of [["HOME", homedir()], ["TMPDIR", tmpdir()]] as const) {
+  const defaults: Array<[string, string]> = [["HOME", homedir()]];
+  if (defaultTmpDir !== undefined) defaults.push(["TMPDIR", defaultTmpDir]);
+  for (const [name, value] of defaults) {
     if (!bindings.has(name) && bareMentions(name) === 0) bindings.set(name, value);
   }
   const assignedOnce = (name: string): boolean => bareMentions(name) === 1;
@@ -456,7 +460,7 @@ function floorBindings(command: string, tokens: readonly ShellToken[], inherited
     const name = match[1]!;
     if (!assignedOnce(name)) { bindings.delete(name); continue; }
     const words = match[3]!.trim().split(/\s+/u).filter(Boolean);
-    let directory: string | undefined = tmpdir();
+    let directory: string | undefined = defaultTmpDir;
     for (let index = 0; index < words.length; index += 1) {
       const word = words[index]!;
       if (word === "-p" || word === "--tmpdir") directory = words[index + 1];
@@ -464,7 +468,9 @@ function floorBindings(command: string, tokens: readonly ShellToken[], inherited
       else if (!word.startsWith("-") && word.includes("/")) directory = dirname(word);
       if (word === "-p") index += 1;
     }
-    if (directory !== undefined && /^\$\{?TMPDIR\}?(?=\/|$)/u.test(directory)) directory = tmpdir() + directory.replace(/^\$\{?TMPDIR\}?/u, "");
+    if (directory !== undefined && /^\$\{?TMPDIR\}?(?=\/|$)/u.test(directory)) {
+      directory = defaultTmpDir !== undefined ? defaultTmpDir + directory.replace(/^\$\{?TMPDIR\}?/u, "") : undefined;
+    }
     if (directory === undefined || !isAbsolute(directory) || /[$`*?[{~]/u.test(directory)) bindings.delete(name);
     else bindings.set(name, join(directory, `mktemp-${name}`));
   }

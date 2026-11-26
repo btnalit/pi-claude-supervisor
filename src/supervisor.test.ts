@@ -5714,12 +5714,19 @@ test("automatic Supervisor injects task-scoped TMPDIR/TMP/TEMP, honors declared 
     capturedListener?.({ type: "permission_request", handle, request: { requestId: "r-out", toolUseId: "t-out", toolName: "Write", input: { file_path: join(outsideTmp, "escape.txt") }, raw: {} } });
     // Delete inside sibling /tmp directory -> deny (narrowed delete floor).
     capturedListener?.({ type: "permission_request", handle, request: { requestId: "r-del", toolUseId: "t-del", toolName: "Bash", input: { command: `rm -rf ${outsideTmp}/x` }, raw: {} } });
+    // $TMPDIR and $(mktemp -d) resolve inside the task-scoped temp root -> allow, while rm -rf "$TMPDIR" (whole root) -> deny.
+    capturedListener?.({ type: "permission_request", handle, request: { requestId: "r-tmpdir-child", toolUseId: "t-tmpdir-child", toolName: "Bash", input: { command: "rm -rf \"$TMPDIR/scratch\"" }, raw: {} } });
+    capturedListener?.({ type: "permission_request", handle, request: { requestId: "r-mktemp", toolUseId: "t-mktemp", toolName: "Bash", input: { command: "d=$(mktemp -d); rm -rf \"$d\"" }, raw: {} } });
+    capturedListener?.({ type: "permission_request", handle, request: { requestId: "r-tmpdir-root", toolUseId: "t-tmpdir-root", toolName: "Bash", input: { command: "rm -rf \"$TMPDIR\"" }, raw: {} } });
     await supervisor.poll();
 
     assert.equal(responded.find((r) => r.requestId === "r-tmp")?.behavior, "allow");
     assert.equal(responded.find((r) => r.requestId === "r-lane")?.behavior, "allow");
     assert.equal(responded.find((r) => r.requestId === "r-out")?.behavior, "deny");
     assert.equal(responded.find((r) => r.requestId === "r-del")?.behavior, "deny");
+    assert.equal(responded.find((r) => r.requestId === "r-tmpdir-child")?.behavior, "allow");
+    assert.equal(responded.find((r) => r.requestId === "r-mktemp")?.behavior, "allow");
+    assert.equal(responded.find((r) => r.requestId === "r-tmpdir-root")?.behavior, "deny");
 
     // Completing the task removes its owned taskTempRoot.
     await supervisor.verify();
@@ -5730,6 +5737,67 @@ test("automatic Supervisor injects task-scoped TMPDIR/TMP/TEMP, honors declared 
     }
     assert.equal(stillExists, false, "owned taskTempRoot is cleaned up on terminal completion");
   } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("interactive keepWorkerOnCompletion retains taskTempRoot while the released Worker stays open", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-d9a-keepopen-"));
+  const cwd = join(base, "repo");
+  let taskTempDir: string | undefined;
+  try {
+    await mkdir(cwd);
+    await initializeGitRepository(cwd, "worker/d9a-keepopen");
+    const handle: WorkerHandle = { id: "d9a-keepopen-worker", startedAt: new Date().toISOString(), cwd, ownership: "owned" };
+    let released = false;
+    let closedInfo: { cleanupConfirmed: boolean; reason: string; workerReleased?: boolean } | undefined;
+    let capturedListener: WorkerStartInput["eventListener"];
+    const adapter: WorkerAdapter = {
+      capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true, repairableSession: true }),
+      start: async (input) => { capturedListener = input.eventListener; return handle; },
+      getStatus: async () => ({ handle, running: true, detached: released, activeRequests: 0, processGroupCleaned: false }),
+      readOutput: async () => [],
+      send: async () => {},
+      pause: async () => {},
+      resume: async () => {},
+      release: async () => { released = true; },
+      stop: async () => {},
+      killProcessGroup: async () => {},
+      resumeSession: async () => handle,
+    };
+    const supervisor = new Supervisor(adapter, undefined, {
+      reviewer: { review: async () => ({ verdict: "pass", summary: "ok", findings: [], round: 0, checkedAt: new Date().toISOString() }) },
+    });
+    await supervisor.start({
+      task: "keep-open temp root retention",
+      cwd,
+      command: "claude",
+      automation: true,
+      interactive: true,
+      keepWorkerOnCompletion: true,
+      deadlineMs: 0,
+      noOutputTimeoutMs: 0,
+      onDecisionSessionClosed: (_taskId, info) => { closedInfo = info; },
+      spec: {
+        autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2, permissionAuthority: "policy" },
+        acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 2_000 }],
+      },
+      decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+    });
+    taskTempDir = supervisor.taskTempRoot?.canonical;
+    assert.ok(taskTempDir, "interactive automatic task allocates taskTempRoot");
+
+    capturedListener?.({ type: "turn_completed", handle, result: {}, sequence: 1 });
+    await supervisor.poll();
+    await supervisor.verify();
+    assert.equal(supervisor.state, "completed");
+    assert.equal(released, true);
+    assert.equal(closedInfo?.reason, "completed");
+    assert.equal(closedInfo?.workerReleased, true);
+    // taskTempRoot MUST remain alive on disk because the released Claude TUI still uses it as TMPDIR.
+    await access(taskTempDir);
+  } finally {
+    if (taskTempDir) await rm(taskTempDir, { recursive: true, force: true }).catch(() => {});
     await rm(base, { recursive: true, force: true });
   }
 });

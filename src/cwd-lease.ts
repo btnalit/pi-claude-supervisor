@@ -387,8 +387,8 @@ export class CwdLeaseStore {
         // One unreadable or incompatible record (disk full, truncated write,
         // a corrupt JSON file) must not block every other cwd lease in the
         // registry. Quarantine it out of the directory this scan reads instead,
-        // and keep going. Newer schema versions are NOT quarantined so an older
-        // build can never silently drop a newer supervisor's multi-root lock.
+        // and keep going. Builds supporting v2+ never quarantine schema
+        // versions > 2 so a newer supervisor's lock is never silently dropped.
         await this.#quarantine(name, leasePath, error);
         continue;
       }

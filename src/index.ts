@@ -216,7 +216,9 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
     if (!record || record.state !== "active") return;
     const terminal = info.reason === "completed" || info.reason === "human_stop";
     if (terminal && info.cleanupConfirmed) {
-      await cleanupTaskTempRoot(record.taskTempRoot).catch(() => {});
+      // Do not remove taskTempRoot while a kept-open/released Worker is still
+      // alive using it as TMPDIR.
+      if (!info.workerReleased) await cleanupTaskTempRoot(record.taskTempRoot).catch(() => {});
       await decisionStore.close(taskId);
       return;
     }
@@ -733,9 +735,6 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
               : []);
           const canonicalRoots = pinnedWriteRoots.map((root) => root.canonical);
           const taskPaths = [cwdKey, ...canonicalRoots];
-          const taskTempRoot = record.taskTempRoot
-            ? await reverifyOrRecreateTaskTempRoot(record.taskTempRoot, record.taskId)
-            : undefined;
           await releaseSettledReservations();
           if (shuttingDown) throw new Error("Pi session is shutting down");
           if (anyPathsOverlap(allReservedPaths(), taskPaths)) {
@@ -771,11 +770,18 @@ export default function piClaudeSupervisor(pi: ExtensionAPI): void {
           }
           cwdLeases.set(record.taskId, lease);
           let recoveryClaimed = false;
+          let taskTempRoot: PinnedWriteRoot | undefined;
+          let createdFreshTempRoot = false;
           try {
+            if (record.taskTempRoot) {
+              taskTempRoot = await reverifyOrRecreateTaskTempRoot(record.taskTempRoot, record.taskId);
+              createdFreshTempRoot = taskTempRoot.canonical !== record.taskTempRoot.canonical;
+            }
             await decisionStore.beginRecovery(record.taskId);
             recoveryClaimed = true;
             if (shuttingDown) throw new Error("Pi session is shutting down");
           } catch (error) {
+            if (createdFreshTempRoot) await cleanupTaskTempRoot(taskTempRoot).catch(() => {});
             if (recoveryClaimed) await decisionStore.markRecoveryInterrupted(record.taskId).catch(() => {});
             await releaseLease(record.taskId);
             throw error;

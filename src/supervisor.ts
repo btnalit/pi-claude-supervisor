@@ -12,7 +12,7 @@ import { assertAutomaticClaudePermissionConfiguration, assertTrustedAutomaticCla
 import { normalizeReviewReport, type ReviewInput, type TaskReviewer } from "./reviewer.ts";
 import { attachCommand } from "./worker/tmux-adapter.ts";
 import { isWorkerInputError } from "./worker/input-error.ts";
-import { cleanupTaskTempRoot, createTaskTempRoot, pinWriteRoots, type PinnedWriteRoot } from "./write-roots.ts";
+import { cleanupTaskTempRoot, createTaskTempRoot, pinWriteRoots, verifyPinnedWriteRoot, type PinnedWriteRoot } from "./write-roots.ts";
 import type { HookEventSource } from "./hooks/types.ts";
 import type {
   AcceptanceReport,
@@ -82,6 +82,8 @@ export interface SupervisorProgress {
 export interface DecisionSessionClosedInfo {
   cleanupConfirmed: boolean;
   reason: DecisionSessionCloseReason;
+  /** True when the Worker was intentionally released/kept open rather than stopped. */
+  workerReleased?: boolean;
 }
 
 export interface SupervisorTokenUsage {
@@ -1079,13 +1081,15 @@ export class Supervisor {
     const pinned = this.#taskTempRoot
       ? [...this.#pinnedWriteRoots, this.#taskTempRoot]
       : this.#pinnedWriteRoots;
+    const verifiedTaskTemp = this.#taskTempRoot ? verifyPinnedWriteRoot(this.#taskTempRoot) : undefined;
     return {
       ...(writeRoots ? { writeRoots } : {}),
       ...(pinned.length > 0 ? { pinnedWriteRoots: pinned } : {}),
       // When a task-scoped temp root is active, narrow delete-floor temp roots
-      // away from blanket shared `/tmp` to ONLY `cwd`, verified pinned roots
-      // (including the task's own temp root), and session write roots.
-      ...(this.#taskTempRoot ? { tempRoots: [] } : {}),
+      // away from blanket shared `/tmp` to ONLY the verified task temp root
+      // (so `$TMPDIR` and `$(mktemp)` bind inside it, while sibling `/tmp` dirs
+      // stay denied and a swapped temp root fails closed with `[]`).
+      ...(this.#taskTempRoot ? { tempRoots: verifiedTaskTemp ? [verifiedTaskTemp] : [] } : {}),
       ...(this.#remoteGrant ? { remote: this.#remoteGrant } : {}),
     };
   }
@@ -2129,8 +2133,8 @@ export class Supervisor {
     await this.#decision?.close().catch(() => {});
     this.#decision = undefined;
     const closeReasonForStop = stopped ? effectiveCloseReason : "recoverable_failure";
-    await this.#cleanupOwnedTaskTempRoot(closeReasonForStop === "completed" || closeReasonForStop === "human_stop");
-    await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", { cleanupConfirmed, reason: closeReasonForStop })).catch(() => {});
+    await this.#cleanupOwnedTaskTempRoot(!this.#released && (closeReasonForStop === "completed" || closeReasonForStop === "human_stop"));
+    await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", { cleanupConfirmed, reason: closeReasonForStop, ...(this.#released ? { workerReleased: true } : {}) })).catch(() => {});
     if (!stopped && effectiveCloseReason !== "human_stop") {
       await this.#notifyFailure(`worker cleanup could not be confirmed: ${reason}`);
     }
@@ -2919,11 +2923,17 @@ export class Supervisor {
     this.#decision = undefined;
     this.#stopRequested = undefined;
     this.#stopCloseReason = undefined;
+    const workerReleased = releasedInteractive || detached;
     const verificationCloseReason = stopRequested ? stopCloseReason : verificationSucceeded ? "completed" : terminalState === "blocked" ? "blocked" : "recoverable_failure";
-    await this.#cleanupOwnedTaskTempRoot(verificationCloseReason === "completed" || verificationCloseReason === "human_stop");
+    // Never delete taskTempRoot while the Worker is still alive (kept-open
+    // interactive completion or released/detached session): its TMPDIR still
+    // points there, and deleting a /tmp path while live lets another local user
+    // recreate it and capture subsequent temp writes.
+    await this.#cleanupOwnedTaskTempRoot(!workerReleased && (verificationCloseReason === "completed" || verificationCloseReason === "human_stop"));
     await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", {
       cleanupConfirmed,
       reason: verificationCloseReason,
+      ...(workerReleased ? { workerReleased: true } : {}),
     })).catch(() => {});
     this.#verificationAbortController = undefined;
     if (cleanupError && eventError) throw new AggregateError([cleanupError, eventError], "verification cleanup and audit failed");
