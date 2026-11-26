@@ -4,7 +4,7 @@ import { link, mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { assertSafeWorkerCommand, deleteFloorViolation, evaluateCommand, evaluatePermission, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, sameDirectory, shellQuote } from "./policy.ts";
+import { assertSafeWorkerCommand, deleteFloorViolation, evaluateCommand, evaluatePermission, isProtectedBranch, isRoutinePermission, publishCommand, pullRequestCommand, sameDirectory, shellQuote, writeFloorViolation } from "./policy.ts";
 import { createTaskTempRoot, pinWriteRoots } from "./write-roots.ts";
 
 function bash(command: string) {
@@ -1655,5 +1655,321 @@ test("D5 checks sensitive commands in command position only, unwraps literal tim
     "find . -exec echo \"$X\" {} +",
   ]) {
     assert.equal(evaluateCommand(cmd).decision, "deny", `D5 expected deny: ${cmd}`);
+  }
+});
+
+test("Write Floor v1 (#55-3) blocks out-of-R and .git writes across redirects, tee, cp/install/ln, worktree add/move, and nested shells while allowing in-R writes", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-write-floor-"));
+  const repo = join(base, "repo");
+  const sub = join(repo, "packages", "app");
+  const shared = join(repo, "packages", "shared");
+  const lane = join(base, "lane-a");
+  const outside = join(base, "outside");
+  const taskTmp = await createTaskTempRoot("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+  try {
+    await Promise.all([
+      mkdir(join(repo, ".git", "hooks"), { recursive: true }),
+      mkdir(join(repo, ".ssh"), { recursive: true }),
+      mkdir(join(repo, "home", "user", ".ssh"), { recursive: true }),
+      mkdir(join(repo, "2"), { recursive: true }),
+      mkdir(sub, { recursive: true }),
+      mkdir(shared, { recursive: true }),
+      mkdir(lane, { recursive: true }),
+      mkdir(outside, { recursive: true }),
+    ]);
+    await writeFile(join(repo, "a.txt"), "a\n");
+    await writeFile(join(repo, ".git", "HEAD"), "ref: refs/heads/main\n");
+    await writeFile(join(shared, "util.ts"), "export const u = 1;\n");
+    await symlink(outside, join(repo, "escape-link"));
+
+    const pinned = pinWriteRoots([lane], repo);
+    const opts = { pinnedWriteRoots: [...pinned, taskTmp], tempRoots: [taskTmp.canonical] };
+    const judge = (command: string) => writeFloorViolation(command, repo, opts);
+
+    // Allowed in-R writes, safe device sinks, fd duplications, quoted heredoc bodies, and unresolvable dynamic targets.
+    for (const cmd of [
+      "echo hi > notes.txt",
+      "echo hi >> packages/app/out.log",
+      "echo hi >| dist.txt",
+      "echo hi &> build.log",
+      "echo hi &>> build.log",
+      "echo hi 2>&1 | tail -5",
+      "echo hi >&2",
+      "echo hi >&-",
+      "echo hi > /dev/null",
+      "echo hi > /dev/stderr",
+      "echo hi > /dev/fd/2",
+      `echo hi > ${lane}/file.ts`,
+      "echo hi > \"$TMPDIR/out.log\"",
+      "S=$(mktemp -d); echo hi > \"$S/out.log\"",
+      "cat > notes.md <<'EOF'\necho pwn > /etc/passwd\nEOF",
+      "[[ a > b ]] && echo ok",
+      "(( 5 > 3 )) && echo ok",
+      "echo hi > .github/workflows/ci.yml",
+      "echo hi > .gitignore",
+      "echo cd; echo hi > notes.txt",
+      "until [ -n \"$(grep -l 'err' a.txt 2>/dev/null)\" ]; do sleep 1; done",
+      "cd packages/app && echo hi > ../out.txt",
+      "S=packages && export NEXTTIME_DATA=\"$S/app\" && echo hi > notes.txt",
+      "if true; then git add .; fi; echo ok > notes.txt",
+      "export -n FOO && echo ok > notes.txt",
+      "read -n 1 v <<< x && echo ok > notes.txt",
+      "printf -v out %s hi && echo ok > notes.txt",
+      "echo hi > \"$UNKNOWN_OUT\"",
+      "tee out.log",
+      "tee -a -",
+      `tee ${lane}/out.log`,
+      "cp a.txt \"$PWD\"",
+      "cp a.txt packages/app/b.txt",
+      `cp a.txt ${lane}/b.txt`,
+      "install -d packages/app/newdir",
+      "install -m 0755 a.txt packages/app/a.txt",
+      "ln -s ../shared/util.ts packages/app/util.ts",
+      "ln a.txt b-hard.txt",
+      `git worktree add ${lane}/wt -b feat/wt`,
+    ]) {
+      assert.equal(judge(cmd), undefined, `Write Floor expected allow: ${cmd}`);
+    }
+
+    // Denied out-of-R writes, .git pointer/metadata overwrites, escaping symlinks/hardlinks, worktree escapes, and nested writes.
+    for (const cmd of [
+      `echo pwn > ${outside}/pwn.txt`,
+      `echo pwn >> ${outside}/pwn.txt`,
+      `echo pwn >| ${outside}/pwn.txt`,
+      `echo pwn &> ${outside}/pwn.txt`,
+      `echo pwn &>> ${outside}/pwn.txt`,
+      `echo pwn <> ${outside}/pwn.txt`,
+      `echo pwn >&${outside}/pwn.txt`,
+      `echo pwn 2>${outside}/pwn.txt`,
+      `echo>${outside}/pwn.txt`,
+      `> ${outside}/pwn.txt echo pwn`,
+      `exec > ${outside}/pwn.txt`,
+      `cat <<'EOF' > ${outside}/pwn.txt\nhi\nEOF`,
+      "echo pwn > .git/config",
+      "echo pwn > .git/hooks/pre-commit",
+      `echo 'gitdir: /tmp/evil' > ${lane}/.git`,
+      "echo pwn > ~/pwn.txt",
+      "HOME=/tmp/x echo pwn > ~/pwn.txt",
+      "echo pwn > escape-link/pwn.txt",
+      "echo pwn > escape-link/../pwn.txt",
+      "(cd packages/app); echo pwn > ../pwn.txt",
+      `(cd ${outside} && echo pwn > inner.txt)`,
+      `echo hi | tee ${outside}/pwn.txt`,
+      "echo hi | tee -a .git/config",
+      `env -C ${outside} tee pwn.txt`,
+      `sudo -u root tee ${outside}/pwn.txt`,
+      `timeout 10 tee ${outside}/pwn.txt`,
+      `find . -exec cp {} ${outside}/ \\;`,
+      `cp a.txt ${outside}/pwn.txt`,
+      `cp -t ${outside} a.txt`,
+      `cp -rt${outside} a.txt`,
+      `cp --targ=${outside} a.txt`,
+      "cp -T a.txt \"$PWD\"",
+      "cp a.txt .git/config",
+      `cp a.txt ${lane}/.git`,
+      `install -d ${outside}/newdir`,
+      `install -m 0755 a.txt ${outside}/a.txt`,
+      `ln -s ${outside}/target link`,
+      "ln -s ../../../outside/target packages/app/link",
+      "ln -s .git/hooks h",
+      `ln -sf a.txt ${outside}/link`,
+      "ln -snf a.txt \"$PWD\"",
+      `ln ${outside}/src ./hard`,
+      "ln .git/HEAD ./hard",
+      `cp -l ${outside}/src ./hard`,
+      `git worktree add ${outside}/wt`,
+      "git worktree add -b feat ../escape HEAD",
+      "git worktree add --orphan -b feat ../escape",
+      "git -C packages -C app worktree add ../../../escape",
+      `git worktree move wt ${outside}/moved-wt`,
+      `sh -c 'echo x > ${outside}/pwn.txt'`,
+      `echo "$(tee ${outside}/pwn.txt)"`,
+      `echo hi > >(tee ${outside}/pwn.txt)`,
+      // Opus 5.5 adversarial repros:
+      // #2: [[ ... ]] and (( ... )) with trailing redirects or nested subshells
+      `[[ -n $(echo evil >&3) ]] 3>>${outside}/pwn.txt`,
+      `((echo evil) >> ${outside}/pwn.txt)`,
+      `(( 1 )) > ${outside}/pwn.txt`,
+      // #3: cd/pushd tracking with ||, builtin/command/fn, nested bash -c, quoted ")"
+      "cd ~ || exit; echo evil >> .bashrc",
+      "builtin cd ~ && echo evil >> .bashrc",
+      "command cd ~ && echo evil >> .bashrc",
+      "f(){ cd ~; }; f; echo evil >> .bashrc",
+      "pushd ~ && echo evil >> .bashrc",
+      "cd ~ && bash -c 'echo evil >> .bashrc'",
+      "(cd ~; echo \")\"; echo evil >> .bashrc)",
+      // #4: trailing unquoted `)` on .git pointer targets
+      `(echo 'gitdir: /tmp/evil' > ${lane}/.git)`,
+      `(cp a.txt ${lane}/.git)`,
+      // #5: find multiple -exec and -execdir
+      `find . -maxdepth 0 -exec cp a.txt b.txt \\; -exec cp a.txt ${outside}/pwn.txt \\;`,
+      `find ${outside} -execdir cp ${repo}/a.txt pwn.txt \\;`,
+      // #6: optional-arg flags, short abbreviations, bundled worktree flags, env -C/-S
+      `echo evil | tee --output-error ${outside}/pwn.txt`,
+      `cp a.txt --context ${outside}/pwn.txt`,
+      `cp --tar ${outside} a.txt`,
+      `git worktree add -fb feat ${outside}/escape`,
+      `git worktree add --lock --reas why ${outside}/escape`,
+      `env -C${outside} tee -a pwn.txt`,
+      `env -iC${outside} tee -a pwn.txt`,
+      `sudo -D${outside} tee -a pwn.txt`,
+      `env -S 'cp a.txt ${outside}/pwn.txt'`,
+      // #7: text-to-runner commands (trap, pipe-to-shell, sh <<<, npm exec, uv run)
+      `trap 'echo evil >> ${outside}/pwn.txt' EXIT`,
+      `echo 'cp a.txt ${outside}/pwn.txt' | sh`,
+      `echo 'cp a.txt ${outside}/pwn.txt' |& bash`,
+      `sh <<< 'echo evil >> ${outside}/pwn.txt'`,
+      `npm exec -- cp a.txt ${outside}/pwn.txt`,
+      `uv run cp a.txt ${outside}/pwn.txt`,
+      // #8: glob/variable after fixed outside prefix
+      "echo evil >> /hom[e]/u/.bashrc",
+      "cp a.txt ~/.ssh/authorized_key?",
+      "echo evil > /etc/$X",
+      "echo evil > .git/$X",
+      // Opus 5.5 round-2 adversarial repros (F1–F8):
+      // F1: path/operand ending in `cd`/`popd` must NOT disable write checks
+      "echo evil | tee -a ~/.bashrc ./cd",
+      "cp a.txt ~/.ssh/authorized_keys",
+      "cp tools/cd ~/.ssh/authorized_keys",
+      "cp -t ~/.ssh a.txt popd",
+      // F2: fake/pipeline `cd` must NOT shift directory inside R, and heredoc runs at its own segment dir
+      `echo cd ${repo}/packages/app/a/b/c; echo evil >> ../../../../outside/pwn.txt`,
+      `: $(cd ${repo}/packages/app/a/b/c); echo evil >> ../../../../outside/pwn.txt`,
+      `true | cd ${repo}/packages/app/a/b/c; echo evil > ../../../../outside/pwn.txt`,
+      `bash <<'EOF'\necho evil >> ../outside/pwn.txt\nEOF\ncd ${repo}/packages/app/a/b/c`,
+      // F3: `$(...)` and escaped `\)` must NOT pop subshell directory stack early
+      "(cd ~; x=$(date); echo evil >> .bashrc)",
+      "(cd ~; echo \\); echo evil >> .bashrc)",
+      // F4: escaped `\'` and double-quoted `"'"` before `$(...)` must NOT hide substitution
+      `echo \\' $(cp a.txt ${outside}/pwn.txt)`,
+      `echo "'" $(cp a.txt ${outside}/pwn.txt)`,
+      // F5: quoted path followed by unquoted subshell `)` still strips `)`
+      '(echo \'gitdir: /tmp/evil\' > ".git")',
+      `(echo 'gitdir: /tmp/evil' > "${lane}/.git")`,
+      // F6: `find` behind wrapper (`timeout`, `sudo`) still checks multiple `-exec` and `-execdir`
+      `timeout 9 find . -exec cp a.txt b.txt \\; -exec cp a.txt ${outside}/pwn.txt \\;`,
+      `sudo find ${outside} -execdir cp ${repo}/a.txt pwn.txt \\;`,
+      // F7: `env -uC` / `sudo -uD` stop cluster scan at `-u` value letter
+      "env -uC tee -a ~/.bashrc",
+      `sudo -uD tee -a ${outside}/pwn.txt`,
+      // F8: single `>` and `>|` inside `trap` and here-strings (`sh <<<`, `bash <<<`)
+      "trap 'echo evil > ~/.bashrc' EXIT",
+      `sh <<< 'echo evil > ${outside}/pwn.txt'`,
+      `bash <<< 'printf x >| ${outside}/pwn.txt'`,
+      // Opus 5.5 round-3 adversarial repros (possibleDirs + multi-word subst + conditional/bg/failed cd):
+      "eval cd ~; echo evil >> .bashrc",
+      "time cd ~; echo evil >> .bashrc",
+      "case x in x) cd ~;; esac; echo evil >> .bashrc",
+      "f () { cd ~; }; f; echo evil >> .bashrc",
+      "$(echo cd) ~; echo evil >> .bashrc",
+      "(cd ~; x=$(date +%s); echo evil >> .bashrc)",
+      "(cd ~; cat <(true); echo evil >> .bashrc)",
+      `(cd ${sub}; echo $(pwd)); echo evil >> ../outside/pwn.txt`,
+      `cd ~; echo \\' $(cp ${repo}/a.txt .bashrc)`,
+      `cd ~; echo "'" $(cp ${repo}/a.txt .bashrc)`,
+      `cd ${sub} & echo evil >> ../outside/pwn.txt`,
+      `false && cd ${sub}; echo evil >> ../outside/pwn.txt`,
+      `cd ${repo}/nope; echo evil >> ../outside/pwn.txt`,
+      // Opus 5.5 round-4 + Advisor adversarial repros:
+      // P0-1: conditional/loop/case/fn `cd` must NOT replace possibleDirs
+      `if false; then cd ${sub}; fi; echo evil >> ../../pwn.txt`,
+      `case y in x) true; cd ${sub};; esac; echo evil >> ../../pwn.txt`,
+      `while false; do cd ${sub}; done; echo evil >> ../../pwn.txt`,
+      `f(){ true; cd ${sub}; }; echo evil >> ../../pwn.txt`,
+      // P0-2: statement operator `;` inside `$(...)` must NOT drop subshell tracking
+      `(x=$(true; true); cd ${sub}); echo evil >> ../../pwn.txt`,
+      // P0-3: `time -p cd`, `command -p cd`, later `case` arm, `(case ...)`
+      "time -p cd ~; echo evil >> .bashrc",
+      "command -p cd ~; echo evil >> .bashrc",
+      "case x in y) ;; x) cd ~;; esac; echo evil >> .bashrc",
+      "(case x in x) cd ~;; esac; echo evil >> .bashrc)",
+      // P0-4: single-quoted `$(...)` and multiple `$(a) $(b)` inside `trap`/`watch`
+      `trap '$(cp a.txt ${outside}/pwn.txt)' EXIT`,
+      `trap '$(true) $(cp a.txt ${outside}/pwn.txt)' EXIT`,
+      `watch '$(cp a.txt ${outside}/pwn.txt)'`,
+      // P0-5: deferred bodies (`trap`, function, loop) combined with later `cd`
+      "trap 'echo evil >> .bashrc' EXIT; cd ~",
+      "f(){ echo evil >> .bashrc; }; cd ~; f",
+      "for i in 1 2; do echo x >> pwn.txt; cd ..; done",
+      // P1 + Advisor: CDPATH / cdable_vars / deferred eval/source/alias / redirect before cd / mutating pre-cd
+      "export CDPATH=$HOME; cd .ssh; echo k >> authorized_keys",
+      "export CD''PATH=$HOME; cd .ssh; echo k >> authorized_keys",
+      "declare $V=$HOME; cd .ssh; echo k >> authorized_keys",
+      "shopt -s cdable_vars; h=$HOME; cd h; echo k >> .bashrc",
+      "trap 'cd ~' DEBUG; echo x >> .bashrc",
+      "eval 'cd ~'; echo x >> .bashrc",
+      "source x.sh; echo x >> .bashrc",
+      "2>/dev/null cd ~; echo x >> .bashrc",
+      `chmod -x ${sub}; cd ${sub}; echo evil >> ../../pwn.txt`,
+      // Opus 5.5 round-5 adversarial repros (P0-A, P0-B, P0-C, P1-D):
+      "case echo in x) ;; echo) cd ~;; esac; echo evil >> .bashrc",
+      "echo () { cd ~; }; echo; printf 'evil\\n' >> .bashrc",
+      "case x in x) eval 'cd ~';; esac; echo evil >> .bashrc",
+      "f() { eval 'cd ~'; }; f; echo evil >> .bashrc",
+      "echo $(true && cd packages/app && true) && echo evil >> ../../pwn.txt",
+      "<(cd packages/app; true); echo evil >> ../../pwn.txt",
+      "cd packages/app 2 >/dev/null; echo evil >> ../../pwn.txt",
+      "cp -l ~/.bashrc 2 >/dev/null; echo evil >> 2",
+      "V=CD$(printf PATH); mapfile -t $V <<< \"$HOME/Work/other\"; cd packages; echo evil > x.txt",
+      // Opus 5.5 round-6 adversarial repros (escaped fd, dynamic cmd in case/fn, mapfile -C, declare -n):
+      "cp -l ~/.bashrc \\2>/dev/null; echo evil >> 2",
+      "case x in x) $(printf '\\143\\144') ~;; esac; echo evil >> .bashrc",
+      "f() { $(printf '\\143\\144') ~; }; f; echo evil >> .bashrc",
+      "mapfile -C 'cd ..;:' -c 1 a <<< x; echo evil >> pwn.txt",
+      "x=CD$(printf PATH); declare -n r=$x; r=$HOME; cd .ssh; echo k >> authorized_keys",
+      // Opus 5.5 round-7 adversarial repros (line continuation fd, unspaced/quoted case arm, ${!x:=...}):
+      "cd 2\\\n>/dev/null && echo evil >> .bashrc",
+      "case x in x)cd ~;; esac; echo evil >> .bashrc",
+      "case x in x)$(printf '\\143\\144') ~;; esac; echo evil >> .bashrc",
+      "case x in \"x\") $(printf '\\143\\144') ~;; esac; echo evil >> .bashrc",
+      "x=CD$(printf PATH); : ${!x:=$HOME}; cd .ssh; echo k >> authorized_keys",
+      // Opus 5.5 round-8 adversarial repros (multi-`)` case arm patterns, input-redirect `${!x:=...}` / `CDPATH`, unspaced mapfile/declare):
+      "case \"x)\" in \"x)\")cd ~;; esac; echo evil >> .bashrc",
+      "case x in x|\\))cd ~;; esac; echo evil >> .bashrc",
+      "case $(echo x) in $(echo x))cd ~;; esac; echo evil >> .bashrc",
+      "case x in x)mapfile -C 'cd ..;:' -c 1 a <<< x;; esac; echo evil >> pwn.txt",
+      "case x in x)declare -n r=$x;; esac; r=$HOME; cd .ssh; echo k >> authorized_keys",
+      "x=CD$(printf PATH); : <${!x:=$HOME}; cd .ssh; echo k >> authorized_keys",
+      ": <${CDPATH:=$HOME}; cd .ssh; echo k >> authorized_keys",
+      // Opus 5.5 round-9 adversarial repros (attached printf -v, getopts, let, (( )), nested ${!x[...]:=}):
+      "x=CD$(printf PATH); printf -v\"$x\" %s \"$HOME\"; cd .ssh; echo k >> authorized_keys",
+      "x=CD$(printf PATH); getopts / \"$x\" -/; cd home/user/.ssh; echo k >> authorized_keys",
+      "x=CD$(printf PATH); let \"$x=1\"; cd .ssh; echo k >> authorized_keys",
+      "x=CD$(printf PATH)=1; (( $x )); cd .ssh; echo k >> authorized_keys",
+      "x=(CD$(printf PATH)); : ${!x[${#}]:=$HOME}; cd .ssh; echo k >> authorized_keys",
+      // Opus 5.5 round-10 adversarial repros (attached `read -aCDPATH` / `read -raCDPATH`):
+      "read -aCDPATH <<< ..; cd .ssh; echo k >> authorized_keys",
+      "read -raCDPATH <<< ..; cd .ssh; echo k >> authorized_keys",
+      // Opus 5.5 round-11 adversarial repros (`printf -v` hiding CDPATH in `$(cat <<'EOF'...)`):
+      "printf -v\"$(cat <<'EOF'\nCDPATH\nEOF\n)\" %s /home/user; cd .ssh; echo k >> authorized_keys",
+      "printf -v \"$(cat <<'EOF'\nCDPATH\nEOF\n)\" %s /home/user; cd .ssh; echo k >> authorized_keys",
+    ]) {
+      assert.ok(judge(cmd), `Write Floor expected deny: ${cmd}`);
+      assert.equal(evaluatePermission("Bash", bash(cmd), repo, opts).decision, "deny", `evaluatePermission expected deny: ${cmd}`);
+    }
+
+    // P0 regression guard: delete floor MUST still catch here-string scripts (`<<<`).
+    assert.ok(deleteFloorViolation(`bash <<< "rm -rf ${outside}"`, repo, opts), "delete floor must catch bash <<< here-string");
+    assert.ok(deleteFloorViolation(`cat <<< "rm -rf ${outside}" | sh`, repo, opts), "delete floor must catch cat <<< | sh here-string");
+
+    // #9 regression guard: directRefWrite must still catch `>|` into refs/heads/main.
+    assert.equal(evaluateCommand('cd "$(git rev-parse --git-dir)" && echo "$SHA" >| refs/heads/main').decision, "deny");
+
+    // P2 guard: `&>> "$LOG"` on npm run must not be falsely flagged as a dynamic sensitive argument.
+    assert.equal(evaluateCommand('npm run build &>> "$LOG"').decision, "allow");
+
+    // #10 regression guard: symlinked ancestor of cwd (macOS /var -> /private/var) still allows in-R writes!
+    const symBase = join(base, "sym-parent");
+    await symlink(base, symBase);
+    const symRepo = join(symBase, "repo");
+    assert.equal(writeFloorViolation("echo hi > notes.txt", symRepo, { tempRoots: [taskTmp.canonical] }), undefined);
+
+    // Swapping pinned root with a symlink invalidates writes to it immediately.
+    await rm(lane, { recursive: true, force: true });
+    await symlink(outside, lane);
+    assert.ok(judge(`echo pwn > ${lane}/escape.ts`));
+  } finally {
+    await rm(taskTmp.canonical, { recursive: true, force: true }).catch(() => {});
+    await rm(base, { recursive: true, force: true });
   }
 });

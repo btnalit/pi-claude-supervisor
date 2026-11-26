@@ -1,4 +1,4 @@
-import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { verifyPinnedWriteRoot, type PinnedWriteRoot } from "./write-roots.ts";
@@ -168,7 +168,13 @@ export function evaluatePermission(toolName: string, input: unknown, cwd = proce
     ...(options.pinnedWriteRoots ? { pinnedWriteRoots: options.pinnedWriteRoots } : {}),
     ...(options.tempRoots !== undefined ? { tempRoots: options.tempRoots } : {}),
   });
-  return floor ? { decision: "deny", reason: floor } : result;
+  if (floor) return { decision: "deny", reason: floor };
+  const writeFloor = writeFloorViolation(command, cwd, {
+    writeRoots: options.writeRoots ?? [],
+    ...(options.pinnedWriteRoots ? { pinnedWriteRoots: options.pinnedWriteRoots } : {}),
+    ...(options.tempRoots !== undefined ? { tempRoots: options.tempRoots } : {}),
+  });
+  return writeFloor ? { decision: "deny", reason: writeFloor } : result;
 }
 
 export interface DeleteFloorOptions {
@@ -215,6 +221,42 @@ export function deleteFloorViolation(command: string, cwd: string, options: Dele
   return floorScript(command, cwd, roots, new Map(), 0);
 }
 
+/**
+ * Write Floor v1 (#55-3): hard boundary across every permission authority
+ * (policy, hybrid, decision-worker, human approve) blocking statically
+ * resolvable Bash writes outside the unified root set `R` (`cwd`, verified
+ * `pinnedWriteRoots`, `writeRoots`, and `tempRoots`) or targeting `.git`
+ * (including sibling-worktree `.git` pointer files):
+ * - Shell output redirections (`>`, `>>`, `>|`, `&>`, `&>>`, `<>`, `>&file`)
+ * - `tee`, `cp`, `install`, `ln` (destinations, plus symlink targets & hardlink sources)
+ * - `git worktree add <path>` and `git worktree move <old> <new>`
+ *
+ * Unresolvable dynamic targets (`> "$OUT"`), interpreters (`python3 -c`), and
+ * other commands (`touch`/`mkdir`/`sed -i`/`tar`/`curl -o`/`rsync`) remain
+ * outside v1 and fall through to the active permission authority.
+ */
+interface WriteFloorRoots extends FloorRoots {
+  rawCwd: string;
+  rawWriteRoots: readonly string[];
+  pinnedWriteRoots: readonly PinnedWriteRoot[];
+  rawTempRoots: readonly string[];
+}
+
+export function writeFloorViolation(command: string, cwd: string, options: DeleteFloorOptions = {}): string | undefined {
+  const rawWriteRoots = options.writeRoots ?? [];
+  const pinnedWriteRoots = options.pinnedWriteRoots ?? [];
+  const rawTempRoots = options.tempRoots ?? [tmpdir(), "/tmp"];
+  const base = deleteFloorRoots(cwd, rawWriteRoots, rawTempRoots, pinnedWriteRoots);
+  const roots: WriteFloorRoots = {
+    ...base,
+    rawCwd: cwd,
+    rawWriteRoots,
+    pinnedWriteRoots,
+    rawTempRoots,
+  };
+  return writeFloorScript(command, cwd, roots, new Map(), 0);
+}
+
 interface FloorRoots { cwd: string; others: string[]; defaultTmpDir?: string }
 
 const FLOOR_MAX_DEPTH = 6;
@@ -238,7 +280,28 @@ const RUNNER_SUBCOMMANDS = new Set(["exec", "run", "dlx", "x"]);
 const BIN_RUNNERS = new Set(["yarn", "pnpm", "bun"]);
 /** Git options whose value is message or search text, not shell. */
 const GIT_MESSAGE_OPTIONS = new Set(["-m", "--message", "-F", "--file", "--grep", "-S", "-G"]);
-const REDIRECT_OPERATORS = new Set([">", ">>", "<", "<<", ">|", "&>", ">&"]);
+// Note: `<<<` (here-string) is intentionally NOT in REDIRECT_OPERATORS so
+// `segmentWords` retains the here-string body for quoted-script / pipe-to-shell
+// checks in both the delete floor and the write floor.
+const REDIRECT_OPERATORS = new Set([">", ">>", "<", "<<", ">|", "&>", "&>>", "<>", ">&", "<&"]);
+const OUTPUT_REDIRECT_OPERATORS = new Set([">", ">>", ">|", "&>", "&>>", "<>", ">&"]);
+const WRITE_WORD = /(?:^|[^A-Za-z0-9_.-])(?:tee|cp|install|ln|worktree)(?:[^A-Za-z0-9_.-]|$)|>/u;
+const SAFE_DEVICE_WRITE_SINKS = new Set(["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"]);
+const WRITE_FLOOR_COMMANDS = new Set(["tee", "cp", "install", "ln"]);
+const WRITE_FLOOR_WRAPPER_VALUE_FLAGS: Record<string, Set<string>> = {
+  sudo: new Set(["-u", "-g", "-C", "-p", "-h", "-r", "-t", "-U", "-T"]),
+  timeout: new Set(["-s", "--signal", "-k", "--kill-after"]),
+  nice: new Set(["-n", "--adjustment"]),
+  ionice: new Set(["-c", "--class", "-n", "--classdata", "-p", "-P", "-u"]),
+  stdbuf: new Set(["-i", "--input", "-o", "--output", "-e", "--error"]),
+  env: new Set(["-u", "--unset", "-S", "--split-string"]),
+  doas: new Set(["-u", "-C"]),
+  flock: new Set(["-w", "--wait", "--timeout", "-E", "--conflict-exit-code"]),
+};
+const WRITE_FLOOR_CWD_CHANGING_WRAPPER_FLAGS: Record<string, Set<string>> = {
+  sudo: new Set(["-D", "--chdir"]),
+  env: new Set(["-C", "--chdir"]),
+};
 /** Entries under `.git` a find filter must not be able to match. */
 const GIT_STORE_PROBES = [".git", ".git/HEAD", ".git/index", ".git/config", ".git/packed-refs", ".git/objects", ".git/objects/ab/cdef0123",
   ".git/objects/pack/pack-1.pack", ".git/refs/heads/main", ".git/hooks/pre-commit", ".git/logs/HEAD"];
@@ -276,7 +339,7 @@ function floorScript(command: string, start: string | undefined, roots: FloorRoo
     if (first >= words.length) continue;
     const head = floorCommandName(words[first]!);
     // Text piped into a shell is a script.
-    const intoShell = segment.joiner === "|" && SHELL_NAMES.has(floorCommandName(segmentWords(segments[index + 1]?.tokens ?? [])[0]) ?? "");
+    const intoShell = (segment.joiner === "|" || segment.joiner === "|&") && SHELL_NAMES.has(floorCommandName(segmentWords(segments[index + 1]?.tokens ?? [])[0]) ?? "");
     if (intoShell) {
       const violation = nested(words.slice(first + 1).map((word) => word.value).join(" "), directory);
       if (violation) return violation;
@@ -350,6 +413,1083 @@ function floorScript(command: string, start: string | undefined, roots: FloorRoo
   return undefined;
 }
 
+const WRITE_FLOOR_CONTROL_KEYWORDS = new Set([
+  "if", "then", "elif", "else", "fi", "while", "until", "for", "do", "done",
+  "case", "esac", "select", "coproc", "function", "{", "}",
+]);
+const WRITE_FLOOR_DEFERRED_BUILTINS = new Set(["eval", "source", ".", "trap", "alias", "shopt"]);
+const WRITE_FLOOR_ENV_MUTATORS = new Set(["export", "declare", "typeset", "readonly", "local", "read", "mapfile", "readarray", "getopts", "let"]);
+const WRITE_FLOOR_NAMEREF_BUILTINS = new Set(["declare", "typeset", "local"]);
+
+/** True only when `text` is a single `$(…)` whose opening `$(` closes at the very last character (never `$(a) $(b)`). */
+function isSingleBalancedCommandSubst(text: string): boolean {
+  if (!text.startsWith("$(") || !text.endsWith(")")) return false;
+  let depth = 0;
+  let quote: "'" | '"' | undefined;
+  for (let i = 1; i < text.length; i += 1) {
+    const ch = text[i]!;
+    if (quote === "'") { if (ch === "'") quote = undefined; continue; }
+    if (ch === "\\") { i += 1; continue; }
+    if (quote === '"') { if (ch === '"') quote = undefined; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === "(") depth += 1;
+    else if (ch === ")") {
+      depth -= 1;
+      if (depth === 0) return i === text.length - 1;
+      if (depth < 0) return false;
+    }
+  }
+  return false;
+}
+
+/** Parse `cd`/`pushd` options (`-L`, `-P`, `-e`, `-@`, `--`) and return its single literal operand, or `undefined` if invalid/multiple/missing. */
+function parseSimpleCdOperand(args: readonly ShellToken[]): { target: ShellToken | undefined; invalid: boolean } {
+  let options = true;
+  const operands: ShellToken[] = [];
+  for (const tok of args) {
+    if (options && tok.value === "--") { options = false; continue; }
+    if (options && tok.value.startsWith("-") && tok.value !== "-") {
+      if (!/^-[LPe@]+$/u.test(tok.value)) return { target: undefined, invalid: true };
+      continue;
+    }
+    operands.push(tok);
+  }
+  if (operands.length > 1) return { target: undefined, invalid: true };
+  if (operands.length === 0) return { target: undefined, invalid: false }; // bare `cd` -> $HOME
+  if (operands[0]!.value === "-") return { target: undefined, invalid: true };
+  return { target: operands[0], invalid: false };
+}
+
+/** True when `process.env.CDPATH` could redirect a relative `cd target` away from `baseDir`. */
+function cdpathCouldShadow(targetValue: string): boolean {
+  const cdpath = process.env.CDPATH;
+  if (!cdpath || isAbsolute(targetValue) || targetValue.startsWith("./") || targetValue.startsWith("../") || targetValue === "." || targetValue === "..") {
+    return false;
+  }
+  return cdpath.split(":").some((entry) => {
+    if (!entry || entry === ".") return false;
+    try { return statSync(join(entry, targetValue)).isDirectory(); }
+    catch { return false; }
+  });
+}
+
+function directoryAccessible(path: string): boolean {
+  try {
+    if (!statSync(path).isDirectory()) return false;
+    accessSync(path, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Two-pass fail-closed Write Floor script evaluator:
+ * - Pass 1 computes per-segment `possibleDirs` and whole-command `allSeenDirs`,
+ *   failing closed (`undefined`) on deferred evaluators (`eval`/`source`/`.`/`trap`/`alias`/`shopt`),
+ *   `CDPATH`/`cdable_vars`, dynamic command names, control-flow + `cd`, or unverified `cd`.
+ *   Pure flat `cd <existing-accessible-dir> && ...` replaces the directory ONLY
+ *   within its `&&` chain (and only if no earlier mutating segment could have
+ *   changed the filesystem before `cd` ran).
+ * - Pass 2 checks every segment's redirects, command writes, pipe-to-shell,
+ *   quoted scripts, heredocs, and raw command/process substitutions against the
+ *   appropriate directory set (`allSeenDirs` whenever control flow or deferred
+ *   constructs are present).
+ */
+function writeFloorScript(
+  command: string,
+  start: string | undefined,
+  roots: WriteFloorRoots,
+  inherited: ReadonlyMap<string, string>,
+  depth: number,
+): string | undefined {
+  if (depth >= FLOOR_MAX_DEPTH) {
+    return WRITE_WORD.test(command) ? "Worker cannot write through commands nested this deep; flatten the command" : undefined;
+  }
+  const lexical = lexShell(command.trim());
+  if (lexical.error) {
+    return depth > 0 && WRITE_WORD.test(command) ? "Worker cannot write through a script the policy cannot parse" : undefined;
+  }
+  const bindings = floorBindings(command, lexical.tokens, inherited, roots.defaultTmpDir);
+  const nested = (body: string, directory: string | undefined): string | undefined => writeFloorScript(body, directory, roots, bindings, depth + 1);
+  const rawSubstBodies = substitutionBodies(withoutQuotedHeredocs(command));
+  const { tokens: dataResolved, embeddedBySegment } = resolveDataTokens(lexical.tokens);
+  const tokens = resolveLiteralBindings(applyFloorBindings(dataResolved, bindings));
+  const segments = floorSegments(tokens);
+
+  // Detect control-flow / compound syntax anywhere in the command (on non-heredoc tokens).
+  const nonDataTokens = tokens.filter((t) => !t.operator && !t.data && !t.heredoc);
+  const hasControlFlow = nonDataTokens.some((t) => {
+    const clean = t.value.replace(/^[({]+|[});]+$/gu, "");
+    return WRITE_FLOOR_CONTROL_KEYWORDS.has(t.value)
+      || WRITE_FLOOR_CONTROL_KEYWORDS.has(clean)
+      || (t.leadingOpenParens ?? 0) > 0
+      || (t.trailingCloseParens ?? 0) > 0
+      || t.value === "()"
+      || t.value === "(){"
+      || /^[A-Za-z_][A-Za-z0-9_]*\(\)\{?$/u.test(t.value);
+  });
+  const hasAnySubst = rawSubstBodies.length > 0 || nonDataTokens.some((t) => t.inSubst === true);
+
+  // Pass 1: compute per-segment possibleDirs and whole-command allSeenDirs.
+  const segmentDirs: Array<Set<string | undefined>> = [];
+  const allSeenDirs = new Set<string | undefined>([start]);
+  let possibleDirs = new Set<string | undefined>([start]);
+  let globalCwdUnknown = lexical.tokens.some((t) => !t.operator && !t.heredoc && (/CDPATH|cdable_vars/u.test(t.value) || /\$\{!/u.test(t.value)));
+  if (globalCwdUnknown) {
+    possibleDirs.add(undefined);
+    allSeenDirs.add(undefined);
+  }
+  let hasDynamicEarlier = false;
+  let preChainDirs: Set<string | undefined> | undefined;
+
+  for (let segIdx = 0; segIdx < segments.length; segIdx += 1) {
+    const segment = segments[segIdx]!;
+    const prevJoiner = segIdx > 0 ? segments[segIdx - 1]!.joiner : undefined;
+    const prevHasDynamic = hasDynamicEarlier;
+    if (segment.tokens.some((t) => !t.operator && !t.data && (t.dynamic || t.value.startsWith("((")))) {
+      hasDynamicEarlier = true;
+    }
+    // If a flat `cd` replaced `possibleDirs` only for its `&&` chain, union back
+    // the pre-cd directory once the `&&` chain ends (`;`, `||`, `&`).
+    if (preChainDirs && prevJoiner !== "&&") {
+      for (const dir of preChainDirs) possibleDirs.add(dir);
+      preChainDirs = undefined;
+    }
+    const words = segmentWords(segment.tokens);
+    let first = 0;
+    while (first < words.length && (FLOOR_KEYWORDS.has(words[first]!.value) || /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[first]!.value))) first += 1;
+
+    // Detect `CDPATH` / `cdable_vars` (without `\b` anchors so attached forms like
+    // `read -aCDPATH` or `printf -vCDPATH` are caught) OR indirect parameter expansion
+    // (`${!...}`) across ALL non-operator, non-data tokens — including input-redirect
+    // targets like `<${!x:=$HOME}` that `segmentWords` drops.
+    if (segment.tokens.some((t) => !t.operator && !t.data && (/CDPATH|cdable_vars/u.test(t.value) || /\$\{!/u.test(t.value)))) {
+      globalCwdUnknown = true;
+      possibleDirs.add(undefined);
+      allSeenDirs.add(undefined);
+    }
+
+    // Snapshot possibleDirs BEFORE this segment's own `cd` runs (so redirects on the `cd` segment itself are checked properly).
+    segmentDirs.push(new Set(possibleDirs));
+
+    if (first >= words.length) continue;
+
+    // Locate the effective command word skipping `builtin` / `command` / `time` + their flags.
+    let cmdIdx = first;
+    while (cmdIdx < words.length) {
+      const w = words[cmdIdx]!.value.replace(/^[({]+|[});]+$/gu, "");
+      if (w === "builtin" || w === "command" || w === "time") {
+        cmdIdx += 1;
+        while (cmdIdx < words.length && words[cmdIdx]!.value.startsWith("-") && words[cmdIdx]!.value !== "--") cmdIdx += 1;
+        if (cmdIdx < words.length && words[cmdIdx]!.value === "--") cmdIdx += 1;
+        continue;
+      }
+      break;
+    }
+    const cmdTok = words[cmdIdx];
+    const cmdWord = cmdTok?.value.replace(/^[({]+|[});]+$/gu, "") ?? "";
+
+    // Deferred evaluators (`eval`, `source`, `.`, `trap`, `alias`, `shopt`) or
+    // dynamic command names can change cwd or define aliases arbitrarily -> fail closed.
+    if (WRITE_FLOOR_DEFERRED_BUILTINS.has(cmdWord) || Boolean(cmdTok?.dynamic)) {
+      globalCwdUnknown = true;
+      possibleDirs.add(undefined);
+      allSeenDirs.add(undefined);
+      continue;
+    }
+
+    // `mapfile -C` / `readarray -C` executes a callback string in the current shell like `eval`.
+    if ((cmdWord === "mapfile" || cmdWord === "readarray") && words.slice(cmdIdx + 1).some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*C/u.test(w.value))) {
+      globalCwdUnknown = true;
+      possibleDirs.add(undefined);
+      allSeenDirs.add(undefined);
+      continue;
+    }
+
+    // Dynamic `(( ... ))` arithmetic evaluation can assign a computed variable name
+    // (e.g. `(( $x ))` where `x='CDPATH=1'`).
+    if (cmdWord.startsWith("((") && words.slice(cmdIdx).some((w) => w.dynamic || /[$`*?[\]{}~]/u.test(w.value))) {
+      globalCwdUnknown = true;
+      possibleDirs.add(undefined);
+      allSeenDirs.add(undefined);
+      continue;
+    }
+
+    // Dynamic env mutators (`declare $v=~`, `export $v=~`, `mapfile -t $v`, `getopts / "$x"`,
+    // `let "$x"`, `printf -v $v` / `printf -v"$v"`) or namerefs (`declare -n r=$x`,
+    // `typeset -n`, `local -n`) could set CDPATH.
+    // Check only the variable NAME (before `=`) for non-nameref assignments so `export FOO="$BAR"` stays allowed.
+    if (WRITE_FLOOR_ENV_MUTATORS.has(cmdWord)) {
+      const restWords = words.slice(cmdIdx + 1);
+      const hasNameref = WRITE_FLOOR_NAMEREF_BUILTINS.has(cmdWord)
+        && restWords.some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*n/u.test(w.value));
+      const hasDynamicName = restWords.some((w) => {
+        if (cmdWord === "read" && !w.value.startsWith("--")) {
+          const attachedArray = /^-[A-Za-z]*a(.+)$/u.exec(w.value);
+          if (attachedArray && /[$`*?[\]{}~]/u.test(attachedArray[1]!)) return true;
+        }
+        if (w.value.startsWith("-") && cmdWord !== "let") return false;
+        const eq = w.value.indexOf("=");
+        const varName = eq >= 0 ? w.value.slice(0, eq) : w.value;
+        return /[$`*?[\]{}~]/u.test(varName);
+      });
+      if (hasNameref || hasDynamicName) {
+        globalCwdUnknown = true;
+        possibleDirs.add(undefined);
+        allSeenDirs.add(undefined);
+        continue;
+      }
+    }
+    if (cmdWord === "printf" && words.slice(cmdIdx + 1).some((w, i, arr) => {
+      if (w.value === "-v") {
+        const target = arr[i + 1];
+        return Boolean(target && (target.dynamic || /[$`*?[\]{}~]/u.test(target.value) || /\bCDPATH\b/u.test(target.value)));
+      }
+      if (w.value.startsWith("-v") && w.value.length > 2) {
+        const rest = w.value.slice(2);
+        return /[$`*?[\]{}~]/u.test(rest) || /\bCDPATH\b/u.test(rest);
+      }
+      return false;
+    })) {
+      globalCwdUnknown = true;
+      possibleDirs.add(undefined);
+      allSeenDirs.add(undefined);
+      continue;
+    }
+
+    // In control-flow mode, scan every word in the segment while tracking
+    // inner command positions (after `case` arm `pat)`, `{`, `NAME()`, `function NAME`,
+    // keywords, `builtin`/`command`/`time`):
+    // - In command position: fail closed on dynamic command names (`$(printf …)`),
+    //   `cd`/`pushd`/`popd`, ALL deferred builtins (including `.`), and `mapfile -C` / `declare -n`.
+    // - In non-command position: still fail closed on `cd`/`pushd`/`popd` and named
+    //   deferred builtins (excluding bare `.`, so `git add .` / `find .` stay allowed).
+    if (hasControlFlow) {
+      let inCmdPos = true;
+      let skipFunctionName = false;
+      for (let wi = first; wi < words.length; wi += 1) {
+        const tok = words[wi]!;
+        const rawVal = tok.value;
+        const clean = rawVal.replace(/^[({$]+|[});]+$/gu, "");
+        if (skipFunctionName) {
+          skipFunctionName = false;
+          inCmdPos = true;
+          continue;
+        }
+        if (rawVal === "function") { skipFunctionName = true; continue; }
+        if (rawVal === "case") { inCmdPos = false; continue; }
+        if (FLOOR_KEYWORDS.has(rawVal) || rawVal === "{" || rawVal === "(" || rawVal === "()" || rawVal === "(){"
+          || /^[A-Za-z_][A-Za-z0-9_]*\(\)\{?$/u.test(rawVal)
+          || (/^[A-Za-z_][A-Za-z0-9_]*$/u.test(rawVal) && (words[wi + 1]?.value === "()" || words[wi + 1]?.value === "(){"))) {
+          inCmdPos = true;
+          continue;
+        }
+        if ((tok.trailingCloseParens ?? 0) > 0) {
+          // `case` arm pattern like `x)` or `"x")`: the next word is in command position!
+          inCmdPos = true;
+          continue;
+        }
+        // Unspaced `case` arm (`x)cd`, `"x)")cd`, `x|\))cd`, `$(echo x))cd`, `x)$(printf …)`):
+        // check the command text after EVERY `)` in `rawVal` (pattern itself may contain `)`).
+        if (rawVal.includes(")")) {
+          let matchedWrapper = false;
+          let matchedDanger = false;
+          for (const piece of rawVal.split(")").slice(1)) {
+            const afterParen = piece.replace(/^[({]+|[});]+$/gu, "");
+            if (!afterParen) continue;
+            if (afterParen === "cd" || afterParen === "pushd" || afterParen === "popd"
+              || WRITE_FLOOR_DEFERRED_BUILTINS.has(afterParen)
+              || /[$`*?[\]{}]/u.test(afterParen)
+              || ((afterParen === "mapfile" || afterParen === "readarray") && words.slice(wi + 1).some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*C/u.test(w.value)))
+              || (WRITE_FLOOR_NAMEREF_BUILTINS.has(afterParen) && words.slice(wi + 1).some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*n/u.test(w.value)))) {
+              matchedDanger = true;
+              break;
+            }
+            if (afterParen === "builtin" || afterParen === "command" || afterParen === "time") {
+              matchedWrapper = true;
+            }
+          }
+          if (matchedDanger) {
+            globalCwdUnknown = true;
+            possibleDirs.add(undefined);
+            allSeenDirs.add(undefined);
+            break;
+          }
+          if (matchedWrapper) {
+            inCmdPos = true;
+            continue;
+          }
+        }
+        if (inCmdPos && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(rawVal)) continue;
+        if (inCmdPos && (clean === "builtin" || clean === "command" || clean === "time")) {
+          while (wi + 1 < words.length && words[wi + 1]!.value.startsWith("-")) wi += 1;
+          continue;
+        }
+        const isDirOrNamedDeferred = clean === "cd" || clean === "pushd" || clean === "popd"
+          || (WRITE_FLOOR_DEFERRED_BUILTINS.has(clean) && clean !== ".");
+        if (isDirOrNamedDeferred || (inCmdPos && (tok.dynamic || clean === "."))) {
+          globalCwdUnknown = true;
+          possibleDirs.add(undefined);
+          allSeenDirs.add(undefined);
+          break;
+        }
+        if (inCmdPos && (clean === "mapfile" || clean === "readarray") && words.slice(wi + 1).some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*C/u.test(w.value))) {
+          globalCwdUnknown = true;
+          possibleDirs.add(undefined);
+          allSeenDirs.add(undefined);
+          break;
+        }
+        if (inCmdPos && WRITE_FLOOR_NAMEREF_BUILTINS.has(clean) && words.slice(wi + 1).some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*n/u.test(w.value))) {
+          globalCwdUnknown = true;
+          possibleDirs.add(undefined);
+          allSeenDirs.add(undefined);
+          break;
+        }
+        inCmdPos = false;
+      }
+      continue;
+    }
+
+    // Flat mode (no control flow anywhere in the command):
+    const inPipelineOrBg = prevJoiner === "|" || prevJoiner === "|&"
+      || segment.joiner === "|" || segment.joiner === "|&" || segment.joiner === "&";
+
+    if (cmdWord === "cd" || cmdWord === "pushd") {
+      if (inPipelineOrBg) continue;
+      // If `cd` appears inside a command/process substitution (`$(true && cd sub)`),
+      // it never changes the outer shell's directory — do NOT shift `possibleDirs`.
+      if (cmdTok?.inSubst) continue;
+      const parsed = parseSimpleCdOperand(words.slice(cmdIdx + 1));
+      // Structural CDPATH closure: in bash, `cd <bare-relative>` (not starting with
+      // `/`, `./`, `../`, `.`, `..`) consults `CDPATH`. If ANY earlier statement in
+      // this shell invocation contained a dynamic expansion or arithmetic evaluation,
+      // an arbitrary builtin could have computed and assigned `CDPATH` at runtime.
+      const isBareRelative = parsed.target !== undefined
+        && !parsed.target.value.startsWith("/")
+        && !parsed.target.value.startsWith("./")
+        && !parsed.target.value.startsWith("../")
+        && parsed.target.value !== "."
+        && parsed.target.value !== "..";
+      // Bare `pushd` swaps the directory stack rather than moving to `$HOME`.
+      if (parsed.invalid
+        || (cmdWord === "pushd" && !parsed.target)
+        || (parsed.target && cdpathCouldShadow(parsed.target.value))
+        || (prevHasDynamic && isBareRelative)) {
+        possibleDirs.add(undefined);
+        allSeenDirs.add(undefined);
+        continue;
+      }
+      const nextDirs = new Set<string | undefined>();
+      let allAccessibleAndPhysical = true;
+      for (const dir of possibleDirs) {
+        const resolvedNext = resolveCd(parsed.target ? [parsed.target] : [], dir);
+        if (!resolvedNext || !directoryAccessible(resolvedNext)) {
+          nextDirs.add(undefined);
+          allSeenDirs.add(undefined);
+          allAccessibleAndPhysical = false;
+          continue;
+        }
+        let physical: string;
+        try { physical = realpathSync.native(resolvedNext); }
+        catch { physical = resolvedNext; allAccessibleAndPhysical = false; }
+        nextDirs.add(physical);
+        allSeenDirs.add(physical);
+        if (physical !== resolvedNext) {
+          nextDirs.add(resolvedNext);
+          allSeenDirs.add(resolvedNext);
+          allAccessibleAndPhysical = false;
+        }
+      }
+      // ONLY replace `possibleDirs` for the ONE unambiguous top-level idiom:
+      // `cd <existing-accessible-non-symlink-dir> && ...` at segment 0 with
+      // ZERO substitutions and ZERO control flow anywhere in the command.
+      // Every other `cd`/`pushd` strictly UNIONS old + new directories.
+      const canReplace = segIdx === 0
+        && cmdWord === "cd"
+        && !hasAnySubst
+        && allAccessibleAndPhysical
+        && prevJoiner === undefined
+        && segment.joiner === "&&";
+      if (canReplace) {
+        preChainDirs ??= new Set(possibleDirs);
+        possibleDirs = nextDirs;
+      } else {
+        for (const d of nextDirs) possibleDirs.add(d);
+      }
+      continue;
+    }
+
+    if (cmdWord === "popd") {
+      if (!inPipelineOrBg) {
+        possibleDirs.add(undefined);
+        allSeenDirs.add(undefined);
+      }
+      continue;
+    }
+  }
+
+  // Pass 2: judge every segment's redirects, command writes, pipe-to-shell,
+  // quoted scripts, and heredoc bodies against the resolved directory set.
+  for (let segIdx = 0; segIdx < segments.length; segIdx += 1) {
+    const segment = segments[segIdx]!;
+    const dirsForSegment = hasControlFlow || globalCwdUnknown ? allSeenDirs : segmentDirs[segIdx]!;
+    const checkDirs = (fn: (dir: string | undefined) => string | undefined): string | undefined => {
+      for (const dir of dirsForSegment) {
+        const violation = fn(dir);
+        if (violation) return violation;
+      }
+      return undefined;
+    };
+
+    const segEmbedded = embeddedBySegment.get(segIdx);
+    if (segEmbedded) {
+      for (const body of segEmbedded) {
+        const v = checkDirs((dir) => nested(body, dir));
+        if (v) return v;
+      }
+    }
+
+    const redirectTargets = extractOutputRedirectTargets(segment.tokens);
+    for (const target of redirectTargets) {
+      const v = checkDirs((dir) => judgeWriteTarget(target, dir, roots, { allowRootDir: false, verb: "write to" }));
+      if (v) return v;
+    }
+
+    const words = segmentWords(segment.tokens);
+    let first = 0;
+    while (first < words.length && (FLOOR_KEYWORDS.has(words[first]!.value) || /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[first]!.value))) first += 1;
+    if (first >= words.length) continue;
+
+    const head = floorCommandName(words[first]);
+    const intoShell = (segment.joiner === "|" || segment.joiner === "|&")
+      && SHELL_NAMES.has(floorCommandName(segmentWords(segments[segIdx + 1]?.tokens ?? [])[0]) ?? "");
+    if (intoShell) {
+      const body = words.slice(first + 1).map((word) => word.value).join(" ");
+      const v = checkDirs((dir) => nested(body, dir));
+      if (v) return v;
+    }
+
+    const runs = head !== undefined && PACKAGE_RUNNERS.has(head) && words.slice(first + 1).some((word) =>
+      RUNNER_SUBCOMMANDS.has(word.value) || (BIN_RUNNERS.has(head) && WRITE_FLOOR_COMMANDS.has(floorCommandName(word) ?? "")),
+    );
+    const stops = head !== undefined && FLOOR_STOP_COMMANDS.has(head) && head !== "tee" && !runs;
+
+    if (!stops) {
+      const segValues = words.slice(first).map((w) => w.value);
+      for (const body of nestedShellCommands(segValues.map((v) => v.toLowerCase()), segValues)) {
+        const v = checkDirs((dir) => nested(body, dir));
+        if (v) return v;
+      }
+      for (let cursor = first + 1; cursor < words.length; cursor += 1) {
+        const word = words[cursor]!;
+        if (head === "git" && (GIT_MESSAGE_OPTIONS.has(words[cursor - 1]!.value) || /^--(?:message|grep|file)=/u.test(word.value))) continue;
+        if (/\s/u.test(word.value) && WRITE_WORD.test(word.value)) {
+          // Only unwrap a SINGLE balanced `$(…)` (never `$(a) $(b)`), so
+          // `until [ -n "$(grep … 2>/dev/null)" ]` loses its outer `)` while
+          // `trap '$(cp a /out)' EXIT` and `trap '$(true) $(cp a /out)' EXIT` are both caught.
+          const cleaned = isSingleBalancedCommandSubst(word.value)
+            ? word.value.slice(2, -1)
+            : word.value.replace(/^[A-Za-z0-9_.-]+=/u, "");
+          const v = checkDirs((dir) => nested(cleaned, dir));
+          if (v) return v;
+        }
+      }
+      const v = checkDirs((dir) => checkWriteCommandsInWords(words, first, dir, roots, nested));
+      if (v) return v;
+    }
+  }
+
+  // Evaluate raw-source command/process substitutions (`$(…)`, `<(…)`, `>(…)`,
+  // backticks) against EVERY directory seen during the command.
+  for (const body of rawSubstBodies) {
+    for (const dir of allSeenDirs) {
+      const violation = nested(body, dir);
+      if (violation) return violation;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Extract shell output redirection target tokens from one segment.
+ * For `[[ ... ]]` and `(( ... ))` (ONLY when a matching `]]`/`))` actually
+ * closes them!), skip tokens inside the test/arithmetic expression while still
+ * checking any redirections that follow `]]`/`))` (e.g. `(( 1 )) > /etc/x`).
+ */
+function extractOutputRedirectTargets(segment: readonly ShellToken[]): ShellToken[] {
+  const targets: ShellToken[] = [];
+  let i = 0;
+  const firstVal = segment[0]?.value ?? "";
+  if (firstVal === "[[") {
+    const closeIdx = segment.findIndex((tok, idx) => idx > 0 && !tok.operator && tok.value === "]]");
+    if (closeIdx >= 0) i = closeIdx + 1;
+  } else if (firstVal.startsWith("((")) {
+    const closeIdx = segment.findIndex((tok, idx) => idx >= 0 && !tok.operator && tok.value.endsWith("))"));
+    if (closeIdx >= 0) i = closeIdx + 1;
+  }
+  for (; i < segment.length; i += 1) {
+    const token = segment[i]!;
+    if (!token.operator || !OUTPUT_REDIRECT_OPERATORS.has(token.value)) continue;
+    const next = segment[i + 1];
+    if (!next) continue;
+    // `>&WORD` or `N>&WORD`: fd dup ONLY when WORD is all digits or `-`;
+    // otherwise bash redirects stdout+stderr to the file named WORD.
+    if (token.value === ">&") {
+      if (!next.operator && !next.data && !/^(?:\d+|-)$/u.test(next.value)) {
+        targets.push(next);
+      }
+      i += 1;
+      continue;
+    }
+    if (!next.operator && !next.data) {
+      targets.push(next);
+      i += 1;
+    }
+  }
+  return targets;
+}
+
+function checkWriteCommandsInWords(
+  words: readonly ShellToken[],
+  first: number,
+  directory: string | undefined,
+  roots: WriteFloorRoots,
+  nested: (body: string, directory: string | undefined) => string | undefined,
+): string | undefined {
+  let effectiveDir = directory;
+  let inFind = false;
+  for (let cursor = first; cursor < words.length; cursor += 1) {
+    const raw = words[cursor]!.value;
+    if (cursor > first && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(raw)) continue;
+    if (inFind && (raw === "-execdir" || raw === "-okdir")) {
+      effectiveDir = undefined;
+      continue;
+    }
+    const name = floorCommandName(words[cursor]);
+    if (!name) continue;
+    // Handle `env`/`sudo` wrappers including attached/clustered `-C`/`-D` and `env -S`.
+    if (name === "env" || name === "sudo") {
+      const cwdLetter = name === "env" ? "C" : "D";
+      const valFlags = WRITE_FLOOR_WRAPPER_VALUE_FLAGS[name];
+      let idx = cursor + 1;
+      while (idx < words.length && words[idx]!.value.startsWith("-")) {
+        const flagTok = words[idx]!.value;
+        if (flagTok === "--") { idx += 1; break; }
+        const eq = flagTok.indexOf("=");
+        const flagName = eq > 0 ? flagTok.slice(0, eq) : flagTok;
+        if (flagName === `-${cwdLetter}` || flagName === "--chdir") {
+          const dirArg = eq > 0 ? { ...words[idx]!, value: flagTok.slice(eq + 1) } : words[idx + 1];
+          effectiveDir = dirArg ? resolveCd([dirArg], effectiveDir) : undefined;
+          if (eq < 0) idx += 1;
+          idx += 1;
+          continue;
+        }
+        if (name === "env" && (flagName === "-S" || flagName === "--split-string")) {
+          const scriptArg = eq > 0 ? flagTok.slice(eq + 1) : words[idx + 1]?.value;
+          if (scriptArg) {
+            const violation = nested(scriptArg, effectiveDir);
+            if (violation) return violation;
+          }
+          if (eq < 0) idx += 1;
+          idx += 1;
+          continue;
+        }
+        // Short clusters for `env`/`sudo` (e.g. `env -iC/home/u`, `env -C/home/u`, `sudo -D/etc`, `env -S'cp ...'`).
+        // Walk letter-by-letter and STOP at the first letter that consumes a value
+        // (e.g. `-uC` means `-u C`, NOT `-u` + `-C`) so value text is never misread as flags.
+        if (!flagTok.startsWith("--") && flagTok.length > 2) {
+          const letters = flagTok.slice(1);
+          const valueLetters = name === "env" ? new Set(["u"]) : new Set(["u", "g", "C", "p", "h", "r", "t", "U", "T"]);
+          let handledCluster = false;
+          for (let c = 0; c < letters.length; c += 1) {
+            const ch = letters[c]!;
+            const restOfWord = letters.slice(c + 1);
+            if (ch === cwdLetter) {
+              const dirArg = restOfWord ? { ...words[idx]!, value: restOfWord } : words[idx + 1];
+              effectiveDir = dirArg ? resolveCd([dirArg], effectiveDir) : undefined;
+              if (!restOfWord) idx += 1;
+              idx += 1;
+              handledCluster = true;
+              break;
+            }
+            if (name === "env" && ch === "S") {
+              const scriptArg = restOfWord || words[idx + 1]?.value;
+              if (scriptArg) {
+                const violation = nested(scriptArg, effectiveDir);
+                if (violation) return violation;
+              }
+              if (!restOfWord) idx += 1;
+              idx += 1;
+              handledCluster = true;
+              break;
+            }
+            if (valueLetters.has(ch)) {
+              if (!restOfWord) idx += 1;
+              idx += 1;
+              handledCluster = true;
+              break;
+            }
+          }
+          if (handledCluster) continue;
+        }
+        if (valFlags?.has(flagName)) {
+          if (eq < 0) idx += 1;
+          idx += 1;
+          continue;
+        }
+        idx += 1;
+      }
+      cursor = idx - 1;
+      continue;
+    }
+    const valFlags = WRITE_FLOOR_WRAPPER_VALUE_FLAGS[name];
+    if (valFlags) {
+      let idx = cursor + 1;
+      while (idx < words.length && words[idx]!.value.startsWith("-")) {
+        const flagTok = words[idx]!.value;
+        if (flagTok === "--") { idx += 1; break; }
+        const eq = flagTok.indexOf("=");
+        const flagName = eq > 0 ? flagTok.slice(0, eq) : flagTok;
+        if (valFlags.has(flagName)) {
+          if (eq < 0) idx += 1;
+          idx += 1;
+          continue;
+        }
+        idx += 1;
+      }
+      if (name === "timeout" && idx < words.length) idx += 1;
+      if (name === "flock" && idx < words.length) idx += 1;
+      cursor = idx - 1;
+      continue;
+    }
+    if (name === "tee") {
+      const violation = checkTeeWriteTargets(trimFindExecTerminator(words.slice(cursor + 1), cursor > first), effectiveDir, roots);
+      if (violation) return violation;
+      if (!inFind) return undefined;
+      continue;
+    }
+    if (WRITE_FLOOR_COMMANDS.has(name)) {
+      const violation = checkFileWriteCommandTargets(name, trimFindExecTerminator(words.slice(cursor + 1), cursor > first), effectiveDir, roots);
+      if (violation) return violation;
+      if (!inFind) return undefined;
+      continue;
+    }
+    if (name === "git") {
+      const violation = checkGitWorktreeWriteTargets(trimFindExecTerminator(words.slice(cursor + 1), cursor > first), effectiveDir, roots);
+      if (violation) return violation;
+      if (cursor === first) break;
+      continue;
+    }
+    if (name === "find") { inFind = true; continue; }
+    if (cursor === first && (name === "xargs" || name === "parallel")) continue;
+    if (cursor === first && PACKAGE_RUNNERS.has(name)) continue;
+    if (cursor === first && FLOOR_STOP_COMMANDS.has(name)) break;
+  }
+  return undefined;
+}
+
+/** Strip trailing `;` or `+` terminator from `find ... -exec <cmd> ... \;` / `+` operands. */
+function trimFindExecTerminator(args: readonly ShellToken[], nested: boolean): readonly ShellToken[] {
+  if (!nested) return args;
+  const end = args.findIndex((tok) => !tok.operator && (tok.value === ";" || tok.value === "+"));
+  return end >= 0 ? args.slice(0, end) : args;
+}
+
+function checkTeeWriteTargets(args: readonly ShellToken[], directory: string | undefined, roots: WriteFloorRoots): string | undefined {
+  let options = true;
+  for (let i = 0; i < args.length; i += 1) {
+    const tok = args[i]!;
+    if (options && tok.value === "--") { options = false; continue; }
+    if (options && tok.value.startsWith("-") && tok.value !== "-") {
+      // Note: `--output-error` takes an optional arg ONLY via `=` (`--output-error=MODE`),
+      // NEVER a separate next word, so `tee --output-error /etc/x` writes `/etc/x`.
+      continue;
+    }
+    if (tok.value === "-") continue;
+    const violation = judgeWriteTarget(tok, directory, roots, { allowRootDir: false, verb: "write to" });
+    if (violation) return violation;
+  }
+  return undefined;
+}
+
+// Note: `--context` and `-Z` take optional/no separate value in GNU cp/install/ln
+// (`--context=CTX` only), so they MUST NOT swallow the next operand.
+const CP_INSTALL_LN_VALUE_FLAGS = new Set(["-S", "--suffix", "-m", "--mode", "-o", "--owner", "-g", "--group", "--strip-program"]);
+
+function checkFileWriteCommandTargets(
+  name: string,
+  args: readonly ShellToken[],
+  directory: string | undefined,
+  roots: WriteFloorRoots,
+): string | undefined {
+  let options = true;
+  let targetDir: ShellToken | undefined;
+  let noTargetDir = false;
+  let force = false;
+  let noDeref = false;
+  let symbolic = false;
+  let hardlink = name === "ln";
+  let installDirectoryMode = false;
+  const positionals: ShellToken[] = [];
+
+  for (let i = 0; i < args.length; i += 1) {
+    const tok = args[i]!;
+    const val = tok.value;
+    if (options && val === "--") { options = false; continue; }
+    if (options && val.startsWith("-") && val !== "-") {
+      if (val.startsWith("--")) {
+        const eq = val.indexOf("=");
+        const flagName = eq > 0 ? val.slice(0, eq) : val;
+        // Match GNU long-option unambiguous prefixes (`--t` / `--tar` / `--target-directory`,
+        // `--no-t` / `--no-target-directory`, `--sym` / `--symbolic-link`, `--lin` / `--link`).
+        if (flagName.length >= 3 && "--target-directory".startsWith(flagName)) {
+          if (eq > 0) targetDir = { ...tok, value: val.slice(eq + 1) };
+          else if (i + 1 < args.length) { targetDir = args[i + 1]; i += 1; }
+          continue;
+        }
+        if (flagName.length >= 6 && "--no-target-directory".startsWith(flagName)) { noTargetDir = true; continue; }
+        if (flagName === "--force") { force = true; continue; }
+        if (flagName === "--no-dereference") { noDeref = true; continue; }
+        if (flagName.length >= 5 && ("--symbolic".startsWith(flagName) || "--symbolic-link".startsWith(flagName))) { symbolic = true; hardlink = false; continue; }
+        if (flagName.length >= 4 && "--link".startsWith(flagName)) { hardlink = true; continue; }
+        if (name === "install" && flagName.length >= 5 && "--directory".startsWith(flagName)) { installDirectoryMode = true; continue; }
+        if (CP_INSTALL_LN_VALUE_FLAGS.has(flagName)) {
+          if (eq < 0 && i + 1 < args.length) i += 1;
+          continue;
+        }
+        // Optional-arg flags (`--backup[=C]`, `--reflink[=W]`, `--preserve[=L]`, `--context[=CTX]`) take no separate word.
+        continue;
+      }
+      // Short option or cluster (e.g. `-sf`, `-rt/etc`, `-rt /etc`, `-lnf`).
+      const letters = val.slice(1);
+      for (let c = 0; c < letters.length; c += 1) {
+        const ch = letters[c]!;
+        if (ch === "t") {
+          const attached = letters.slice(c + 1);
+          if (attached) targetDir = { ...tok, value: attached };
+          else if (i + 1 < args.length) { targetDir = args[i + 1]; i += 1; }
+          break;
+        }
+        if (ch === "T") { noTargetDir = true; continue; }
+        if (ch === "f") { force = true; continue; }
+        if (ch === "n" || ch === "h") { noDeref = true; continue; }
+        if (ch === "s" && (name === "ln" || name === "cp")) { symbolic = true; hardlink = false; continue; }
+        if (ch === "l" && name === "cp") { hardlink = true; continue; }
+        if (ch === "d" && name === "install") { installDirectoryMode = true; continue; }
+        if (["S", "m", "o", "g"].includes(ch)) {
+          const attached = letters.slice(c + 1);
+          if (!attached && i + 1 < args.length) i += 1;
+          break;
+        }
+      }
+      continue;
+    }
+    positionals.push(tok);
+  }
+
+  const destAsFile = noTargetDir || (name === "ln" && noDeref && force);
+  let destToken: ShellToken | undefined;
+  let sources: ShellToken[] = [];
+
+  if (targetDir) {
+    const v = judgeWriteTarget(targetDir, directory, roots, { allowRootDir: true, verb: `${name} into` });
+    if (v) return v;
+    destToken = targetDir;
+    sources = positionals;
+  } else if (installDirectoryMode) {
+    for (const dirTok of positionals) {
+      const v = judgeWriteTarget(dirTok, directory, roots, { allowRootDir: true, verb: "install directory" });
+      if (v) return v;
+    }
+    return undefined;
+  } else if (positionals.length >= 2) {
+    destToken = positionals.at(-1)!;
+    sources = positionals.slice(0, -1);
+    const v = judgeWriteTarget(destToken, directory, roots, { allowRootDir: !destAsFile, verb: `${name} to` });
+    if (v) return v;
+  } else if (name === "ln" && positionals.length === 1) {
+    sources = positionals;
+    const baseName = basename(stripTrailingSubshellParen(positionals[0]!));
+    if (baseName) {
+      destToken = { value: baseName, operator: false, dynamic: positionals[0]!.dynamic };
+      const v = judgeWriteTarget(destToken, directory, roots, { allowRootDir: false, verb: "ln to" });
+      if (v) return v;
+    }
+  }
+
+  // Hardlinks (`ln` without `-s`, `cp -l`): refusing outside-R / `.git` sources prevents mutating external inodes.
+  if (hardlink && !symbolic) {
+    for (const src of sources) {
+      const v = judgeWriteTarget(src, directory, roots, { allowRootDir: false, verb: "hard-link from" });
+      if (v) return v;
+    }
+  }
+
+  // Symlinks (`ln -s`, `cp -s`): refuse statically resolvable targets pointing outside R or into `.git`.
+  if (symbolic) {
+    const linkParent = resolveSymlinkParent(destToken, Boolean(targetDir), destAsFile, directory);
+    for (const src of sources) {
+      const v = judgeSymlinkTarget(src, linkParent, roots);
+      if (v) return v;
+    }
+  }
+
+  return undefined;
+}
+
+function stripTrailingSubshellParen(token: ShellToken): string {
+  const count = token.trailingCloseParens ?? 0;
+  return count > 0 ? token.value.slice(0, Math.max(0, token.value.length - count)) : token.value;
+}
+
+function resolveSymlinkParent(
+  destToken: ShellToken | undefined,
+  isTargetDirFlag: boolean,
+  destAsFile: boolean,
+  directory: string | undefined,
+): string | undefined {
+  if (!destToken) return directory;
+  if (destToken.dynamic) return undefined;
+  const cleaned = stripTrailingSubshellParen(destToken);
+  const raw = cleaned.startsWith("~/") || cleaned === "~"
+    ? homedir() + cleaned.slice(1)
+    : cleaned;
+  if (!isAbsolute(raw) && directory === undefined) return undefined;
+  const resolvedDest = isAbsolute(raw) ? resolve(raw) : resolve(directory!, raw);
+  if (isTargetDirFlag) return resolvedDest;
+  if (!destAsFile) {
+    try {
+      if (statSync(resolvedDest).isDirectory()) return resolvedDest;
+    } catch { /* non-existent destination: link is placed in dirname(dest) */ }
+  }
+  return dirname(resolvedDest);
+}
+
+function judgeSymlinkTarget(target: ShellToken, linkParent: string | undefined, roots: WriteFloorRoots): string | undefined {
+  const literal = resolveStaticPathValue(target, linkParent);
+  if (literal === undefined) return undefined;
+  if (!isAbsolute(literal) && linkParent === undefined) return undefined;
+  const lexical = isAbsolute(literal) ? resolve(literal) : resolve(linkParent!, literal);
+  if (lexical.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) {
+    return `Worker cannot create a symlink targeting Git metadata (${target.value})`;
+  }
+  const canonical = resolveExistingPath(lexical);
+  if (canonical.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) {
+    return `Worker cannot create a symlink targeting Git metadata (${target.value})`;
+  }
+  const allRoots = [roots.cwd, ...roots.others];
+  const inside = allRoots.some((root) => {
+    const prefix = root === "/" ? "/" : `${root}/`;
+    return canonical === root || canonical.startsWith(prefix);
+  });
+  if (!inside) {
+    return `Worker cannot create a symlink pointing outside the task directory (${target.value})`;
+  }
+  return undefined;
+}
+
+function checkGitWorktreeWriteTargets(args: readonly ShellToken[], directory: string | undefined, roots: WriteFloorRoots): string | undefined {
+  let effectiveDir = directory;
+  let index = 0;
+  while (index < args.length) {
+    const word = args[index]!.value;
+    if (word === "-C") {
+      const next = args[index + 1];
+      if (!next) return undefined;
+      effectiveDir = resolveCd([next], effectiveDir);
+      index += 2;
+      continue;
+    }
+    if (word === "-c" || word === "--git-dir" || word === "--work-tree" || word === "--namespace") {
+      index += 2;
+      continue;
+    }
+    if (word.startsWith("-")) { index += 1; continue; }
+    break;
+  }
+  if (args[index]?.value.toLowerCase() !== "worktree") return undefined;
+  const action = args[index + 1]?.value.toLowerCase();
+  if (action !== "add" && action !== "move") return undefined;
+  const positionals: ShellToken[] = [];
+  let options = true;
+  for (let i = index + 2; i < args.length; i += 1) {
+    const tok = args[i]!;
+    const val = tok.value;
+    if (options && val === "--") { options = false; continue; }
+    if (options && val.startsWith("-")) {
+      if (action === "add") {
+        if (val.startsWith("--")) {
+          const eq = val.indexOf("=");
+          const flag = eq > 0 ? val.slice(0, eq) : val;
+          // Match git's abbreviated `--reason` prefix (e.g. `--reas why`).
+          if (flag.length >= 4 && "--reason".startsWith(flag) && eq < 0) i += 1;
+        } else {
+          // Bundled short options like `-fb feat <path>` or `-qb feat <path>`.
+          const letters = val.slice(1);
+          for (let c = 0; c < letters.length; c += 1) {
+            if (letters[c] === "b" || letters[c] === "B") {
+              if (c === letters.length - 1) i += 1;
+              break;
+            }
+          }
+        }
+      }
+      continue;
+    }
+    positionals.push(tok);
+  }
+  const target = action === "add" ? positionals[0] : positionals[1];
+  if (!target) return undefined;
+  return judgeWriteTarget(target, effectiveDir, roots, { allowRootDir: false, verb: `git worktree ${action} to` });
+}
+
+function resolveStaticPathValue(target: ShellToken, directory: string | undefined): string | undefined {
+  let value = stripTrailingSubshellParen(target);
+  if (directory !== undefined && /\$(?:\{PWD\}|PWD(?![A-Za-z0-9_]))/u.test(value)) {
+    value = value.replace(/\$(?:\{PWD\}|PWD(?![A-Za-z0-9_]))/gu, directory);
+  }
+  if (value === "~" || value.startsWith("~/")) {
+    value = homedir() + value.slice(1);
+  }
+  if (/[$`*?[\]{}~]/u.test(value)) return undefined;
+  return value;
+}
+
+/**
+ * When a write target contains a glob or variable AFTER a fixed prefix (e.g.
+ * `/etc/$X`, `~/.ssh/authorized_key?`, `/hom[e]/u/.bashrc`, `.git/$X`), check
+ * whether that fixed prefix is already proven outside every root in `R` or
+ * names `.git`. Pure leading-dynamic targets (`"$OUT"`) return undefined so
+ * they fall through to the active permission authority.
+ */
+function checkDynamicWritePrefix(
+  target: ShellToken,
+  directory: string | undefined,
+  roots: WriteFloorRoots,
+  verb: string,
+): string | undefined {
+  let value = stripTrailingSubshellParen(target);
+  if (directory !== undefined && /\$(?:\{PWD\}|PWD(?![A-Za-z0-9_]))/u.test(value)) {
+    value = value.replace(/\$(?:\{PWD\}|PWD(?![A-Za-z0-9_]))/gu, directory);
+  }
+  if (value === "~" || value.startsWith("~/")) {
+    value = homedir() + value.slice(1);
+  }
+  // No literal path structure before the dynamic expansion (e.g. `"$OUT"`).
+  if (/^[$`~{]/u.test(value)) return undefined;
+  const fullPath = isAbsolute(value) ? value : (directory !== undefined ? `${directory.replace(/\/+$/u, "")}/${value}` : undefined);
+  if (!fullPath) return undefined;
+  const segments = fullPath.replaceAll("\\", "/").split("/").filter(Boolean);
+  if (segments.length === 0) return undefined;
+
+  // Check if any literal segment before the first `$`/`backtick` names `.git`.
+  for (const seg of segments) {
+    if (/[$`]/u.test(seg)) break;
+    if (seg.toLowerCase() === ".git" || (/[*?[]/u.test(seg) && globMatches(seg, ".git"))) {
+      return `Worker cannot ${verb} Git metadata or .git pointers (${target.value})`;
+    }
+  }
+
+  // Build candidate canonical root segment lists for every root in R.
+  const allRootPaths = [
+    roots.cwd,
+    ...roots.others,
+    roots.rawCwd,
+    ...roots.rawWriteRoots,
+    ...roots.rawTempRoots,
+    ...roots.pinnedWriteRoots.map((r) => r.declared),
+  ].filter((p) => isAbsolute(p));
+  const rootSegLists = [...new Set(allRootPaths.map((p) => resolve(p).replaceAll("\\", "/")))].map((p) => p.split("/").filter(Boolean));
+
+  // Walk segments up to the first `$` / backtick / `{`; if the prefix cannot
+  // lie inside OR be a prefix of ANY root in R, it is provably outside R!
+  const concreteSegments: string[] = [];
+  for (const seg of segments) {
+    if (/[$`{}]/u.test(seg)) break;
+    if (seg === ".") continue;
+    if (seg === "..") {
+      if (concreteSegments.length > 0 && !/[*?[]/u.test(concreteSegments.at(-1)!)) concreteSegments.pop();
+      else break;
+      continue;
+    }
+    concreteSegments.push(seg);
+  }
+  if (concreteSegments.length === 0) return undefined;
+
+  const matchesAnyRoot = rootSegLists.some((rootSegs) => {
+    const limit = Math.min(concreteSegments.length, rootSegs.length);
+    for (let k = 0; k < limit; k += 1) {
+      const seg = concreteSegments[k]!;
+      const rootSeg = rootSegs[k]!;
+      if (/[*?[]/u.test(seg)) {
+        if (!globMatches(seg, rootSeg)) return false;
+      } else if (seg !== rootSeg) {
+        return false;
+      }
+    }
+    // If concreteSegments is shorter than rootSegs, it could still be an ancestor
+    // of a root (e.g. `/tmp/$X` when a root is `/tmp/pi-claude-task-…`): only
+    // allow if a later dynamic segment follows; if the entire path ended before
+    // reaching any root (e.g. `/tmp/x?` vs `/tmp/pi-claude-task-…`), concreteSegments[1]
+    // already failed `globMatches("x?", "pi-claude-task-…")`.
+    return true;
+  });
+  if (!matchesAnyRoot) {
+    return `Worker cannot ${verb} outside the task directory (${target.value})`;
+  }
+  return undefined;
+}
+
+function judgeWriteTarget(
+  target: ShellToken,
+  directory: string | undefined,
+  roots: WriteFloorRoots,
+  options: { allowRootDir: boolean; verb: string },
+): string | undefined {
+  const cleanedRaw = stripTrailingSubshellParen(target);
+  if (SAFE_DEVICE_WRITE_SINKS.has(cleanedRaw) || /^\/(?:dev|proc\/self)\/fd\/\d+$/u.test(cleanedRaw)) {
+    return undefined;
+  }
+  const literal = resolveStaticPathValue(target, directory);
+  if (literal === undefined) {
+    // Still check any fixed literal/glob prefix (e.g. `/etc/$X`, `~/.ssh/key?`, `/hom[e]/u/.bashrc`).
+    return checkDynamicWritePrefix(target, directory, roots, options.verb);
+  }
+  if (SAFE_DEVICE_WRITE_SINKS.has(literal) || /^\/(?:dev|proc\/self)\/fd\/\d+$/u.test(literal)) {
+    return undefined;
+  }
+  if (!isAbsolute(literal) && directory === undefined) {
+    return `Worker cannot ${options.verb} a relative path after a cd the policy cannot follow (${target.value})`;
+  }
+  const unnormalized = isAbsolute(literal) ? literal : `${directory!.replace(/\/+$/u, "")}/${literal}`;
+  const rawSegments = unnormalized.replaceAll("\\", "/").split("/");
+  if (rawSegments.some((segment) => segment.toLowerCase() === ".git")) {
+    return `Worker cannot ${options.verb} Git metadata or .git pointers (${target.value})`;
+  }
+  // Judge against unified root set R passing RAW cwd + writeRoots + tempRoots +
+  // pinnedWriteRoots so symlinked OS ancestors (macOS /tmp -> /private/tmp,
+  // /var -> /private/var) match via `pathBelow` identically to Write/Edit.
+  const combinedWriteRoots = [...roots.rawWriteRoots, ...roots.rawTempRoots];
+  const violation = classifyWritePath(unnormalized, roots.rawCwd, combinedWriteRoots, roots.pinnedWriteRoots);
+  if (violation === "git-metadata") {
+    return `Worker cannot ${options.verb} Git metadata or .git pointers (${target.value})`;
+  }
+  if (violation === "cwd-missing") {
+    return `the task working directory no longer exists, so nothing can be written (${target.value})`;
+  }
+  if (violation === "outside-cwd") {
+    return `Worker cannot ${options.verb} outside the task directory (${target.value})`;
+  }
+  if (!options.allowRootDir) {
+    const resolved = resolveExistingPath(resolve(unnormalized));
+    if (resolved === roots.cwd || roots.others.includes(resolved)) {
+      return `Worker cannot overwrite a task or write-root directory itself (${target.value})`;
+    }
+  }
+  return undefined;
+}
+
 const FLOOR_KEYWORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "!", "(", "{", "}", "done", "fi", "esac"]);
 
 function deleteFloorRoots(cwd: string, writeRoots: readonly string[], tempRoots: readonly string[], pinnedWriteRoots: readonly PinnedWriteRoot[] = []): FloorRoots {
@@ -382,12 +1522,23 @@ function floorSegments(tokens: readonly ShellToken[]): { tokens: ShellToken[]; j
   return segments;
 }
 
-/** A statement's words: no operators, quoted heredoc data or redirection targets (a process substitution and a here-string stay). */
+/** A statement's words: no operators, fd-redirect numbers, quoted heredoc data or redirection targets (a process substitution and a here-string stay). */
 function segmentWords(segment: readonly ShellToken[]): ShellToken[] {
   const words: ShellToken[] = [];
   let skipNext = false;
   for (const token of segment) {
-    if (token.operator) { skipNext = REDIRECT_OPERATORS.has(token.value); continue; }
+    if (token.operator) {
+      if (REDIRECT_OPERATORS.has(token.value)) {
+        // Strip ONLY an adjacent fd prefix (`2>/dev/null`, `{fd}>/dev/null`),
+        // never a space-separated argument (`cd sub 2 >/dev/null`, `cp -l a 2 >/dev/null`).
+        const prev = words.at(-1);
+        if (prev?.fdPrefix) words.pop();
+        skipNext = true;
+      } else {
+        skipNext = false;
+      }
+      continue;
+    }
     const skip = skipNext && !token.value.startsWith("(");
     skipNext = false;
     if (skip || token.data) continue;
@@ -409,26 +1560,37 @@ function withoutQuotedHeredocs(command: string): string {
   return command.replace(/<<-?[ \t]*(['"])([^'"\s]+)\1([^\n]*)\n[\s\S]*?(?:\n[ \t]*\2[ \t]*(?=\n|\)|$)|$)/gu, "<<$1$2$1$3");
 }
 
-/** The bodies of `$(…)`, `<(…)`, `>(…)` and backticks outside single quotes. */
+/** The bodies of `$(…)`, `<(…)`, `>(…)` and backticks outside single quotes (tracking double quotes and backslash escapes). */
 function substitutionBodies(command: string): string[] {
   const bodies: string[] = [];
   let single = false;
+  let double = false;
   for (let index = 0; index < command.length; index += 1) {
     const character = command[index]!;
-    if (character === "\\" && !single) { index += 1; continue; }
-    if (character === "'") { single = !single; continue; }
-    if (single) continue;
+    if (single) { if (character === "'") single = false; continue; }
+    if (character === "\\") { index += 1; continue; }
+    if (double) {
+      if (character === '"') { double = false; continue; }
+    } else {
+      if (character === "'") { single = true; continue; }
+      if (character === '"') { double = true; continue; }
+    }
     if (character === "`") {
-      const close = command.indexOf("`", index + 1);
-      if (close < 0) break;
+      let close = index + 1;
+      while (close < command.length && command[close] !== "`") {
+        if (command[close] === "\\") close += 1;
+        close += 1;
+      }
+      if (close >= command.length) break;
       bodies.push(command.slice(index + 1, close));
       index = close;
       continue;
     }
-    if (character === "(" && index > 0 && "$<>".includes(command[index - 1]!)) {
+    if (character === "(" && index > 0 && (command[index - 1] === "$" || (!double && (command[index - 1] === "<" || command[index - 1] === ">")))) {
       let level = 1;
       let cursor = index + 1;
       for (; cursor < command.length && level > 0; cursor += 1) {
+        if (command[cursor] === "\\") { cursor += 1; continue; }
         if (command[cursor] === "(") level += 1;
         else if (command[cursor] === ")") level -= 1;
       }
@@ -970,6 +2132,18 @@ interface ShellToken {
   dynamic: boolean;
   /** A quoted heredoc body: literal text whose meaning depends on the command that consumes it. */
   data?: boolean;
+  /** True when the token originated from a quoted heredoc body (`<<'EOF'`), which never undergoes shell substitution. */
+  heredoc?: boolean;
+  /** True when the token contained any single- or double-quoted segment in the original command. */
+  quoted?: boolean;
+  /** Number of unquoted, unescaped leading `(` subshell openers (excluding `((`). */
+  leadingOpenParens?: number;
+  /** Number of unquoted, unescaped trailing `)` subshell closers (excluding `)` that close `$(…)` / `))`). */
+  trailingCloseParens?: number;
+  /** True when the token was lexed while inside an open `$(…)` / `<(…)` / `>(…)` substitution. */
+  inSubst?: boolean;
+  /** True when this unquoted digit/`{fd}` token immediately preceded a redirection operator with no whitespace (`2>/dev/null`, NOT `2 >/dev/null`). */
+  fdPrefix?: boolean;
 }
 
 const protectedBranches = new Set(["main", "master", "trunk", "integration", "develop"]);
@@ -1589,7 +2763,7 @@ function evaluateRepositoryBoundary(tokens: readonly ShellToken[], canonical: st
   if (hasGit && (hasRewriteOperation || hasBranchDeleteOrMove || hasForcedBranchCreate) && hasProtectedBranch) {
     return { decision: "deny", reason: "Worker cannot rewrite or delete a protected integration branch" };
   }
-  const directRefWrite = tokens.some((token) => token.operator && (token.value === ">" || token.value === ">>"))
+  const directRefWrite = tokens.some((token) => token.operator && OUTPUT_REDIRECT_OPERATORS.has(token.value))
     || ["cp", "echo", "install", "mv", "printf", "sed", "tee"].includes(lower[0] ?? "");
   if (/\.git[\\/](?:HEAD|packed-refs|refs[\\/]heads[\\/])/iu.test(canonical)
     || (directRefWrite && hasProtectedBranch && /refs[\\/]heads[\\/]/iu.test(canonical))) {
@@ -1951,7 +3125,7 @@ function hasDynamicSensitiveArgument(segment: readonly ShellToken[], depth = 0):
   const words: ShellToken[] = [];
   let afterRedirect = false;
   for (const token of segment) {
-    if (token.operator) { afterRedirect = [">", ">>", "<", "<<<", ">|", "&>"].includes(token.value); continue; }
+    if (token.operator) { afterRedirect = REDIRECT_OPERATORS.has(token.value) || token.value === "<<<"; continue; }
     if (!afterRedirect && !token.data) words.push(token);
     afterRedirect = false;
   }
@@ -2165,8 +3339,8 @@ function resolveLiteralBindings(tokens: readonly ShellToken[]): ShellToken[] {
  * `git commit -m`) it is text the boundary never needs to see; fed to anything
  * else it stays in the command as literal words for the pattern checks.
  */
-function resolveDataTokens(tokens: readonly ShellToken[]): { tokens: ShellToken[]; embedded: string[] } {
-  if (!tokens.some((token) => token.data)) return { tokens: [...tokens], embedded: [] };
+function resolveDataTokens(tokens: readonly ShellToken[]): { tokens: ShellToken[]; embedded: string[]; embeddedBySegment: Map<number, string[]> } {
+  if (!tokens.some((token) => token.data)) return { tokens: [...tokens], embedded: [], embeddedBySegment: new Map() };
   const segments: { tokens: ShellToken[]; joiner?: string }[] = [{ tokens: [] }];
   for (const token of tokens) {
     if (token.operator && SEGMENT_SPLIT_OPERATORS.has(token.value)) {
@@ -2176,7 +3350,7 @@ function resolveDataTokens(tokens: readonly ShellToken[]): { tokens: ShellToken[
     }
     segments.at(-1)!.tokens.push(token);
   }
-  const commandOf = (segment: readonly ShellToken[]): { name: string; words: string[] } | undefined => {
+  const commandOf = (segment: readonly ShellToken[]): { name: string; words: string[]; mutatesShellVar: boolean } | undefined => {
     let afterRedirect = false;
     let name: string | undefined;
     const words: string[] = [];
@@ -2192,29 +3366,37 @@ function resolveDataTokens(tokens: readonly ShellToken[]): { tokens: ShellToken[
       }
       words.push(word);
     }
-    return name === undefined ? undefined : { name, words };
+    const mutatesShellVar = name === "printf" && segment.some((token) => !token.operator && token.value.startsWith("-v"));
+    return name === undefined ? undefined : { name, words, mutatesShellVar };
   };
   const resolved: ShellToken[] = [];
   const embedded: string[] = [];
+  const embeddedBySegment = new Map<number, string[]>();
   segments.forEach((segment, index) => {
     const bodies = segment.tokens.filter((token) => token.data);
     if (bodies.length === 0) {
       resolved.push(...segment.tokens, ...(segment.joiner ? [{ value: segment.joiner, operator: true, dynamic: false }] : []));
       return;
     }
-    const consumers: { name: string; words: string[] }[] = [];
+    const consumers: { name: string; words: string[]; mutatesShellVar: boolean }[] = [];
     for (let cursor = index; cursor < segments.length; cursor += 1) {
       const command = commandOf(segments[cursor]!.tokens);
       if (command) consumers.push(command);
-      if (segments[cursor]!.joiner !== "|") break;
+      if (segments[cursor]!.joiner !== "|" && segments[cursor]!.joiner !== "|&") break;
     }
     const shellConsumer = consumers.some((consumer) => SHELL_NAMES.has(consumer.name) || consumer.name === "eval" || consumer.name === "source" || consumer.name === ".");
-    const sinkOnly = consumers.length > 0 && consumers.every((consumer) => DATA_SINK_COMMANDS.has(consumer.name) || (consumer.name === "git" && consumer.words.includes("commit")));
-    if (shellConsumer) embedded.push(...bodies.map((token) => token.value));
+    const sinkOnly = consumers.length > 0 && consumers.every((consumer) =>
+      (!consumer.mutatesShellVar && DATA_SINK_COMMANDS.has(consumer.name))
+      || (consumer.name === "git" && consumer.words.includes("commit")));
+    if (shellConsumer) {
+      const bodyTexts = bodies.map((token) => token.value);
+      embedded.push(...bodyTexts);
+      embeddedBySegment.set(index, [...(embeddedBySegment.get(index) ?? []), ...bodyTexts]);
+    }
     const kept = shellConsumer || sinkOnly ? segment.tokens.filter((token) => !token.data) : segment.tokens.map((token) => ({ ...token, data: false }));
     resolved.push(...kept, ...(segment.joiner ? [{ value: segment.joiner, operator: true, dynamic: false }] : []));
   });
-  return { tokens: resolved, embedded };
+  return { tokens: resolved, embedded, embeddedBySegment };
 }
 
 /**
@@ -2230,14 +3412,19 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
   let dynamic = false;
   let started = false;
   let tokenQuoted = false;
+  let tokenEscaped = false;
   let tokenData = false;
+  let leadingOpenParens = 0;
+  let atLeadingParen = true;
+  let trailingCloseParens = 0;
+  let substParenDepth = 0;
   let quote: "single" | "double" | undefined;
   // Heredocs: the word after `<<` names the delimiter; the body starts on the
   // next line and ends at a line equal to it. A quoted delimiter makes the body
   // pure data, which the boundary never needs to see.
   let expectDelimiter: { stripTabs: boolean } | undefined;
   const pendingHeredocs: { delimiter: string; quoted: boolean; stripTabs: boolean }[] = [];
-  const flush = (): void => {
+  const flush = (adjacentRedirect = false): void => {
     if (!started) return;
     // A bare `[`, `[[`, `]`, `]]`, `{` or `}` is shell syntax, not an expansion.
     if (/^[[\]{}]+$/u.test(value)) dynamic = false;
@@ -2246,15 +3433,34 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
       expectDelimiter = undefined;
       dynamic = false;
     }
-    tokens.push({ value, operator: false, dynamic, ...(tokenData ? { data: true } : {}) });
+    // Arithmetic `((…))` is not a subshell paren opener/closer.
+    const effectiveLeading = value.startsWith("((") && leadingOpenParens >= 2 ? leadingOpenParens - 2 : leadingOpenParens;
+    const effectiveTrailing = value.endsWith("))") && trailingCloseParens >= 2 ? trailingCloseParens - 2 : trailingCloseParens;
+    // Bash treats any quoted OR backslash-escaped digit (`\2>/dev/null`, `2\3>`) as a plain argument, never an fd prefix.
+    const fdPrefix = adjacentRedirect && !tokenQuoted && !tokenEscaped && /^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})$/u.test(value);
+    tokens.push({
+      value,
+      operator: false,
+      dynamic,
+      ...(tokenData ? { data: true } : {}),
+      ...(tokenQuoted ? { quoted: true } : {}),
+      ...(effectiveLeading > 0 ? { leadingOpenParens: effectiveLeading } : {}),
+      ...(effectiveTrailing > 0 ? { trailingCloseParens: effectiveTrailing } : {}),
+      ...(substParenDepth > 0 ? { inSubst: true } : {}),
+      ...(fdPrefix ? { fdPrefix: true } : {}),
+    });
     value = "";
     dynamic = false;
     started = false;
     tokenQuoted = false;
+    tokenEscaped = false;
     tokenData = false;
+    leadingOpenParens = 0;
+    atLeadingParen = true;
+    trailingCloseParens = 0;
   };
   const pushOperator = (operator: string): void => {
-    flush();
+    flush(REDIRECT_OPERATORS.has(operator) || operator === "<<<");
     tokens.push({ value: operator, operator: true, dynamic: false });
   };
   /** Consume the heredoc bodies that start after the newline at `newlineIndex`; returns the index to resume lexing at. */
@@ -2273,7 +3479,7 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
       const body = bodyLines.join("\n");
       // A quoted delimiter suppresses expansion: the body is data for its
       // consumer. An unquoted one expands, so the body is an ordinary argument.
-      tokens.push(heredoc.quoted ? { value: body, operator: false, dynamic: false, data: true } : { value: body, operator: false, dynamic: /[$`]/u.test(body) });
+      tokens.push(heredoc.quoted ? { value: body, operator: false, dynamic: false, data: true, heredoc: true } : { value: body, operator: false, dynamic: /[$`]/u.test(body) });
       if (!terminated) break;
     }
     return Math.min(position, input.length);
@@ -2282,12 +3488,16 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
     const character = input[index]!;
     const next = input[index + 1];
     if (quote === "single") {
+      atLeadingParen = false;
+      trailingCloseParens = 0;
       if (character === "'") quote = undefined;
       else value += character;
       started = true;
       continue;
     }
     if (quote === "double") {
+      atLeadingParen = false;
+      trailingCloseParens = 0;
       if (character === '"') quote = undefined;
       else if (character === "\\" && next === "\n") index += 1;
       else if (character === "\\" && next !== undefined && /[\\"$`]/u.test(next)) { value += next; index += 1; }
@@ -2300,12 +3510,21 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
       started = true;
       continue;
     }
-    if (character === "'") { quote = "single"; started = true; tokenQuoted = true; continue; }
-    if (character === '"') { quote = "double"; started = true; tokenQuoted = true; continue; }
+    if (character === "'") { quote = "single"; started = true; tokenQuoted = true; atLeadingParen = false; trailingCloseParens = 0; continue; }
+    if (character === '"') { quote = "double"; started = true; tokenQuoted = true; atLeadingParen = false; trailingCloseParens = 0; continue; }
     if (character === "\\") {
-      if (next === "\n") index += 1;
-      else if (next !== undefined) { value += next; index += 1; }
-      started = true;
+      atLeadingParen = false;
+      trailingCloseParens = 0;
+      if (next === "\n") {
+        // Line continuation (`\<newline>`) is deleted before word splitting by bash;
+        // it does NOT quote/escape an adjacent fd digit (`2\<newline>>/dev/null` is still `2>`).
+        index += 1;
+      } else if (next !== undefined) {
+        tokenEscaped = true;
+        value += next;
+        index += 1;
+        started = true;
+      }
       continue;
     }
     // A comment runs to the end of the line.
@@ -2325,15 +3544,32 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
       continue;
     }
     if (/\s/u.test(character)) { flush(); continue; }
-    if (character === "$" || character === "`") { dynamic = true; value += character; started = true; continue; }
+    if (character === "$" || character === "`") {
+      atLeadingParen = false;
+      trailingCloseParens = 0;
+      dynamic = true;
+      value += character;
+      started = true;
+      continue;
+    }
     // Brace, tilde and pathname expansion can change command names, targets or
     // Git refs after this lexical pass. Treat all unquoted expansion markers as
     // dynamic rather than attempting to model Bash's expansion order.
     // A tilde expands only at the start of a word (or of an assignment value);
     // `HEAD~1` and `a~b` are literal text.
-    if (character === "~") { if (value === "" || /[=:]$/u.test(value)) dynamic = true; value += character; started = true; continue; }
-    if ("*?[]{}".includes(character)) { dynamic = true; value += character; started = true; continue; }
+    if (character === "~") { atLeadingParen = false; trailingCloseParens = 0; if (value === "" || /[=:]$/u.test(value)) dynamic = true; value += character; started = true; continue; }
+    if ("*?[]{}".includes(character)) { atLeadingParen = false; trailingCloseParens = 0; dynamic = true; value += character; started = true; continue; }
     if (";&|<>".includes(character)) {
+      if ((character === "<" || character === ">") && next === "(") {
+        // Process substitution `<(…)` / `>(…)` — track paren depth without counting its `)` as a subshell closer.
+        pushOperator(character);
+        substParenDepth += 1;
+        value += "(";
+        started = true;
+        atLeadingParen = false;
+        index += 1;
+        continue;
+      }
       if (character === "<" && next === "<") {
         const third = input[index + 2];
         if (third === "<") { pushOperator("<<<"); index += 2; continue; }
@@ -2343,12 +3579,40 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
         index += stripTabs ? 2 : 1;
         continue;
       }
+      if (character === "<" && next === ">") { pushOperator("<>"); index += 1; continue; }
+      if (character === "<" && next === "&") { pushOperator("<&"); index += 1; continue; }
+      if (character === ">" && next === "|") { pushOperator(">|"); index += 1; continue; }
+      if (character === ">" && next === "&") { pushOperator(">&"); index += 1; continue; }
+      if (character === "|" && next === "&") { pushOperator("|&"); index += 1; continue; }
+      if (character === "&" && next === ">") {
+        if (input[index + 2] === ">") { pushOperator("&>>"); index += 2; continue; }
+        pushOperator("&>");
+        index += 1;
+        continue;
+      }
       const operator = next && ((character === "&" && next === "&") || (character === "|" && next === "|") || (character === ">" && next === ">"))
         ? `${character}${next}`
         : character;
       pushOperator(operator);
       if (operator.length === 2) index += 1;
       continue;
+    }
+    if (character === "(") {
+      const prevChar = index > 0 ? input[index - 1] : undefined;
+      if (prevChar === "$" || substParenDepth > 0) {
+        substParenDepth += 1;
+        atLeadingParen = false;
+      } else if (atLeadingParen) {
+        leadingOpenParens += 1;
+      }
+      trailingCloseParens = 0;
+    } else if (character === ")") {
+      atLeadingParen = false;
+      if (substParenDepth > 0) { substParenDepth -= 1; trailingCloseParens = 0; }
+      else trailingCloseParens += 1;
+    } else {
+      atLeadingParen = false;
+      trailingCloseParens = 0;
     }
     value += character;
     started = true;
@@ -2358,7 +3622,7 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
   return { tokens };
 }
 
-const SEGMENT_SPLIT_OPERATORS = new Set(["|", "&&", "||", ";", "&"]);
+const SEGMENT_SPLIT_OPERATORS = new Set(["|", "|&", "&&", "||", ";", "&"]);
 
 /**
  * Utilities whose effects are fully visible in their static argv. Anything that
@@ -2561,22 +3825,19 @@ function hasUnquotedParenthesis(command: string): boolean {
 
 /**
  * Remove `N>&M`, `>&N`, `N>&-` and `<&N` descriptor duplications, which only
- * re-route existing streams and never name a file. The lexer emits them as
- * `[N] > & M`; any other `&` adjacent to a redirection (e.g. `&> file`) is
- * left in place and fails the ordinary target check.
+ * re-route existing streams and never name a file. Any other `>& file` or
+ * `&> file` is left in place so the target is validated as a file write.
  */
 function withoutFdDuplication(tokens: readonly ShellToken[]): ShellToken[] | undefined {
   const result: ShellToken[] = [];
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index]!;
-    const redirect = token.operator && (token.value === ">" || token.value === ">>" || token.value === "<") ? token : undefined;
-    const ampersand = tokens[index + 1];
-    const target = tokens[index + 2];
-    if (redirect && ampersand?.operator && ampersand.value === "&" && target && !target.operator && /^(?:\d+|-)$/u.test(target.value)) {
+    const target = tokens[index + 1];
+    if (token.operator && (token.value === ">&" || token.value === "<&") && target && !target.operator && /^(?:\d+|-)$/u.test(target.value)) {
       // An optional leading descriptor number belongs to this redirection.
       const previous = result.at(-1);
       if (previous && !previous.operator && /^\d+$/u.test(previous.value) && result.length > 0) result.pop();
-      index += 2;
+      index += 1;
       continue;
     }
     result.push(token);
@@ -3004,7 +4265,7 @@ function hasUnsafeRedirection(
 ): boolean {
   for (let index = 0; index < segment.length; index += 1) {
     const token = segment[index]!;
-    if (token.operator && (token.value === ">" || token.value === ">>")) {
+    if (token.operator && OUTPUT_REDIRECT_OPERATORS.has(token.value)) {
       const target = segment[index + 1];
       if (!target || target.operator) return true;
       if (isUnsafeRedirectTarget(target.value, effectiveDir, writeRoots, boundaryCwd)) return true;
