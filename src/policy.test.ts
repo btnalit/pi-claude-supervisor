@@ -1774,10 +1774,67 @@ test("Write Floor v1 (#55-3) blocks out-of-R and .git writes across redirects, t
       `sh -c 'echo x > ${outside}/pwn.txt'`,
       `echo "$(tee ${outside}/pwn.txt)"`,
       `echo hi > >(tee ${outside}/pwn.txt)`,
+      // Opus 5.5 adversarial repros:
+      // #2: [[ ... ]] and (( ... )) with trailing redirects or nested subshells
+      `[[ -n $(echo evil >&3) ]] 3>>${outside}/pwn.txt`,
+      `((echo evil) >> ${outside}/pwn.txt)`,
+      `(( 1 )) > ${outside}/pwn.txt`,
+      // #3: cd/pushd tracking with ||, builtin/command/fn, nested bash -c, quoted ")"
+      "cd ~ || exit; echo evil >> .bashrc",
+      "builtin cd ~ && echo evil >> .bashrc",
+      "command cd ~ && echo evil >> .bashrc",
+      "f(){ cd ~; }; f; echo evil >> .bashrc",
+      "pushd ~ && echo evil >> .bashrc",
+      "cd ~ && bash -c 'echo evil >> .bashrc'",
+      "(cd ~; echo \")\"; echo evil >> .bashrc)",
+      // #4: trailing unquoted `)` on .git pointer targets
+      `(echo 'gitdir: /tmp/evil' > ${lane}/.git)`,
+      `(cp a.txt ${lane}/.git)`,
+      // #5: find multiple -exec and -execdir
+      `find . -maxdepth 0 -exec cp a.txt b.txt \\; -exec cp a.txt ${outside}/pwn.txt \\;`,
+      `find ${outside} -execdir cp ${repo}/a.txt pwn.txt \\;`,
+      // #6: optional-arg flags, short abbreviations, bundled worktree flags, env -C/-S
+      `echo evil | tee --output-error ${outside}/pwn.txt`,
+      `cp a.txt --context ${outside}/pwn.txt`,
+      `cp --tar ${outside} a.txt`,
+      `git worktree add -fb feat ${outside}/escape`,
+      `git worktree add --lock --reas why ${outside}/escape`,
+      `env -C${outside} tee -a pwn.txt`,
+      `env -iC${outside} tee -a pwn.txt`,
+      `sudo -D${outside} tee -a pwn.txt`,
+      `env -S 'cp a.txt ${outside}/pwn.txt'`,
+      // #7: text-to-runner commands (trap, pipe-to-shell, sh <<<, npm exec, uv run)
+      `trap 'echo evil >> ${outside}/pwn.txt' EXIT`,
+      `echo 'cp a.txt ${outside}/pwn.txt' | sh`,
+      `echo 'cp a.txt ${outside}/pwn.txt' |& bash`,
+      `sh <<< 'echo evil >> ${outside}/pwn.txt'`,
+      `npm exec -- cp a.txt ${outside}/pwn.txt`,
+      `uv run cp a.txt ${outside}/pwn.txt`,
+      // #8: glob/variable after fixed outside prefix
+      "echo evil >> /hom[e]/u/.bashrc",
+      "cp a.txt ~/.ssh/authorized_key?",
+      "echo evil > /etc/$X",
+      "echo evil > .git/$X",
     ]) {
       assert.ok(judge(cmd), `Write Floor expected deny: ${cmd}`);
       assert.equal(evaluatePermission("Bash", bash(cmd), repo, opts).decision, "deny", `evaluatePermission expected deny: ${cmd}`);
     }
+
+    // P0 regression guard: delete floor MUST still catch here-string scripts (`<<<`).
+    assert.ok(deleteFloorViolation(`bash <<< "rm -rf ${outside}"`, repo, opts), "delete floor must catch bash <<< here-string");
+    assert.ok(deleteFloorViolation(`cat <<< "rm -rf ${outside}" | sh`, repo, opts), "delete floor must catch cat <<< | sh here-string");
+
+    // #9 regression guard: directRefWrite must still catch `>|` into refs/heads/main.
+    assert.equal(evaluateCommand('cd "$(git rev-parse --git-dir)" && echo "$SHA" >| refs/heads/main').decision, "deny");
+
+    // P2 guard: `&>> "$LOG"` on npm run must not be falsely flagged as a dynamic sensitive argument.
+    assert.equal(evaluateCommand('npm run build &>> "$LOG"').decision, "allow");
+
+    // #10 regression guard: symlinked ancestor of cwd (macOS /var -> /private/var) still allows in-R writes!
+    const symBase = join(base, "sym-parent");
+    await symlink(base, symBase);
+    const symRepo = join(symBase, "repo");
+    assert.equal(writeFloorViolation("echo hi > notes.txt", symRepo, { tempRoots: [taskTmp.canonical] }), undefined);
 
     // Swapping pinned root with a symlink invalidates writes to it immediately.
     await rm(lane, { recursive: true, force: true });

@@ -296,7 +296,7 @@ copy-mode、Stop-hook block、后台任务、AskUserQuestion、限流模拟；�
   4. D5 的动态参数放宽 **不适用于** 删除/移动目标。
 - ✅ **新增：写入底线 v1（#55-3）**（接在 `evaluatePermission` 的 Bash 分支，与删除底线共用统一根集合 `R`，任何授权模式与人工 approve 都无法越过）：
   覆盖静态可解析的目标——shell 输出重定向（`>`、`>>`、`>|`、`&>`、`&>>`、`<>`、`>&file`，放行 `/dev/null`、`/dev/stdout`、`/dev/stderr`、`/dev/tty`、`/dev/fd/*`、`/proc/self/fd/*` 与 `2>&1`/`>&-`）、`tee`、`cp`/`install`/`ln`（含 `-t`/`--target-directory` 前缀、短选项紧贴、硬链接源校验与符号链接目标相对链接父目录的词法解析）、`git worktree add/move`（含累计 `-C`），并阻止覆写 `.git`（含兄弟工作树 `.git` 指针文件）或指向 `R` 之外。
-  **明确延后/残余风险**（v1 不覆盖，回落至当前权限模式处理）：无法静态解析的动态目标（`> "$OUT"`）、解释器写文件（`python3 -c`）、以及 `touch`/`mkdir`/`truncate`/`dd of=`/`sed -i`/`tar -C`/`curl -o`/`wget -O`/`rsync`/`git clone`/`cp -P` 复制既有越界符号链接。
+  **明确延后/残余风险**（v1 不覆盖，回落至当前权限模式处理）：无法静态解析的动态目标（`> "$OUT"`）、解释器写文件（`python3 -c`）、以及 `touch`/`mkdir`/`truncate`/`dd of=`/`sed -i`/`tar -C`/`curl -o`/`wget -O`/`rsync`/`docker cp`/`scp`/`git clone`/`git diff --output`/`git format-patch -o`/`git archive -o`/`git bundle create`/`cp -P` 复制既有越界符号链接。
 - 保留：拒绝 push、send-pack/receive-pack、PR/release/API 变更、合并进受保护分支（按 D4 收窄匹配方式）；拒绝修改
   git remote 与传输配置（`remote`、`url`、`push`、`credential`、`core.hooksPath`）；拒绝写 `.git` 元数据（现状仅覆盖 Write/Edit；Bash 侧由上条补齐）；拒绝改写/删除受保护分支；
   interactive 模式保留 PreToolUse 否决；开启推送授权时保留字面授权与远端 URL 基线；杀进程/tmux 服务器前的 pid + 启动时间身份核验；
