@@ -270,6 +270,8 @@ export interface TaskSpec {
   scope: string[];
   constraints: string[];
   forbidden: string[];
+  /** Optional extra absolute directories (sibling worktrees, etc.) pinned at startup and leased alongside cwd. */
+  writeRoots?: string[];
   acceptance: AcceptanceCheck[];
   maxRepairRounds: number;
   autonomy: TaskAutonomy;

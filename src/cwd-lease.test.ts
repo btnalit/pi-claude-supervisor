@@ -757,3 +757,90 @@ test("removeEmptyChildCgroups removes nested empty directories bottom-up", async
   await access(blocked);
   await rm(root2, { recursive: true, force: true });
 });
+
+test("multi-root leases enforce bidirectional overlap, preserve roots across reads, reject newer schema versions, and require matching roots on handoff/takeover", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-multi-lease-"));
+  const leaseDir = join(base, "leases");
+  const cwdA = join(base, "cwd-a");
+  const cwdB = join(base, "cwd-b");
+  const rootA = join(base, "root-a");
+  const rootASub = join(rootA, "sub");
+  const rootB = join(base, "root-b");
+  try {
+    await Promise.all([
+      mkdir(cwdA),
+      mkdir(cwdB),
+      mkdir(rootASub, { recursive: true }),
+      mkdir(rootB),
+    ]);
+    const store = new CwdLeaseStore(leaseDir);
+    const taskA = randomUUID();
+    const taskB = randomUUID();
+
+    const leaseA = await store.acquire(cwdA, taskA, "jsonl", { roots: [rootA] });
+    assert.equal(leaseA.record.version, 2);
+    assert.equal(leaseA.record.roots?.length, 1);
+
+    // Round-trip through list() preserves roots.
+    const listed = await store.list();
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0]?.version, 2);
+    assert.deepEqual(listed[0]?.roots, leaseA.record.roots);
+
+    // Bidirectional overlap checks:
+    // 1. B.cwd overlaps A.root
+    await assert.rejects(() => store.acquire(rootASub, taskB, "jsonl"), /lease is held/u);
+    // 2. B.root overlaps A.cwd
+    await assert.rejects(() => store.acquire(cwdB, taskB, "jsonl", { roots: [cwdA] }), /lease is held/u);
+    // 3. B.root overlaps A.root
+    await assert.rejects(() => store.acquire(cwdB, taskB, "jsonl", { roots: [rootASub] }), /lease is held/u);
+    // 4. Disjoint cwdB + rootB succeeds.
+    const leaseB = await store.acquire(cwdB, taskB, "jsonl", { roots: [rootB] });
+    await leaseB.release();
+    await leaseA.release();
+
+    // Handoff requires exact sorted root-set match.
+    const handoffTask = randomUUID();
+    const seeded = await store.acquire(cwdA, handoffTask, "tmux", { roots: [rootA] });
+    await seeded.updateWorker({
+      transport: "tmux",
+      sessionName: "s-multi",
+      ownership: "adopted",
+      pid: process.pid,
+      startTime: "123",
+      tmuxPaneId: "%1",
+      paneStartTime: "123",
+      paneCommand: "claude",
+    });
+    // Mark owner dead so handoff can be attempted.
+    const leaseFile = join(leaseDir, `${seeded.record.leaseId}.json`);
+    const raw = JSON.parse(await readFile(leaseFile, "utf8")) as Record<string, unknown>;
+    raw.ownerPid = 999_999_999;
+    raw.ownerStartTime = "1";
+    await writeFile(leaseFile, `${JSON.stringify(raw)}\n`);
+    // Mismatched roots on handoff must be rejected.
+    await assert.rejects(
+      () => store.acquire(cwdA, randomUUID(), "tmux", { roots: [rootB], handoff: { sessionName: "s-multi" } }),
+      /lease is held/u,
+    );
+    await rm(leaseFile, { force: true });
+
+    // Future schema version (v3) fails closed and is NOT quarantined.
+    const futureId = randomUUID();
+    const futurePath = join(leaseDir, `${futureId}.json`);
+    await writeFile(futurePath, `${JSON.stringify({
+      version: 3,
+      leaseId: futureId,
+      taskId: randomUUID(),
+      cwd: cwdA,
+      ownerPid: process.pid,
+      acquiredAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    })}\n`);
+    await assert.rejects(() => store.acquire(cwdB, randomUUID(), "jsonl"), /unsupported cwd lease schema version: 3/u);
+    assert.deepEqual(await store.quarantined(), [], "newer schema lease must not be quarantined");
+    await access(futurePath);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});

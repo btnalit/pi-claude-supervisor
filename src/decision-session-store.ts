@@ -5,6 +5,7 @@ import { currentLockOwner, lockOwnerAlive } from "./lock-owner.ts";
 import { redactSensitive } from "./redaction.ts";
 import { normalizeTaskSpec } from "./acceptance.ts";
 import type { TaskSpec } from "./types.ts";
+import { assertSafeWriteRootPath, isPinnedWriteRoot, type PinnedWriteRoot } from "./write-roots.ts";
 
 /**
  * Two lists of URL strings and nothing else; a persisted baseline is data the
@@ -45,6 +46,10 @@ export interface DecisionSessionRecord {
   remoteBaseline?: { fetch: string[]; push: string[] };
   /** Real executable identity pinned by automatic startup and recovery. */
   resolvedExecutable?: string;
+  /** Startup-pinned extra write roots (declared TaskSpec.writeRoots) for recovery re-verification. */
+  pinnedWriteRoots?: PinnedWriteRoot[];
+  /** Per-task private scratch temp directory pinned at startup (D9a) for recovery reuse. */
+  taskTempRoot?: PinnedWriteRoot;
   turn: number;
   repairRound?: number;
   lastFindingSignature?: string;
@@ -96,6 +101,15 @@ export class DecisionSessionStore {
     assertNoCredentialPath(decisionSessionFile);
     assertNoCredentialPath(record.cwd);
     if (record.resolvedExecutable !== undefined) assertResolvedExecutable(record.resolvedExecutable);
+    for (const root of record.spec?.writeRoots ?? []) assertSafeWriteRootPath(root);
+    if (record.pinnedWriteRoots !== undefined) {
+      if (!Array.isArray(record.pinnedWriteRoots) || !record.pinnedWriteRoots.every(isPinnedWriteRoot)) {
+        throw new Error("invalid Decision Worker pinned write roots");
+      }
+    }
+    if (record.taskTempRoot !== undefined && !isPinnedWriteRoot(record.taskTempRoot)) {
+      throw new Error("invalid Decision Worker task temp root");
+    }
     await this.#withLock(() => this.#saveUnlocked({ ...record, decisionSessionFile }));
   }
 
@@ -421,6 +435,8 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     || (value.baseBranch !== undefined && (typeof value.baseBranch !== "string" || !/^[A-Za-z0-9._/-]+$/u.test(value.baseBranch)))
     || (value.remoteBaseline !== undefined && !isRemoteBaseline(value.remoteBaseline))
     || (value.resolvedExecutable !== undefined && (typeof value.resolvedExecutable !== "string" || !isAbsolute(value.resolvedExecutable) || value.resolvedExecutable.length > 4_096))
+    || (value.pinnedWriteRoots !== undefined && (!Array.isArray(value.pinnedWriteRoots) || !value.pinnedWriteRoots.every(isPinnedWriteRoot)))
+    || (value.taskTempRoot !== undefined && !isPinnedWriteRoot(value.taskTempRoot))
     || (value.startedAt !== undefined && (typeof value.startedAt !== "string" || !Number.isFinite(Date.parse(value.startedAt))))
     || (value.recoveryWorker !== undefined && !isRecoveryWorker(value.recoveryWorker))) {
     throw new Error("invalid Decision Worker session record");
@@ -430,6 +446,8 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
   assertNoCredentialPath(decisionSessionFile);
   assertNoCredentialPath(value.cwd);
   if (value.resolvedExecutable !== undefined) assertResolvedExecutable(value.resolvedExecutable);
+  const spec = normalizeTaskSpec(value.spec, value.task);
+  for (const root of spec.writeRoots ?? []) assertSafeWriteRootPath(root);
   const recoveryWorker = value.recoveryWorker && {
     id: value.recoveryWorker.id,
     ...(value.recoveryWorker.pid !== undefined ? { pid: value.recoveryWorker.pid } : {}),
@@ -439,7 +457,7 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     version: 1,
     taskId: value.taskId,
     task: value.task,
-    spec: normalizeTaskSpec(value.spec, value.task),
+    spec,
     cwd: value.cwd,
     command: value.command,
     args: [...value.args],
@@ -453,6 +471,8 @@ function normalizeRecord(value: Partial<DecisionSessionRecord>, directory: strin
     ...(typeof value.baseBranch === "string" ? { baseBranch: value.baseBranch } : {}),
     ...(isRemoteBaseline(value.remoteBaseline) ? { remoteBaseline: { fetch: [...value.remoteBaseline.fetch], push: [...value.remoteBaseline.push] } } : {}),
     ...(typeof value.resolvedExecutable === "string" ? { resolvedExecutable: value.resolvedExecutable } : {}),
+    ...(value.pinnedWriteRoots && value.pinnedWriteRoots.length > 0 ? { pinnedWriteRoots: value.pinnedWriteRoots.map((root) => ({ ...root })) } : {}),
+    ...(value.taskTempRoot ? { taskTempRoot: { ...value.taskTempRoot } } : {}),
     turn: value.turn ?? 0,
     repairRound: value.repairRound ?? 0,
     ...(typeof value.lastFindingSignature === "string" ? { lastFindingSignature: value.lastFindingSignature } : {}),
@@ -471,6 +491,9 @@ function redactRecord<T extends Partial<DecisionSessionRecord>>(value: T): T {
   const safe = redactSensitive(value) as T;
   if (typeof value.cwd === "string") safe.cwd = value.cwd;
   if (typeof value.decisionSessionFile === "string") safe.decisionSessionFile = value.decisionSessionFile;
+  if (value.spec?.writeRoots && safe.spec) safe.spec = { ...safe.spec, writeRoots: [...value.spec.writeRoots] };
+  if (value.pinnedWriteRoots) safe.pinnedWriteRoots = value.pinnedWriteRoots.map((root) => ({ ...root }));
+  if (value.taskTempRoot) safe.taskTempRoot = { ...value.taskTempRoot };
   return safe;
 }
 

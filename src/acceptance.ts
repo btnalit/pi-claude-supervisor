@@ -13,11 +13,13 @@ export function normalizeTaskSpec(value: unknown, fallbackGoal: string, autonomy
   const source = (value ?? {}) as Record<string, unknown>;
   const goal = typeof source.goal === "string" && source.goal.trim() ? source.goal.trim() : fallbackGoal.trim();
   if (!goal) throw new Error("task goal must not be empty");
+  const writeRoots = stringList(source.writeRoots, "writeRoots");
   return {
     goal,
     scope: stringList(source.scope, "scope"),
     constraints: stringList(source.constraints, "constraints"),
     forbidden: stringList(source.forbidden, "forbidden"),
+    ...(writeRoots.length > 0 ? { writeRoots } : {}),
     acceptance: normalizeChecks(source.acceptance),
     maxRepairRounds: normalizeRepairRounds(source.maxRepairRounds),
     autonomy: normalizeAutonomy(source.autonomy, autonomyDefaults),

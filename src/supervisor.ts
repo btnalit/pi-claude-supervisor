@@ -12,6 +12,7 @@ import { assertAutomaticClaudePermissionConfiguration, assertTrustedAutomaticCla
 import { normalizeReviewReport, type ReviewInput, type TaskReviewer } from "./reviewer.ts";
 import { attachCommand } from "./worker/tmux-adapter.ts";
 import { isWorkerInputError } from "./worker/input-error.ts";
+import { cleanupTaskTempRoot, createTaskTempRoot, pinWriteRoots, verifyPinnedWriteRoot, type PinnedWriteRoot } from "./write-roots.ts";
 import type { HookEventSource } from "./hooks/types.ts";
 import type {
   AcceptanceReport,
@@ -56,6 +57,8 @@ export interface DecisionSessionReadyInfo {
   baseBranch?: string;
   remoteBaseline?: RemoteDestination;
   resolvedExecutable: string;
+  pinnedWriteRoots?: PinnedWriteRoot[];
+  taskTempRoot?: PinnedWriteRoot;
   lastFindingSignature?: string;
 }
 
@@ -97,6 +100,12 @@ export interface SupervisorStartOptions {
   task: string;
   /** Structured Goal / Evidence / Sign-off specification. */
   spec?: TaskSpecInput;
+  /** Pre-pinned declared writeRoots (validated and leased before Supervisor.start). */
+  pinnedWriteRoots?: readonly PinnedWriteRoot[];
+  /** Pre-created or recovered task-scoped private temp directory (D9a). */
+  taskTempRoot?: PinnedWriteRoot;
+  /** Supervisor runtime paths (stateDir, hookDir, leaseDir, decisionDir) excluded from declared writeRoots. */
+  protectedWriteRootPaths?: readonly string[];
   /** Override the first worker message; recovery uses an empty message to avoid replay. */
   initialInput?: string;
   cwd: string;
@@ -339,6 +348,9 @@ export class Supervisor {
   #startAbortCompletion?: Promise<void>;
   #released = false;
   #releasing = false;
+  #pinnedWriteRoots: PinnedWriteRoot[] = [];
+  #taskTempRoot?: PinnedWriteRoot;
+  #ownsTaskTempRoot = false;
   #releaseCompletion?: Promise<void>;
   #terminalNoticeSent = false;
   #progressHeartbeatMs = 60_000;
@@ -378,6 +390,10 @@ export class Supervisor {
   get released() { return this.#released; }
   /** True when the active task is running under unattended automation. */
   get automation() { return this.#automation; }
+  /** Startup-pinned declared write roots for this task. */
+  get pinnedWriteRoots(): readonly PinnedWriteRoot[] { return this.#pinnedWriteRoots; }
+  /** Private task-scoped scratch temp directory (D9a), when active. */
+  get taskTempRoot(): PinnedWriteRoot | undefined { return this.#taskTempRoot; }
   /** Wall-clock budget of the active task, or undefined when no deadline is configured. */
   get deadline(): DecisionDeadlineContext | undefined { return this.#deadlineContext(); }
   /** Structural copy of the Worker + Pi-side token/cost accounting for this task. */
@@ -435,6 +451,9 @@ export class Supervisor {
     this.#parkReasonLabel = undefined;
     this.#released = false;
     this.#releasing = false;
+    this.#pinnedWriteRoots = [];
+    this.#taskTempRoot = undefined;
+    this.#ownsTaskTempRoot = false;
     this.#releaseCompletion = undefined;
     this.#lastStopWasOperator = false;
     this.#terminalNoticeSent = false;
@@ -527,9 +546,25 @@ export class Supervisor {
       if (this.#automation && !["jsonl", "tmux"].includes(this.#adapter.capabilities().transport)) {
         throw new Error("automatic supervision requires the claude-jsonl or automated tmux transport");
       }
+      const declaredWriteRoots = spec.writeRoots ?? [];
+      this.#pinnedWriteRoots = options.pinnedWriteRoots !== undefined
+        ? options.pinnedWriteRoots.map((root) => ({ ...root }))
+        : declaredWriteRoots.length > 0
+          ? pinWriteRoots(declaredWriteRoots, options.cwd, { protectedPaths: options.protectedWriteRootPaths, env: options.env })
+          : [];
+      if (options.taskTempRoot !== undefined) {
+        this.#taskTempRoot = { ...options.taskTempRoot };
+        this.#ownsTaskTempRoot = false;
+      } else if (this.#automation) {
+        this.#taskTempRoot = await createTaskTempRoot(taskId);
+        this.#ownsTaskTempRoot = true;
+      }
+      const tempEnvOverrides: NodeJS.ProcessEnv = this.#taskTempRoot
+        ? { TMPDIR: this.#taskTempRoot.canonical, TMP: this.#taskTempRoot.canonical, TEMP: this.#taskTempRoot.canonical }
+        : {};
       const workerEnvironment = this.#automation
-        ? automaticWorkerEnvironment(options.env)
-        : options.env;
+        ? automaticWorkerEnvironment({ ...options.env, ...tempEnvOverrides })
+        : (this.#taskTempRoot ? { ...options.env, ...tempEnvOverrides } : options.env);
       if (this.#automation) {
         trustedWorkerCommand = await assertTrustedAutomaticClaudeExecutable(options.command, options.expectedClaudeExecutable);
         const hadExplicitPermissionMode = (options.args ?? []).some((value) => value === "--permission-mode" || value.startsWith("--permission-mode="));
@@ -588,6 +623,8 @@ export class Supervisor {
                 noOutputTimeoutMs: this.#noOutputTimeoutMs,
                 startedAt: this.#task!.startedAt,
                 resolvedExecutable: trustedWorkerCommand,
+                ...(this.#pinnedWriteRoots.length > 0 ? { pinnedWriteRoots: this.#pinnedWriteRoots.map((root) => ({ ...root })) } : {}),
+                ...(this.#taskTempRoot ? { taskTempRoot: { ...this.#taskTempRoot } } : {}),
                 turn: this.#turn,
                 repairRound: this.#repairRound,
                 ...(this.#task?.baseCommit ? { baseCommit: this.#task.baseCommit } : {}),
@@ -691,6 +728,7 @@ export class Supervisor {
       } catch { /* logging failure must not hide the startup failure */ }
       await this.#decision?.close().catch(() => {});
       this.#decision = undefined;
+      await this.#cleanupOwnedTaskTempRoot(true);
       await Promise.resolve(this.#onDecisionSessionClosed?.(taskId, { cleanupConfirmed: startupCleanupConfirmed, reason: "recoverable_failure" })).catch(() => {});
       this.#startAbortController = undefined;
       this.#startToken = undefined;
@@ -1036,9 +1074,30 @@ export class Supervisor {
     })).catch(() => {});
   }
 
-  /** Permission options for one request; the single place the live grant is attached. */
+  /** Permission options for one request; the single place the unified root set R and live grant are assembled. */
   #permissionOptions(writeRoots?: readonly string[]): PermissionPolicyOptions {
-    return { ...(writeRoots ? { writeRoots } : {}), ...(this.#remoteGrant ? { remote: this.#remoteGrant } : {}) };
+    const pinned = this.#taskTempRoot
+      ? [...this.#pinnedWriteRoots, this.#taskTempRoot]
+      : this.#pinnedWriteRoots;
+    const verifiedTaskTemp = this.#taskTempRoot ? verifyPinnedWriteRoot(this.#taskTempRoot) : undefined;
+    return {
+      ...(writeRoots ? { writeRoots } : {}),
+      ...(pinned.length > 0 ? { pinnedWriteRoots: pinned } : {}),
+      // When a task-scoped temp root is active, narrow delete-floor temp roots
+      // away from blanket shared `/tmp` to ONLY the verified task temp root
+      // (so `$TMPDIR` and `$(mktemp)` bind inside it, while sibling `/tmp` dirs
+      // stay denied and a swapped temp root fails closed with `[]`).
+      ...(this.#taskTempRoot ? { tempRoots: verifiedTaskTemp ? [verifiedTaskTemp] : [] } : {}),
+      ...(this.#remoteGrant ? { remote: this.#remoteGrant } : {}),
+    };
+  }
+
+  async #cleanupOwnedTaskTempRoot(force: boolean): Promise<void> {
+    if (!this.#ownsTaskTempRoot || !force) return;
+    const root = this.#taskTempRoot;
+    this.#taskTempRoot = undefined;
+    this.#ownsTaskTempRoot = false;
+    await cleanupTaskTempRoot(root).catch(() => {});
   }
 
   /**
@@ -2071,7 +2130,9 @@ export class Supervisor {
     }
     await this.#decision?.close().catch(() => {});
     this.#decision = undefined;
-    await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", { cleanupConfirmed, reason: stopped ? effectiveCloseReason : "recoverable_failure" })).catch(() => {});
+    const closeReasonForStop = stopped ? effectiveCloseReason : "recoverable_failure";
+    await this.#cleanupOwnedTaskTempRoot(!this.#released && (closeReasonForStop === "completed" || closeReasonForStop === "human_stop"));
+    await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", { cleanupConfirmed, reason: closeReasonForStop })).catch(() => {});
     if (!stopped && effectiveCloseReason !== "human_stop") {
       await this.#notifyFailure(`worker cleanup could not be confirmed: ${reason}`);
     }
@@ -2860,9 +2921,16 @@ export class Supervisor {
     this.#decision = undefined;
     this.#stopRequested = undefined;
     this.#stopCloseReason = undefined;
+    const workerReleased = releasedInteractive || detached;
+    const verificationCloseReason = stopRequested ? stopCloseReason : verificationSucceeded ? "completed" : terminalState === "blocked" ? "blocked" : "recoverable_failure";
+    // Never delete taskTempRoot while the Worker is still alive (kept-open
+    // interactive completion or released/detached session): its TMPDIR still
+    // points there, and deleting a /tmp path while live lets another local user
+    // recreate it and capture subsequent temp writes.
+    await this.#cleanupOwnedTaskTempRoot(!workerReleased && (verificationCloseReason === "completed" || verificationCloseReason === "human_stop"));
     await Promise.resolve(this.#onDecisionSessionClosed?.(this.#task?.taskId ?? "", {
       cleanupConfirmed,
-      reason: stopRequested ? stopCloseReason : verificationSucceeded ? "completed" : terminalState === "blocked" ? "blocked" : "recoverable_failure",
+      reason: verificationCloseReason,
     })).catch(() => {});
     this.#verificationAbortController = undefined;
     if (cleanupError && eventError) throw new AggregateError([cleanupError, eventError], "verification cleanup and audit failed");
