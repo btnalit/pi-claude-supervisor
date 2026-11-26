@@ -586,18 +586,32 @@ function writeFloorScript(
       continue;
     }
 
-    // Dynamic env mutators (`declare $v=~`, `export $v=~`, `mapfile -t $v`, `printf -v $v`) could set CDPATH.
-    // Check only the variable NAME (before `=`), so `export FOO="$BAR"` stays allowed.
-    if (WRITE_FLOOR_ENV_MUTATORS.has(cmdWord) && words.slice(cmdIdx + 1).some((w) => {
-      if (w.value.startsWith("-")) return false;
-      const eq = w.value.indexOf("=");
-      const varName = eq >= 0 ? w.value.slice(0, eq) : w.value;
-      return /[$`*?[\]{}~]/u.test(varName);
-    })) {
+    // `mapfile -C` / `readarray -C` executes a callback string in the current shell like `eval`.
+    if ((cmdWord === "mapfile" || cmdWord === "readarray") && words.slice(cmdIdx + 1).some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*C/u.test(w.value))) {
       globalCwdUnknown = true;
       possibleDirs.add(undefined);
       allSeenDirs.add(undefined);
       continue;
+    }
+
+    // Dynamic env mutators (`declare $v=~`, `export $v=~`, `mapfile -t $v`, `printf -v $v`)
+    // or namerefs (`declare -n r=$x`, `typeset -n`, `local -n`) could set CDPATH.
+    // Check only the variable NAME (before `=`) for non-nameref assignments so `export FOO="$BAR"` stays allowed.
+    if (WRITE_FLOOR_ENV_MUTATORS.has(cmdWord)) {
+      const restWords = words.slice(cmdIdx + 1);
+      const hasNameref = restWords.some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*n/u.test(w.value));
+      const hasDynamicName = restWords.some((w) => {
+        if (w.value.startsWith("-")) return false;
+        const eq = w.value.indexOf("=");
+        const varName = eq >= 0 ? w.value.slice(0, eq) : w.value;
+        return /[$`*?[\]{}~]/u.test(varName);
+      });
+      if (hasNameref || hasDynamicName) {
+        globalCwdUnknown = true;
+        possibleDirs.add(undefined);
+        allSeenDirs.add(undefined);
+        continue;
+      }
     }
     if (cmdWord === "printf" && words.slice(cmdIdx + 1).some((w, i, arr) => w === arr[i] && (w.value === "-v" || w.value.startsWith("-v")) && (arr[i + 1]?.dynamic || /\bCDPATH\b/u.test(arr[i + 1]?.value ?? "")))) {
       globalCwdUnknown = true;
@@ -606,19 +620,64 @@ function writeFloorScript(
       continue;
     }
 
-    // In control-flow mode, ANY mention of `cd`/`pushd`/`popd` OR deferred
-    // builtins (`eval`/`source`/`.`/`trap`/`alias`/`shopt`) anywhere in the
-    // segment — with NO stop-command exemption (a `case` arm `echo) cd ~` or
-    // function `echo () { cd ~; }` begins with `echo`!) — fails closed globally.
+    // In control-flow mode, scan every word in the segment while tracking
+    // inner command positions (after `case` arm `pat)`, `{`, `NAME()`, `function NAME`,
+    // keywords, `builtin`/`command`/`time`):
+    // - In command position: fail closed on dynamic command names (`$(printf …)`),
+    //   `cd`/`pushd`/`popd`, ALL deferred builtins (including `.`), and `mapfile -C` / `declare -n`.
+    // - In non-command position: still fail closed on `cd`/`pushd`/`popd` and named
+    //   deferred builtins (excluding bare `.`, so `git add .` / `find .` stay allowed).
     if (hasControlFlow) {
-      const hasDirOrDeferred = words.slice(first).some((w) => {
-        const clean = w.value.replace(/^[({$]+|[});]+$/gu, "");
-        return clean === "cd" || clean === "pushd" || clean === "popd" || WRITE_FLOOR_DEFERRED_BUILTINS.has(clean);
-      });
-      if (hasDirOrDeferred) {
-        globalCwdUnknown = true;
-        possibleDirs.add(undefined);
-        allSeenDirs.add(undefined);
+      let inCmdPos = true;
+      let skipFunctionName = false;
+      for (let wi = first; wi < words.length; wi += 1) {
+        const tok = words[wi]!;
+        const rawVal = tok.value;
+        const clean = rawVal.replace(/^[({$]+|[});]+$/gu, "");
+        if (skipFunctionName) {
+          skipFunctionName = false;
+          inCmdPos = true;
+          continue;
+        }
+        if (rawVal === "function") { skipFunctionName = true; continue; }
+        if (rawVal === "case") { inCmdPos = false; continue; }
+        if (FLOOR_KEYWORDS.has(rawVal) || rawVal === "{" || rawVal === "(" || rawVal === "()" || rawVal === "(){"
+          || /^[A-Za-z_][A-Za-z0-9_]*\(\)\{?$/u.test(rawVal)
+          || (/^[A-Za-z_][A-Za-z0-9_]*$/u.test(rawVal) && (words[wi + 1]?.value === "()" || words[wi + 1]?.value === "(){"))) {
+          inCmdPos = true;
+          continue;
+        }
+        if (rawVal.endsWith(")") && !tok.quoted && !tok.inSubst) {
+          // `case` arm pattern like `x)` or `echo)`: the next word is in command position!
+          inCmdPos = true;
+          continue;
+        }
+        if (inCmdPos && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(rawVal)) continue;
+        if (inCmdPos && (clean === "builtin" || clean === "command" || clean === "time")) {
+          while (wi + 1 < words.length && words[wi + 1]!.value.startsWith("-")) wi += 1;
+          continue;
+        }
+        const isDirOrNamedDeferred = clean === "cd" || clean === "pushd" || clean === "popd"
+          || (WRITE_FLOOR_DEFERRED_BUILTINS.has(clean) && clean !== ".");
+        if (isDirOrNamedDeferred || (inCmdPos && (tok.dynamic || clean === "."))) {
+          globalCwdUnknown = true;
+          possibleDirs.add(undefined);
+          allSeenDirs.add(undefined);
+          break;
+        }
+        if (inCmdPos && (clean === "mapfile" || clean === "readarray") && words.slice(wi + 1).some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*C/u.test(w.value))) {
+          globalCwdUnknown = true;
+          possibleDirs.add(undefined);
+          allSeenDirs.add(undefined);
+          break;
+        }
+        if (inCmdPos && WRITE_FLOOR_ENV_MUTATORS.has(clean) && words.slice(wi + 1).some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*n/u.test(w.value))) {
+          globalCwdUnknown = true;
+          possibleDirs.add(undefined);
+          allSeenDirs.add(undefined);
+          break;
+        }
+        inCmdPos = false;
       }
       continue;
     }
@@ -3268,6 +3327,7 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
   let dynamic = false;
   let started = false;
   let tokenQuoted = false;
+  let tokenEscaped = false;
   let tokenData = false;
   let leadingOpenParens = 0;
   let atLeadingParen = true;
@@ -3291,7 +3351,8 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
     // Arithmetic `((…))` is not a subshell paren opener/closer.
     const effectiveLeading = value.startsWith("((") && leadingOpenParens >= 2 ? leadingOpenParens - 2 : leadingOpenParens;
     const effectiveTrailing = value.endsWith("))") && trailingCloseParens >= 2 ? trailingCloseParens - 2 : trailingCloseParens;
-    const fdPrefix = adjacentRedirect && !tokenQuoted && /^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})$/u.test(value);
+    // Bash treats any quoted OR backslash-escaped digit (`\2>/dev/null`, `2\3>`) as a plain argument, never an fd prefix.
+    const fdPrefix = adjacentRedirect && !tokenQuoted && !tokenEscaped && /^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})$/u.test(value);
     tokens.push({
       value,
       operator: false,
@@ -3307,6 +3368,7 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
     dynamic = false;
     started = false;
     tokenQuoted = false;
+    tokenEscaped = false;
     tokenData = false;
     leadingOpenParens = 0;
     atLeadingParen = true;
@@ -3368,6 +3430,7 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
     if (character === "\\") {
       atLeadingParen = false;
       trailingCloseParens = 0;
+      tokenEscaped = true;
       if (next === "\n") index += 1;
       else if (next !== undefined) { value += next; index += 1; }
       started = true;
