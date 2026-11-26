@@ -882,36 +882,56 @@ function classifyWritePath(
 
 /**
  * Walk a path relative to an already-resolved root one segment at a time,
- * refusing `..` that would climb out, any `.git` segment, and any segment that
- * is (or fails to be inspected as) a symlink — the kernel would follow it out
- * of the root even though the pathname stays inside.
+ * refusing `..` that would climb out, any `.git` segment, dangling symlinks,
+ * and any symlink whose real target leaves `root` or enters `.git`. Symlinks
+ * whose canonical target stays cleanly inside `root` (e.g. monorepo workspace
+ * links) are followed by resetting the walk cursor to the resolved in-root
+ * path (D9b).
  */
 function walkWritePath(relativePath: string, root: string): WritePathViolation | undefined {
+  const canonicalRoot = resolveExistingPath(root);
+  const rootPrefix = canonicalRoot === "/" ? "/" : `${canonicalRoot}/`;
   const normalized: string[] = [];
+  let followedSymlink = false;
   for (const segment of relativePath.replaceAll("\\", "/").split("/")) {
     if (!segment || segment === ".") continue;
     if (segment === "..") {
-      if (normalized.length === 0) return "outside-cwd";
+      // Once a symlink has been followed, the kernel resolves `..` from the
+      // symlink's real target while Write/Edit tools normalize `..` lexically
+      // (which can escape `root` when the symlink target is deeper than the
+      // link, e.g. pnpm's `node_modules/foo -> .pnpm/.../node_modules/foo`).
+      // Refuse any `..` after a symlink segment so lexical and kernel views can
+      // never diverge.
+      if (followedSymlink || normalized.length === 0) return "outside-cwd";
       normalized.pop();
       continue;
     }
     if (segment.toLowerCase() === ".git") return "git-metadata";
-    const candidate = join(root, ...normalized, segment);
+    const candidate = join(canonicalRoot, ...normalized, segment);
     try {
       const info = lstatSync(candidate);
-      if (info.isSymbolicLink()) return "git-metadata";
+      if (info.isSymbolicLink()) {
+        let target: string;
+        try { target = realpathSync.native(candidate); }
+        catch { return "git-metadata"; }
+        if (target.replaceAll("\\", "/").split("/").some((part) => part.toLowerCase() === ".git")) return "git-metadata";
+        if (target !== canonicalRoot && !target.startsWith(rootPrefix)) return "outside-cwd";
+        const rel = target === canonicalRoot ? "" : target.slice(rootPrefix.length);
+        normalized.length = 0;
+        if (rel) normalized.push(...rel.split("/").filter(Boolean));
+        followedSymlink = true;
+        continue;
+      }
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "ENOENT" && code !== "ENOTDIR") return "git-metadata";
     }
     normalized.push(segment);
   }
-  const absolute = join(root, ...normalized);
+  const absolute = join(canonicalRoot, ...normalized);
   // Defense-in-depth: confirm the deepest existing ancestor of `absolute`
   // resolves within `root` (and contains no `.git` segment).
-  const canonicalRoot = resolveExistingPath(root);
   const resolvedAncestor = resolveExistingPath(absolute);
-  const rootPrefix = canonicalRoot === "/" ? "/" : `${canonicalRoot}/`;
   if (resolvedAncestor !== canonicalRoot && !resolvedAncestor.startsWith(rootPrefix)) return "outside-cwd";
   if (resolvedAncestor.replaceAll("\\", "/").split("/").some((segment) => segment.toLowerCase() === ".git")) return "git-metadata";
   try {
@@ -2134,7 +2154,8 @@ const SEGMENT_SPLIT_OPERATORS = new Set(["|", "&&", "||", ";", "&"]);
 const ROUTINE_SHELL_COMMANDS = new Set([
   "ls", "cat", "head", "tail", "grep", "rg", "egrep", "fgrep", "sed", "awk", "cut", "uniq", "wc", "tr",
   "find", "echo", "printf", "pwd", "which", "true", "false", "test", "[", "diff", "stat",
-  "basename", "dirname", "realpath", "readlink", "date", "sleep", "timeout", "node", "npm", "tsc", "git",
+  "basename", "dirname", "realpath", "readlink", "date", "sleep", "timeout",
+  "node", "npm", "pnpm", "tsc", "git", "make", "cargo", "go", "pytest",
 ]);
 
 /** Read-only or local-commit git subcommands whose remaining arguments cannot discard or relocate work. */
@@ -2148,12 +2169,15 @@ const ROUTINE_GIT_STASH_SUBCOMMANDS = new Set(["list", "show", "push"]);
 const ROUTINE_GIT_GLOBAL_FLAGS = new Set(["--no-pager", "-P", "--no-optional-locks"]);
 /** `npm run <script>` executes repository-defined scripts; that is accepted by design because the scripts are reviewed repository content, like `node ./script.js`. */
 const ROUTINE_NPM_SUBCOMMANDS = new Set(["test", "run", "ls"]);
+const ROUTINE_PNPM_SUBCOMMANDS = new Set(["test", "run", "ls", "list"]);
+const ROUTINE_CARGO_SUBCOMMANDS = new Set(["test", "check", "build", "clippy", "fmt", "doc", "bench", "metadata", "tree"]);
+const ROUTINE_GO_SUBCOMMANDS = new Set(["test", "vet", "build", "fmt", "doc", "list", "version"]);
 const ROUTINE_NODE_FLAG = /^(?:--test(?:-(?:only|name-pattern|skip-pattern|concurrency|timeout|force-exit|coverage|isolation)(?:=.*)?)?|--check|-c|--version|-v|--enable-source-maps|--no-warnings|--experimental-strip-types)$/u;
 /** `timeout` is the only transparent wrapper: it runs exactly the static argv that follows its duration. */
 const WRAPPER_COMMANDS = new Set(["timeout"]);
 const GIT_DRIVER_FLAGS = /^--(?:ext-diff|textconv|no-textconv|exec-path)/u;
 const NODE_BUILTIN_REPORTERS = new Set(["spec", "tap", "dot", "junit", "lcov"]);
-const NPM_RELOCATING_FLAGS = /^(?:--prefix|-C|--userconfig|--globalconfig|--location|-g|--global|--registry|--cache|--script-shell|--ignore-scripts)(?:=|$)/u;
+const NPM_RELOCATING_FLAGS = /^(?:--prefix|-C|--dir|--store-dir|--userconfig|--globalconfig|--config|--location|-g|--global|--registry|--cache|--script-shell|--ignore-scripts)(?:=|$)/u;
 const FIND_WRITE_ACTIONS = new Set(["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"]);
 
 /**
@@ -2204,16 +2228,102 @@ function isRoutineShellCommand(command: string, cwd: string, writeRoots: readonl
   if (hasUnquotedParenthesis(command)) return false;
   const tokens = withoutFdDuplication(lexical.tokens);
   if (!tokens) return false;
-  const segments: ShellToken[][] = [[]];
+  const segments: Array<{ tokens: ShellToken[]; joiner?: string }> = [{ tokens: [] }];
   for (const token of tokens) {
     if (token.operator && SEGMENT_SPLIT_OPERATORS.has(token.value)) {
-      segments.push([]);
+      segments.at(-1)!.joiner = token.value;
+      segments.push({ tokens: [] });
       continue;
     }
-    segments.at(-1)!.push(token);
+    segments.at(-1)!.tokens.push(token);
   }
-  if (segments.some((segment) => segment.length === 0)) return false;
-  return segments.every((segment) => isRoutineSegment(segment, cwd, 0, writeRoots));
+  if (segments.some((segment) => segment.tokens.length === 0)) return false;
+  let effectiveDir = cwd;
+  let sawCd = false;
+  for (let i = 0; i < segments.length; i += 1) {
+    const segment = segments[i]!;
+    const prevJoiner = i > 0 ? segments[i - 1]!.joiner : undefined;
+    // Once a `cd` has shifted `effectiveDir`, disallow `;`, `||`, or `&`
+    // anywhere later so a skipped/failed `cd` can never let a later command run
+    // from the original directory while checked against `effectiveDir`.
+    if (sawCd && (prevJoiner === ";" || prevJoiner === "||" || prevJoiner === "&")) return false;
+    const nextDir = routineCdTarget(segment.tokens, effectiveDir, cwd, writeRoots, prevJoiner, segment.joiner);
+    if (nextDir === "invalid") return false;
+    if (nextDir !== undefined) {
+      effectiveDir = nextDir;
+      sawCd = true;
+      continue;
+    }
+    if (!isRoutineSegment(segment.tokens, effectiveDir, 0, writeRoots, cwd)) return false;
+  }
+  return true;
+}
+
+/**
+ * Allow a plain literal `cd <dir> && <cmd>` whose target is an existing real
+ * (non-symlink) directory inside the unified root set `R` (`cwd` or a granted
+ * write root, never `.git`, never crossing a symlink so bash's default `cd -L`
+ * cannot diverge from the real path). Must be preceded only by start-of-command
+ * or `&&`/`;`, and MUST be followed by `&&` (never bare trailing `cd`, `;`,
+ * `|`, `||`, or `&`).
+ */
+function routineCdTarget(
+  segment: readonly ShellToken[],
+  effectiveDir: string,
+  boundaryCwd: string,
+  writeRoots: readonly string[],
+  prevJoiner: string | undefined,
+  nextJoiner: string | undefined,
+): string | "invalid" | undefined {
+  const words = segment.filter((token) => !token.operator).map((token) => token.value);
+  // Match `cd` case-sensitively: on case-insensitive filesystems (macOS), `CD`
+  // can invoke `/usr/bin/cd` in a subprocess that exits 0 without changing the
+  // parent shell's cwd.
+  if (words.length === 0 || words[0] !== "cd") return undefined;
+  // Redirections on cd, preceding `|`/`||`/`&`, or anything other than `&&`
+  // after `cd` (including a bare trailing `cd`) make execution or later cwd
+  // tracking ambiguous.
+  if (segment.some((token) => token.operator)) return "invalid";
+  if (prevJoiner !== undefined && prevJoiner !== "&&" && prevJoiner !== ";") return "invalid";
+  if (nextJoiner !== "&&") return "invalid";
+  let target: string | undefined;
+  if (words.length === 2 && !words[1]!.startsWith("-")) target = words[1]!;
+  else if (words.length === 3 && words[1] === "--" && words[2] !== "-") target = words[2]!;
+  else return "invalid";
+  if (!target || target === "-" || target.startsWith("~")) return "invalid";
+  const unnormalized = isAbsolute(target) ? target : `${effectiveDir.replace(/\/+$/u, "")}/${target}`;
+  if (classifyWritePath(unnormalized, boundaryCwd, writeRoots) !== undefined) return "invalid";
+  // Target MUST exist as a real directory and MUST NOT cross any symlink from
+  // effectiveDir (so bash's lexical `cd -L` and physical `cd -P` agree 100%).
+  const resolved = resolve(effectiveDir, target);
+  let realTarget: string;
+  let realEffective: string;
+  try {
+    const statInfo = statSync(resolved);
+    if (!statInfo.isDirectory()) return "invalid";
+    realTarget = realpathSync.native(resolved);
+    realEffective = realpathSync.native(effectiveDir);
+  } catch {
+    return "invalid";
+  }
+  const lexicalFromReal = isAbsolute(target) ? resolve(target) : resolve(realEffective, target);
+  if (realTarget !== lexicalFromReal) {
+    // Allow only when target itself is an absolute path through a symlinked
+    // OS root (e.g., /var -> /private/var on macOS) whose relative walk from a
+    // verified root contains no symlinks.
+    const realBoundary = resolveExistingPath(boundaryCwd);
+    const matchingRoot = [boundaryCwd, ...writeRoots]
+      .find((r) => isAbsolute(r) && pathBelow(target!, [r, resolveExistingPath(r)]) !== undefined);
+    if (!isAbsolute(target) || !matchingRoot) return "invalid";
+    const rootReal = resolveExistingPath(matchingRoot);
+    const below = pathBelow(target, [matchingRoot, rootReal]);
+    if (below === undefined || resolve(rootReal, below) !== realTarget) return "invalid";
+    if (realTarget !== realBoundary && !realTarget.startsWith(`${realBoundary}/`)
+      && !writeRoots.some((r) => { const rr = resolveExistingPath(r); return realTarget === rr || realTarget.startsWith(`${rr}/`); })) {
+      return "invalid";
+    }
+  }
+  return realTarget;
 }
 
 /** True when `(` or `)` appears outside single/double quotes and not backslash-escaped. */
@@ -2260,15 +2370,27 @@ function withoutFdDuplication(tokens: readonly ShellToken[]): ShellToken[] | und
   return result;
 }
 
-function isRoutineSegment(segment: readonly ShellToken[], cwd: string, depth: number, writeRoots: readonly string[] = []): boolean {
+function isRoutineSegment(
+  segment: readonly ShellToken[],
+  effectiveDir: string,
+  depth: number,
+  writeRoots: readonly string[] = [],
+  boundaryCwd: string = effectiveDir,
+): boolean {
   if (depth > 5) return false;
-  if (hasUnsafeRedirection(segment, cwd, writeRoots)) return false;
+  if (hasUnsafeRedirection(segment, effectiveDir, writeRoots, boundaryCwd)) return false;
   const words = segment.filter((token) => !token.operator).map((token) => token.value);
   if (words.length === 0) return false;
-  return isRoutineWords(words, cwd, depth, writeRoots);
+  return isRoutineWords(words, effectiveDir, depth, writeRoots, boundaryCwd);
 }
 
-function isRoutineWords(words: readonly string[], cwd: string, depth: number, writeRoots: readonly string[] = []): boolean {
+function isRoutineWords(
+  words: readonly string[],
+  effectiveDir: string,
+  depth: number,
+  writeRoots: readonly string[] = [],
+  boundaryCwd: string = effectiveDir,
+): boolean {
   if (depth > 5) return false;
   const first = words[0]!;
   // A program named by path (./ls, /tmp/x/ls) is an arbitrary executable, not
@@ -2278,21 +2400,26 @@ function isRoutineWords(words: readonly string[], cwd: string, depth: number, wr
   if (WRAPPER_COMMANDS.has(head)) {
     const wrapped = unwrapWrapper(head, words.slice(1));
     if (!wrapped || wrapped.length === 0) return false;
-    return isRoutineWords(wrapped, cwd, depth + 1, writeRoots);
+    return isRoutineWords(wrapped, effectiveDir, depth + 1, writeRoots, boundaryCwd);
   }
   if (!ROUTINE_SHELL_COMMANDS.has(head)) return false;
   const rest = words.slice(1);
   // Every path-looking argument (absolute, `..`-escaping, `~`, or the value of
-  // a `--flag=path`) must resolve inside the task cwd. This keeps reads of
-  // /etc, ~/.ssh or ~/.aws and every option that names an outside file out of
-  // the routine set, at the cost of an occasional model call for a sed script
-  // that happens to start with `/`.
-  if (rest.some((word) => namesPathOutsideCwd(word, cwd, writeRoots))) return false;
+  // a `--flag=path`) must resolve inside the task boundary R. This keeps reads
+  // of /etc, ~/.ssh or ~/.aws and every option that names an outside file out
+  // of the routine set, at the cost of an occasional model call for a sed
+  // script that happens to start with `/`.
+  if (rest.some((word) => namesPathOutsideCwd(word, effectiveDir, writeRoots, boundaryCwd))) return false;
   switch (head) {
-    case "git": return isRoutineGit(rest, cwd);
+    case "git": return isRoutineGit(rest, effectiveDir, boundaryCwd, writeRoots);
     case "npm": return isRoutineNpm(rest);
-    case "node": return isRoutineNode(rest, cwd);
-    case "tsc": return isRoutineTsc(rest, cwd);
+    case "pnpm": return isRoutinePnpm(rest);
+    case "make": return isRoutineMake(rest, effectiveDir, boundaryCwd, writeRoots);
+    case "cargo": return isRoutineCargo(rest, effectiveDir, boundaryCwd, writeRoots);
+    case "go": return isRoutineGo(rest, effectiveDir, boundaryCwd, writeRoots);
+    case "pytest": return isRoutinePytest(rest, effectiveDir, boundaryCwd, writeRoots);
+    case "node": return isRoutineNode(rest, effectiveDir, boundaryCwd, writeRoots);
+    case "tsc": return isRoutineTsc(rest, effectiveDir, boundaryCwd, writeRoots);
     case "sed": return isRoutineSed(rest);
     case "awk": return !rest.some((word) => word.startsWith("-i") || word === "-f" || word.startsWith("--file") || /[>|]|\bsystem\b|\bgetline\b/u.test(word));
     case "find": return !rest.some((word) => FIND_WRITE_ACTIONS.has(word));
@@ -2318,13 +2445,13 @@ function unwrapWrapper(head: string, rest: readonly string[]): string[] | undefi
   return words.slice(index + 1);
 }
 
-function isRoutineGit(rest: readonly string[], cwd: string): boolean {
+function isRoutineGit(rest: readonly string[], effectiveDir: string, boundaryCwd: string, writeRoots: readonly string[]): boolean {
   let index = 0;
   while (index < rest.length) {
     const word = rest[index]!;
     if (word === "-C") {
       const target = rest[index + 1];
-      if (!target || !isInsideCwdArgument(target, cwd)) return false;
+      if (!target || !isInsideBoundaryArgument(target, effectiveDir, boundaryCwd, writeRoots)) return false;
       index += 2;
       continue;
     }
@@ -2357,9 +2484,9 @@ function isRoutineGit(rest: readonly string[], cwd: string): boolean {
 
 const TSC_PATH_FLAGS = /^--?(?:out|outDir|outFile|declarationDir|tsBuildInfoFile|rootDir|project|p|build|b)$/u;
 
-function isRoutineTsc(rest: readonly string[], cwd: string): boolean {
+function isRoutineTsc(rest: readonly string[], effectiveDir: string, boundaryCwd: string, writeRoots: readonly string[]): boolean {
   // Every flag that names an output or project location must stay inside the
-  // task cwd, whether written as `--outDir dir` or `--outDir=dir`.
+  // task boundary R, whether written as `--outDir dir` or `--outDir=dir`.
   for (let index = 0; index < rest.length; index += 1) {
     const word = rest[index]!;
     const equals = word.indexOf("=");
@@ -2367,7 +2494,7 @@ function isRoutineTsc(rest: readonly string[], cwd: string): boolean {
     if (!TSC_PATH_FLAGS.test(flag)) continue;
     const value = equals > 0 ? word.slice(equals + 1) : rest[index + 1];
     if (value === undefined || value.startsWith("-")) continue;
-    if (!isInsideCwdArgument(value, cwd)) return false;
+    if (!isInsideBoundaryArgument(value, effectiveDir, boundaryCwd, writeRoots)) return false;
     if (equals < 0) index += 1;
   }
   return true;
@@ -2383,10 +2510,237 @@ function isRoutineNpm(rest: readonly string[]): boolean {
   return subcommand !== undefined && ROUTINE_NPM_SUBCOMMANDS.has(subcommand.toLowerCase());
 }
 
-function isRoutineNode(rest: readonly string[], cwd: string): boolean {
+const ROUTINE_PNPM_PRE_FLAGS = new Set(["-r", "--recursive", "-s", "--silent", "-w", "--workspace-root"]);
+
+function isRoutinePnpm(rest: readonly string[]): boolean {
+  const separator = rest.indexOf("--");
+  const pnpmArguments = separator >= 0 ? rest.slice(0, separator) : rest;
+  if (pnpmArguments.some((word) => NPM_RELOCATING_FLAGS.test(word))) return false;
+  // Only skip known safe pre-subcommand flags so an unknown option's value
+  // (e.g. `--test-pattern test exec …`) can never be mistaken for the subcommand.
+  for (let index = 0; index < pnpmArguments.length; index += 1) {
+    const word = pnpmArguments[index]!;
+    if (word === "--filter" || word === "-F") {
+      if (index + 1 >= pnpmArguments.length) return false;
+      index += 1;
+      continue;
+    }
+    if (word.startsWith("--filter=") || word.startsWith("-F=")) continue;
+    if (ROUTINE_PNPM_PRE_FLAGS.has(word)) continue;
+    if (word.startsWith("-")) return false;
+    return ROUTINE_PNPM_SUBCOMMANDS.has(word.toLowerCase());
+  }
+  return false;
+}
+
+// Strict allowlists for make / cargo / go / pytest flags: any unrecognized,
+// abbreviated, or clustered flag returns false (escalating to the Decision
+// Worker instead of auto-approving as routine).
+const MAKE_BOOL_FLAGS = new Set([
+  "-n", "--just-print", "--dry-run", "--recon",
+  "-s", "--silent", "--quiet",
+  "-k", "--keep-going",
+  "-B", "--always-make",
+  "-i", "--ignore-errors",
+  "-w", "--print-directory", "--no-print-directory",
+  "-S", "--no-keep-going", "--stop",
+]);
+
+function isRoutineMake(rest: readonly string[], effectiveDir: string, boundaryCwd: string, writeRoots: readonly string[]): boolean {
+  for (let index = 0; index < rest.length; index += 1) {
+    const word = rest[index]!;
+    if (word === "--") continue;
+    if (word.startsWith("-")) {
+      if (MAKE_BOOL_FLAGS.has(word)) continue;
+      if (word === "-j" || word === "--jobs") {
+        if (index + 1 < rest.length && /^\d+$/u.test(rest[index + 1]!)) index += 1;
+        continue;
+      }
+      if (/^(?:-j\d+|--jobs=\d+)$/u.test(word)) continue;
+      if (word === "-C" || word === "--directory") {
+        const value = rest[index + 1];
+        if (!value || !isInsideBoundaryArgument(value, effectiveDir, boundaryCwd, writeRoots)) return false;
+        index += 1;
+        continue;
+      }
+      if (word.startsWith("--directory=")) {
+        const value = word.slice("--directory=".length);
+        if (!value || !isInsideBoundaryArgument(value, effectiveDir, boundaryCwd, writeRoots)) return false;
+        continue;
+      }
+      // Reject all other flags (including -f, -I, -e, -E, abbreviated --ev, short clusters like -kC..).
+      return false;
+    }
+    // Block all Makefile variable assignments (`SHELL=…`, `CC=…`, `MAKE=…`, etc.).
+    if (word.includes("=")) return false;
+  }
+  return true;
+}
+
+const CARGO_BOOL_FLAGS = new Set([
+  "--release", "--debug", "--all-targets", "--all-features", "--no-default-features",
+  "--workspace", "--all", "--lib", "--bins", "--tests", "--benches", "--examples",
+  "--doc", "--no-run", "--no-fail-fast", "--locked", "--frozen", "--offline",
+  "--quiet", "-q", "--verbose", "-v", "-vv", "--check", "--no-deps",
+]);
+const CARGO_VALUE_FLAGS = new Set([
+  "-p", "--package", "-F", "--features", "-j", "--jobs",
+  "--bin", "--test", "--bench", "--example", "--profile", "--target",
+  "--color", "--message-format", "--format-version", "--edition", "--depth", "--edges",
+]);
+const CARGO_PATH_FLAGS = new Set(["--manifest-path", "--target-dir"]);
+const CARGO_PASSTHROUGH_BOOL_FLAGS = new Set([
+  "--nocapture", "--show-output", "--exact", "--ignored", "--include-ignored",
+  "--list", "--quiet", "-q", "--check",
+]);
+const CARGO_PASSTHROUGH_VALUE_FLAGS = new Set([
+  "--test-threads", "--color", "--skip", "--format",
+  "-D", "--deny", "-W", "--warn", "-A", "--allow",
+]);
+
+function isRoutineCargo(rest: readonly string[], effectiveDir: string, boundaryCwd: string, writeRoots: readonly string[]): boolean {
+  const separator = rest.indexOf("--");
+  const cargoArguments = separator >= 0 ? rest.slice(0, separator) : rest;
+  const passthrough = separator >= 0 ? rest.slice(separator + 1) : [];
+  let subcommand: string | undefined;
+  for (let index = 0; index < cargoArguments.length; index += 1) {
+    const word = cargoArguments[index]!;
+    if (!word.startsWith("-")) {
+      if (!subcommand) {
+        subcommand = word.toLowerCase();
+        if (!ROUTINE_CARGO_SUBCOMMANDS.has(subcommand)) return false;
+      }
+      continue;
+    }
+    const equals = word.indexOf("=");
+    const flag = equals > 0 ? word.slice(0, equals) : word;
+    if (equals < 0 && CARGO_BOOL_FLAGS.has(flag)) continue;
+    if (CARGO_VALUE_FLAGS.has(flag)) {
+      const value = equals > 0 ? word.slice(equals + 1) : cargoArguments[index + 1];
+      if (!value || (equals < 0 && value.startsWith("-"))) return false;
+      if (equals < 0) index += 1;
+      continue;
+    }
+    if (CARGO_PATH_FLAGS.has(flag)) {
+      const value = equals > 0 ? word.slice(equals + 1) : cargoArguments[index + 1];
+      if (!value || !isInsideBoundaryArgument(value, effectiveDir, boundaryCwd, writeRoots)) return false;
+      if (equals < 0) index += 1;
+      continue;
+    }
+    // Reject any unrecognized flag (including --config, -Z, -vZ..., +nightly).
+    return false;
+  }
+  if (!subcommand) return false;
+  for (let index = 0; index < passthrough.length; index += 1) {
+    const word = passthrough[index]!;
+    if (!word.startsWith("-")) continue;
+    const equals = word.indexOf("=");
+    const flag = equals > 0 ? word.slice(0, equals) : word;
+    if (equals < 0 && CARGO_PASSTHROUGH_BOOL_FLAGS.has(flag)) continue;
+    if (CARGO_PASSTHROUGH_VALUE_FLAGS.has(flag)) {
+      const value = equals > 0 ? word.slice(equals + 1) : passthrough[index + 1];
+      if (!value) return false;
+      if (equals < 0) index += 1;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+const GO_BOOL_FLAGS = new Set([
+  "-v", "-race", "-short", "-json", "-failfast", "-a", "-n", "-x",
+  "-work", "-trimpath", "-cover", "-benchmem", "-m", "-all", "-deps", "-buildvcs",
+]);
+const GO_VALUE_FLAGS = new Set([
+  "-run", "-skip", "-bench", "-benchtime", "-count", "-timeout",
+  "-parallel", "-p", "-tags", "-f", "-coverpkg", "-covermode",
+  "-shuffle", "-mod", "-list",
+]);
+const GO_PATH_FLAGS = new Set(["-o", "-C", "-coverprofile"]);
+
+function isRoutineGo(rest: readonly string[], effectiveDir: string, boundaryCwd: string, writeRoots: readonly string[]): boolean {
+  const subcommand = rest[0]?.toLowerCase();
+  if (!subcommand || !ROUTINE_GO_SUBCOMMANDS.has(subcommand)) return false;
+  for (let index = 1; index < rest.length; index += 1) {
+    const word = rest[index]!;
+    if (word === "--") break;
+    if (!word.startsWith("-")) continue;
+    const equals = word.indexOf("=");
+    const rawFlag = equals > 0 ? word.slice(0, equals) : word;
+    // Go's flag package accepts `-flag` and `--flag` interchangeably.
+    const normFlag = rawFlag.startsWith("--") ? rawFlag.slice(1) : rawFlag;
+    if (equals < 0 && GO_BOOL_FLAGS.has(normFlag)) continue;
+    if (normFlag === "-buildvcs" && equals > 0) {
+      const val = word.slice(equals + 1);
+      if (val === "auto" || val === "true" || val === "false") continue;
+      return false;
+    }
+    if (GO_VALUE_FLAGS.has(normFlag)) {
+      const value = equals > 0 ? word.slice(equals + 1) : rest[index + 1];
+      if (!value) return false;
+      if (equals < 0) index += 1;
+      continue;
+    }
+    if (GO_PATH_FLAGS.has(normFlag)) {
+      const value = equals > 0 ? word.slice(equals + 1) : rest[index + 1];
+      if (!value || !isInsideBoundaryArgument(value, effectiveDir, boundaryCwd, writeRoots)) return false;
+      if (equals < 0) index += 1;
+      continue;
+    }
+    // Reject all other flags (including -ldflags, -gccgoflags, -compiler, -exec, -toolexec, -vettool, -trace, -overlay, -pkgdir, -modfile).
+    return false;
+  }
+  return true;
+}
+
+const PYTEST_BOOL_FLAGS = new Set([
+  "-q", "--quiet", "-v", "--verbose", "-s", "-x", "--exitfirst",
+  "--ff", "--failed-first", "--lf", "--last-failed", "--nf", "--new-first",
+  "--no-header", "--no-summary", "--collect-only", "--co", "--version",
+  "--disable-warnings", "--strict-markers", "--strict-config", "--full-trace",
+  "--show-capture=no", "--show-capture=stdout", "--show-capture=stderr", "--show-capture=all",
+  "--color=yes", "--color=no", "--color=auto",
+]);
+const PYTEST_VALUE_FLAGS = new Set([
+  "-k", "-m", "--tb", "--maxfail", "-r", "--durations", "-n", "--capture", "--color", "--show-capture",
+]);
+const PYTEST_PATH_FLAGS = new Set(["-c", "--rootdir", "--basetemp", "--junitxml", "--junit-xml"]);
+
+function isRoutinePytest(rest: readonly string[], effectiveDir: string, boundaryCwd: string, writeRoots: readonly string[]): boolean {
+  for (let index = 0; index < rest.length; index += 1) {
+    const word = rest[index]!;
+    if (word === "--") break;
+    if (!word.startsWith("-")) continue;
+    const equals = word.indexOf("=");
+    const flag = equals > 0 ? word.slice(0, equals) : word;
+    if (PYTEST_BOOL_FLAGS.has(word)) continue;
+    // Allow short boolean clusters ONLY from `{q, v, s, x}` (e.g. `-vv`, `-qx`, `-sv`).
+    if (/^-[qvsx]+$/u.test(word)) continue;
+    // Allow `-r<chars>` (e.g. `-ra`, `-rfE`).
+    if (/^-r[A-Za-z]+$/u.test(word)) continue;
+    if (PYTEST_VALUE_FLAGS.has(flag)) {
+      const value = equals > 0 ? word.slice(equals + 1) : rest[index + 1];
+      if (!value) return false;
+      if (equals < 0) index += 1;
+      continue;
+    }
+    if (PYTEST_PATH_FLAGS.has(flag)) {
+      const value = equals > 0 ? word.slice(equals + 1) : rest[index + 1];
+      if (!value || !isInsideBoundaryArgument(value, effectiveDir, boundaryCwd, writeRoots)) return false;
+      if (equals < 0) index += 1;
+      continue;
+    }
+    // Reject all other flags (including -o, -qo, -vc/..., --override-ini, -p, etc.).
+    return false;
+  }
+  return true;
+}
+
+function isRoutineNode(rest: readonly string[], effectiveDir: string, boundaryCwd: string, writeRoots: readonly string[]): boolean {
   // Inline evaluation (-e/-p/--eval=/--print=/--input-type) and module
   // preloading (-r/--require/--import) run ad-hoc code; only a script inside
-  // the task cwd, with a small set of harmless flags, is routine.
+  // the task boundary R, with a small set of harmless flags, is routine.
   let sawScript = false;
   for (const word of rest) {
     if (sawScript) continue; // arguments to the script itself
@@ -2397,7 +2751,7 @@ function isRoutineNode(rest: readonly string[], cwd: string): boolean {
       if (!ROUTINE_NODE_FLAG.test(word)) return false;
       continue;
     }
-    if (!isInsideCwdArgument(word, cwd)) return false;
+    if (!isInsideBoundaryArgument(word, effectiveDir, boundaryCwd, writeRoots)) return false;
     sawScript = true;
   }
   return sawScript || rest.some((word) => /^--test/u.test(word));
@@ -2428,66 +2782,93 @@ function sedScriptWritesFiles(script: string): boolean {
   return /(?:^|[;{}\s])[wWrRe]\s*[^\s]|\/[gIp\d]*[we]/u.test(script);
 }
 
-function hasUnsafeRedirection(segment: readonly ShellToken[], cwd: string, writeRoots: readonly string[] = []): boolean {
+function hasUnsafeRedirection(
+  segment: readonly ShellToken[],
+  effectiveDir: string,
+  writeRoots: readonly string[] = [],
+  boundaryCwd: string = effectiveDir,
+): boolean {
   for (let index = 0; index < segment.length; index += 1) {
     const token = segment[index]!;
     if (token.operator && (token.value === ">" || token.value === ">>")) {
       const target = segment[index + 1];
       if (!target || target.operator) return true;
-      if (isUnsafeRedirectTarget(target.value, cwd, writeRoots)) return true;
+      if (isUnsafeRedirectTarget(target.value, effectiveDir, writeRoots, boundaryCwd)) return true;
     }
   }
   return false;
 }
 
-function isUnsafeRedirectTarget(target: string, cwd: string, writeRoots: readonly string[] = []): boolean {
+function isUnsafeRedirectTarget(
+  target: string,
+  effectiveDir: string,
+  writeRoots: readonly string[] = [],
+  boundaryCwd: string = effectiveDir,
+): boolean {
   if (target === "/dev/null") return false; // the one device sink that discards rather than writes
   if (target.startsWith("/dev/") || target.startsWith("~") || target.startsWith("&")) return true;
-  // The same check the Write/Edit tools get, against the same roots: inside
-  // the cwd or a granted write root after resolving `..`, not Git metadata,
-  // and not through a symlink or hard link out of it. One root set governs
-  // both tools, so `cmd > <scratchpad>/out` is as routine as writing it.
-  return classifyWritePath(target, cwd, writeRoots) !== undefined;
+  // Pass unnormalized `${effectiveDir}/${target}` so `pathBelow` and
+  // `walkWritePath` still see every `link/..` segment instead of collapsing it
+  // lexically with `path.resolve`.
+  const checkedTarget = isAbsolute(target) || effectiveDir === boundaryCwd
+    ? target
+    : `${effectiveDir.replace(/\/+$/u, "")}/${target}`;
+  return classifyWritePath(checkedTarget, boundaryCwd, writeRoots) !== undefined;
 }
 
-/** True for an argument that names a filesystem location outside the task cwd (or ~), including `--flag=path` values. */
-function namesPathOutsideCwd(word: string, cwd: string, writeRoots: readonly string[] = []): boolean {
-  const value = word.startsWith("--") && word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
+/** True for an argument that names a filesystem location outside the task boundary R (or ~), including `-flag=path` and `--flag=path` values. */
+function namesPathOutsideCwd(
+  word: string,
+  effectiveDir: string,
+  writeRoots: readonly string[] = [],
+  boundaryCwd: string = effectiveDir,
+): boolean {
+  const value = word.startsWith("-") && word.includes("=") ? word.slice(word.indexOf("=") + 1) : word;
   if (value === "/dev/null") return false;
   if (value.startsWith("~")) return true;
   const pathLike = value.startsWith("/") || /(?:^|[\\/])\.\.(?:[\\/]|$)/u.test(value);
-  // A path inside a granted write root is inside for this purpose too, judged
-  // by the same walk the Write tool gets (symlinks and metadata included).
-  if (pathLike && !isInsideCwd(value, cwd)) return writeRoots.length === 0 || classifyWritePath(value, cwd, writeRoots) !== undefined;
+  const unnormalizedCandidate = isAbsolute(value) ? value : `${effectiveDir.replace(/\/+$/u, "")}/${value}`;
+  const resolvedCandidate = isAbsolute(value) ? value : resolve(effectiveDir, value);
+  // A path inside the task boundary R (cwd or a granted write root) is allowed,
+  // judged by the same unnormalized walk the Write tool gets (symlinks and
+  // metadata included).
+  if (pathLike) {
+    return classifyWritePath(unnormalizedCandidate, boundaryCwd, writeRoots) !== undefined;
+  }
   // An argument that exists on disk may be (or pass through) a symlink that
-  // leaves the cwd; compare real paths. A non-existent argument is a pattern or
-  // a literal and needs no check.
+  // leaves the boundary R; compare real paths. A non-existent argument is a
+  // pattern or a literal and needs no check.
   if (value.startsWith("-") || value === "") return false;
   let root: string;
-  try { root = realpathSync.native(cwd); }
+  try { root = realpathSync.native(boundaryCwd); }
   catch { return true; }
+  const allowedRoots = [root, ...writeRoots.filter((r) => isAbsolute(r)).map((r) => resolveExistingPath(r))];
+  const inAllowedRoots = (realPath: string): boolean => allowedRoots.some((allowed) => {
+    const rel = relative(allowed, realPath);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  });
   // Resolve the nearest existing ancestor so a symlinked directory component
   // (`link/new-file`) is caught even when the leaf does not exist yet.
-  let candidate = resolve(cwd, value);
+  let candidate = resolvedCandidate;
   while (true) {
     try {
       const real = realpathSync.native(candidate);
-      const rel = relative(root, real);
-      return rel !== "" && (rel.startsWith("..") || isAbsolute(rel));
+      return !inAllowedRoots(real);
     } catch {
       const parent = dirname(candidate);
       if (parent === candidate) return false;
-      const relParent = relative(cwd, parent);
-      if (relParent === "" ) return false; // reached the cwd itself: nothing left to resolve
+      const relParent = relative(effectiveDir, parent);
+      if (relParent === "") return false; // reached effectiveDir itself: nothing left to resolve
       candidate = parent;
     }
   }
 }
 
-function isInsideCwdArgument(pathValue: string, cwd: string): boolean {
+function isInsideBoundaryArgument(pathValue: string, effectiveDir: string, boundaryCwd: string, writeRoots: readonly string[]): boolean {
   if (pathValue.startsWith("~")) return false;
-  const value = pathValue.includes("=") && pathValue.startsWith("--") ? pathValue.slice(pathValue.indexOf("=") + 1) : pathValue;
-  return isInsideCwd(value, cwd);
+  const value = pathValue.includes("=") && pathValue.startsWith("-") ? pathValue.slice(pathValue.indexOf("=") + 1) : pathValue;
+  const unnormalized = isAbsolute(value) ? value : `${effectiveDir.replace(/\/+$/u, "")}/${value}`;
+  return classifyWritePath(unnormalized, boundaryCwd, writeRoots) === undefined;
 }
 
 function isInsideCwd(pathValue: string, cwd: string): boolean {

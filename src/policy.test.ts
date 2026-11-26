@@ -1406,3 +1406,163 @@ test("pinnedWriteRoots enforce symlink/replace-in-place invalidation, .git prote
     await rm(base, { recursive: true, force: true });
   }
 });
+
+test("D9b allows in-root symlinks while still blocking escaping, dangling, .git, and hard-linked targets", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-d9b-"));
+  const repo = join(base, "repo");
+  const outside = join(base, "outside");
+  try {
+    await Promise.all([
+      mkdir(join(repo, ".git"), { recursive: true }),
+      mkdir(join(repo, "libs", "shared"), { recursive: true }),
+      mkdir(join(repo, "a", "b", "c"), { recursive: true }),
+      mkdir(join(repo, "packages"), { recursive: true }),
+      mkdir(outside, { recursive: true }),
+    ]);
+    await writeFile(join(repo, ".git", "HEAD"), "ref: refs/heads/main\n");
+    await writeFile(join(repo, "libs", "shared", "real.ts"), "export const x = 1;\n");
+    await link(join(repo, ".git", "HEAD"), join(repo, "libs", "shared", "hardlink-head"));
+    await symlink(join("..", "libs", "shared"), join(repo, "packages", "shared-link"));
+    await symlink(join("a", "b", "c"), join(repo, "deep"));
+    await symlink(join(repo, "libs", "shared", "real.ts"), join(repo, "file-link.ts"));
+    await symlink(join(repo, "libs", "shared", "hardlink-head"), join(repo, "sym-to-hardlink"));
+    await symlink(join(repo, ".git"), join(repo, "git-link"));
+    await symlink(outside, join(repo, "escape-link"));
+    await symlink(join(repo, "does-not-exist"), join(repo, "dangling-link"));
+
+    // Valid in-root directory & file symlinks are allowed.
+    assert.equal(evaluatePermission("Write", { file_path: "packages/shared-link/new.ts", content: "ok" }, repo).decision, "allow");
+    assert.equal(evaluatePermission("Edit", { file_path: "file-link.ts" }, repo).decision, "allow");
+    assert.equal(evaluatePermission("Write", { file_path: join(repo, "packages", "shared-link", "sub", "a.ts"), content: "ok" }, repo).decision, "allow");
+
+    // Any `..` after a symlink (e.g. pnpm's deep symlink target `deep -> a/b/c`
+    // where lexical normalization climbs out of repo!) MUST be denied.
+    assert.equal(evaluatePermission("Write", { file_path: "deep/../../x.ts", content: "no" }, repo).decision, "deny");
+    assert.equal(evaluatePermission("Write", { file_path: "packages/shared-link/../../../outside/pwn.ts", content: "no" }, repo).decision, "deny");
+    // Symlinks to outside, .git, dangling targets, or hard-linked git metadata remain denied.
+    assert.equal(evaluatePermission("Write", { file_path: "escape-link/pwn.ts", content: "no" }, repo).decision, "deny");
+    assert.equal(evaluatePermission("Write", { file_path: "escape-link/../x.ts", content: "no" }, repo).decision, "deny");
+    assert.equal(evaluatePermission("Write", { file_path: "git-link/config", content: "no" }, repo).decision, "deny");
+    assert.equal(evaluatePermission("Write", { file_path: "dangling-link", content: "no" }, repo).decision, "deny");
+    assert.equal(evaluatePermission("Write", { file_path: "sym-to-hardlink", content: "no" }, repo).decision, "deny");
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("D9e recognizes pnpm, make, cargo, go, pytest, and literal cd within R while rejecting dangerous flags and escapes", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-d9e-"));
+  const repo = join(base, "repo");
+  const subdir = join(repo, "packages", "app");
+  const lane = join(base, "lane-a");
+  const outside = join(base, "outside");
+  try {
+    await Promise.all([
+      mkdir(subdir, { recursive: true }),
+      mkdir(join(repo, "a", "b", "c"), { recursive: true }),
+      mkdir(lane, { recursive: true }),
+      mkdir(outside, { recursive: true }),
+    ]);
+    await symlink(outside, join(repo, "escape-dir"));
+    await symlink(join("a", "b", "c"), join(repo, "deep"));
+    const pinned = pinWriteRoots([lane], repo);
+    const opts = { pinnedWriteRoots: pinned };
+
+    // Allowed routine commands.
+    for (const cmd of [
+      "pnpm test",
+      "pnpm run build",
+      "pnpm --filter @app/web test",
+      "pnpm ls --depth 0",
+      "make",
+      "make test",
+      "make -j4 check",
+      "make -C packages/app test",
+      "cargo test",
+      "cargo clippy --all-targets",
+      "cargo build --release",
+      "cargo fmt --check",
+      "cargo check --manifest-path packages/app/Cargo.toml",
+      "go test ./...",
+      "go vet ./...",
+      "go build -buildvcs=false -o bin/app ./cmd/app",
+      "pytest",
+      "pytest -q tests/test_app.py",
+      "pytest -k foo --basetemp tmp_pytest",
+      "cd packages/app && npm test",
+      "cd packages/app && cat ../sibling.txt",
+      "cd packages/app && echo hi > ../out.txt",
+      `cd ${lane} && git status`,
+      `cd ${lane} && pnpm test`,
+    ]) {
+      assert.equal(isRoutinePermission("Bash", bash(cmd), repo, opts), true, `expected routine: ${cmd}`);
+    }
+
+    // Rejected non-routine commands.
+    for (const cmd of [
+      "pnpm publish",
+      "pnpm dlx evil-pkg",
+      "pnpm -C /tmp test",
+      "pnpm --dir /tmp test",
+      "pnpm --test-pattern test exec evil",
+      "make SHELL=/bin/sh test",
+      "make CC=/tmp/evil test",
+      "make -E '$(shell id)'",
+      "make -E'pwn:;id' pwn",
+      "make '--ev=x:;id' x",
+      "make -e test",
+      "make -C /tmp test",
+      "make -C/tmp test",
+      "make -kC.. test",
+      "make -kf/tmp/Makefile test",
+      "make -f /etc/passwd",
+      "make -f/etc/passwd",
+      "cargo publish",
+      "cargo install evil",
+      "cargo test --config build.rustc=/tmp/evil",
+      "cargo test -Z unstable-options",
+      "cargo -Zunstable-options test",
+      "cargo -vZunstable-options test",
+      "cargo test --manifest-path /tmp/Cargo.toml",
+      "go run ./cmd/app",
+      "go test -exec /tmp/evil ./...",
+      "go test --exec=sh ./...",
+      "go vet -vettool=/tmp/evil ./...",
+      "go build '-ldflags=-linkmode=external -extld=/tmp/evil' ./...",
+      "go test -trace=/tmp/x ./...",
+      "go build -toolexec=/tmp/evil ./...",
+      "go build -buildvcs '-toolexec=sh -c id' ./...",
+      "go test -buildvcs -exec=sh ./...",
+      "go build -o /tmp/out ./...",
+      "pytest --basetemp /tmp/out",
+      "pytest -c /etc/pytest.ini",
+      "pytest -c/etc/pytest.ini",
+      "pytest -vc/etc/pytest.ini",
+      "pytest -o cache_dir=/tmp/x",
+      "pytest -qo cache_dir=/tmp/x",
+      "pytest --override-ini=cache_dir=/tmp/x",
+      "pytest --rootdir /tmp",
+      "CD packages/app && echo hi > ../../x",
+      "cd packages/app",
+      "cd packages/app && cat ../../../etc/passwd",
+      "cd packages/app && echo hi > ../../../escape.txt",
+      "cd packages && echo hi > ../escape-dir/../x",
+      "true || cd packages/app && echo hi > ../x",
+      "echo | cd packages/app && echo hi > ../x",
+      "cd does-not-exist && echo hi > ../x",
+      "cd packages/app ; echo hi > ../x",
+      "false && cd packages/app && echo hi ; echo hi > ../x",
+      "cd deep && cd ../.. && echo hi > x",
+      `cd ${outside} && ls`,
+      "cd ~ && ls",
+      "cd - && ls",
+      "cd packages/app | cat",
+      "cd packages/app || ls",
+      "cd escape-dir && ls",
+    ]) {
+      assert.equal(isRoutinePermission("Bash", bash(cmd), repo, opts), false, `expected non-routine: ${cmd}`);
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
