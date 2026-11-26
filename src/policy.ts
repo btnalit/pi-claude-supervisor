@@ -1785,11 +1785,13 @@ const D5_GIT_TAG_ALLOWED_FLAGS = new Set(["-l", "--list", "--contains", "--merge
 const D5_PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn"]);
 const D5_PACKAGE_ALLOWED_SUBCOMMANDS = new Set(["test", "run", "exec", "lint", "build", "check", "typecheck", "ls", "list"]);
 const D5_PACKAGE_RUNNER_SUBCOMMANDS = new Set(["run", "exec"]);
-const D5_PACKAGE_PRE_BOOL_FLAGS = new Set(["-r", "--recursive", "-w", "--workspace-root", "-s", "--silent"]);
-/** Text/read-only commands that never execute their positional arguments as commands. */
+const D5_PNPM_PRE_BOOL_FLAGS = new Set(["-r", "--recursive", "-w", "--workspace-root", "-s", "--silent"]);
+const D5_NPM_PRE_BOOL_FLAGS = new Set(["-s", "--silent"]);
+const D5_YARN_PRE_BOOL_FLAGS = new Set(["-s", "--silent"]);
+/** Text/read-only commands that do not execute their positional arguments as commands. */
 const D5_TEXT_ONLY_COMMANDS = new Set([
-  "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ls", "stat", "file",
-  "wc", "diff", "md5sum", "sha1sum", "sha256sum", "bat", "view", "echo", "printf", "sort", "uniq",
+  "cat", "head", "tail", "grep", "egrep", "fgrep", "rg", "ls", "stat", "file",
+  "wc", "diff", "md5sum", "sha1sum", "sha256sum", "echo", "printf", "uniq",
   "cut", "tr", "nl", "tac", "rev", "column", "fold", "paste", "comm", "cmp", "od", "hexdump", "xxd",
   "base64", "jq", "yq", "tee",
 ]);
@@ -1870,20 +1872,34 @@ function isReadOnlyGitDynamicSafe(argv: readonly ShellToken[]): boolean {
 function isPackageManagerGlobOnlySafe(argv: readonly ShellToken[], depth: number): boolean {
   const values = argv.map((t) => t.value);
   const lower = values.map((v) => v.toLowerCase());
+  const pkgManager = lower[0]!.split(/[\\/]/u).at(-1) ?? lower[0]!;
   if (lower.includes("publish")) return false;
-  // Strictly allowlist pre-subcommand flags so `-C . pub*` / `--prefix . pub*`
-  // can never shift a flag value into subcommand position.
+  // Strictly allowlist pre-subcommand flags per package manager so value flags
+  // (`npm -w <ws>`, `-C .`, `--prefix .`) can never shift a value into
+  // subcommand position.
   let subIndex = -1;
   for (let i = 1; i < argv.length; i += 1) {
     const tok = argv[i]!;
     if (tok.dynamic) return false;
-    if (tok.value === "--filter" || tok.value === "-F") {
-      if (i + 1 >= argv.length || argv[i + 1]!.dynamic) return false;
-      i += 1;
-      continue;
+    if (pkgManager === "pnpm") {
+      if (tok.value === "--filter" || tok.value === "-F") {
+        if (i + 1 >= argv.length || argv[i + 1]!.dynamic) return false;
+        i += 1;
+        continue;
+      }
+      if (tok.value.startsWith("--filter=") || tok.value.startsWith("-F=")) continue;
+      if (D5_PNPM_PRE_BOOL_FLAGS.has(tok.value)) continue;
+    } else if (pkgManager === "npm") {
+      if (tok.value === "-w" || tok.value === "--workspace") {
+        if (i + 1 >= argv.length || argv[i + 1]!.dynamic) return false;
+        i += 1;
+        continue;
+      }
+      if (tok.value.startsWith("--workspace=")) continue;
+      if (D5_NPM_PRE_BOOL_FLAGS.has(tok.value)) continue;
+    } else if (pkgManager === "yarn") {
+      if (D5_YARN_PRE_BOOL_FLAGS.has(tok.value)) continue;
     }
-    if (tok.value.startsWith("--filter=") || tok.value.startsWith("-F=")) continue;
-    if (D5_PACKAGE_PRE_BOOL_FLAGS.has(tok.value)) continue;
     if (tok.value.startsWith("-")) return false;
     subIndex = i;
     break;

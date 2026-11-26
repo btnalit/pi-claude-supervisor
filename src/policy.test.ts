@@ -1626,6 +1626,8 @@ test("D5 checks sensitive commands in command position only, unwraps literal tim
     "npm publish $DIR",
     "pnpm -C . pub*",
     "npm --prefix . pub*",
+    "npm -w test pub*",
+    "npm -w build publi[s]h",
     "pnpm exec git pu* origin main",
     "pnpm --filter=$PKG test",
     "npm test -- --grep=$PAT",
