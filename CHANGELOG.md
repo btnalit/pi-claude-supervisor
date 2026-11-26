@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented here.
 
+## [0.11.0](https://github.com/btnalit/pi-claude-supervisor/compare/v0.10.1...v0.11.0) (2026-11-26)
+
+
+### Features
+
+* **policy:** add pinned declared writeRoots, multi-root leases, and task-scoped temp root ([#94](https://github.com/btnalit/pi-claude-supervisor/issues/94)) ([fa2e972](https://github.com/btnalit/pi-claude-supervisor/commit/fa2e97200851529aa6cd554303122e2f3c55a88d))
+* **policy:** add Write Floor v1 blocking out-of-root and .git writes across redirects, tee, cp/install/ln, and git worktree ([#100](https://github.com/btnalit/pi-claude-supervisor/issues/100)) ([570643f](https://github.com/btnalit/pi-claude-supervisor/commit/570643fb8a117a8271dcb70bb56b3638cfc9b4ec))
+* **policy:** allow in-root symlinks and expand routine toolset with pnpm/make/cargo/go/pytest and literal cd ([#97](https://github.com/btnalit/pi-claude-supervisor/issues/97)) ([260493b](https://github.com/btnalit/pi-claude-supervisor/commit/260493bb9cc53fee63c4ecaebba72f9c2cccd0ff))
+* **policy:** narrow remote/destructive boundary and allow local lane merges ([#91](https://github.com/btnalit/pi-claude-supervisor/issues/91)) ([5babf06](https://github.com/btnalit/pi-claude-supervisor/commit/5babf06a933e76bf32450dc8c8669e54426cb3bf))
+* **policy:** scope dynamic-argument sensitivity to command position, read-only git, and package filename globs ([#98](https://github.com/btnalit/pi-claude-supervisor/issues/98)) ([a68f82b](https://github.com/btnalit/pi-claude-supervisor/commit/a68f82b00c117cc1c1f55ab94767cfe6d025ab41))
+* **report:** add read-only event log quality report CLI ([#95](https://github.com/btnalit/pi-claude-supervisor/issues/95)) ([a93ee55](https://github.com/btnalit/pi-claude-supervisor/commit/a93ee55911c2245d7d6d9b7b37737fa734c949fb))
+* **supervisor:** hand back interactive tmux sessions on park and retain lease until pane exits ([#96](https://github.com/btnalit/pi-claude-supervisor/issues/96)) ([dfdf335](https://github.com/btnalit/pi-claude-supervisor/commit/dfdf335d12bf939368d5cd4eb97991dba6efc9a4))
+
+
+### Bug Fixes
+
+* **env:** relax group-writable check, disable autoupdater, and repair detached HEAD before parking ([#99](https://github.com/btnalit/pi-claude-supervisor/issues/99)) ([6fbfca2](https://github.com/btnalit/pi-claude-supervisor/commit/6fbfca22a7d4895cac0f3c9dcd9b865007f54c42))
+* **index:** stop unfinished owned automatic workers on Pi shutdown ([#92](https://github.com/btnalit/pi-claude-supervisor/issues/92)) ([b680df2](https://github.com/btnalit/pi-claude-supervisor/commit/b680df212410e72789be416bfb90758d072e956a))
+* **supervisor:** harden AskUserQuestion timeout, permission failure fallback, and Decision parsing ([#93](https://github.com/btnalit/pi-claude-supervisor/issues/93)) ([721ba09](https://github.com/btnalit/pi-claude-supervisor/commit/721ba09b1b12196e64a6ead7d396c32a3d802085))
+* **supervisor:** operator stop owns the outcome; release during verification parks instead of failing ([#89](https://github.com/btnalit/pi-claude-supervisor/issues/89)) ([ea54db4](https://github.com/btnalit/pi-claude-supervisor/commit/ea54db4d31e12ca55f4ef783b8c84bdd7fa4b9ef))
+
 ## [0.10.1](https://github.com/btnalit/pi-claude-supervisor/compare/v0.10.0...v0.10.1) (2026-11-25)
 
 
