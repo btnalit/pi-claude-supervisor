@@ -1415,6 +1415,7 @@ test("D9b allows in-root symlinks while still blocking escaping, dangling, .git,
     await Promise.all([
       mkdir(join(repo, ".git"), { recursive: true }),
       mkdir(join(repo, "libs", "shared"), { recursive: true }),
+      mkdir(join(repo, "a", "b", "c"), { recursive: true }),
       mkdir(join(repo, "packages"), { recursive: true }),
       mkdir(outside, { recursive: true }),
     ]);
@@ -1422,6 +1423,7 @@ test("D9b allows in-root symlinks while still blocking escaping, dangling, .git,
     await writeFile(join(repo, "libs", "shared", "real.ts"), "export const x = 1;\n");
     await link(join(repo, ".git", "HEAD"), join(repo, "libs", "shared", "hardlink-head"));
     await symlink(join("..", "libs", "shared"), join(repo, "packages", "shared-link"));
+    await symlink(join("a", "b", "c"), join(repo, "deep"));
     await symlink(join(repo, "libs", "shared", "real.ts"), join(repo, "file-link.ts"));
     await symlink(join(repo, "libs", "shared", "hardlink-head"), join(repo, "sym-to-hardlink"));
     await symlink(join(repo, ".git"), join(repo, "git-link"));
@@ -1433,7 +1435,9 @@ test("D9b allows in-root symlinks while still blocking escaping, dangling, .git,
     assert.equal(evaluatePermission("Edit", { file_path: "file-link.ts" }, repo).decision, "allow");
     assert.equal(evaluatePermission("Write", { file_path: join(repo, "packages", "shared-link", "sub", "a.ts"), content: "ok" }, repo).decision, "allow");
 
-    // Escaping via `..` after following an in-root symlink is denied.
+    // Any `..` after a symlink (e.g. pnpm's deep symlink target `deep -> a/b/c`
+    // where lexical normalization climbs out of repo!) MUST be denied.
+    assert.equal(evaluatePermission("Write", { file_path: "deep/../../x.ts", content: "no" }, repo).decision, "deny");
     assert.equal(evaluatePermission("Write", { file_path: "packages/shared-link/../../../outside/pwn.ts", content: "no" }, repo).decision, "deny");
     // Symlinks to outside, .git, dangling targets, or hard-linked git metadata remain denied.
     assert.equal(evaluatePermission("Write", { file_path: "escape-link/pwn.ts", content: "no" }, repo).decision, "deny");
@@ -1455,10 +1459,12 @@ test("D9e recognizes pnpm, make, cargo, go, pytest, and literal cd within R whil
   try {
     await Promise.all([
       mkdir(subdir, { recursive: true }),
+      mkdir(join(repo, "a", "b", "c"), { recursive: true }),
       mkdir(lane, { recursive: true }),
       mkdir(outside, { recursive: true }),
     ]);
     await symlink(outside, join(repo, "escape-dir"));
+    await symlink(join("a", "b", "c"), join(repo, "deep"));
     const pinned = pinWriteRoots([lane], repo);
     const opts = { pinnedWriteRoots: pinned };
 
@@ -1498,25 +1504,45 @@ test("D9e recognizes pnpm, make, cargo, go, pytest, and literal cd within R whil
       "pnpm dlx evil-pkg",
       "pnpm -C /tmp test",
       "pnpm --dir /tmp test",
+      "pnpm --test-pattern test exec evil",
       "make SHELL=/bin/sh test",
+      "make CC=/tmp/evil test",
       "make -E '$(shell id)'",
+      "make -E'pwn:;id' pwn",
       "make -e test",
       "make -C /tmp test",
+      "make -C/tmp test",
       "make -f /etc/passwd",
+      "make -f/etc/passwd",
       "cargo publish",
       "cargo install evil",
       "cargo test --config build.rustc=/tmp/evil",
       "cargo test -Z unstable-options",
+      "cargo -Zunstable-options test",
       "cargo test --manifest-path /tmp/Cargo.toml",
       "go run ./cmd/app",
       "go test -exec /tmp/evil ./...",
+      "go test --exec=sh ./...",
+      "go vet -vettool=/tmp/evil ./...",
+      "go test -trace=/tmp/x ./...",
       "go build -toolexec=/tmp/evil ./...",
       "go build -o /tmp/out ./...",
       "pytest --basetemp /tmp/out",
       "pytest -c /etc/pytest.ini",
+      "pytest -c/etc/pytest.ini",
+      "pytest -o cache_dir=/tmp/x",
+      "pytest --override-ini=cache_dir=/tmp/x",
       "pytest --rootdir /tmp",
+      "cd packages/app",
       "cd packages/app && cat ../../../etc/passwd",
       "cd packages/app && echo hi > ../../../escape.txt",
+      "cd packages && echo hi > ../escape-dir/../x",
+      "true || cd packages/app && echo hi > ../x",
+      "echo | cd packages/app && echo hi > ../x",
+      "cd does-not-exist && echo hi > ../x",
+      "cd packages/app ; echo hi > ../x",
+      "false && cd packages/app && echo hi ; echo hi > ../x",
+      "cd deep && cd ../.. && echo hi > x",
       `cd ${outside} && ls`,
       "cd ~ && ls",
       "cd - && ls",
