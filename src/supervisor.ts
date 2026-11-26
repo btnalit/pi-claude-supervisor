@@ -2386,15 +2386,20 @@ export class Supervisor {
         await this.#parkCandidate(`${reason}; candidate cannot be published`, undefined, undefined, "Review limits");
         return result;
       }
+      if (this.#automation && this.#task.baseCommit && !repositoryEvidence.branch && repositoryEvidence.head) {
+        const reason = "HEAD is detached (e.g. an unfinished rebase, cherry-pick, or detached checkout); finish or abort any in-progress git operation and switch back onto the task branch before finishing";
+        this.#lastVerification = result;
+        if (await this.#requestRepair(result, reason)) {
+          this.#verificationAbortController = undefined;
+          return result;
+        }
+        await this.#parkCandidate("local candidate branch is unavailable (detached HEAD)", undefined, undefined, "Detached HEAD");
+        return result;
+      }
       if (this.#automation && (this.#task.baseCommit || this.#task.spec.autonomy.requireLocalCommit)
         && repositoryEvidence.complete === false) {
         this.#lastVerification = result;
         await this.#parkCandidate("repository evidence is incomplete or truncated; candidate cannot be published", undefined, undefined, "Repository evidence");
-        return result;
-      }
-      if (this.#automation && this.#task.baseCommit && !repositoryEvidence.branch) {
-        this.#lastVerification = result;
-        await this.#parkCandidate("local candidate branch is unavailable (detached HEAD)");
         return result;
       }
       if (this.#task.spec.autonomy.requireLocalCommit) {

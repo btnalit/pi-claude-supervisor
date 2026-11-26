@@ -414,7 +414,7 @@ export async function collectRepositoryEvidence(cwd: string, options: Pick<Verif
     commits: commitsResult.text,
     untracked: untrackedResult.text,
     ...(baseRef ? { baseRef } : {}),
-    ...(branchResult.text.trim() !== "(none)" ? { branch: branchResult.text.trim() } : {}),
+    ...(branchResult.complete && branchResult.text.trim() && branchResult.text.trim() !== "(none)" ? { branch: branchResult.text.trim() } : {}),
     ...(head ? { head } : {}),
     complete: statusResult.complete && diffResult.complete && commitsResult.complete && branchResult.complete && untrackedResult.complete,
     truncated: statusResult.truncated || diffResult.truncated || commitsResult.truncated || branchResult.truncated || untrackedResult.truncated,

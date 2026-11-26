@@ -6078,4 +6078,118 @@ test("T11: interactive park (both direct park and verification block) hands back
   }
 });
 
+test("D8a: detached HEAD during verification requests a bounded repair round before parking", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-claude-supervisor-d8a-"));
+  const cwdRepair = join(base, "repo-repair");
+  const cwdPark = join(base, "repo-park");
+  const runGit = async (dir: string, args: string[]) => {
+    await promisify(execFile)("git", args, { cwd: dir });
+  };
+  try {
+    await Promise.all([mkdir(cwdRepair), mkdir(cwdPark)]);
+    await Promise.all([
+      initializeGitRepository(cwdRepair, "worker/d8a-repair"),
+      initializeGitRepository(cwdPark, "worker/d8a-park"),
+    ]);
+
+    // 1. With repair budget: detached HEAD triggers repair_requested, Worker switches back to branch, next verify completes.
+    {
+      const handle: WorkerHandle = { id: "d8a-repair-worker", startedAt: new Date().toISOString(), cwd: cwdRepair, ownership: "owned" };
+      let running = true;
+      const sends: string[] = [];
+      let listener: WorkerStartInput["eventListener"];
+      const events = new FlakyEventLog("never-fail");
+      const adapter: WorkerAdapter = {
+        capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true, repairableSession: true }),
+        start: async (input) => { listener = input.eventListener; return handle; },
+        getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+        readOutput: async () => [],
+        send: async (_h, text) => { sends.push(text); },
+        pause: async () => {},
+        resume: async () => {},
+        stop: async () => { running = false; },
+        killProcessGroup: async () => { running = false; },
+        resumeSession: async () => handle,
+      };
+      const supervisor = new Supervisor(adapter, events as unknown as ConstructorParameters<typeof Supervisor>[1], {
+        reviewer: { review: async () => ({ verdict: "pass", summary: "ok", findings: [], round: 0, checkedAt: new Date().toISOString() }) },
+      });
+      await supervisor.start({
+        task: "d8a detached repair",
+        cwd: cwdRepair,
+        command: "claude",
+        automation: true,
+        deadlineMs: 0,
+        noOutputTimeoutMs: 0,
+        spec: {
+          maxRepairRounds: 1,
+          autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 },
+          acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 2_000 }],
+        },
+        decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+      });
+
+      // Detach HEAD after startup (e.g., mid-rebase / detached checkout).
+      await runGit(cwdRepair, ["checkout", "-q", "--detach", "HEAD"]);
+      listener?.({ type: "turn_completed", handle, result: {}, sequence: 1 });
+      await supervisor.poll();
+      await supervisor.verify();
+      assert.equal(supervisor.state, "running", "detached HEAD should trigger a repair round instead of immediately parking");
+      assert.equal(sends.length, 1);
+      assert.match(sends[0]!, /HEAD is detached/u);
+      assert.ok(events.events.some((e) => e.type === "repair_requested"));
+
+      // Worker repairs by switching back onto its task branch; verification now passes.
+      await runGit(cwdRepair, ["checkout", "-q", "worker/d8a-repair"]);
+      listener?.({ type: "turn_completed", handle, result: {}, sequence: 2 });
+      await supervisor.poll();
+      await supervisor.verify();
+      assert.equal(supervisor.state, "completed");
+    }
+
+    // 2. With zero repair budget: detached HEAD parks cleanly with Detached HEAD label.
+    {
+      const handle: WorkerHandle = { id: "d8a-park-worker", startedAt: new Date().toISOString(), cwd: cwdPark, ownership: "owned" };
+      let running = true;
+      let listener: WorkerStartInput["eventListener"];
+      const adapter: WorkerAdapter = {
+        capabilities: () => ({ transport: "tmux", interactiveInput: true, pause: true, resumeSession: false, processGroupControl: true, persistentSession: true, repairableSession: true }),
+        start: async (input) => { listener = input.eventListener; return handle; },
+        getStatus: async () => ({ handle, running, activeRequests: 0, processGroupCleaned: !running }),
+        readOutput: async () => [],
+        send: async () => {},
+        pause: async () => {},
+        resume: async () => {},
+        stop: async () => { running = false; },
+        killProcessGroup: async () => { running = false; },
+        resumeSession: async () => handle,
+      };
+      const supervisor = new Supervisor(adapter, undefined, { reviewer: automaticReviewer() });
+      await supervisor.start({
+        task: "d8a detached park without budget",
+        cwd: cwdPark,
+        command: "claude",
+        automation: true,
+        deadlineMs: 0,
+        noOutputTimeoutMs: 0,
+        spec: {
+          maxRepairRounds: 0,
+          autonomy: { unattended: true, requireLocalCommit: false, maxDecisionRetries: 2 },
+          acceptance: [{ id: "pass", name: "pass", command: process.execPath, args: ["-e", "process.exit(0)"], required: true, timeoutMs: 2_000 }],
+        },
+        decisionWorkerFactory: () => ({ start: async () => {}, updateContext: () => {}, notify: () => {}, close: async () => {} }),
+      });
+
+      await runGit(cwdPark, ["checkout", "-q", "--detach", "HEAD"]);
+      listener?.({ type: "turn_completed", handle, result: {}, sequence: 1 });
+      await supervisor.poll();
+      await supervisor.verify();
+      assert.equal(supervisor.state, "blocked");
+      assert.equal(supervisor.parkReasonLabel, "Detached HEAD");
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
 
