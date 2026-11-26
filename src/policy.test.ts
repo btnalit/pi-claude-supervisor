@@ -192,11 +192,11 @@ test("a name bound to literal text is not an unseen argument", () => {
   // Every bound value is substituted, so a loop that would push is still a push.
   assert.equal(evaluateCommand("for c in status push; do git $c origin main; done").decision, "deny");
   assert.equal(evaluateCommand("ACTION=push; git $ACTION origin main").decision, "deny");
-  // A binding to dynamic text, or an unbound name, is still unseen.
-  assert.equal(evaluateCommand("for c in $(git rev-list HEAD~3..HEAD); do git show $c; done").decision, "deny");
-  assert.equal(evaluateCommand("C=$(git rev-parse HEAD); git show $C").decision, "deny");
-  assert.equal(evaluateCommand("git show $c").decision, "deny");
-  assert.equal(evaluateCommand("X=literal; X=$Y; git show $X").decision, "deny");
+  // A binding to dynamic text, or an unbound name, is still unseen on mutating git commands.
+  assert.equal(evaluateCommand("for c in $(git rev-list HEAD~3..HEAD); do git cherry-pick $c; done").decision, "deny");
+  assert.equal(evaluateCommand("C=$(git rev-parse HEAD); git tag $C").decision, "deny");
+  assert.equal(evaluateCommand("git add $c").decision, "deny");
+  assert.equal(evaluateCommand("X=literal; X=$Y; git commit -m $X").decision, "deny");
   // A tilde expands only at the start of a word: `HEAD~1` is a revision, `~/x` is a home path.
   assert.equal(evaluateCommand("git reset -q --soft HEAD~1 && git restore --staged docs/x.md").decision, "allow");
   assert.equal(evaluateCommand("git diff HEAD~3..HEAD -- src/").decision, "allow");
@@ -1564,5 +1564,96 @@ test("D9e recognizes pnpm, make, cargo, go, pytest, and literal cd within R whil
     }
   } finally {
     await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("D5 checks sensitive commands in command position only, unwraps literal timeout, allows read-only git dynamic args and package filename globs", () => {
+  // Real-world shapes observed in #55 / local events.jsonl that must be allowed:
+  for (const cmd of [
+    // #2: transparent literal `timeout 300` wrapping non-sensitive `docker run` with $PWD
+    "timeout 300 docker run --rm -v \"$PWD/deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro\" caddy:2.10 caddy validate --config /etc/caddy/Caddyfile",
+    // #4: quoted heredoc + pnpm exec biome with pure filename glob (`graph-*.test.ts`)
+    "cat > ObjectView.tsx <<'EOF'\nexport const ok = 1;\nEOF\npnpm exec biome check --write packages/web/src/lib/graph-*.test.ts",
+    // #7: `sh` in argument position of `docker run` (not command position) with $PWD/$NEXTTIME_DATA
+    "docker run --rm -v \"$PWD:/repo:ro\" -v \"$NEXTTIME_DATA:$NEXTTIME_DATA\" -w /repo alpine:3.20 sh -c 'ls -la /repo'",
+    // #9 read-only loop: read-only git subcommands with dynamic args / globs
+    "git branch --list 's6/lane-*'",
+    "git rev-parse --short $b",
+    "git log -n $N --oneline",
+    "git diff $BASE..$HEAD -- src/",
+    "git show --stat $SHA",
+    "git tag -l 'v*'",
+    // Sensitive word in argument position of non-sensitive command
+    "grep -rn timeout \"$DIR\"",
+    "echo sh \"$VAR\"",
+    // Pure filename glob on non-publish npm/pnpm/yarn
+    "npm test -- src/*.test.ts",
+    "pnpm run lint -- packages/*/src/*.ts",
+    "yarn test src/*.spec.ts",
+    // Literal time / nohup wrapping non-sensitive command
+    "time docker ps -f \"name=$NAME\"",
+  ]) {
+    assert.equal(evaluateCommand(cmd).decision, "allow", `D5 expected allow: ${cmd}`);
+  }
+
+  // Must remain DENIED (zero boundary weakening):
+  for (const cmd of [
+    // Dynamic git subcommand or global flag before subcommand
+    "git $ACTION origin main",
+    "git -C $DIR status",
+    "git -c $OPT log",
+    "git st* --short",
+    // Mutating git subcommands with dynamic args
+    "git push $REMOTE feat",
+    "git merge $BRANCH",
+    "git remote set-url origin $URL",
+    "git config $KEY $VAL",
+    "git update-ref refs/heads/main $SHA",
+    "git commit -m $MSG",
+    "git add \"$FILE\"",
+    "git apply \"$PATCH\"",
+    // git branch / tag without read-only query flag (creates/deletes refs!)
+    "git branch $NEW_BRANCH",
+    "git branch -D $BRANCH",
+    "git branch --list -D $BRANCH",
+    "git tag $NEW_TAG",
+    "git tag -l -d $TAG",
+    // Package manager with variable expansion, dynamic subcommand/script, relocating flag, sensitive target, or publish
+    "npm run $script",
+    "pnpm exec $bin src/*.ts",
+    "pnpm $sub src/*.ts",
+    "pnpm publish *.tgz",
+    "npm publish $DIR",
+    "pnpm -C . pub*",
+    "npm --prefix . pub*",
+    "npm -w test pub*",
+    "npm -w build publi[s]h",
+    "pnpm exec git pu* origin main",
+    "pnpm --filter=$PKG test",
+    "npm test -- --grep=$PAT",
+    // Hiding sensitive commands behind shell constructs or unknown wrappers must stay DENIED
+    "case x in x) git $S origin main;; esac",
+    "f() { git $S origin main; }",
+    "coproc git $S origin main",
+    "linux64 git $S origin main",
+    "uv run git $S origin main",
+    "docker run alpine git $S origin main",
+    // Transparent wrapper with dynamic wrapper args or wrapping sensitive command
+    "timeout $DUR docker ps",
+    "timeout 30 $CMD",
+    "timeout 30 git push $REMOTE",
+    "timeout 30 sh -c \"$X\"",
+    "timeout 30 timeout 30 timeout 30 timeout 30 timeout 30 docker run -v \"$PWD:/x\" alpine",
+    // Shell/network/elevation commands in command position with dynamic args
+    "sh -c \"$X\"",
+    "bash -lc \"$X\"",
+    "curl -X POST \"$URL\"",
+    "gh pr create --title \"$TITLE\"",
+    "sudo ls \"$DIR\"",
+    "env FOO=1 ls \"$DIR\"",
+    "ls | xargs $TOOL",
+    "find . -exec echo \"$X\" {} +",
+  ]) {
+    assert.equal(evaluateCommand(cmd).decision, "deny", `D5 expected deny: ${cmd}`);
   }
 });
