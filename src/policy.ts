@@ -419,6 +419,7 @@ const WRITE_FLOOR_CONTROL_KEYWORDS = new Set([
 ]);
 const WRITE_FLOOR_DEFERRED_BUILTINS = new Set(["eval", "source", ".", "trap", "alias", "shopt"]);
 const WRITE_FLOOR_ENV_MUTATORS = new Set(["export", "declare", "typeset", "readonly", "local", "read", "mapfile", "readarray"]);
+const WRITE_FLOOR_NAMEREF_BUILTINS = new Set(["declare", "typeset", "local"]);
 
 /** True only when `text` is a single `$(…)` whose opening `$(` closes at the very last character (never `$(a) $(b)`). */
 function isSingleBalancedCommandSubst(text: string): boolean {
@@ -550,8 +551,9 @@ function writeFloorScript(
     let first = 0;
     while (first < words.length && (FLOOR_KEYWORDS.has(words[first]!.value) || /^[A-Za-z_][A-Za-z0-9_]*=/u.test(words[first]!.value))) first += 1;
 
-    // Detect `CDPATH` / `cdable_vars` anywhere in non-heredoc words (after quote removal).
-    if (words.some((w) => /\b(?:CDPATH|cdable_vars)\b/u.test(w.value))) {
+    // Detect `CDPATH` / `cdable_vars` OR indirect parameter assignment (`${!x:=...}`,
+    // which in bash can assign `CDPATH` dynamically) anywhere in non-heredoc words.
+    if (words.some((w) => /\b(?:CDPATH|cdable_vars)\b/u.test(w.value) || /\$\{![^}]*[:?]?=/u.test(w.value))) {
       globalCwdUnknown = true;
       possibleDirs.add(undefined);
       allSeenDirs.add(undefined);
@@ -599,7 +601,8 @@ function writeFloorScript(
     // Check only the variable NAME (before `=`) for non-nameref assignments so `export FOO="$BAR"` stays allowed.
     if (WRITE_FLOOR_ENV_MUTATORS.has(cmdWord)) {
       const restWords = words.slice(cmdIdx + 1);
-      const hasNameref = restWords.some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*n/u.test(w.value));
+      const hasNameref = WRITE_FLOOR_NAMEREF_BUILTINS.has(cmdWord)
+        && restWords.some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*n/u.test(w.value));
       const hasDynamicName = restWords.some((w) => {
         if (w.value.startsWith("-")) return false;
         const eq = w.value.indexOf("=");
@@ -647,10 +650,31 @@ function writeFloorScript(
           inCmdPos = true;
           continue;
         }
-        if (rawVal.endsWith(")") && !tok.quoted && !tok.inSubst) {
-          // `case` arm pattern like `x)` or `echo)`: the next word is in command position!
+        if ((tok.trailingCloseParens ?? 0) > 0) {
+          // `case` arm pattern like `x)` or `"x")`: the next word is in command position!
           inCmdPos = true;
           continue;
+        }
+        // Unspaced `case` arm (`x)cd`, `"x")cd`, `x)$(printf …)`, `x)mapfile`, `x)declare`):
+        // an unquoted `)` mid-token starts a new command immediately after it.
+        if (rawVal.includes(")")) {
+          const afterParen = rawVal.slice(rawVal.indexOf(")") + 1).replace(/^[({]+|[});]+$/gu, "");
+          if (afterParen) {
+            if (afterParen === "cd" || afterParen === "pushd" || afterParen === "popd"
+              || WRITE_FLOOR_DEFERRED_BUILTINS.has(afterParen)
+              || /[$`*?[\]{}]/u.test(afterParen)
+              || ((afterParen === "mapfile" || afterParen === "readarray") && words.slice(wi + 1).some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*C/u.test(w.value)))
+              || (WRITE_FLOOR_NAMEREF_BUILTINS.has(afterParen) && words.slice(wi + 1).some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*n/u.test(w.value)))) {
+              globalCwdUnknown = true;
+              possibleDirs.add(undefined);
+              allSeenDirs.add(undefined);
+              break;
+            }
+            if (afterParen === "builtin" || afterParen === "command" || afterParen === "time") {
+              inCmdPos = true;
+              continue;
+            }
+          }
         }
         if (inCmdPos && /^[A-Za-z_][A-Za-z0-9_]*=/u.test(rawVal)) continue;
         if (inCmdPos && (clean === "builtin" || clean === "command" || clean === "time")) {
@@ -671,7 +695,7 @@ function writeFloorScript(
           allSeenDirs.add(undefined);
           break;
         }
-        if (inCmdPos && WRITE_FLOOR_ENV_MUTATORS.has(clean) && words.slice(wi + 1).some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*n/u.test(w.value))) {
+        if (inCmdPos && WRITE_FLOOR_NAMEREF_BUILTINS.has(clean) && words.slice(wi + 1).some((w) => !w.value.startsWith("--") && /^-[A-Za-z]*n/u.test(w.value))) {
           globalCwdUnknown = true;
           possibleDirs.add(undefined);
           allSeenDirs.add(undefined);
@@ -3430,10 +3454,16 @@ function lexShell(input: string): { tokens: ShellToken[]; error?: string } {
     if (character === "\\") {
       atLeadingParen = false;
       trailingCloseParens = 0;
-      tokenEscaped = true;
-      if (next === "\n") index += 1;
-      else if (next !== undefined) { value += next; index += 1; }
-      started = true;
+      if (next === "\n") {
+        // Line continuation (`\<newline>`) is deleted before word splitting by bash;
+        // it does NOT quote/escape an adjacent fd digit (`2\<newline>>/dev/null` is still `2>`).
+        index += 1;
+      } else if (next !== undefined) {
+        tokenEscaped = true;
+        value += next;
+        index += 1;
+        started = true;
+      }
       continue;
     }
     // A comment runs to the end of the line.
