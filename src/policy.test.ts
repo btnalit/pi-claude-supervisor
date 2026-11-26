@@ -1704,6 +1704,7 @@ test("Write Floor v1 (#55-3) blocks out-of-R and .git writes across redirects, t
       "(( 5 > 3 )) && echo ok",
       "echo hi > .github/workflows/ci.yml",
       "echo hi > .gitignore",
+      "echo cd; echo hi > notes.txt",
       "echo hi > \"$UNKNOWN_OUT\"",
       "tee out.log",
       "tee -a -",
@@ -1815,6 +1816,36 @@ test("Write Floor v1 (#55-3) blocks out-of-R and .git writes across redirects, t
       "cp a.txt ~/.ssh/authorized_key?",
       "echo evil > /etc/$X",
       "echo evil > .git/$X",
+      // Opus 5.5 round-2 adversarial repros (F1–F8):
+      // F1: path/operand ending in `cd`/`popd` must NOT disable write checks
+      "echo evil | tee -a ~/.bashrc ./cd",
+      "cp a.txt ~/.ssh/authorized_keys",
+      "cp tools/cd ~/.ssh/authorized_keys",
+      "cp -t ~/.ssh a.txt popd",
+      // F2: fake/pipeline `cd` must NOT shift directory inside R, and heredoc runs at its own segment dir
+      `echo cd ${repo}/packages/app/a/b/c; echo evil >> ../../../../outside/pwn.txt`,
+      `: $(cd ${repo}/packages/app/a/b/c); echo evil >> ../../../../outside/pwn.txt`,
+      `true | cd ${repo}/packages/app/a/b/c; echo evil > ../../../../outside/pwn.txt`,
+      `bash <<'EOF'\necho evil >> ../outside/pwn.txt\nEOF\ncd ${repo}/packages/app/a/b/c`,
+      // F3: `$(...)` and escaped `\)` must NOT pop subshell directory stack early
+      "(cd ~; x=$(date); echo evil >> .bashrc)",
+      "(cd ~; echo \\); echo evil >> .bashrc)",
+      // F4: escaped `\'` and double-quoted `"'"` before `$(...)` must NOT hide substitution
+      `echo \\' $(cp a.txt ${outside}/pwn.txt)`,
+      `echo "'" $(cp a.txt ${outside}/pwn.txt)`,
+      // F5: quoted path followed by unquoted subshell `)` still strips `)`
+      '(echo \'gitdir: /tmp/evil\' > ".git")',
+      `(echo 'gitdir: /tmp/evil' > "${lane}/.git")`,
+      // F6: `find` behind wrapper (`timeout`, `sudo`) still checks multiple `-exec` and `-execdir`
+      `timeout 9 find . -exec cp a.txt b.txt \\; -exec cp a.txt ${outside}/pwn.txt \\;`,
+      `sudo find ${outside} -execdir cp ${repo}/a.txt pwn.txt \\;`,
+      // F7: `env -uC` / `sudo -uD` stop cluster scan at `-u` value letter
+      "env -uC tee -a ~/.bashrc",
+      `sudo -uD tee -a ${outside}/pwn.txt`,
+      // F8: single `>` and `>|` inside `trap` and here-strings (`sh <<<`, `bash <<<`)
+      "trap 'echo evil > ~/.bashrc' EXIT",
+      `sh <<< 'echo evil > ${outside}/pwn.txt'`,
+      `bash <<< 'printf x >| ${outside}/pwn.txt'`,
     ]) {
       assert.ok(judge(cmd), `Write Floor expected deny: ${cmd}`);
       assert.equal(evaluatePermission("Bash", bash(cmd), repo, opts).decision, "deny", `evaluatePermission expected deny: ${cmd}`);
